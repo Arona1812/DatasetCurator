@@ -68,8 +68,8 @@ ESCALATE_SMART_CROP_CLOSE_CALLS = True
 SMART_CROP_ESCALATION_MAX_DELTA = 10.0
 
 # Eindeutiges Triggerwort für das spätere LoRA-Training.
-TRIGGER_WORD = "Kuebra"
-INPUT_FOLDER = r"C:\AI\Dataset Curator\Kuebra"
+TRIGGER_WORD = ""
+INPUT_FOLDER = r""
 
 # Zielgröße des finalen Datensatzes. Das Skript versucht diese Zahl zu erreichen,
 # notfalls auch mit guten Reservebildern aus Review-Kandidaten.
@@ -193,7 +193,7 @@ IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
 CAPTION_PROFILE = "ernie"  # "ernie" | "z_image_base" | "custom"
 CAPTION_POLICY = {
     "include_gender_class": True,
-    "include_skin_tone": True,   #Ernie
+    "include_skin_tone": True, 
     "include_body_build": True,
     "include_tattoos": True,
     "include_glasses": True,
@@ -203,7 +203,7 @@ CAPTION_POLICY = {
     "include_lighting": True,
     "include_gaze": True,
     "include_expression": True,
-    "include_hair_always": True,   #Ernie
+    "include_hair_always": True,   
     "include_hair_when_variable": True,
     "include_beard_always": False,
     "include_beard_when_variable": True,
@@ -610,17 +610,15 @@ def local_filesize_kb(image_path: str) -> float:
 
 def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
     """
-    Erkennt Instagram-Story-Rahmen (farbige/unscharfe Balken links/rechts
-    und ggf. oben/unten) und schneidet sie weg.
+    Erkennt Instagram-Story-Rahmen (farbige Balken, Blur-Hintergründe,
+    Gradient-Verläufe links/rechts und ggf. oben/unten) und schneidet sie weg.
 
-    Strategie:
-    - Berechnet den horizontalen Farbgradienten pro Spalte.
-    - Frame-Kanten erzeugen eine scharfe, über viele Zeilen konsistente
-      Farbdiskontinuität (= hoher Anteil an Zeilen mit starkem Gradienten).
-    - Wenn nur eine Seite klar erkannt wird, wird Symmetrie angenommen und
-      mit einem niedrigeren Schwellwert auf der gegenüberliegenden Seite gesucht.
-    - Oben/unten: Zeilen mit sehr niedriger Varianz (= UI-Bereich, Caption-Text
-      auf einfarbigem Hintergrund) werden ebenfalls entfernt.
+    Zweistufige Erkennung:
+    1. Frame-Indikator: Prüft ob die äußeren ~15% pro Seite ein Frame-Pattern
+       haben (median_row_std < 15 = jede Zeile im Strip ist nahezu einfarbig,
+       auch wenn sich die Farbe von Zeile zu Zeile ändert → Gradient/Blur/Solid).
+    2. Kanten-Lokalisierung: Findet die genaue Grenze zwischen Frame und Foto
+       über horizontale Farbgradienten mit Symmetrie-Fallback.
 
     Gibt den Pfad der permanent gespeicherten, gecroppten Datei zurück
     (in IG_FRAME_CROP_DIR), oder None wenn kein Frame erkannt wurde.
@@ -642,14 +640,41 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
         img = np.array(pil_img, dtype=np.float32)
         h, w = img.shape[:2]
 
-        # Zu kleine Bilder: kein Frame-Crop sinnvoll
         if w < 400 or h < 400:
             return None
 
-        # ── Horizontale Gradienten (vertikale Frame-Kanten) ──
-        h_grad = np.abs(np.diff(img, axis=1)).mean(axis=2)  # (h, w-1)
+        # ── STUFE 1: Frame-Indikator via Zeilen-Uniformität ──
+        # Echte IG-Rahmen (solid, blur, gradient) haben pro Zeile fast
+        # identische Pixelwerte innerhalb des Randstreifens.
+        # median_row_std < 15 = Frame-Pattern, >= 15 = normaler Bildinhalt.
+        # Wir testen mehrere Probe-Breiten (schmal → breit), weil ein
+        # zu breiter Probe-Strip bei schmalen Rahmen in das Foto hineinragt
+        # und fälschlicherweise hohe Varianz zeigt.
+        # Mindestens 2 von 4 Breiten müssen Frame-Pattern bestätigen, damit
+        # ein einzelner Grenzwert-Treffer bei der schmalsten Probe kein
+        # False Positive auslöst.
 
-        # Anteil der Zeilen mit starkem Gradienten pro Spalte
+        def is_frame_side(side: str) -> bool:
+            hits = 0
+            for divisor in [20, 14, 10, 7]:
+                pw = max(20, w // divisor)
+                if side == "left":
+                    strip = img[:, :pw, :]
+                else:
+                    strip = img[:, w - pw:, :]
+                row_stds = strip.std(axis=1).mean(axis=1)
+                if float(np.median(row_stds)) < 15.0:
+                    hits += 1
+            return hits >= 3
+
+        left_is_frame = is_frame_side("left")
+        right_is_frame = is_frame_side("right")
+
+        if not left_is_frame and not right_is_frame:
+            return None
+
+        # ── STUFE 2: Exakte Kanten-Lokalisierung ──
+        h_grad = np.abs(np.diff(img, axis=1)).mean(axis=2)  # (h, w-1)
         col_score_strict = uniform_filter1d(
             (h_grad > 20).sum(axis=0) / h, size=3
         )
@@ -657,79 +682,76 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
             (h_grad > 10).sum(axis=0) / h, size=3
         )
 
-        # Linke Kante: stärkster Peak im linken Drittel
-        left_zone = col_score_strict[: w // 3]
-        left_cands = np.where(left_zone > 0.20)[0]
-        if len(left_cands) > 0:
-            best = left_cands[np.argmax(left_zone[left_cands])]
-            left_edge = int(best) + 1
-        else:
-            left_edge = 0
+        # Linke Kante suchen (nur wenn links als Frame erkannt)
+        left_edge = 0
+        if left_is_frame:
+            left_zone = col_score_strict[: w // 3]
+            left_cands = np.where(left_zone > 0.15)[0]
+            if len(left_cands) > 0:
+                best = left_cands[np.argmax(left_zone[left_cands])]
+                left_edge = int(best) + 1
+            else:
+                # Gradient ist so weich dass keine scharfe Kante existiert.
+                # Fallback: Zeile-für-Zeile row_std scannen und finden wo
+                # der Inhalt beginnt (row_std springt über 15).
+                for col in range(max(10, w // 20), w // 3):
+                    strip = img[:, col:col + 5, :]
+                    if float(np.median(strip.std(axis=1).mean(axis=1))) >= 15.0:
+                        left_edge = col
+                        break
 
-        # Rechte Kante: stärkster Peak im rechten Drittel
-        r_off = 2 * w // 3
-        right_zone = col_score_strict[r_off:]
-        right_cands = np.where(right_zone > 0.20)[0]
-        if len(right_cands) > 0:
-            best = right_cands[np.argmax(right_zone[right_cands])]
-            right_edge = int(r_off + best)
-        else:
-            right_edge = w
+        # Rechte Kante suchen (nur wenn rechts als Frame erkannt)
+        right_edge = w
+        if right_is_frame:
+            r_off = 2 * w // 3
+            right_zone = col_score_strict[r_off:]
+            right_cands = np.where(right_zone > 0.15)[0]
+            if len(right_cands) > 0:
+                best = right_cands[np.argmax(right_zone[right_cands])]
+                right_edge = int(r_off + best)
+            else:
+                for col in range(w - max(10, w // 20), 2 * w // 3, -1):
+                    strip = img[:, col - 5:col, :]
+                    if float(np.median(strip.std(axis=1).mean(axis=1))) >= 15.0:
+                        right_edge = col
+                        break
 
         left_border = left_edge
         right_border = w - right_edge
 
-        # Symmetrie-Fallback: eine Seite klar → gegenüber mit niedrigerem
-        # Schwellwert im symmetrischen Bereich (±20 px) suchen.
-        if left_border >= IG_FRAME_MIN_BORDER_PX and right_border < 15:
+        # Symmetrie-Fallback: wenn nur eine Seite per Stufe-1 erkannt wurde,
+        # aber die andere Seite eine schwächere Kante hat
+        if left_is_frame and not right_is_frame and left_border >= IG_FRAME_MIN_BORDER_PX:
             sym = w - left_border
-            for col in range(max(0, sym - 20), min(len(col_score_relaxed), sym + 21)):
-                if col_score_relaxed[col] > 0.15:
+            for col in range(max(0, sym - 25), min(len(col_score_relaxed), sym + 26)):
+                if col_score_relaxed[col] > 0.12:
                     right_edge = col
                     right_border = w - right_edge
                     break
-        elif right_border >= IG_FRAME_MIN_BORDER_PX and left_border < 15:
+        elif right_is_frame and not left_is_frame and right_border >= IG_FRAME_MIN_BORDER_PX:
             sym = right_border
-            for col in range(max(0, sym - 20), min(w // 3, sym + 21)):
-                if col_score_relaxed[col] > 0.15:
+            for col in range(max(0, sym - 25), min(w // 3, sym + 26)):
+                if col_score_relaxed[col] > 0.12:
                     left_edge = col + 1
                     left_border = left_edge
                     break
 
+        # Mindestens eine Seite muss signifikanten Rand haben
         has_frame = (
-            (left_border >= IG_FRAME_MIN_BORDER_PX and right_border >= IG_FRAME_MIN_BORDER_PX)
-            or left_border >= IG_FRAME_MIN_BORDER_PX * 2
-            or right_border >= IG_FRAME_MIN_BORDER_PX * 2
+            left_border >= IG_FRAME_MIN_BORDER_PX
+            or right_border >= IG_FRAME_MIN_BORDER_PX
         )
-
         if not has_frame:
             return None
 
         # ── False-Positive-Filter ──
-        # Echte IG-Rahmen sind relativ schmal (max ~18% pro Seite) und
-        # farblich uniform (Solid oder Blur). Normaler Bildinhalt, der
-        # zufällig eine vertikale Kante erzeugt, hat dagegen hohe Varianz
-        # und nimmt oft >20% der Bildbreite ein.
+        # Kein einzelner Rand breiter als 30% der Bildbreite
         max_border = max(left_border, right_border)
-        if max_border / w > 0.20:
+        if max_border / w > 0.30:
             return None
 
-        # Border-Uniformität prüfen: Standardabweichung der Pixelwerte
-        # im erkannten Rahmenbereich. Echte IG-Rahmen: std < 45,
-        # normaler Bildinhalt: std > 50.
-        for border_start, border_end in [
-            (0, left_edge) if left_border >= IG_FRAME_MIN_BORDER_PX else (None, None),
-            (right_edge, w) if right_border >= IG_FRAME_MIN_BORDER_PX else (None, None),
-        ]:
-            if border_start is None:
-                continue
-            border_strip = img[:, border_start:border_end, :]
-            border_std = float(border_strip.std(axis=(0, 1)).mean())
-            if border_std > 45.0:
-                return None
-
-        # ── Vertikale Gradienten (horizontale Frame-Kanten oben/unten) ──
-        v_grad = np.abs(np.diff(img, axis=0)).mean(axis=2)  # (h-1, w)
+        # ── Vertikale Kanten (oben/unten) ──
+        v_grad = np.abs(np.diff(img, axis=0)).mean(axis=2)
         row_score = uniform_filter1d(
             (v_grad > 20).sum(axis=1) / w, size=3
         )
@@ -744,8 +766,6 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
         bottom_edge = int(bot_off + bot_cands[np.argmax(bot_zone[bot_cands])]) if len(bot_cands) > 0 else h
 
         # ── UI-Elemente / Captions entfernen ──
-        # Innerhalb des Frames: oben/unten Bereiche mit sehr niedriger Varianz
-        # (= einfarbiger IG-Hintergrund mit UI-Overlays oder Caption-Text)
         inner = img[top_edge:bottom_edge, left_edge:right_edge, :]
         inner_h = inner.shape[0]
 
@@ -771,8 +791,7 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
         if content_w < IG_FRAME_MIN_CONTENT_PX or content_h < IG_FRAME_MIN_CONTENT_PX:
             return None
 
-        # Nur croppen, wenn tatsächlich signifikant Rand entfernt wurde
-        total_removed = left_border + right_border + (final_top) + (h - final_bottom)
+        total_removed = left_border + right_border + final_top + (h - final_bottom)
         if total_removed < 40:
             return None
 
@@ -2858,16 +2877,26 @@ def main() -> None:
     if EXPORT_REVIEW_IMAGES:
         review_export = sorted(review_items, key=lambda r: -int(r.get("quality_total", 0)))
         for row in review_export:
-            new_basename = f"{SAFE_TRIGGER}_review_{counters['review']:03d}"
-            counters["review"] += 1
-            row["output_bucket"] = "review"
+            needs_text_cleanup = bool(row.get("watermark_or_overlay") or row.get("prominent_readable_text"))
+
+            if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
+                bucket = "caption_remove"
+                out_dir = CAPTION_REMOVE_DIR
+                new_basename = f"{SAFE_TRIGGER}_{counters['caption_remove']:03d}"
+            else:
+                bucket = "review"
+                out_dir = REVIEW_DIR
+                new_basename = f"{SAFE_TRIGGER}_review_{counters['review']:03d}"
+
+            counters[bucket] += 1
+            row["output_bucket"] = bucket
             row["new_basename"] = new_basename
             row["final_caption"] = build_caption(row, global_rules)
 
             try:
                 cropped = body_aware_crop(row["original_path"], row)
-                img_out = os.path.join(REVIEW_DIR, f"{new_basename}.jpg")
-                txt_out = os.path.join(REVIEW_DIR, f"{new_basename}.txt")
+                img_out = os.path.join(out_dir, f"{new_basename}.jpg")
+                txt_out = os.path.join(out_dir, f"{new_basename}.txt")
                 cropped.save(img_out, "JPEG", quality=100)
                 with open(txt_out, "w", encoding="utf-8") as f:
                     f.write(row["final_caption"])

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import gradio as gr
+from PIL import Image
 
 # ============================================================
 # UI LANGUAGE / I18N
@@ -79,6 +80,19 @@ _active_process: Optional[subprocess.Popen] = None
 
 # Alle Standardwerte an einer Stelle – wird sowohl fuer Defaults als
 # auch fuer Save/Load verwendet.
+SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
+    "include_glasses",
+    "include_piercings",
+    "include_makeup",
+    "include_background",
+    "include_lighting",
+    "include_gaze",
+    "include_expression",
+    "include_hair_always",
+    "include_beard_when_variable",
+    "include_mirror_selfie_marker",
+]
+
 DEFAULTS: Dict[str, Any] = {
     # UI
     "ui_language": "en",
@@ -88,6 +102,7 @@ DEFAULTS: Dict[str, Any] = {
     "c_target": 30,
     "c_api_key": "",
     "c_model": "gpt-5.4-nano",
+    "c_use_trigger_check": False,
     "c_trigger_model": "gpt-5.4-nano",
     "c_use_review_escalation": True,
     "c_review_escalation_model": "",
@@ -126,25 +141,8 @@ DEFAULTS: Dict[str, Any] = {
     "c_max_session": 5,
     "c_use_diversity": True,
     # Captions
-    "c_caption_profile": "ernie",
-    "c_captions": [
-        "include_gender_class",
-        "include_skin_tone",
-        "include_body_build",
-        "include_tattoos",
-        "include_glasses",
-        "include_piercings",
-        "include_makeup",
-        "include_background",
-        "include_lighting",
-        "include_gaze",
-        "include_expression",
-        "include_hair_always",        
-        "include_hair_when_variable",
-        "include_beard_when_variable",
-        "include_mirror_selfie_marker",
-        "include_eye_color",
-    ],
+    "c_caption_profile": "shared_compact",
+    "c_captions": list(SHARED_COMPACT_CAPTION_FIELDS),
     # Export
     "c_exp_review": True,
     "c_exp_reject": True,
@@ -180,42 +178,14 @@ CAPTION_FIELD_CHOICES: List[str] = [
 ]
 
 CAPTION_PROFILE_PRESETS: Dict[str, List[str]] = {
-    "z_image_base": [
-        "include_gender_class",
-        "include_glasses",
-        "include_piercings",
-        "include_makeup",
-        "include_background",
-        "include_lighting",
-        "include_gaze",
-        "include_expression",
-        "include_hair_when_variable",
-        "include_beard_when_variable",
-        "include_mirror_selfie_marker",
-    ],
-    "ernie": [
-        "include_gender_class",
-        "include_skin_tone",
-        "include_body_build",
-        "include_tattoos",
-        "include_glasses",
-        "include_piercings",
-        "include_makeup",
-        "include_background",
-        "include_lighting",
-        "include_gaze",
-        "include_expression",
-        "include_hair_always",
-        "include_hair_when_variable",
-        "include_beard_when_variable",
-        "include_mirror_selfie_marker",
-        "include_eye_color",
-    ],
+    "shared_compact": list(SHARED_COMPACT_CAPTION_FIELDS),
 }
 
 
 def normalize_caption_profile(value: Optional[str]) -> str:
     v = (value or "").strip().lower()
+    if v in {"shared_compact", "z_image_base", "ernie"}:
+        return "shared_compact"
     if v in CAPTION_PROFILE_PRESETS:
         return v
     return "custom"
@@ -223,8 +193,7 @@ def normalize_caption_profile(value: Optional[str]) -> str:
 
 def caption_profile_choices() -> List[Tuple[str, str]]:
     return [
-        ("Z-Image_Base", "z_image_base"),
-        ("ERNIE", "ernie"),
+        (tr("Shared Compact (Z-Image + ERNIE)", "Shared Compact (Z-Image + ERNIE)"), "shared_compact"),
         (tr("Custom", "Custom"), "custom"),
     ]
 
@@ -332,7 +301,7 @@ def save_language_and_restart(lang_code: str) -> str:
 def save_settings_fn(
     ui_language,
     # Curator
-    c_trigger, c_input, c_target, c_api_key, c_model, c_trigger_model,
+    c_trigger, c_input, c_target, c_api_key, c_model, c_use_trigger_check, c_trigger_model,
     c_use_review_escalation, c_review_escalation_model,
     c_review_escalation_score_min, c_review_escalation_score_max,
     c_escalate_on_review, c_escalate_on_conflict, c_escalate_smart_crop, c_smart_crop_escalation_delta,
@@ -354,6 +323,7 @@ def save_settings_fn(
         "ui_language": "en",
         "c_trigger": c_trigger, "c_input": c_input, "c_target": c_target,
         "c_api_key": c_api_key, "c_model": c_model,
+        "c_use_trigger_check": c_use_trigger_check,
         "c_trigger_model": c_trigger_model,
         "c_use_review_escalation": c_use_review_escalation,
         "c_review_escalation_model": c_review_escalation_model,
@@ -412,6 +382,40 @@ def scan_images(folder: str, limit: int = 60) -> List[str]:
         imgs.extend(glob(os.path.join(folder, ext)))
     imgs.sort(key=os.path.getmtime, reverse=True)
     return imgs[:limit]
+
+
+def load_gallery_image(path: str, max_size: Tuple[int, int] = (1600, 1600)) -> Optional[Image.Image]:
+    """Load an image into memory so Gradio does not need direct filesystem access."""
+    try:
+        with Image.open(path) as img:
+            preview = img.convert("RGB")
+            resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+            preview.thumbnail(max_size, resampling)
+            return preview
+    except Exception:
+        return None
+
+
+def load_gallery_images(paths: List[str], max_size: Tuple[int, int] = (1600, 1600)) -> List[Image.Image]:
+    images: List[Image.Image] = []
+    for path in paths:
+        preview = load_gallery_image(path, max_size=max_size)
+        if preview is not None:
+            images.append(preview)
+    return images
+
+
+def build_gallery_with_captions(
+    paths: List[str],
+    captions: List[str],
+    max_size: Tuple[int, int] = (1600, 1600),
+) -> List[Tuple[Image.Image, str]]:
+    gallery_data: List[Tuple[Image.Image, str]] = []
+    for path, caption in zip(paths, captions):
+        preview = load_gallery_image(path, max_size=max_size)
+        if preview is not None:
+            gallery_data.append((preview, caption))
+    return gallery_data
 
 
 def output_root_for(input_folder: str, trigger_word: str) -> str:
@@ -487,7 +491,7 @@ def run_script(
     log_lines: List[str] = []
     progress = 0.0
     last_gallery_update = 0
-    images: List[str] = []
+    images: List[Any] = []
 
     try:
         for line in _active_process.stdout:
@@ -501,7 +505,7 @@ def run_script(
 
             processed_count = sum(1 for l in log_lines if re.match(r"\s*\[\d+/\d+\]", l))
             if image_scan_folder and processed_count - last_gallery_update >= 5:
-                images = scan_images(image_scan_folder)
+                images = load_gallery_images(scan_images(image_scan_folder))
                 last_gallery_update = processed_count
 
             log_text = "\n".join(log_lines[-500:])
@@ -528,7 +532,7 @@ def run_script(
         pass
 
     if image_scan_folder:
-        images = scan_images(image_scan_folder)
+        images = load_gallery_images(scan_images(image_scan_folder))
 
     log_text = "\n".join(log_lines[-500:])
     status = (
@@ -547,7 +551,7 @@ def run_script(
 # ============================================================
 
 def start_curator(
-    trigger_word, input_folder, target_size, api_key, ai_model, trigger_check_model,
+    trigger_word, input_folder, target_size, api_key, ai_model, use_trigger_check, trigger_check_model,
     use_review_escalation, review_escalation_model,
     review_escalation_score_min, review_escalation_score_max,
     escalate_on_review, escalate_on_conflict, escalate_smart_crop, smart_crop_escalation_delta,
@@ -576,10 +580,6 @@ def start_curator(
 
     all_caption_keys = list(CAPTION_FIELD_CHOICES)
     caption_policy = {k: (k in caption_options) for k in all_caption_keys}
-    if normalize_caption_profile(caption_profile) == "ernie":
-        caption_policy["include_body_build"] = True
-        caption_policy["include_tattoos"] = True
-        caption_policy["include_eye_color"] = True
 
     config = {
         "TRIGGER_WORD": trigger_word.strip(),
@@ -587,6 +587,7 @@ def start_curator(
         "TARGET_DATASET_SIZE": int(target_size),
         "API_KEY": api_key.strip(),
         "AI_MODEL": ai_model.strip(),
+        "USE_AI_TRIGGERWORD_CHECK": use_trigger_check,
         "TRIGGER_CHECK_MODEL": trigger_check_model.strip() or ai_model.strip(),
         "USE_REVIEW_ESCALATION": use_review_escalation,
         "REVIEW_ESCALATION_MODEL": review_escalation_model.strip(),
@@ -687,10 +688,10 @@ def load_results(input_folder, trigger_word, subfolder):
         "Smart Crop Paare": "07_smart_crop_pairs",
     }
     target = os.path.join(root, folder_map.get(subfolder, "01_train_ready"))
-    images = scan_images(target, limit=100)
+    image_paths = scan_images(target, limit=100)
 
     captions = []
-    for img_path in images:
+    for img_path in image_paths:
         txt_path = os.path.splitext(img_path)[0] + ".txt"
         if os.path.isfile(txt_path):
             with open(txt_path, "r", encoding="utf-8") as f:
@@ -698,7 +699,7 @@ def load_results(input_folder, trigger_word, subfolder):
         else:
             captions.append("")
 
-    gallery_data = [(img, cap) for img, cap in zip(images, captions)]
+    gallery_data = build_gallery_with_captions(image_paths, captions)
 
     safe = re.sub(r"[^\w\-]+", "_", trigger_word.strip()).strip("_") or "subject"
     report_path = os.path.join(root, f"dataset_report_{safe}.md")
@@ -708,8 +709,8 @@ def load_results(input_folder, trigger_word, subfolder):
             report = f.read()
 
     info = tr(
-        f"📁 {target}\n📷 {len(images)} Bilder gefunden",
-        f"📁 {target}\n📷 {len(images)} images found",
+        f"📁 {target}\n📷 {len(image_paths)} Bilder gefunden",
+        f"📁 {target}\n📷 {len(image_paths)} images found",
     )
     return gallery_data, report, info
 
@@ -825,12 +826,20 @@ def build_ui() -> gr.Blocks:
                             ),
                             max_lines=1,
                         )
+                        c_use_trigger_check = gr.Checkbox(
+                            label=tr("Trigger-Check aktivieren", "Enable trigger check"),
+                            value=S["c_use_trigger_check"],
+                            info=tr(
+                                "Prüft das Triggerwort per KI auf Kollisionen oder problematische Ähnlichkeiten. Wenn deaktiviert, wird die Prüfung komplett übersprungen.",
+                                "Checks the trigger word via AI for collisions or problematic similarities. If disabled, the check is skipped entirely.",
+                            ),
+                        )
                         c_trigger_model = gr.Textbox(
                             label=tr("Trigger-Check-Modell", "Trigger-check model"),
                             value=S["c_trigger_model"],
                             info=tr(
-                                "Optional separates Modell für die Triggerwort-Prüfung. Leer = primäres Modell verwenden.",
-                                "Optional separate model for trigger-word checks. Empty = use primary model.",
+                                "Optional separates Modell für die Triggerwort-Prüfung. Leer = primäres Modell verwenden. Wird nur genutzt, wenn der Trigger-Check aktiviert ist.",
+                                "Optional separate model for trigger-word checks. Empty = use primary model. Only used when trigger check is enabled.",
                             ),
                             max_lines=1,
                         )
@@ -1157,10 +1166,10 @@ def build_ui() -> gr.Blocks:
                     c_caption_profile = gr.Dropdown(
                         label=tr("Caption-Preset", "Caption preset"),
                         choices=caption_profile_choices(),
-                        value=normalize_caption_profile(S.get("c_caption_profile")) or "ernie",
+                        value=normalize_caption_profile(S.get("c_caption_profile")) or "shared_compact",
                         info=tr(
-                            "Schaltet zwischen modellabhängigen Voreinstellungen um. Danach kannst du die Felder unten weiterhin individuell anpassen.",
-                            "Switches between model-specific presets. You can still fine-tune the fields below afterwards.",
+                            "Gemeinsames kompaktes Character-LoRA-Schema für Z-Image und ERNIE. Danach kannst du die Felder unten weiterhin individuell anpassen.",
+                            "Shared compact Character-LoRA schema for Z-Image and ERNIE. You can still fine-tune the fields below afterwards.",
                         ),
                     )
                     c_captions = gr.CheckboxGroup(
@@ -1228,7 +1237,7 @@ def build_ui() -> gr.Blocks:
 
                 # Alle Curator-Inputs als Liste (fuer Save und Start)
                 curator_inputs = [
-                    c_trigger, c_input, c_target, c_api_key, c_model, c_trigger_model,
+                    c_trigger, c_input, c_target, c_api_key, c_model, c_use_trigger_check, c_trigger_model,
                     c_use_review_escalation, c_review_escalation_model,
                     c_review_escalation_score_min, c_review_escalation_score_max,
                     c_escalate_on_review, c_escalate_on_conflict, c_escalate_smart_crop, c_smart_crop_escalation_delta,
