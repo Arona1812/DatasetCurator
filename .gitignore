@@ -1,0 +1,13 @@
+curator_env
+Datasets
+token.txt
+__pycache__
+
+# UI runtime configs (contain API key / local paths)
+_ui_config.json
+_ui_video_config.json
+_ui_settings.json
+
+# Curator outputs / caches (often large)
+curated_*/
+*/curated_*/
