@@ -15,7 +15,7 @@ This project started from a very practical frustration: manually sorting, prepar
 
 ## Requirements
 
-To use the OpenAI-assisted features of this project, you need your own OpenAI API key as well as sufficient API credit or available free tokens on your account. Also you need python.
+To use the OpenAI-assisted features of this project, you need your own OpenAI API key as well as sufficient API credit or available free tokens on your account. Also you need python 3.10.
 
 ## Features
 

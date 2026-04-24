@@ -4,8 +4,8 @@ setlocal
 :: ============================================================
 :: LoRA Dataset Curator - Unified Launcher
 :: ============================================================
-:: Erstellt die venv, installiert Abhaengigkeiten, startet UI.
-:: Einfach doppelklicken.
+:: Creates the venv, installs dependencies, and starts the UI.
+:: Just double-click.
 :: ============================================================
 
 cd /d "%~dp0"
@@ -16,41 +16,41 @@ echo   LoRA Dataset Curator
 echo ========================================
 echo.
 
-:: --- Schritt 1: Virtuelle Umgebung ---
+:: --- Step 1: Virtual environment ---
 if exist "curator_env\Scripts\activate.bat" (
-    echo [1/3] Virtuelle Umgebung vorhanden.
+    echo [1/3] Virtual environment found.
 ) else (
-    echo [1/3] Erstelle virtuelle Umgebung...
+    echo [1/3] Creating virtual environment...
     py -3.10 -m venv curator_env
     if errorlevel 1 goto :err_python
-    echo       Erstellt.
+    echo       Created.
 )
 
 call curator_env\Scripts\activate.bat
 
-:: --- Schritt 2: Abhaengigkeiten ---
+:: --- Step 2: Dependencies ---
 if exist "curator_env\_install_done.marker" (
-    echo [2/3] Abhaengigkeiten bereits installiert.
+    echo [2/3] Dependencies already installed.
 ) else (
-    echo [2/3] Installiere Abhaengigkeiten...
-    echo       Das kann einige Minuten dauern.
+    echo [2/3] Installing dependencies...
+    echo       This may take a few minutes.
     echo.
     call :do_install
     if errorlevel 1 goto :err_install
     echo done > "curator_env\_install_done.marker"
     echo.
-    echo       Installation abgeschlossen.
+    echo       Installation complete.
 )
 
-:: --- Schritt 3: UI starten ---
+:: --- Step 3: Start UI ---
 if not exist "dataset_curator_ui.py" goto :err_missing
 
-echo [3/3] Starte UI...
+echo [3/3] Starting UI...
 echo.
 echo ========================================
-echo   UI startet im Browser automatisch.
-echo   Port ist ggf. nicht 7860, wenn belegt.
-echo   Zum Beenden: Ctrl+C hier druecken.
+echo   The UI will open automatically in your browser.
+echo   The port may not be 7860 if it is already in use.
+echo   To stop it, press Ctrl+C here.
 echo ========================================
 echo.
 
@@ -60,7 +60,7 @@ python dataset_curator_ui.py
 :: Exit code 5 = UI requested restart (e.g. after language change)
 if %errorlevel%==5 (
     echo.
-    echo [UI] Neustart angefordert...
+    echo [UI] Restart requested...
     timeout /t 1 /nobreak >nul
     goto :run_ui
 )
@@ -70,16 +70,16 @@ exit /b 0
 
 
 :: ============================================================
-:: Installations-Subroutine
-:: (Liegt ausserhalb aller if-Bloecke, damit Sonderzeichen
-::  wie > = und Klammern keine Probleme machen.)
+:: Installation subroutine
+:: (Placed outside all if blocks so that special characters
+::  such as > = and parentheses do not cause issues.)
 :: ============================================================
 :do_install
 
 echo       - pip upgrade...
 python -m pip install --upgrade pip setuptools wheel
 
-echo       - Basis-Pakete...
+echo       - Base packages...
 python -m pip install requests pillow numpy scipy
 
 echo       - MediaPipe...
@@ -101,25 +101,25 @@ exit /b 0
 
 
 :: ============================================================
-:: Fehlerbehandlung
+:: Error handling
 :: ============================================================
 :err_python
 echo.
-echo FEHLER: Python 3.10 nicht gefunden.
-echo Bitte installieren: https://www.python.org/downloads/
+echo ERROR: Python 3.10 not found.
+echo Please install it from: https://www.python.org/downloads/
 pause
 exit /b 1
 
 :err_install
 echo.
-echo FEHLER bei der Installation. Siehe Ausgabe oben.
+echo ERROR during installation. See output above.
 pause
 exit /b 1
 
 :err_missing
 echo.
-echo FEHLER: dataset_curator_ui.py nicht gefunden.
-echo Bitte folgende Dateien hierher kopieren:
+echo ERROR: dataset_curator_ui.py not found.
+echo Please copy the following files here:
 echo   - dataset_curator_ui.py
 echo   - dataset_curator_v2.py
 echo   - video_Processor.py

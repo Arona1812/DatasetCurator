@@ -1554,18 +1554,18 @@ if __name__ == "__main__":
     if not os.path.isfile(VIDEO_SCRIPT):
         missing.append(f"  - {VIDEO_SCRIPT}")
     if missing:
-        print("⚠️ Fehlende Skripte:")
+        print("WARNING: Missing scripts:")
         for m in missing:
             print(m)
-        print("Bitte alle Dateien in denselben Ordner legen.\n")
+        print("Please place all files in the same folder.\n")
 
     venv_ok = os.path.isfile(os.path.join(SCRIPT_DIR, "curator_env", "Scripts", "python.exe"))
 
     # Avoid UnicodeEncodeError on Windows consoles (cp1252) by not printing emojis.
     print(f"Python:        {VENV_PYTHON}")
-    print(f"Venv gefunden: {'Ja' if venv_ok else 'Nein'}")
-    print(f"Settings:      {SETTINGS_PATH} ({'vorhanden' if os.path.isfile(SETTINGS_PATH) else 'neu'})")
-    print(f"Skript-Ordner: {SCRIPT_DIR}\n")
+    print(f"Venv found:    {'Yes' if venv_ok else 'No'}")
+    print(f"Settings:      {SETTINGS_PATH} ({'present' if os.path.isfile(SETTINGS_PATH) else 'new'})")
+    print(f"Script folder: {SCRIPT_DIR}\n")
 
     app = build_ui()
     app.queue()
