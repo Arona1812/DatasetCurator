@@ -145,9 +145,13 @@ HARD_MAX_DARK_MEDIAN      = 20        # Unter 30/255 -> zu dunkel
 HARD_MIN_BRIGHT_MEDIAN    = 255       # Über 225/255 -> überbelichtet
 
 # pHash-Vorfilter VOR der API: berechnet alle Hashes lokal und wirft
-# pixelnahe Duplikate raus bevor ein einziger API-Call gemacht wird.
-# Nutzt denselben PHASH_HAMMING_THRESHOLD wie der spätere Pass-2-Filter.
+# nur nahezu identische Bilder raus, bevor ein einziger API-Call gemacht wird.
+# Wichtig: Early-Dedup ist absichtlich strenger als der spaetere Pass-2-Filter,
+# damit aehnliche Varianten (Pose, Mimik, kleine Perspektivwechsel) nicht schon
+# vor der eigentlichen Analyse komplett verschwinden.
 USE_EARLY_PHASH_DEDUP     = True
+EARLY_PHASH_HAMMING_THRESHOLD = 4
+EARLY_PHASH_KEEP_PER_GROUP = 2
 
 # Qualitätsschwellen (0-100, nach interner ×10-Normalisierung)
 # Bilder unter diesem Wert werden von "keep" auf "review" herabgestuft.
@@ -1112,11 +1116,17 @@ def local_quick_reject_post_crop(image_path: str, width: int, height: int) -> Op
 
 def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dict[str, int]]:
     """
-    Berechnet pHash für alle Bilder und entfernt pixelnahe Duplikate
+    Berechnet pHash für alle Bilder und entfernt nur nahezu identische,
+    pixelnahe Duplikate
     BEVOR die API aufgerufen wird. Gibt (survivors, duplicates, phash_cache) zurück.
     phash_cache: {absoluter_pfad: phash_int} für Wiederverwendung in local_subject_metrics.
     Gewinner werden pro Duplikat-Gruppe anhand eines deterministischen,
     lokalen Qualitätsscores gewählt; Dateigröße ist nur Tie-Breaker.
+
+    Unterschiede zur spaeteren Pass-2-Deduplikation:
+    - strengere Schwelle (EARLY_PHASH_HAMMING_THRESHOLD)
+    - Gruppierung nur gegen einen Anchor je Gruppe, um Kettenbildung zu vermeiden
+    - mehrere Bilder pro Gruppe koennen erhalten bleiben
     """
     if not USE_EARLY_PHASH_DEDUP or not USE_PHASH_DUPLICATE_SCORING:
         return image_paths, [], {}
@@ -1148,15 +1158,17 @@ def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dic
     for path, phash in hashed_items:
         assigned = False
         for group in groups:
-            if any(hamming_distance(phash, member_hash) <= PHASH_HAMMING_THRESHOLD for _, member_hash in group["members"]):
+            anchor_hash = group["anchor_hash"]
+            if hamming_distance(phash, anchor_hash) <= EARLY_PHASH_HAMMING_THRESHOLD:
                 group["members"].append((path, phash))
                 assigned = True
                 break
         if not assigned:
-            groups.append({"members": [(path, phash)]})
+            groups.append({"anchor_hash": phash, "members": [(path, phash)]})
 
     survivors = list(no_hash_paths)
     score_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
+    keep_per_group = max(1, int(EARLY_PHASH_KEEP_PER_GROUP))
     for group in groups:
         members: List[Tuple[str, int]] = group["members"]
         ranked_members = []
@@ -1176,16 +1188,23 @@ def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dic
             reverse=True,
         )
 
-        winner = ranked_members[0][0]
-        survivor_set.add(winner)
-        survivors.append(winner)
-        for member_path, _, _ in ranked_members[1:]:
+        kept_members = ranked_members[:keep_per_group]
+        removed_members = ranked_members[keep_per_group:]
+
+        for member_path, _, _ in kept_members:
+            survivor_set.add(member_path)
+            survivors.append(member_path)
+
+        for member_path, _, _ in removed_members:
             duplicate_set.add(member_path)
 
     survivors = [p for p in image_paths if p in survivor_set or (p in no_hash_paths and p not in duplicate_set)]
     duplicates = [p for p in image_paths if p in duplicate_set]
 
-    safe_print(f"   ↳ Early pHash: kept {len(survivors)}, removed {len(duplicates)} duplicates\n")
+    safe_print(
+        f"   ↳ Early pHash: kept {len(survivors)}, removed {len(duplicates)} duplicates "
+        f"(threshold={EARLY_PHASH_HAMMING_THRESHOLD}, keep/group={keep_per_group})\n"
+    )
     return survivors, duplicates, phash_cache
 
 
@@ -3283,7 +3302,10 @@ def main() -> None:
             bucket = "train_ready"
             out_dir = TRAIN_READY_DIR
 
-        new_basename = f"{SAFE_TRIGGER}_{counters[bucket]:03d}"
+        if bucket == "caption_remove":
+            new_basename = f"{SAFE_TRIGGER}-caption_remove_{counters[bucket]:03d}"
+        else:
+            new_basename = f"{SAFE_TRIGGER}_{counters[bucket]:03d}"
         counters[bucket] += 1
 
         row["output_bucket"] = bucket
@@ -3307,7 +3329,7 @@ def main() -> None:
             if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
                 bucket = "caption_remove"
                 out_dir = CAPTION_REMOVE_DIR
-                new_basename = f"{SAFE_TRIGGER}_{counters['caption_remove']:03d}"
+                new_basename = f"{SAFE_TRIGGER}-caption_remove_{counters['caption_remove']:03d}"
             else:
                 bucket = "review"
                 out_dir = REVIEW_DIR

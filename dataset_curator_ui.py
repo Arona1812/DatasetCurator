@@ -138,6 +138,8 @@ DEFAULTS: Dict[str, Any] = {
     "c_face_min_blur": 45,
     "c_blur_norm_edge": 512,
     "c_use_early_phash": True,
+    "c_early_phash_thresh": 4,
+    "c_early_phash_keep": 2,
     # Subject-Sanity-Check (Gliedmassen-Filter)
     "c_subject_sanity": True,
     "c_subject_min_torso": 2,
@@ -338,6 +340,7 @@ def save_settings_fn(
     c_use_filesize, c_min_filesize,
     c_use_blur, c_min_blur, c_face_min_blur, c_blur_norm_edge,
     c_use_early_phash,
+    c_early_phash_thresh, c_early_phash_keep,
     c_subject_sanity, c_subject_min_torso,
     c_ig_frame_crop, c_ig_two_stage_bar,
     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
@@ -371,6 +374,8 @@ def save_settings_fn(
         "c_use_blur": c_use_blur, "c_min_blur": c_min_blur,
         "c_face_min_blur": c_face_min_blur, "c_blur_norm_edge": c_blur_norm_edge,
         "c_use_early_phash": c_use_early_phash,
+        "c_early_phash_thresh": c_early_phash_thresh,
+        "c_early_phash_keep": c_early_phash_keep,
         "c_subject_sanity": c_subject_sanity,
         "c_subject_min_torso": c_subject_min_torso,
         "c_ig_frame_crop": c_ig_frame_crop,
@@ -597,6 +602,7 @@ def start_curator(
     use_filesize_filter, min_filesize_kb,
     use_blur_filter, min_blur_variance, face_min_blur_variance, blur_norm_edge,
     use_early_phash,
+    early_phash_threshold, early_phash_keep_per_group,
     subject_sanity, subject_min_torso,
     ig_frame_crop, ig_two_stage_bar,
     use_clip, use_phash, phash_threshold, clip_threshold,
@@ -655,6 +661,8 @@ def start_curator(
         "ENABLE_IG_FRAME_CROP": ig_frame_crop,
         "IG_FRAME_TWO_STAGE_BAR_DETECT": ig_two_stage_bar,
         "USE_EARLY_PHASH_DEDUP": use_early_phash,
+        "EARLY_PHASH_HAMMING_THRESHOLD": int(early_phash_threshold),
+        "EARLY_PHASH_KEEP_PER_GROUP": int(early_phash_keep_per_group),
         "USE_CLIP_DUPLICATE_SCORING": use_clip,
         "USE_PHASH_DUPLICATE_SCORING": use_phash,
         "PHASH_HAMMING_THRESHOLD": int(phash_threshold),
@@ -1104,10 +1112,33 @@ def build_ui() -> gr.Blocks:
                         label=tr("Early pHash-Dedup (vor API)", "Early pHash dedup (pre-API)"),
                         value=S["c_use_early_phash"],
                         info=tr(
-                            "Findet pixelnahe Duplikate lokal VOR der API. Spart API-Kosten.",
-                            "Finds near pixel-duplicates locally before the API. Saves API cost.",
+                            "Findet lokal vor der API nur nahezu identische Pixel-Duplikate. Über Schwelle + Keep-pro-Gruppe bleiben ähnliche Varianten erhalten.",
+                            "Finds only near-identical pixel duplicates locally before the API. Threshold + keep-per-group let similar variants survive.",
                         ),
                     )
+                    with gr.Row():
+                        c_early_phash_thresh = gr.Slider(
+                            label=tr("Early pHash Hamming-Schwelle", "Early pHash hamming threshold"),
+                            minimum=1,
+                            maximum=12,
+                            step=1,
+                            value=S["c_early_phash_thresh"],
+                            info=tr(
+                                "Nur für den Vorfilter vor der API. Niedriger = strenger. 4 entfernt primär Fast-1:1-Duplikate.",
+                                "Pre-API filter only. Lower = stricter. 4 mainly removes almost 1:1 duplicates.",
+                            ),
+                        )
+                        c_early_phash_keep = gr.Slider(
+                            label=tr("Early pHash: Keep pro Gruppe", "Early pHash: keep per group"),
+                            minimum=1,
+                            maximum=5,
+                            step=1,
+                            value=S["c_early_phash_keep"],
+                            info=tr(
+                                "Wie viele der besten Bilder je Early-pHash-Gruppe vor der API erhalten bleiben. 2 lässt ähnliche Varianten durch.",
+                                "How many top images per early pHash group are kept before the API. 2 lets similar variants survive.",
+                            ),
+                        )
 
                 with gr.Accordion(tr("🖼️ Instagram-Frame / UI-Rand-Entfernung", "🖼️ Instagram frame / UI border removal"), open=False):
                     gr.Markdown(tr(
@@ -1374,6 +1405,7 @@ def build_ui() -> gr.Blocks:
                     c_use_filesize, c_min_filesize,
                     c_use_blur, c_min_blur, c_face_min_blur, c_blur_norm_edge,
                     c_use_early_phash,
+                    c_early_phash_thresh, c_early_phash_keep,
                     c_subject_sanity, c_subject_min_torso,
                     c_ig_frame_crop, c_ig_two_stage_bar,
                     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
