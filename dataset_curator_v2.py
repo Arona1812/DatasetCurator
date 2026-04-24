@@ -214,22 +214,23 @@ SLEEP_BETWEEN_CALLS = 1.0
 # Export
 # --------------------------------
 EXPORT_REVIEW_IMAGES = True  # Exportiert Review-Bilder zusätzlich in einen separaten Ordner
-EXPORT_REJECT_IMAGES = True  # Exportiert Reject-Bilder physisch mit; oft aus = spart Platz
-EXPORT_SMART_CROP_COMPARISON = True  # Exportiert Vergleichspaare (Original vs. Headshot-Crop) in 07_smart_crop_pairs
+EXPORT_REJECT_IMAGES = False  # Exportiert Reject-Bilder physisch mit; oft aus = spart Platz
+EXPORT_SMART_CROP_COMPARISON = False  # Exportiert Vergleichspaare (Original vs. Headshot-Crop) in 08_smart_crop_pairs
 
 # --------------------------------
 # Ausgabeordner
 # --------------------------------
 OUTPUT_ROOT = os.path.join(INPUT_FOLDER, f"curated_{TRIGGER_WORD}")
 TRAIN_READY_DIR = os.path.join(OUTPUT_ROOT, "01_train_ready")
-CAPTION_REMOVE_DIR = os.path.join(OUTPUT_ROOT, "02_caption_remove")
-REVIEW_DIR = os.path.join(OUTPUT_ROOT, "03_review")
-REJECT_DIR = os.path.join(OUTPUT_ROOT, "04_reject")
-MANUAL_REVIEW_DIR = os.path.join(OUTPUT_ROOT, "05_needs_manual_review")
+KEEP_UNUSED_DIR = os.path.join(OUTPUT_ROOT, "02_keep_unused")
+CAPTION_REMOVE_DIR = os.path.join(OUTPUT_ROOT, "03_caption_remove")
+REVIEW_DIR = os.path.join(OUTPUT_ROOT, "04_review")
+REJECT_DIR = os.path.join(OUTPUT_ROOT, "05_reject")
+MANUAL_REVIEW_DIR = os.path.join(OUTPUT_ROOT, "06_needs_manual_review")
 CACHE_DIR = os.path.join(OUTPUT_ROOT, "_cache")
 CLIP_CACHE_DIR = os.path.join(CACHE_DIR, "clip")
 TRIGGER_CACHE_DIR = os.path.join(CACHE_DIR, "trigger")
-SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "07_smart_crop_pairs")
+SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "08_smart_crop_pairs")
 IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
 
 # Caption-Regeln
@@ -255,7 +256,7 @@ CAPTION_POLICY = {
 }
 
 # Bilder mit Text / Wasserzeichen bei Bedarf separat ausgeben
-SEND_TEXT_IMAGES_TO_CAPTION_REMOVE = True  # Bilder mit sichtbarem Text/Watermark -> 02_caption_remove statt train_ready
+SEND_TEXT_IMAGES_TO_CAPTION_REMOVE = True  # Bilder mit sichtbarem Text/Watermark -> 03_caption_remove statt train_ready
 INTERACTIVE_CAPTION_OVERRIDE = True        # Pausiert nach der Caption-Regel-Analyse und fragt dich nach optionalen Overrides
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
@@ -339,14 +340,15 @@ if os.path.exists(_UI_CONFIG_PATH):
     # da INPUT_FOLDER und TRIGGER_WORD sich geaendert haben koennten.
     OUTPUT_ROOT = os.path.join(INPUT_FOLDER, f"curated_{TRIGGER_WORD}")
     TRAIN_READY_DIR = os.path.join(OUTPUT_ROOT, "01_train_ready")
-    CAPTION_REMOVE_DIR = os.path.join(OUTPUT_ROOT, "02_caption_remove")
-    REVIEW_DIR = os.path.join(OUTPUT_ROOT, "03_review")
-    REJECT_DIR = os.path.join(OUTPUT_ROOT, "04_reject")
-    MANUAL_REVIEW_DIR = os.path.join(OUTPUT_ROOT, "05_needs_manual_review")
+    KEEP_UNUSED_DIR = os.path.join(OUTPUT_ROOT, "02_keep_unused")
+    CAPTION_REMOVE_DIR = os.path.join(OUTPUT_ROOT, "03_caption_remove")
+    REVIEW_DIR = os.path.join(OUTPUT_ROOT, "04_review")
+    REJECT_DIR = os.path.join(OUTPUT_ROOT, "05_reject")
+    MANUAL_REVIEW_DIR = os.path.join(OUTPUT_ROOT, "06_needs_manual_review")
     CACHE_DIR = os.path.join(OUTPUT_ROOT, "_cache")
     CLIP_CACHE_DIR = os.path.join(CACHE_DIR, "clip")
     TRIGGER_CACHE_DIR = os.path.join(CACHE_DIR, "trigger")
-    SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "07_smart_crop_pairs")
+    SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "08_smart_crop_pairs")
     IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
 
 # Keep environment and in-script config consistent (also helps if other libs/tools
@@ -362,6 +364,7 @@ if API_KEY:
 for folder in [
     OUTPUT_ROOT,
     TRAIN_READY_DIR,
+    KEEP_UNUSED_DIR,
     CAPTION_REMOVE_DIR,
     REVIEW_DIR,
     CACHE_DIR,
@@ -3246,6 +3249,19 @@ def main() -> None:
         if row["original_filename"] in selected_names:
             row["selected"] = True
 
+    # Keep-Bilder, die qualitativ ok sind, aber durch Cluster-/Diversity-Selection
+    # nicht ins finale Dataset gekommen sind, landen in einem eigenen Ordner
+    # (02_keep_unused). Sie sind weder Review-Kandidaten (wo der Curator unsicher
+    # war) noch Rejects, sondern "Overflow" – falls du manuell Bilder nachziehen
+    # willst, weil dir das Training noch etwas Daten fehlt.
+    unselected_keep = [
+        r for r in all_rows
+        if r.get("base_status") == "keep"
+        and r["original_filename"] not in selected_names
+    ]
+    for r in unselected_keep:
+        r.setdefault("status_notes", []).append("keep_not_selected_by_diversity")
+
     # PASS 5: Speichern
     shot_order = {"headshot": 0, "medium": 1, "full_body": 2}
     selected_sorted = sorted(
@@ -3255,6 +3271,7 @@ def main() -> None:
 
     counters = {
         "train_ready": 1,
+        "keep_unused": 1,
         "caption_remove": 1,
         "review": 1,
     }
@@ -3349,6 +3366,28 @@ def main() -> None:
                     f.write(row["final_caption"])
             except Exception:
                 pass
+
+    # Keep-Unused-Export: qualitativ als keep eingestufte Bilder, die wegen
+    # Cluster-/Diversity-Selection nicht im finalen Dataset gelandet sind.
+    # Werden inklusive Caption exportiert, sodass sie bei Bedarf direkt ins
+    # Training-Set gezogen werden koennen.
+    keep_unused_sorted = sorted(unselected_keep, key=lambda r: -int(r.get("quality_total", 0)))
+    for row in keep_unused_sorted:
+        new_basename = f"{SAFE_TRIGGER}_unused_{counters['keep_unused']:03d}"
+        counters["keep_unused"] += 1
+        row["output_bucket"] = "keep_unused"
+        row["new_basename"] = new_basename
+        row["final_caption"] = build_caption(row, global_rules)
+
+        try:
+            cropped = body_aware_crop(row["original_path"], row)
+            img_out = os.path.join(KEEP_UNUSED_DIR, f"{new_basename}.jpg")
+            txt_out = os.path.join(KEEP_UNUSED_DIR, f"{new_basename}.txt")
+            cropped.save(img_out, "JPEG", quality=100)
+            with open(txt_out, "w", encoding="utf-8") as f:
+                f.write(row["final_caption"])
+        except Exception:
+            pass
 
     if EXPORT_REJECT_IMAGES:
         reject_export = sorted(reject_items, key=lambda r: -int(r.get("quality_total", 0)))
@@ -3621,6 +3660,7 @@ def main() -> None:
         "input_images": len(all_rows),
         "kept_clean_candidates_before_selection": len(valid_candidates),
         "review_candidates": len(review_items),
+        "keep_unused_overflow": len(unselected_keep),
         "rejected": len(reject_items),
         "selected_total": len(selected_sorted),
         "selected_train_ready": sum(1 for r in selected_sorted if r.get("output_bucket") == "train_ready"),
@@ -3669,6 +3709,8 @@ def main() -> None:
     safe_print(f"JSONL: {jsonl_path}")
     safe_print(f"MD:    {md_path}")
     safe_print(f"Train-ready:     {TRAIN_READY_DIR}")
+    if unselected_keep:
+        safe_print(f"Keep-unused:     {KEEP_UNUSED_DIR} ({len(unselected_keep)} overflow)")
     if EXPORT_SMART_CROP_COMPARISON and crop_pairs:
         safe_print(f"Crop comparisons: {SMART_CROP_COMPARISON_DIR} ({len(crop_pairs)} pairs)")
     safe_print(f"Caption-remove:  {CAPTION_REMOVE_DIR}")
