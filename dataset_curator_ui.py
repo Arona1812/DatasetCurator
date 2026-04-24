@@ -81,6 +81,10 @@ _active_process: Optional[subprocess.Popen] = None
 # Alle Standardwerte an einer Stelle – wird sowohl fuer Defaults als
 # auch fuer Save/Load verwendet.
 SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
+    "include_gender_class",
+    "include_skin_tone",
+    "include_body_build",
+    "include_tattoos",
     "include_glasses",
     "include_piercings",
     "include_makeup",
@@ -89,8 +93,10 @@ SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
     "include_gaze",
     "include_expression",
     "include_hair_always",
+    "include_hair_when_variable",
     "include_beard_when_variable",
     "include_mirror_selfie_marker",
+    "include_eye_color",
 ]
 
 DEFAULTS: Dict[str, Any] = {
@@ -211,6 +217,16 @@ def get_caption_preset_values(profile: Optional[str]) -> List[str]:
     if normalized in CAPTION_PROFILE_PRESETS:
         return list(CAPTION_PROFILE_PRESETS[normalized])
     return list(DEFAULTS["c_captions"])
+
+
+def resolve_caption_fields_for_profile(
+    profile: Optional[str],
+    current_fields: Optional[List[str]] = None,
+) -> List[str]:
+    normalized = normalize_caption_profile(profile)
+    if normalized == "custom":
+        return list(current_fields) if current_fields is not None else list(DEFAULTS["c_captions"])
+    return get_caption_preset_values(normalized)
 
 
 def detect_caption_profile(selected_fields: Optional[List[str]]) -> str:
@@ -1281,8 +1297,8 @@ def build_ui() -> gr.Blocks:
                         ),
                     )
                     c_caption_profile.change(
-                        fn=lambda profile: get_caption_preset_values(profile),
-                        inputs=[c_caption_profile],
+                        fn=resolve_caption_fields_for_profile,
+                        inputs=[c_caption_profile, c_captions],
                         outputs=[c_captions],
                     )
                     c_captions.change(
