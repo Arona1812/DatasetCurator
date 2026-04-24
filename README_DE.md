@@ -15,7 +15,7 @@ Dieses Projekt ist aus einem sehr praktischen Frust entstanden: Das manuelle Sor
 
 ## Voraussetzungen
 
-Für die OpenAI-gestützten Funktionen dieses Projekts benötigst du einen eigenen OpenAI-API-Schlüssel sowie ausreichend API-Guthaben oder verfügbare kostenlose Tokens auf deinem Account.
+Für die OpenAI-gestützten Funktionen dieses Projekts benötigst du einen eigenen OpenAI-API-Schlüssel sowie ausreichend API-Guthaben oder verfügbare kostenlose Tokens auf deinem Account. Außerdem wird Python benötigt.
 
 ---
 
