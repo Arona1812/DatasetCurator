@@ -1276,8 +1276,8 @@ def build_ui() -> gr.Blocks:
                         choices=CAPTION_FIELD_CHOICES,
                         value=S["c_captions"],
                         info=tr(
-                            "Aktivierte Felder werden in die Trainingsbeschreibung aufgenommen.",
-                            "Enabled fields will be included in the training captions.",
+                            "Aktivierte Felder werden in die Trainings-Captions aufgenommen. Welche Merkmale enthalten sein sollten, hängt vom Basismodell und der Quelle ab. Für ERNIE wird meist empfohlen, alle Attribute einzubeziehen, da das Basis-Dataset stärker asiatisch geprägt ist. Bei Z-Image Base gehen die Meinungen auseinander: Manche empfehlen ebenfalls, alles aufzunehmen, andere nur flexible bzw. veränderliche Merkmale, damit die LoRA besser lernt, was zur Person gehört und was nicht. Nach diesem Ansatz lässt man permanente Eigenschaften wie Hautfarbe, eine konstante Frisur oder Tattoos eher weg, während veränderliche Dinge wie Kleidung oder Brillen enthalten bleiben sollten.",
+                            "Enabled fields will be included in the training captions. Which attributes should be included depends on the base model and the source. For ERNIE, it is generally recommended to include all attributes, since its base dataset is more Asian-focused. For Z-Image Base, opinions differ: some recommend including everything, while others suggest including only flexible or changeable attributes so the LoRA can better learn which traits belong to the person and which do not. In that approach, persistent traits such as skin tone, a consistent hairstyle, or tattoos are usually left out, while changeable items such as clothing or glasses should remain included.",
                         ),
                     )
                     c_caption_profile.change(
