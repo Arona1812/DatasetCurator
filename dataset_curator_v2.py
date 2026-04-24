@@ -1,6 +1,7 @@
 import os
 os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
 
+import logging
 import re
 import io
 import csv
@@ -11,8 +12,25 @@ import base64
 import hashlib
 import shutil
 import traceback
+import warnings
 from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple
+
+
+HF_HUB_UNAUTH_WARNING = "You are sending unauthenticated requests to the HF Hub"
+
+
+class _SuppressHfHubUnauthWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return HF_HUB_UNAUTH_WARNING not in record.getMessage()
+
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*You are sending unauthenticated requests to the HF Hub.*",
+    category=UserWarning,
+)
+logging.getLogger("huggingface_hub.utils._http").addFilter(_SuppressHfHubUnauthWarning())
 
 import requests
 import numpy as np

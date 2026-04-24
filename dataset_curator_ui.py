@@ -13,6 +13,7 @@ automatisch wiederhergestellt.
 import os
 import re
 import json
+import inspect
 import subprocess
 import sys
 import threading
@@ -30,6 +31,9 @@ from PIL import Image
 
 # Default UI language. Is overwritten during build_ui() from settings.
 UI_LANG = "en"  # "en" | "de"
+
+UI_THEME = gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
+UI_CSS = ".log-box textarea { font-family: 'Consolas', 'Courier New', monospace !important; font-size: 12px !important; }"
 
 
 def tr(de: str, en: str) -> str:
@@ -770,11 +774,20 @@ def build_ui() -> gr.Blocks:
     global UI_LANG
     UI_LANG = _normalize_lang(S.get("ui_language"))
 
-    with gr.Blocks(
-        title=tr("LoRA Dataset Curator", "LoRA Dataset Curator"),
-        theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate"),
-        css=".log-box textarea { font-family: 'Consolas', 'Courier New', monospace !important; font-size: 12px !important; }",
-    ) as app:
+    blocks_kwargs = {
+        "title": tr("LoRA Dataset Curator", "LoRA Dataset Curator"),
+    }
+
+    # Gradio <=5 expects theme/css on Blocks(), while Gradio >=6 moves them to
+    # launch(). Detect support dynamically so the UI works on both old and new
+    # versions without warnings.
+    blocks_signature = inspect.signature(gr.Blocks.__init__)
+    if "theme" in blocks_signature.parameters:
+        blocks_kwargs["theme"] = UI_THEME
+    if "css" in blocks_signature.parameters:
+        blocks_kwargs["css"] = UI_CSS
+
+    with gr.Blocks(**blocks_kwargs) as app:
 
         with gr.Row():
             ui_language = gr.Dropdown(
@@ -1561,14 +1574,22 @@ if __name__ == "__main__":
     base_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
     launched = False
     last_err: Optional[Exception] = None
+    launch_signature = inspect.signature(app.launch)
     for port in range(base_port, base_port + 20):
         try:
-            app.launch(
-                server_name="127.0.0.1",
-                server_port=port,
-                inbrowser=True,
-                share=False,
-            )
+            launch_kwargs = {
+                "server_name": "127.0.0.1",
+                "server_port": port,
+                "inbrowser": True,
+                "share": False,
+            }
+
+            if "theme" in launch_signature.parameters:
+                launch_kwargs["theme"] = UI_THEME
+            if "css" in launch_signature.parameters:
+                launch_kwargs["css"] = UI_CSS
+
+            app.launch(**launch_kwargs)
             launched = True
             break
         except OSError as e:
