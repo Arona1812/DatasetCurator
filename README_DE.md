@@ -22,19 +22,24 @@ Für die OpenAI-gestützten Funktionen dieses Projekts benötigst du einen eigen
 ## Features
 
 - Gradio-Weboberfläche für Dataset Curator und Video Processor
-- Persistente UI-Einstellungen sowie umschaltbare UI-Sprache auf Englisch/Deutsch
+- Persistente UI-Einstellungen mit automatischem Wiederherstellen sowie umschaltbare UI-Sprache auf Englisch/Deutsch
 - Video-Frame-Extraktion per InsightFace-Referenzbild (`buffalo_l`)
-- Lokale Vorfilter für Auflösung, Dateigröße, Unschärfe, Belichtung und frühe pHash-Deduplizierung
+- Lokale Vorfilter für Auflösung, Dateigröße, Unschärfe, Belichtung und frühe pHash-Deduplizierung vor API-Aufrufen
+- Optionaler Subject-Sanity-/Gliedmaßen-Filter auf Basis erkannter Torso-Landmarks
 - Duplikaterkennung mit pHash und OpenCLIP / CLIP für semantische Ähnlichkeit
 - OpenAI-gestützte Bildbewertung für Qualität, Shot-Typ, Motivklarheit, Attribute, Text/Wasserzeichen und Caption-Metadaten
+- Optionale Eskalation auf ein stärkeres Modell für schwierige Review-Fälle, Status-Konflikte und knappe Smart-Crop-Entscheidungen
 - Optionale KI-Prüfung des Trigger-Worts
 - Automatisches Captioning mit konfigurierbaren Caption-Profilen und optionalen Caption-Regel-Overrides
+- Bilder mit Text/Wasserzeichen können automatisch nach `caption_remove` statt in den Train-Ready-Output einsortiert werden
 - Session-/Outfit-Clustering und Diversity-Penalties für mehr Datensatzvielfalt
 - Smart-Pre-Crop für Headshots aus weiteren Bildern inklusive Export von Original-vs.-Crop-Vergleichspaaren
+- Entfernung von Instagram-/UI-Rändern bei Screenshots und Social-Media-Captures
 - Bucket-taugliche Crop-Profile zur Reduzierung der Trainings-Buckets
 - Strukturierte Ausgabeordner für Train-Ready-, Caption-Remove-, Review-, Reject- und Manual-Review-Bilder
 - Audit-/Embedding-Cache sowie Retry-/Resume-Logik zum Sparen von Zeit und API-Kosten
-- Ergebnis-Export mit Captions, CSV-Daten und Markdown-Dataset-Report
+- Integrierter Ergebnis-Viewer in der UI mit Bildgalerie, Captions und Vorschau des Dataset-Reports
+- Ergebnis-Export mit Captions, CSV-, JSONL-Daten und Markdown-Dataset-Report
 
 ---
 

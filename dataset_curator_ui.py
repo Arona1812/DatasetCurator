@@ -123,9 +123,17 @@ DEFAULTS: Dict[str, Any] = {
     # Vorfilter
     "c_use_filesize": True,
     "c_min_filesize": 80,
-    "c_use_blur": False,
-    "c_min_blur": 20,
+    "c_use_blur": True,
+    "c_min_blur": 25,
+    "c_face_min_blur": 45,
+    "c_blur_norm_edge": 512,
     "c_use_early_phash": True,
+    # Subject-Sanity-Check (Gliedmassen-Filter)
+    "c_subject_sanity": True,
+    "c_subject_min_torso": 2,
+    # IG-Frame-Detection
+    "c_ig_frame_crop": True,
+    "c_ig_two_stage_bar": True,
     # Duplikate
     "c_use_clip": True,
     "c_use_phash": True,
@@ -307,7 +315,11 @@ def save_settings_fn(
     c_escalate_on_review, c_escalate_on_conflict, c_escalate_smart_crop, c_smart_crop_escalation_delta,
     c_ratio_h, c_ratio_m, c_ratio_f,
     c_keep_min, c_reject, c_min_side,
-    c_use_filesize, c_min_filesize, c_use_blur, c_min_blur, c_use_early_phash,
+    c_use_filesize, c_min_filesize,
+    c_use_blur, c_min_blur, c_face_min_blur, c_blur_norm_edge,
+    c_use_early_phash,
+    c_subject_sanity, c_subject_min_torso,
+    c_ig_frame_crop, c_ig_two_stage_bar,
     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
     c_smart_crop, c_crop_gain, c_crop_pad,
     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,
@@ -337,7 +349,12 @@ def save_settings_fn(
         "c_keep_min": c_keep_min, "c_reject": c_reject, "c_min_side": c_min_side,
         "c_use_filesize": c_use_filesize, "c_min_filesize": c_min_filesize,
         "c_use_blur": c_use_blur, "c_min_blur": c_min_blur,
+        "c_face_min_blur": c_face_min_blur, "c_blur_norm_edge": c_blur_norm_edge,
         "c_use_early_phash": c_use_early_phash,
+        "c_subject_sanity": c_subject_sanity,
+        "c_subject_min_torso": c_subject_min_torso,
+        "c_ig_frame_crop": c_ig_frame_crop,
+        "c_ig_two_stage_bar": c_ig_two_stage_bar,
         "c_use_clip": c_use_clip, "c_use_phash": c_use_phash,
         "c_phash_thresh": c_phash_thresh, "c_clip_thresh": c_clip_thresh,
         "c_smart_crop": c_smart_crop, "c_crop_gain": c_crop_gain, "c_crop_pad": c_crop_pad,
@@ -557,7 +574,11 @@ def start_curator(
     escalate_on_review, escalate_on_conflict, escalate_smart_crop, smart_crop_escalation_delta,
     ratio_h, ratio_m, ratio_f,
     keep_score_min, hard_reject_score, hard_min_side,
-    use_filesize_filter, min_filesize_kb, use_blur_filter, min_blur_variance, use_early_phash,
+    use_filesize_filter, min_filesize_kb,
+    use_blur_filter, min_blur_variance, face_min_blur_variance, blur_norm_edge,
+    use_early_phash,
+    subject_sanity, subject_min_torso,
+    ig_frame_crop, ig_two_stage_bar,
     use_clip, use_phash, phash_threshold, clip_threshold,
     enable_smart_crop, crop_min_gain, crop_padding,
     use_clustering, max_outfit, max_session, use_diversity,
@@ -607,6 +628,12 @@ def start_curator(
         "HARD_MIN_FILESIZE_KB": int(min_filesize_kb),
         "USE_BLUR_FILTER": use_blur_filter,
         "HARD_MIN_BLUR_VARIANCE": float(min_blur_variance),
+        "FACE_MIN_BLUR_VARIANCE": float(face_min_blur_variance),
+        "BLUR_NORMALIZE_LONG_EDGE": int(blur_norm_edge),
+        "ENABLE_SUBJECT_SANITY_CHECK": subject_sanity,
+        "SUBJECT_MIN_TORSO_LANDMARKS": int(subject_min_torso),
+        "ENABLE_IG_FRAME_CROP": ig_frame_crop,
+        "IG_FRAME_TWO_STAGE_BAR_DETECT": ig_two_stage_bar,
         "USE_EARLY_PHASH_DEDUP": use_early_phash,
         "USE_CLIP_DUPLICATE_SCORING": use_clip,
         "USE_PHASH_DUPLICATE_SCORING": use_phash,
@@ -1003,22 +1030,45 @@ def build_ui() -> gr.Blocks:
                         )
                     with gr.Row():
                         c_use_blur = gr.Checkbox(
-                            label=tr("Unschärfe-Filter", "Blur filter"),
+                            label=tr("Unschärfe-Filter (zweistufig)", "Blur filter (two-stage)"),
                             value=S["c_use_blur"],
                             info=tr(
-                                "Verwirft unscharfe/verwackelte Bilder per Laplacian-Varianz. Filtert sehr stark, nur bei sehr großen Datensätzen verwenden",
-                                "Rejects blurry/shaky images using Laplacian variance. Careful, very picky! Don't use until you really have a big database",
+                                "Stufe 1 prüft das ganze Bild vor der API (laxer Totalausfall-Filter). Stufe 2 prüft gezielt die Gesichtsregion nach der Gesichtserkennung. Beide Messungen laufen auf der normierten Bildgröße.",
+                                "Stage 1 checks the whole image before the API (lax total-failure filter). Stage 2 targets the face region after face detection. Both measurements run on the normalized size.",
                             ),
                         )
                         c_min_blur = gr.Slider(
-                            label=tr("Min. Laplacian-Varianz", "Min Laplacian variance"),
+                            label=tr("Stufe 1: Min. Varianz (Gesamtbild)", "Stage 1: min variance (full image)"),
                             minimum=5,
                             maximum=200,
                             step=5,
                             value=S["c_min_blur"],
                             info=tr(
-                                "Je höher, desto strenger. 20 = mild, 100+ = streng.",
-                                "Higher = stricter. 20 = more mild, 100+ = strict.",
+                                "Totalausfall-Schwelle auf dem normierten Gesamtbild. Niedriger = milder. 25 = nur komplett verwackelte Bilder werden gefiltert.",
+                                "Total-failure threshold on the normalized full image. Lower = milder. 25 = only completely blurry images are rejected.",
+                            ),
+                        )
+                    with gr.Row():
+                        c_face_min_blur = gr.Slider(
+                            label=tr("Stufe 2: Min. Varianz (Gesichts-Bbox)", "Stage 2: min variance (face bbox)"),
+                            minimum=10,
+                            maximum=200,
+                            step=5,
+                            value=S["c_face_min_blur"],
+                            info=tr(
+                                "Schärfe-Schwelle in der Face-Bbox nach API+Gesichtserkennung. 45 = konservativ, lässt Beauty-Filter-Selfies durch. 70+ = streng.",
+                                "Sharpness threshold inside the face bbox after API+face detection. 45 = conservative, keeps beauty-filter selfies. 70+ = strict.",
+                            ),
+                        )
+                        c_blur_norm_edge = gr.Slider(
+                            label=tr("Normierungs-Kantenlänge (px)", "Normalization edge size (px)"),
+                            minimum=256,
+                            maximum=1024,
+                            step=64,
+                            value=S["c_blur_norm_edge"],
+                            info=tr(
+                                "Vor der Blur-Messung werden alle Bilder auf diese längste Kante skaliert. Macht Schwellenwerte auflösungsunabhängig. 512 ist Standard.",
+                                "Before blur measurement, all images are resized to this long edge. Makes thresholds resolution-independent. 512 is the default.",
                             ),
                         )
                     c_use_early_phash = gr.Checkbox(
@@ -1029,6 +1079,55 @@ def build_ui() -> gr.Blocks:
                             "Finds near pixel-duplicates locally before the API. Saves API cost.",
                         ),
                     )
+
+                with gr.Accordion(tr("🖼️ Instagram-Frame / UI-Rand-Entfernung", "🖼️ Instagram frame / UI border removal"), open=False):
+                    gr.Markdown(tr(
+                        "*Erkennt und entfernt IG-Story-Rahmen, Schatten-Gradienten und Android-Nav-Bars VOR der API, damit die Analyse auf dem bereinigten Bild läuft.*",
+                        "*Detects and removes IG-story frames, drop-shadow gradients and Android nav bars BEFORE the API so the analysis runs on the cleaned image.*",
+                    ))
+                    with gr.Row():
+                        c_ig_frame_crop = gr.Checkbox(
+                            label=tr("IG-Frame-Crop aktivieren", "Enable IG frame crop"),
+                            value=S["c_ig_frame_crop"],
+                            info=tr(
+                                "Hauptschalter. Bei 'aus' werden Bilder unverändert weitergegeben.",
+                                "Main switch. When off, images are passed through unchanged.",
+                            ),
+                        )
+                        c_ig_two_stage_bar = gr.Checkbox(
+                            label=tr("Zweistufige Bar-Detection (oben/unten)", "Two-stage bar detection (top/bottom)"),
+                            value=S["c_ig_two_stage_bar"],
+                            info=tr(
+                                "Zusätzliche Erkennung für Android-Nav-Bars (schwarz + UI-Icons) und Drop-Shadow-Gradienten. Triggert nur, wenn schon ein Seitenrand gefunden wurde – verhindert False-Positives bei dunklen Kissen/Haaren.",
+                                "Additional detection for Android nav bars (black + UI icons) and drop-shadow gradients. Only triggers when a side border was already detected – prevents false positives on dark pillows/hair.",
+                            ),
+                        )
+
+                with gr.Accordion(tr("🧍 Subject-Sanity-Check (Gliedmaßen-Filter)", "🧍 Subject sanity check (limb filter)"), open=False):
+                    gr.Markdown(tr(
+                        "*Verwirft Bilder ohne sichtbares Gesicht UND ohne erkennbaren Torso (nur Füße, Hände o.ä.). Rückenansichten mit klarem Torso bleiben erhalten.*",
+                        "*Rejects images with neither a visible face nor a recognizable torso (feet only, hands only, etc.). Back-view shots with a clear torso are kept.*",
+                    ))
+                    with gr.Row():
+                        c_subject_sanity = gr.Checkbox(
+                            label=tr("Sanity-Check aktivieren", "Enable sanity check"),
+                            value=S["c_subject_sanity"],
+                            info=tr(
+                                "Nutzt MediaPipe-Pose und prüft Schulter/Hüft-Landmarks, wenn kein Gesicht sichtbar ist.",
+                                "Uses MediaPipe pose and checks shoulder/hip landmarks when no face is visible.",
+                            ),
+                        )
+                        c_subject_min_torso = gr.Slider(
+                            label=tr("Min. Torso-Landmarks (von 4)", "Min torso landmarks (of 4)"),
+                            minimum=1,
+                            maximum=4,
+                            step=1,
+                            value=S["c_subject_min_torso"],
+                            info=tr(
+                                "Wie viele der 4 Landmarks (2 Schultern, 2 Hüften) sichtbar sein müssen. 2 = Standard: halber Torso reicht. 4 = sehr streng.",
+                                "How many of the 4 landmarks (2 shoulders, 2 hips) must be visible. 2 = default: half torso is enough. 4 = very strict.",
+                            ),
+                        )
 
                 with gr.Accordion(tr("🔗 Duplikaterkennung (nach API)", "🔗 Duplicate detection (post-API)"), open=False):
                     gr.Markdown(tr(
@@ -1243,7 +1342,11 @@ def build_ui() -> gr.Blocks:
                     c_escalate_on_review, c_escalate_on_conflict, c_escalate_smart_crop, c_smart_crop_escalation_delta,
                     c_ratio_h, c_ratio_m, c_ratio_f,
                     c_keep_min, c_reject, c_min_side,
-                    c_use_filesize, c_min_filesize, c_use_blur, c_min_blur, c_use_early_phash,
+                    c_use_filesize, c_min_filesize,
+                    c_use_blur, c_min_blur, c_face_min_blur, c_blur_norm_edge,
+                    c_use_early_phash,
+                    c_subject_sanity, c_subject_min_torso,
+                    c_ig_frame_crop, c_ig_two_stage_bar,
                     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
                     c_smart_crop, c_crop_gain, c_crop_pad,
                     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,

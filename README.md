@@ -20,20 +20,24 @@ To use the OpenAI-assisted features of this project, you need your own OpenAI AP
 ## Features
 
 - Gradio web UI for the dataset curator and video processor
-- Persistent UI settings plus switchable English/German UI language
+- Persistent UI settings with automatic restore plus switchable English/German UI language
 - Video frame extraction using an InsightFace reference image (`buffalo_l`)
-- Local pre-filters for resolution, file size, blur, exposure and early pHash dedup
+- Local pre-filters for resolution, file size, blur, exposure and early pHash dedup before API calls
+- Optional subject-sanity / limb filter based on torso landmark detection
 - Duplicate detection using pHash and OpenCLIP / CLIP semantic similarity
 - OpenAI-powered image auditing for quality, shot type, subject clarity, attributes, text/watermarks and caption metadata
+- Optional stronger-model escalation for difficult review cases, status conflicts and close smart-crop decisions
 - Optional AI trigger-word check
 - Automatic captioning with configurable caption profiles and optional caption rule overrides
+- Text/watermark images can be routed automatically into `caption_remove` for manual cleanup instead of training-ready output
 - Session/outfit clustering and diversity penalties for better dataset variety
 - Smart pre-crop for headshots from wider images, including original-vs-crop comparison export
-- removing of instagram frames (somewhat working)
+- Instagram/UI frame border removal for screenshots and social-media captures
 - Bucket-friendly crop profiles to reduce training bucket spread
 - Structured output folders for train-ready, caption-remove, review, reject and manual-review images
 - Audit/embedding cache plus retry/resume logic to save time and API costs
-- Result export with captions, CSV data and a markdown dataset report
+- Integrated result viewer in the UI with image gallery, captions and dataset report preview
+- Result export with captions, CSV, JSONL and a markdown dataset report
 
 ---
 

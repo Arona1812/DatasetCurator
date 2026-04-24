@@ -94,10 +94,24 @@ USE_MIN_FILESIZE_FILTER   = True
 HARD_MIN_FILESIZE_KB      = 80        # Unter 80 KB -> reject
 
 # Unschärfe-Erkennung per Laplacian-Varianz (OpenCV).
-# Niedrige Varianz = wenig Kanten = verwackelt oder weichgezeichnet.
-# Empfehlung: 60-100. Sehr streng: 120+. Deaktivieren bei vielen Kunstfotos.
-USE_BLUR_FILTER           = False
-HARD_MIN_BLUR_VARIANCE    = 20.0
+# Zweistufig:
+#   Stufe 1 (vor API): laxer Full-Image-Check auf 512px normiert,
+#     faengt nur Totalausfaelle ab (spart API-Calls).
+#   Stufe 2 (nach API + Face-Detection): strenger Check auf der
+#     Face-Bbox (das ist fuer LoRA entscheidend), mit Fallback auf
+#     Gesamtbild wenn kein Gesicht da ist.
+#
+# Normierung: Bilder werden vor der Messung auf BLUR_NORMALIZE_LONG_EDGE
+# Pixel (laengste Seite) resized. Damit ist die Varianz ueber Datasets
+# mit gemischten Aufloesungen vergleichbar. Ohne Normierung liefern
+# kleine Bilder systematisch hoehere Werte als grosse.
+USE_BLUR_FILTER            = True
+BLUR_NORMALIZE_LONG_EDGE   = 512       # Zielgroesse fuer Blur-Messung (px, laengste Seite)
+HARD_MIN_BLUR_VARIANCE     = 25.0      # Stufe 1: Totalausfall-Schwelle auf Gesamtbild (laxer Vorfilter)
+FACE_MIN_BLUR_VARIANCE     = 45.0      # Stufe 2: Schwelle in der Face-Bbox. Konservativ gesetzt,
+                                       # damit Beauty-Filter-Selfies nicht faelschlich rausfallen;
+                                       # trifft aber klar verwackelte Gesichter.
+FACE_BLUR_PADDING_FACTOR   = 0.15      # Face-Bbox um diesen Faktor erweitern vor Blur-Messung
 
 # Belichtungs-Check per Histogramm-Median (PIL, kein OpenCV nötig).
 # Zu dunkel: Median < DARK_THRESHOLD. Zu hell: Median > BRIGHT_THRESHOLD.
@@ -233,6 +247,29 @@ SMART_PRECROP_ALLOW_DATASET_DUPLICATES = False  # False = Original und Crop dür
 ENABLE_IG_FRAME_CROP = True                # IG-Frame-Erkennung aktivieren
 IG_FRAME_MIN_BORDER_PX = 30               # Mindestbreite eines Rahmens in Pixeln, um als Frame zu gelten
 IG_FRAME_MIN_CONTENT_PX = 400             # Mindestbreite/-höhe des verbleibenden Inhalts nach Frame-Crop
+# Zweistufige Bar-Detection (fuer Android-Nav-Bars, Drop-Shadow-Gradienten oben/unten):
+# Erkennt uniforme Bloecke am oberen/unteren Rand, tolerant gegenueber UI-Icons
+# (Nav-Buttons, Textfelder). Triggert nur wenn bereits Seitenframe gefunden wurde
+# (verhindert False-Positives bei normalen dunklen Bildelementen wie Kissen oder
+# dunklem Hintergrund). Ausschalten wenn unerwartete Crops auftreten.
+IG_FRAME_TWO_STAGE_BAR_DETECT = True
+
+
+# ── SUBJECT-SANITY-CHECK (Gliedmassen-/Winkel-Filter) ──────────────────────────
+# Verwirft Bilder wie "nur Fuesse am Strand" oder "nur Haare + Hand",
+# die zwar technisch ok sind, aber fuer Person-LoRAs nutzlos:
+# kein Torso, kein Gesicht, kein Wiedererkennungsmerkmal.
+# Loest NUR aus, wenn face_visible == False (aus API- oder lokaler Erkennung).
+# Sichtbare Gesichter sind per Definition verwertbar und werden nie
+# durch diesen Filter gekillt. Rueckenansichten mit klar erkennbarem
+# Torso (mind. 2 von 4 Schulter/Hueft-Landmarks) bleiben erhalten.
+ENABLE_SUBJECT_SANITY_CHECK = True
+# Wie viele der 4 Torso-Landmarks (2 Schultern + 2 Hueften) mit ausreichender
+# Sichtbarkeit vorhanden sein muessen, damit ein faceless-Bild als valider
+# Koerper gilt. Bei < diesem Wert -> reject als "no_torso_no_face".
+SUBJECT_MIN_TORSO_LANDMARKS = 2
+# Mindest-Sichtbarkeit pro Landmark (MediaPipe-Visibility, 0..1)
+SUBJECT_LANDMARK_VIS_MIN = 0.55
 
 
 # ── UI-Config Override ────────────────────────────────────────────────────────
@@ -523,9 +560,16 @@ def generate_headshot_crop(
 
 def local_blur_variance(image_path: str) -> float:
     """
-    Berechnet die Laplacian-Varianz als Schärfemaß.
-    Niedrige Werte = unscharf/verwackelt. Benötigt OpenCV.
-    Gibt -1.0 zurück wenn OpenCV nicht verfügbar ist (Filter überspringen).
+    Berechnet die Laplacian-Varianz als Schaerfemass.
+    Niedrige Werte = unscharf/verwackelt. Benoetigt OpenCV.
+
+    WICHTIG: Das Bild wird VOR der Messung auf BLUR_NORMALIZE_LONG_EDGE
+    (laengste Seite) heruntergerechnet. Ohne diese Normierung liefern
+    kleine Bilder systematisch hoehere Varianzen als grosse, was jeden
+    festen Threshold unbrauchbar macht. Nach Normierung sind die Werte
+    ueber unterschiedliche Aufloesungen hinweg vergleichbar.
+
+    Gibt -1.0 zurueck wenn OpenCV nicht verfuegbar ist (Filter ueberspringen).
     """
     if not HAVE_CV2:
         return -1.0
@@ -533,9 +577,104 @@ def local_blur_variance(image_path: str) -> float:
         img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if img is None:
             return -1.0
+        h, w = img.shape[:2]
+        long_edge = max(h, w)
+        if long_edge > BLUR_NORMALIZE_LONG_EDGE:
+            scale = BLUR_NORMALIZE_LONG_EDGE / float(long_edge)
+            new_w = max(1, int(round(w * scale)))
+            new_h = max(1, int(round(h * scale)))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
         return float(cv2.Laplacian(img, cv2.CV_64F).var())
     except Exception:
         return -1.0
+
+
+def local_blur_variance_in_face(image_path: str, face_bbox: Optional[List[int]]) -> float:
+    """
+    Misst die Laplacian-Varianz nur innerhalb der Face-Bbox (leicht erweitert),
+    normiert auf BLUR_NORMALIZE_LONG_EDGE. Fuer LoRA-Training ist entscheidend,
+    dass das Gesicht scharf ist, nicht der Hintergrund.
+
+    face_bbox: [x, y, w, h] in Pixeln relativ zum Originalbild, oder None.
+    Gibt bei None oder Fehler -1.0 zurueck (Filter ueberspringen).
+    """
+    if not HAVE_CV2 or not face_bbox:
+        return -1.0
+    try:
+        fx, fy, fw, fh = [int(v) for v in face_bbox]
+        if fw <= 0 or fh <= 0:
+            return -1.0
+        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            return -1.0
+        H, W = img.shape[:2]
+        # Bbox um FACE_BLUR_PADDING_FACTOR erweitern, damit Kanten
+        # (Kieferlinie, Haaransatz) mit in die Messung einfliessen.
+        pad_x = int(round(fw * FACE_BLUR_PADDING_FACTOR))
+        pad_y = int(round(fh * FACE_BLUR_PADDING_FACTOR))
+        x1 = max(0, fx - pad_x)
+        y1 = max(0, fy - pad_y)
+        x2 = min(W, fx + fw + pad_x)
+        y2 = min(H, fy + fh + pad_y)
+        if x2 <= x1 or y2 <= y1:
+            return -1.0
+        crop = img[y1:y2, x1:x2]
+        ch, cw = crop.shape[:2]
+        long_edge = max(ch, cw)
+        # Normierung: Face-Crop auf dieselbe Zielgroesse wie Vollbild-Messung.
+        # So sind Face-Werte und Full-Image-Werte direkt vergleichbar.
+        if long_edge != BLUR_NORMALIZE_LONG_EDGE:
+            scale = BLUR_NORMALIZE_LONG_EDGE / float(long_edge)
+            new_w = max(8, int(round(cw * scale)))
+            new_h = max(8, int(round(ch * scale)))
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+            crop = cv2.resize(crop, (new_w, new_h), interpolation=interp)
+        return float(cv2.Laplacian(crop, cv2.CV_64F).var())
+    except Exception:
+        return -1.0
+
+
+def subject_torso_landmark_count(image_path: str) -> int:
+    """
+    Zaehlt wie viele der 4 Kern-Torso-Landmarks (linke/rechte Schulter,
+    linke/rechte Huefte) mit ausreichender Sichtbarkeit (>= SUBJECT_LANDMARK_VIS_MIN)
+    erkannt werden. Nutzt MediaPipe Pose.
+
+    Gibt einen Wert zwischen 0 und 4 zurueck. -1 wenn MediaPipe nicht
+    verfuegbar ist (dann soll der Caller den Check ueberspringen, nicht
+    verwerfen).
+
+    Gedacht als Sanity-Check: wenn ein Bild KEIN Gesicht zeigt und auch
+    keinen erkennbaren Torso, dann sind es vermutlich nur isolierte
+    Gliedmassen (Fuesse, Haende) und fuer Person-LoRAs nutzlos.
+    """
+    if MP_POSE is None or not HAVE_CV2:
+        return -1
+    try:
+        img_bgr = cv2.imread(image_path)
+        if img_bgr is None:
+            return -1
+        rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pose_result = MP_POSE.process(rgb)
+        if not pose_result or not pose_result.pose_landmarks:
+            return 0
+        # MediaPipe PoseLandmark-Indizes:
+        # 11 = LEFT_SHOULDER, 12 = RIGHT_SHOULDER
+        # 23 = LEFT_HIP,      24 = RIGHT_HIP
+        torso_idx = (11, 12, 23, 24)
+        lms = pose_result.pose_landmarks.landmark
+        count = 0
+        for idx in torso_idx:
+            if idx >= len(lms):
+                continue
+            lm = lms[idx]
+            if (lm.visibility >= SUBJECT_LANDMARK_VIS_MIN
+                    and 0.0 <= lm.x <= 1.0
+                    and 0.0 <= lm.y <= 1.0):
+                count += 1
+        return count
+    except Exception:
+        return -1
 
 
 def local_exposure_median(image_path: str) -> float:
@@ -764,6 +903,83 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
         bot_zone = row_score[bot_off:]
         bot_cands = np.where(bot_zone > 0.20)[0]
         bottom_edge = int(bot_off + bot_cands[np.argmax(bot_zone[bot_cands])]) if len(bot_cands) > 0 else h
+
+        # ── Zweistufige Bar-Detection (fuer Android-Nav-Bars, IG-Shadow-Frames) ──
+        # Die gradienten-basierte Suche oben verpasst zwei haeufige Faelle:
+        #   1) Grosse schwarze Android-Nav-Bar, die weit ueber der 70%-Marke
+        #      beginnt (Suchzone ist dann komplett innerhalb der Bar → kein Gradient).
+        #   2) Weiche Schatten-Gradienten oben/unten (Drop-Shadows um innere Fotos),
+        #      die der row_score>0.25-Schwelle nicht genuegen.
+        # Diese Zusatz-Detection triggert NUR, wenn bereits ein Seitenrahmen gefunden
+        # wurde. Damit wird verhindert, dass dunkle Kopfkissen o.ae. fuer eine Bar
+        # gehalten werden.
+        def _detect_bar_two_stage(side: str) -> int:
+            """
+            Zweistufige Erkennung einer uniformen Bar am oberen/unteren Rand.
+            Stufe A: Row-std < 15 -> fast einfarbige Zeile.
+            Stufe B: Ab Ende von Stufe A weiter suchen, wenn die Bar eine
+            typische dunkle (<60) oder helle (>200) Farbe hat — auch wenn
+            die Zeile UI-Elemente (Icons, Buttons) enthaelt, solange die
+            dominante Farbe dieselbe bleibt (>55% Pixel). Fuer Android-
+            Nav-Bars mit schwarzem Hintergrund + weisse Nav-Icons.
+            """
+            max_rows = int(h * 0.5)
+            if side == "bottom":
+                rows_region = img[h - max_rows:, :, :][::-1]  # von unten
+            else:
+                rows_region = img[:max_rows, :, :]
+            row_stds_local = rows_region.std(axis=1).mean(axis=1)
+
+            stage_a = 0
+            gap_a = 0
+            for i, std_v in enumerate(row_stds_local):
+                if std_v < 15.0:
+                    stage_a = i + 1
+                    gap_a = 0
+                else:
+                    gap_a += 1
+                    if gap_a > 20:
+                        break
+            if stage_a == 0:
+                return 0
+
+            ref_mean = float(rows_region[:stage_a].mean())
+            is_dark_bar = ref_mean < 60.0
+            is_bright_bar = ref_mean > 200.0
+            if not (is_dark_bar or is_bright_bar):
+                # Uniforme aber "mittelhelle" Zone (z.B. bunter IG-Frame ohne
+                # UI-Overlays): Stufe B uebspringen, Stage-A-Laenge zurueckgeben.
+                return stage_a
+
+            stage_b = stage_a
+            gap_b = 0
+            for i in range(stage_a, len(row_stds_local)):
+                row_px = rows_region[i]
+                if is_dark_bar:
+                    dominant_mask = (row_px < 40).all(axis=-1)
+                else:
+                    dominant_mask = (row_px > 220).all(axis=-1)
+                dominant_ratio = float(dominant_mask.sum()) / float(row_px.shape[0])
+                if dominant_ratio > 0.55:
+                    stage_b = i + 1
+                    gap_b = 0
+                else:
+                    gap_b += 1
+                    if gap_b > 15:
+                        break
+            return stage_b
+
+        # Nur anwenden, wenn mindestens eine Seite als Frame erkannt wurde
+        # (sonst False-Positives bei normalen dunklen Bildelementen wie Kissen,
+        #  Haaren, dunklen Hintergruenden).
+        if IG_FRAME_TWO_STAGE_BAR_DETECT and (left_is_frame or right_is_frame):
+            bar_top = _detect_bar_two_stage("top")
+            bar_bot = _detect_bar_two_stage("bottom")
+            # Die bereits gefundene Kante nur erweitern, nicht verengen
+            if bar_top > top_edge:
+                top_edge = bar_top
+            if bar_bot > 0 and (h - bar_bot) < bottom_edge:
+                bottom_edge = h - bar_bot
 
         # ── UI-Elemente / Captions entfernen ──
         inner = img[top_edge:bottom_edge, left_edge:right_edge, :]
@@ -1517,6 +1733,41 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     if multiple_people:
         reasons.append("multiple_people")
         return "reject", reasons
+
+    # ── SUBJECT-SANITY-CHECK (nach Gesichts-Erkennung) ─────────────────────
+    # Bilder ohne sichtbares Gesicht UND ohne erkennbaren Torso sind
+    # isolierte Gliedmassen (Fuesse, Haende) und fuer Person-LoRAs wertlos.
+    # Greift NICHT bei sichtbaren Gesichtern und NICHT bei Rueckenansichten
+    # mit klarem Torso (mind. SUBJECT_MIN_TORSO_LANDMARKS von 4 Landmarks).
+    if ENABLE_SUBJECT_SANITY_CHECK and not face_visible:
+        orig_path = item.get("original_path")
+        if orig_path and os.path.exists(orig_path):
+            torso_count = subject_torso_landmark_count(orig_path)
+            # torso_count == -1 bedeutet MediaPipe nicht verfuegbar -> Check skippen
+            if torso_count >= 0 and torso_count < SUBJECT_MIN_TORSO_LANDMARKS:
+                item.setdefault("status_notes", []).append(
+                    f"subject_sanity_fail_torso_{torso_count}_of_4"
+                )
+                reasons.append("no_torso_no_face")
+                return "reject", reasons
+
+    # ── FACE-BBOX-BLUR-CHECK (Stufe 2) ─────────────────────────────────────
+    # Fuer LoRA-Training ist Gesichtsschaerfe kritisch. Ein unscharfer
+    # Hintergrund bei scharfem Gesicht ist ok, umgekehrt nicht.
+    # Greift nur wenn ein Gesicht sichtbar ist und eine Face-Bbox vorliegt.
+    # Die Stufe-1-Messung im Quick-Reject ist auf Totalausfall kalibriert;
+    # hier prangern wir gezielt unscharfe Gesichter an.
+    if USE_BLUR_FILTER and face_visible:
+        face_bbox = item.get("main_face_bbox")
+        orig_path = item.get("original_path")
+        if face_bbox and orig_path and os.path.exists(orig_path):
+            face_var = local_blur_variance_in_face(orig_path, face_bbox)
+            if face_var >= 0 and face_var < FACE_MIN_BLUR_VARIANCE:
+                item.setdefault("status_notes", []).append(
+                    f"face_blur_variance_{face_var:.1f}_below_{FACE_MIN_BLUR_VARIANCE}"
+                )
+                reasons.append("face_blur_too_high")
+                return "reject", reasons
 
     if score < HARD_REJECT_SCORE:
         reasons.append(f"score_below_hard_reject_floor ({score}<{HARD_REJECT_SCORE})")
