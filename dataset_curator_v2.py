@@ -108,9 +108,16 @@ HARD_MIN_FILESIZE_KB      = 80        # Unter 80 KB -> reject
 USE_BLUR_FILTER            = True
 BLUR_NORMALIZE_LONG_EDGE   = 512       # Zielgroesse fuer Blur-Messung (px, laengste Seite)
 HARD_MIN_BLUR_VARIANCE     = 25.0      # Stufe 1: Totalausfall-Schwelle auf Gesamtbild (laxer Vorfilter)
-FACE_MIN_BLUR_VARIANCE     = 45.0      # Stufe 2: Schwelle in der Face-Bbox. Konservativ gesetzt,
-                                       # damit Beauty-Filter-Selfies nicht faelschlich rausfallen;
-                                       # trifft aber klar verwackelte Gesichter.
+# Stufe 2 (Face-Bbox): Typische Wertbereiche nach Normierung auf 512px:
+#   scharfe Fotos mit guter Beleuchtung:  120-400+
+#   normale Handy-Selfies:                 60-150
+#   Beauty-Filter-Selfies (Skin-Smoothing): 20-60
+#   klar verwackelte Gesichter:            <20
+# Default 45 ist ein Kompromiss: trifft klar verwackelte Gesichter, kann aber
+# stark weichgezeichnete Beauty-Filter-Selfies fangen. Wenn zu viele Bilder
+# faelschlich gerejectet werden: in UI auf 25-30 runterdrehen und spaeter die
+# geloggte face_blur_variance pro Bild in der Report-Auswertung ansehen.
+FACE_MIN_BLUR_VARIANCE     = 45.0
 FACE_BLUR_PADDING_FACTOR   = 0.15      # Face-Bbox um diesen Faktor erweitern vor Blur-Messung
 
 # Belichtungs-Check per Histogramm-Median (PIL, kein OpenCV nötig).
@@ -253,6 +260,12 @@ IG_FRAME_MIN_CONTENT_PX = 400             # Mindestbreite/-höhe des verbleibend
 # (verhindert False-Positives bei normalen dunklen Bildelementen wie Kissen oder
 # dunklem Hintergrund). Ausschalten wenn unerwartete Crops auftreten.
 IG_FRAME_TWO_STAGE_BAR_DETECT = True
+# Cache-Version fuer IG-Frame-Crops. Jede Aenderung an der Detection-Logik,
+# die andere Crop-Ergebnisse liefert, erfordert ein Increment dieser Version,
+# damit vorhandene Caches neu berechnet werden.
+# v1 = Original (nur Seiten + simple Top/Bottom-Gradienten)
+# v2 = + Zweistufige Bar-Detection (Android-Nav-Bars, Drop-Shadows)
+IG_FRAME_CACHE_VERSION = 2
 
 
 # ── SUBJECT-SANITY-CHECK (Gliedmassen-/Winkel-Filter) ──────────────────────────
@@ -276,6 +289,12 @@ SUBJECT_LANDMARK_VIS_MIN = 0.55
 # Wird von dataset_curator_ui.py geschrieben. Überschreibt die Standardwerte
 # oben mit den Werten aus der Weboberfläche. Ohne UI wird dieser Block ignoriert.
 _UI_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_config.json")
+# Interne Konstanten, die nie von der UI ueberschrieben werden duerfen.
+# IG_FRAME_CACHE_VERSION insbesondere: wenn der User eine alte UI-Config mit
+# einer veralteten Version auf den Curator losliesse, wuerden alte Caches
+# faelschlich wiederverwendet. Diese Liste wachst mit jedem internen Feld,
+# das aus strukturellen Gruenden keine UI-Kontrolle haben soll.
+_UI_PROTECTED_KEYS = {"IG_FRAME_CACHE_VERSION"}
 if os.path.exists(_UI_CONFIG_PATH):
     try:
         with open(_UI_CONFIG_PATH, "r", encoding="utf-8") as _f:
@@ -283,6 +302,8 @@ if os.path.exists(_UI_CONFIG_PATH):
         for _k, _v in _ui_cfg.items():
             # CAPTION_POLICY separat mergen, nicht komplett ersetzen
             if _k == "CAPTION_POLICY":
+                continue
+            if _k in _UI_PROTECTED_KEYS:
                 continue
             if _k in globals() and not _k.startswith("_"):
                 globals()[_k] = _v
@@ -771,7 +792,7 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
 
         # Cache-Pfad basierend auf Datei-Hash
         src_hash = file_sha1(image_path)
-        cached_path = os.path.join(IG_FRAME_CROP_DIR, f"{src_hash}_ig_cropped.jpg")
+        cached_path = os.path.join(IG_FRAME_CROP_DIR, f"{src_hash}_ig_cropped_v{IG_FRAME_CACHE_VERSION}.jpg")
         if os.path.exists(cached_path):
             return cached_path
 
@@ -1021,15 +1042,41 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
 
 def local_quick_reject(image_path: str, width: int, height: int) -> Optional[str]:
     """
-    Führt alle aktivierten Grossdatensatz-Vorfilter durch.
-    Gibt einen Reason-String zurück wenn das Bild verworfen werden soll,
-    sonst None. Kein API-Call, kein OpenAI-Kontakt.
+    Legacy-Wrapper: fuehrt ALLE aktivierten Vorfilter durch (Filesize + Blur +
+    Exposure). Wird nicht mehr vom Haupt-Pipelineflow aufgerufen (Pipeline
+    nutzt local_quick_reject_pre_crop + local_quick_reject_post_crop), aber
+    fuer Abwaertskompatibilitaet beibehalten.
     """
     if USE_MIN_FILESIZE_FILTER:
         kb = local_filesize_kb(image_path)
         if kb < HARD_MIN_FILESIZE_KB:
             return f"filesize_too_small_{kb:.0f}kb"
 
+    if USE_BLUR_FILTER:
+        variance = local_blur_variance(image_path)
+        if variance >= 0 and variance < HARD_MIN_BLUR_VARIANCE:
+            return f"blur_variance_too_low_{variance:.1f}"
+
+    if USE_EXPOSURE_FILTER:
+        median = local_exposure_median(image_path)
+        if median < HARD_MAX_DARK_MEDIAN:
+            return f"image_too_dark_median_{median:.0f}"
+        if median > HARD_MIN_BRIGHT_MEDIAN:
+            return f"image_overexposed_median_{median:.0f}"
+
+    return None
+
+
+def local_quick_reject_post_crop(image_path: str, width: int, height: int) -> Optional[str]:
+    """
+    Vorfilter, die NACH dem IG-Frame-Crop laufen sollen: Blur und Exposure.
+    Dateigroesse wurde schon vor dem IG-Crop geprueft (dort ist sie noch
+    die Original-Filesize).
+
+    Der Blur-Check arbeitet mit der auflösungs-normierten Laplacian-Varianz
+    (Stufe 1); der eigentliche Face-Bbox-Check (Stufe 2) laeuft spaeter in
+    local_status_override nach der Face-Detection.
+    """
     if USE_BLUR_FILTER:
         variance = local_blur_variance(image_path)
         if variance >= 0 and variance < HARD_MIN_BLUR_VARIANCE:
@@ -1134,6 +1181,7 @@ def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]]
         "main_face_bbox": None,
         "main_face_ratio": 0.0,
         "pose_bbox": None,
+        "torso_landmark_count": -1,  # -1 = MediaPipe nicht gelaufen / nicht verfuegbar
         "phash": None,
         "mtime_bucket": get_file_mtime_bucket(image_path),
     }
@@ -1204,6 +1252,25 @@ def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]]
                     y1, y2 = max(0, min(ys)), min(h, max(ys))
                     if x2 > x1 and y2 > y1:
                         metrics["pose_bbox"] = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+
+                # Torso-Landmark-Count mitberechnen (vermeidet zweiten
+                # MediaPipe-Call spaeter in subject_torso_landmark_count).
+                # Indizes: 11/12 = Schultern, 23/24 = Hueften.
+                torso_idx = (11, 12, 23, 24)
+                lms = pose_result.pose_landmarks.landmark
+                torso_count = 0
+                for idx in torso_idx:
+                    if idx >= len(lms):
+                        continue
+                    lm = lms[idx]
+                    if (lm.visibility >= SUBJECT_LANDMARK_VIS_MIN
+                            and 0.0 <= lm.x <= 1.0
+                            and 0.0 <= lm.y <= 1.0):
+                        torso_count += 1
+                metrics["torso_landmark_count"] = torso_count
+            else:
+                # Pose-Detection hat nichts gefunden -> 0 Landmarks
+                metrics["torso_landmark_count"] = 0
         except Exception:
             pass
 
@@ -1739,17 +1806,22 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     # isolierte Gliedmassen (Fuesse, Haende) und fuer Person-LoRAs wertlos.
     # Greift NICHT bei sichtbaren Gesichtern und NICHT bei Rueckenansichten
     # mit klarem Torso (mind. SUBJECT_MIN_TORSO_LANDMARKS von 4 Landmarks).
-    if ENABLE_SUBJECT_SANITY_CHECK and not face_visible:
-        orig_path = item.get("original_path")
-        if orig_path and os.path.exists(orig_path):
-            torso_count = subject_torso_landmark_count(orig_path)
-            # torso_count == -1 bedeutet MediaPipe nicht verfuegbar -> Check skippen
-            if torso_count >= 0 and torso_count < SUBJECT_MIN_TORSO_LANDMARKS:
-                item.setdefault("status_notes", []).append(
-                    f"subject_sanity_fail_torso_{torso_count}_of_4"
-                )
-                reasons.append("no_torso_no_face")
-                return "reject", reasons
+    #
+    # Robustheit: Wir vertrauen nicht nur der API-Angabe face_visible, sondern
+    # kombinieren sie mit der lokalen MediaPipe-Face-Detection. Nur wenn BEIDE
+    # kein Gesicht sehen, greift der Torso-Check. Verhindert False-Rejects,
+    # wenn die API ein kleines, aber valides Gesicht uebersehen hat.
+    # Der torso_landmark_count wurde bereits in local_subject_metrics
+    # gesetzt (vermeidet zweiten MediaPipe-Call).
+    if ENABLE_SUBJECT_SANITY_CHECK and not face_visible and face_count_local == 0:
+        torso_count = int(item.get("torso_landmark_count", -1))
+        # torso_count == -1 bedeutet MediaPipe nicht verfuegbar -> Check skippen
+        if torso_count >= 0 and torso_count < SUBJECT_MIN_TORSO_LANDMARKS:
+            item.setdefault("status_notes", []).append(
+                f"subject_sanity_fail_torso_{torso_count}_of_4"
+            )
+            reasons.append("no_torso_no_face")
+            return "reject", reasons
 
     # ── FACE-BBOX-BLUR-CHECK (Stufe 2) ─────────────────────────────────────
     # Fuer LoRA-Training ist Gesichtsschaerfe kritisch. Ein unscharfer
@@ -1757,17 +1829,39 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     # Greift nur wenn ein Gesicht sichtbar ist und eine Face-Bbox vorliegt.
     # Die Stufe-1-Messung im Quick-Reject ist auf Totalausfall kalibriert;
     # hier prangern wir gezielt unscharfe Gesichter an.
+    #
+    # Konsistenz-Hinweis: Nach einem IG-Frame-Crop zeigt `original_path` auf
+    # das gecropte Bild; die Face-Bbox (sowohl aus local_subject_metrics als
+    # auch aus der AI) ist dann ebenfalls relativ zum gecropten Bild. Damit
+    # passen Bbox und Pfad zusammen. Falls du den IG-Crop-Schritt aus der
+    # Pipeline entfernst, muss diese Annahme neu geprueft werden.
     if USE_BLUR_FILTER and face_visible:
         face_bbox = item.get("main_face_bbox")
         orig_path = item.get("original_path")
         if face_bbox and orig_path and os.path.exists(orig_path):
-            face_var = local_blur_variance_in_face(orig_path, face_bbox)
-            if face_var >= 0 and face_var < FACE_MIN_BLUR_VARIANCE:
-                item.setdefault("status_notes", []).append(
-                    f"face_blur_variance_{face_var:.1f}_below_{FACE_MIN_BLUR_VARIANCE}"
-                )
-                reasons.append("face_blur_too_high")
-                return "reject", reasons
+            # Plausibilitaet: Bbox muss innerhalb der Bilddimensionen liegen.
+            img_w = int(item.get("width", 0))
+            img_h = int(item.get("height", 0))
+            fx, fy, fw, fh = [int(v) for v in face_bbox]
+            bbox_ok = (
+                img_w > 0 and img_h > 0
+                and fx >= 0 and fy >= 0 and fw > 0 and fh > 0
+                and (fx + fw) <= img_w + 2 and (fy + fh) <= img_h + 2
+            )
+            if not bbox_ok:
+                item.setdefault("status_notes", []).append("face_blur_skipped_bbox_inconsistent")
+            else:
+                face_var = local_blur_variance_in_face(orig_path, face_bbox)
+                # Immer loggen (auch bei Keep), damit nachher die Verteilung
+                # analysiert und der Threshold empirisch kalibriert werden kann.
+                if face_var >= 0:
+                    item["face_blur_variance"] = round(face_var, 1)
+                if face_var >= 0 and face_var < FACE_MIN_BLUR_VARIANCE:
+                    item.setdefault("status_notes", []).append(
+                        f"face_blur_variance_{face_var:.1f}_below_{FACE_MIN_BLUR_VARIANCE}"
+                    )
+                    reasons.append("face_blur_too_high")
+                    return "reject", reasons
 
     if score < HARD_REJECT_SCORE:
         reasons.append(f"score_below_hard_reject_floor ({score}<{HARD_REJECT_SCORE})")
@@ -1818,6 +1912,17 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     if "motion_blur" in issues or "soft_focus" in issues:
         reasons.append("blur_soft_focus")
 
+    # ── Extreme Winkel / isolierte Gliedmassen ──
+    # extreme_angle = Bird's-Eye / Worm's-Eye / verzerrte Perspektive:
+    #   fuer Person-LoRA-Training ungeeignet (Modell lernt Winkel statt Person).
+    # cropped_limbs + kein Gesicht = isolierte Gliedmasse (z.B. nur Fuesse, nur
+    #   Haende) ohne Torso-Kontext: wertlos. Bei sichtbarem Gesicht darf der
+    #   Koerper gecropt sein (Headshot ist ja gerade das).
+    if "extreme_angle" in issues:
+        reasons.append("extreme_angle_unusable")
+    if "cropped_limbs" in issues and not face_visible:
+        reasons.append("isolated_limbs_no_face")
+
     if not reasons:
         return "keep", reasons
 
@@ -1825,6 +1930,8 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
         "multiple_people",
         "headshot_without_clear_face",
         "major_face_occlusion",
+        "extreme_angle_unusable",
+        "isolated_limbs_no_face",
     }
     # Bei Full-Body-Shots ist ein verdecktes/fehlendes Gesicht kein Hard-Reject
     # (z.B. Rueckenansichten sind wertvolle Trainingsdaten fuer Koerperhaltung/Kleidung)
@@ -1832,6 +1939,13 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     if item.get("shot_type") == "full_body":
         active_hard_rejects.discard("major_face_occlusion")
         active_hard_rejects.discard("headshot_without_clear_face")
+
+    # Hard-Fail ohne Score-Bypass: diese Gruende machen das Bild intrinsisch
+    # untrainierbar, unabhaengig vom Qualitaetsscore.
+    unconditional_rejects = {"extreme_angle_unusable", "isolated_limbs_no_face"}
+    if any(r in unconditional_rejects for r in reasons):
+        return "reject", reasons
+
     if any(r in active_hard_rejects for r in reasons) and score < KEEP_SCORE_MIN:
         return "reject", reasons
 
@@ -2686,8 +2800,68 @@ def main() -> None:
                 safe_print(f"   ❌ Reject: hard pass {width}x{height}")
                 continue
 
-            # ── Grossdatensatz-Vorfilter (lokal, kein API-Call) ────────────
-            quick_reject_reason = local_quick_reject(image_path, width, height)
+            # ── Vorfilter STUFE 1: Dateigroesse (gratis, vor IG-Crop) ──────
+            # Diese Pruefung kommt vor dem IG-Crop, weil sie quasi kostenlos
+            # ist und das Laden kleiner Daten filtern kann, bevor wir
+            # potenziell teure Frame-Detection starten.
+            if USE_MIN_FILESIZE_FILTER:
+                kb = local_filesize_kb(image_path)
+                if kb < HARD_MIN_FILESIZE_KB:
+                    reason = f"filesize_too_small_{kb:.0f}kb"
+                    row.update({
+                        "width": width,
+                        "height": height,
+                        "quality_total": 0,
+                        "base_status": "reject",
+                        "final_status": "reject",
+                        "short_reason": reason,
+                        "local_override_reasons": [reason],
+                    })
+                    all_rows.append(row)
+                    safe_print(f"   ❌ Reject: {reason}")
+                    continue
+
+            file_hash = file_sha1(image_path)
+
+            # ── Instagram-Frame Auto-Crop ──────────────────────────────────
+            # Erkennt IG-Story-Rahmen und ersetzt image_path durch das
+            # gecropte Bild, damit alle folgenden Schritte (Blur, Exposure,
+            # API, Metriken, Hashing) auf dem bereinigten Bild arbeiten.
+            if ENABLE_IG_FRAME_CROP:
+                ig_cropped_path = detect_and_crop_ig_frame(image_path)
+                if ig_cropped_path:
+                    # Dimensionen und Hash des bereinigten Bildes übernehmen
+                    width, height = image_dimensions(ig_cropped_path)
+                    file_hash = file_sha1(ig_cropped_path)
+                    row["ig_frame_cropped"] = True
+                    row.setdefault("status_notes", []).append("ig_frame_auto_cropped")
+                    safe_print(f"   🖼️  IG-Frame erkannt → gecroppt auf {width}x{height}")
+                    # Für die weitere Pipeline das gecropte Bild verwenden
+                    image_path = ig_cropped_path
+                    row["original_path"] = ig_cropped_path
+
+                    # Nach dem Crop Groesse erneut pruefen: Wenn der Crop zu
+                    # klein geworden ist, jetzt erst verwerfen.
+                    if min(width, height) < HARD_MIN_SIDE_PX:
+                        reason = f"hard_pass_too_small_after_ig_crop_{width}x{height}"
+                        row.update({
+                            "width": width,
+                            "height": height,
+                            "quality_total": 0,
+                            "base_status": "reject",
+                            "final_status": "reject",
+                            "short_reason": reason,
+                            "local_override_reasons": [reason],
+                        })
+                        all_rows.append(row)
+                        safe_print(f"   ❌ Reject: {reason}")
+                        continue
+
+            # ── Vorfilter STUFE 2: Blur/Exposure auf gecroptem Bild ────────
+            # Diese Checks laufen NACH dem IG-Crop, damit z.B. ein schwarzer
+            # Android-Nav-Bar die Helligkeits-Mediane nicht verfaelscht und
+            # die Laplacian-Varianz nur den echten Bildinhalt bewertet.
+            quick_reject_reason = local_quick_reject_post_crop(image_path, width, height)
             if quick_reject_reason:
                 row.update({
                     "width": width,
@@ -2702,24 +2876,6 @@ def main() -> None:
                 safe_print(f"   ❌ Reject: {quick_reject_reason}")
                 continue
 
-            file_hash = file_sha1(image_path)
-
-            # ── Instagram-Frame Auto-Crop ──────────────────────────────────
-            # Erkennt IG-Story-Rahmen und ersetzt image_path durch das
-            # gecropte Bild, damit alle folgenden Schritte (API, Metriken,
-            # Hashing) auf dem bereinigten Bild arbeiten.
-            if ENABLE_IG_FRAME_CROP:
-                ig_cropped_path = detect_and_crop_ig_frame(image_path)
-                if ig_cropped_path:
-                    # Dimensionen und Hash des bereinigten Bildes übernehmen
-                    width, height = image_dimensions(ig_cropped_path)
-                    file_hash = file_sha1(ig_cropped_path)
-                    row["ig_frame_cropped"] = True
-                    row.setdefault("status_notes", []).append("ig_frame_auto_cropped")
-                    safe_print(f"   🖼️  IG-Frame erkannt → gecroppt auf {width}x{height}")
-                    # Für die weitere Pipeline das gecropte Bild verwenden
-                    image_path = ig_cropped_path
-                    row["original_path"] = ig_cropped_path
             primary_audit_cache_key = audit_cache_key(file_hash, AI_MODEL, "primary_audit")
             cached = load_cached_audit(primary_audit_cache_key)
             local_meta = local_subject_metrics(image_path, phash_cache=phash_cache)
