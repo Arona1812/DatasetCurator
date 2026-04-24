@@ -28,7 +28,7 @@ if os.path.exists(_UI_CONFIG_PATH):
             if _k in globals() and not _k.startswith("_"):
                 globals()[_k] = _v
     except Exception as _e:
-        print(f"⚠️ UI-Config konnte nicht geladen werden: {_e}")
+        print(f"⚠️ Failed to load UI config: {_e}")
 # ==========================================
 
 def get_sharpness(img):
@@ -69,29 +69,29 @@ def process_minute_chunk(chunk_frames, video_name, minute_idx):
         out_path = os.path.join(TARGET_FOLDER, out_name)
         # 100% Qualität erzwingen, passend zum dataset_curator
         cv2.imwrite(out_path, item['frame'], [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-        print(f"  -> Gespeichert: {out_name} (Schärfe: {item['sharpness']:.1f})")
+        print(f"  -> Saved: {out_name} (sharpness: {item['sharpness']:.1f})")
 
 def main():
     os.makedirs(TARGET_FOLDER, exist_ok=True)
     
     # InsightFace initialisieren
-    print("Lade InsightFace Modell...")
+    print("Loading InsightFace model...")
     app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
     app.prepare(ctx_id=0, det_size=(640, 640))
     
     # Referenzbild laden
-    print(f"Lade Referenzbild: {REFERENCE_IMAGE}")
+    print(f"Loading reference image: {REFERENCE_IMAGE}")
     ref_img = cv2.imread(REFERENCE_IMAGE)
     if ref_img is None:
-        print("FEHLER: Referenzbild nicht gefunden!")
+        print("ERROR: Reference image not found!")
         return
         
     ref_faces = app.get(ref_img)
     if not ref_faces:
-        print("FEHLER: Kein Gesicht auf dem Referenzbild gefunden!")
+        print("ERROR: No face found in the reference image!")
         return
     ref_embedding = ref_faces[0].normed_embedding
-    print("Referenz-Embedding erfolgreich erstellt.\n")
+    print("Reference embedding created successfully.\n")
 
     # Alle Videos suchen
     video_files = []
@@ -99,11 +99,11 @@ def main():
         video_files.extend(glob(os.path.join(SOURCE_FOLDER, ext)))
         video_files.extend(glob(os.path.join(SOURCE_FOLDER, ext.upper())))
         
-    print(f"Gefundene Videos: {len(video_files)}")
+    print(f"Videos found: {len(video_files)}")
 
     for video_path in video_files:
         video_name = os.path.splitext(os.path.basename(video_path))[0]
-        print(f"\nVerarbeite Video: {video_name}")
+        print(f"\nProcessing video: {video_name}")
         
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -148,14 +148,14 @@ def main():
             
             # Wenn eine Minute voll ist, Chunk verarbeiten
             if frame_count % minute_frames == 0:
-                print(f" Analysiere Minute {minute_idx} ({len(current_minute_chunk)} gute Kandidaten gefunden)...")
+                print(f" Analyzing minute {minute_idx} ({len(current_minute_chunk)} good candidates found)...")
                 process_minute_chunk(current_minute_chunk, video_name, minute_idx)
                 current_minute_chunk = []
                 minute_idx += 1
                 
         # Den letzten (angebrochenen) Chunk verarbeiten
         if current_minute_chunk:
-            print(f" Analysiere Rest-Minute {minute_idx} ({len(current_minute_chunk)} gute Kandidaten gefunden)...")
+            print(f" Analyzing final partial minute {minute_idx} ({len(current_minute_chunk)} good candidates found)...")
             process_minute_chunk(current_minute_chunk, video_name, minute_idx)
             
         cap.release()

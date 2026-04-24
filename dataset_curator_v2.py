@@ -311,7 +311,7 @@ if os.path.exists(_UI_CONFIG_PATH):
         if "CAPTION_POLICY" in _ui_cfg and isinstance(_ui_cfg["CAPTION_POLICY"], dict):
             CAPTION_POLICY.update(_ui_cfg["CAPTION_POLICY"])
     except Exception as _e:
-        print(f"⚠️ UI-Config konnte nicht geladen werden: {_e}")
+        print(f"⚠️ Failed to load UI config: {_e}")
 
     # Abgeleitete Pfade muessen nach dem Override neu berechnet werden,
     # da INPUT_FOLDER und TRIGGER_WORD sich geaendert haben koennten.
@@ -1103,7 +1103,7 @@ def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dic
     if not USE_EARLY_PHASH_DEDUP or not USE_PHASH_DUPLICATE_SCORING:
         return image_paths, [], {}
 
-    safe_print(f"\n🔍 Early pHash-Dedup: {len(image_paths)} Bilder werden lokal verglichen...")
+    safe_print(f"\n🔍 Early pHash dedup: locally comparing {len(image_paths)} images...")
     hashes: List[Tuple[str, Optional[int]]] = []
     phash_cache: Dict[str, int] = {}
     for p in image_paths:
@@ -1167,7 +1167,7 @@ def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dic
     survivors = [p for p in image_paths if p in survivor_set or (p in no_hash_paths and p not in duplicate_set)]
     duplicates = [p for p in image_paths if p in duplicate_set]
 
-    safe_print(f"   ↳ Early pHash: {len(survivors)} behalten, {len(duplicates)} Duplikate entfernt\n")
+    safe_print(f"   ↳ Early pHash: kept {len(survivors)}, removed {len(duplicates)} duplicates\n")
     return survivors, duplicates, phash_cache
 
 
@@ -1442,7 +1442,7 @@ def responses_api_call(model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             if attempt >= MAX_RETRIES:
                 break
             sleep_s = RETRY_BASE_SECONDS * attempt
-            safe_print(f"   ↳ API-Fehler, Retry {attempt}/{MAX_RETRIES} in {sleep_s:.1f}s: {e}")
+            safe_print(f"   ↳ API error, retry {attempt}/{MAX_RETRIES} in {sleep_s:.1f}s: {e}")
             time.sleep(sleep_s)
     raise RuntimeError(f"Responses-API fehlgeschlagen: {last_error}")
 
@@ -2070,15 +2070,15 @@ def crop_dedup_selected(selected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 # Crop ist besser oder gleich → Original raus
                 to_remove.add(orig["original_filename"])
                 safe_print(
-                    f"   🔀 Crop gewinnt: {crop.get('original_filename')} "
-                    f"({crop_score:.1f}) > Original ({orig_score:.1f})"
+                    f"   🔀 Crop wins: {crop.get('original_filename')} "
+                    f"({crop_score:.1f}) > original ({orig_score:.1f})"
                 )
             else:
                 # Original ist besser → Crop raus
                 to_remove.add(crop["original_filename"])
                 safe_print(
-                    f"   🔀 Original gewinnt: {crop_of} "
-                    f"({orig_score:.1f}) > Crop ({crop_score:.1f})"
+                    f"   🔀 Original wins: {crop_of} "
+                    f"({orig_score:.1f}) > crop ({crop_score:.1f})"
                 )
 
     if SMART_PRECROP_ALLOW_DATASET_DUPLICATES:
@@ -2724,24 +2724,24 @@ def main() -> None:
             trigger_check = check_trigger_word_via_ai(TRIGGER_WORD)
             if trigger_check.get("is_potentially_problematic", False):
                 warnings.append(
-                    f"Triggerwort '{TRIGGER_WORD}' ist potenziell problematisch ({trigger_check.get('risk_level', 'unknown')}). "
+                    f"Trigger word '{TRIGGER_WORD}' may be problematic ({trigger_check.get('risk_level', 'unknown')}). "
                     f"{trigger_check.get('reason', '')}"
                 )
                 suggestion = trigger_check.get("suggested_trigger", "").strip()
                 if suggestion and suggestion.lower() != TRIGGER_WORD.lower():
-                    warnings.append(f"Vorschlag für ein robusteres Triggerwort: {suggestion}")
+                    warnings.append(f"Suggested more robust trigger word: {suggestion}")
         except Exception as e:
-            warnings.append(f"Triggerwort-Prüfung fehlgeschlagen: {e}")
+            warnings.append(f"Trigger-word check failed: {e}")
 
     for w in warnings:
         safe_print(f"⚠️ {w}")
 
     image_paths = iter_input_images(INPUT_FOLDER)
     if not image_paths:
-        safe_print("Keine Bilder gefunden.")
+        safe_print("No images found.")
         return
 
-    safe_print(f"Gefundene Bilder: {len(image_paths)}")
+    safe_print(f"Images found: {len(image_paths)}")
 
     # ── Early pHash-Dedup VOR der API ──────────────────────────────────────
     early_dup_paths: List[str] = []
@@ -2749,7 +2749,7 @@ def main() -> None:
     if USE_EARLY_PHASH_DEDUP and USE_PHASH_DUPLICATE_SCORING:
         image_paths, early_dup_paths, phash_cache = early_phash_dedup(image_paths)
 
-    safe_print(f"Starte Audit für Triggerwort: {TRIGGER_WORD}")
+    safe_print(f"Starting audit for trigger word: {TRIGGER_WORD}")
     safe_print("")
 
     all_rows: List[Dict[str, Any]] = []
@@ -2835,7 +2835,7 @@ def main() -> None:
                     file_hash = file_sha1(ig_cropped_path)
                     row["ig_frame_cropped"] = True
                     row.setdefault("status_notes", []).append("ig_frame_auto_cropped")
-                    safe_print(f"   🖼️  IG-Frame erkannt → gecroppt auf {width}x{height}")
+                    safe_print(f"   🖼️  IG frame detected → cropped to {width}x{height}")
                     # Für die weitere Pipeline das gecropte Bild verwenden
                     image_path = ig_cropped_path
                     row["original_path"] = ig_cropped_path
@@ -2889,12 +2889,12 @@ def main() -> None:
 
             if cached:
                 audit = cached["audit"] if "audit" in cached else cached
-                safe_print("   ↳ Cache verwendet")
+                safe_print("   ↳ Cache used")
             else:
                 audit = openai_audit_image(image_path, local_meta, model=AI_MODEL)
 
             if audit.get("NSFW_BLOCKED"):
-                safe_print(f"      🔞 NSFW BLOCKIERT: {original_filename} -> Needs Manual Review.")
+                safe_print(f"      🔞 NSFW BLOCKED: {original_filename} -> needs manual review.")
                 review_path = os.path.join(MANUAL_REVIEW_DIR, f"NSFW_{original_filename}")
                 shutil.copy2(image_path, review_path)
                 all_rows.append({
@@ -2933,8 +2933,8 @@ def main() -> None:
 
                         if not coords_valid or not size_valid or not bounds_valid:
                             safe_print(
-                                f"   ⚠️ AI-Face-BBox unplausibel: [{x_rel:.3f}, {y_rel:.3f}, "
-                                f"{w_rel:.3f}, {h_rel:.3f}] – verwende lokale Erkennung"
+                                f"   ⚠️ Implausible AI face bbox: [{x_rel:.3f}, {y_rel:.3f}, "
+                                f"{w_rel:.3f}, {h_rel:.3f}] – using local detection"
                             )
                             row.setdefault("status_notes", []).append("ai_face_bbox_invalid_fallback_local")
                         else:
@@ -2955,7 +2955,7 @@ def main() -> None:
                             row["main_face_ratio"] = bbox_area_ratio(row["main_face_bbox"], img_w, img_h)
                             row.setdefault("status_notes", []).append("used_ai_face_bbox")
                     except Exception as e:
-                        safe_print(f"   ⚠️ Fehler beim Parsen der AI-Face-BBox: {e}")
+                        safe_print(f"   ⚠️ Error while parsing AI face bbox: {e}")
             # ---------------------------------------------------------
             if not cached:
                 audit = normalize_audit_scores(audit)
@@ -2971,9 +2971,9 @@ def main() -> None:
                 cached_escalation = load_cached_audit(escalation_cache_key)
                 if cached_escalation:
                     escalated_audit = cached_escalation.get("audit", cached_escalation)
-                    safe_print(f"   ↳ Escalation-Cache verwendet ({REVIEW_ESCALATION_MODEL})")
+                    safe_print(f"   ↳ Escalation cache used ({REVIEW_ESCALATION_MODEL})")
                 else:
-                    safe_print(f"   ↳ Eskalation mit {REVIEW_ESCALATION_MODEL}...")
+                    safe_print(f"   ↳ Escalating with {REVIEW_ESCALATION_MODEL}...")
                     escalated_audit = openai_audit_image(image_path, local_meta, model=REVIEW_ESCALATION_MODEL)
                     if not escalated_audit.get("NSFW_BLOCKED"):
                         escalated_audit = normalize_audit_scores(escalated_audit)
@@ -3034,7 +3034,7 @@ def main() -> None:
                     )
                     if crop_path:
                         try:
-                            safe_print("   ✂️  Smart Pre-Crop: Headshot-Variante wird geprueft...")
+                            safe_print("   ✂️  Smart pre-crop: evaluating headshot variant...")
 
                             # Eigener Cache-Key: Original-Hash + BBox-Koordinaten
                             bbox_str = "_".join(str(v) for v in ai_bbox)
@@ -3048,7 +3048,7 @@ def main() -> None:
                             crop_local_meta = local_subject_metrics(crop_path)
                             if cached_crop:
                                 crop_audit = cached_crop["audit"] if "audit" in cached_crop else cached_crop
-                                safe_print("   ↳ Crop-Cache verwendet")
+                                safe_print("   ↳ Crop cache used")
                             else:
                                 crop_audit = openai_audit_image(crop_path, crop_local_meta, model=AI_MODEL)
 
@@ -3071,9 +3071,9 @@ def main() -> None:
                                     if cached_crop_escalation:
                                         crop_audit = cached_crop_escalation.get("audit", cached_crop_escalation)
                                         crop_audit = normalize_audit_scores(crop_audit)
-                                        safe_print(f"   ↳ Crop-Escalation-Cache verwendet ({REVIEW_ESCALATION_MODEL})")
+                                        safe_print(f"   ↳ Crop escalation cache used ({REVIEW_ESCALATION_MODEL})")
                                     else:
-                                        safe_print(f"   ↳ Crop-Eskalation mit {REVIEW_ESCALATION_MODEL}...")
+                                        safe_print(f"   ↳ Escalating crop with {REVIEW_ESCALATION_MODEL}...")
                                         escalated_crop_audit = openai_audit_image(crop_path, crop_local_meta, model=REVIEW_ESCALATION_MODEL)
                                         if not escalated_crop_audit.get("NSFW_BLOCKED"):
                                             crop_audit = normalize_audit_scores(escalated_crop_audit)
@@ -3081,8 +3081,8 @@ def main() -> None:
                                     crop_score = float(crop_audit.get("quality_total", 0))
 
                                 safe_print(
-                                    f"   ↳ Crop {crop_score:.1f} vs. Original {orig_score:.1f} "
-                                    f"(Min-Gewinn: {SMART_PRECROP_MIN_GAIN})"
+                                        f"   ↳ Crop {crop_score:.1f} vs. original {orig_score:.1f} "
+                                        f"(min gain: {SMART_PRECROP_MIN_GAIN})"
                                 )
 
                                 if crop_score >= orig_score + SMART_PRECROP_MIN_GAIN:
@@ -3130,7 +3130,7 @@ def main() -> None:
                                     crop_row["local_override_reasons"] = c_local_reasons
 
                                     safe_print(
-                                        f"   ✅ Crop akzeptiert: score={crop_score:.1f} | status={c_base}"
+                                        f"   ✅ Crop accepted: score={crop_score:.1f} | status={c_base}"
                                     )
                                     all_rows.append(crop_row)
                                     time.sleep(SLEEP_BETWEEN_CALLS)
@@ -3148,7 +3148,7 @@ def main() -> None:
                                         })
                                 else:
                                     safe_print(
-                                        f"   ❌ Crop verworfen: Gewinn zu gering "
+                                        f"   ❌ Crop rejected: gain too small "
                                         f"({crop_score:.1f} - {orig_score:.1f} < {SMART_PRECROP_MIN_GAIN})"
                                     )
                                     # Auch verworfene Crops protokollieren (fuer vollstaendigen Export)
@@ -3164,7 +3164,7 @@ def main() -> None:
                                             "winner": "original",  # Original gewinnt automatisch
                                         })
                         except Exception as crop_e:
-                            safe_print(f"   ⚠️ Smart Pre-Crop fehlgeschlagen: {crop_e}")
+                            safe_print(f"   ⚠️ Smart pre-crop failed: {crop_e}")
                         finally:
                             if crop_path and os.path.exists(crop_path):
                                 try:
@@ -3174,7 +3174,7 @@ def main() -> None:
 
         except Exception as e:
             tb = traceback.format_exc()
-            safe_print(f"   ❌ Fehler: {e}")
+            safe_print(f"   ❌ Error: {e}")
             all_rows.append({
                 "original_filename": original_filename,
                 "original_path": image_path,
@@ -3229,7 +3229,7 @@ def main() -> None:
             print("FIXED (stabil erkannt, normalerweise nicht jedes Mal explizit captionen):")
             for k, v in caption_rule_overview.get("fixed", {}).items():
                 print(f" - {k}: {v.get('mode','')} | counts={v.get('counts',{})}")
-            print("OVERRIDE-KANDIDATEN (häufig, aber nicht stabil genug):")
+            print("OVERRIDE CANDIDATES (frequent, but not stable enough):")
             for k, v in caption_rule_overview.get("override", {}).items():
                 print(f" - {k}: mode={v.get('mode','')} | candidates={v.get('candidates',[])} | counts={v.get('counts',{})}")
             ans = input("\nOverride jetzt anpassen? (j/n): ").strip().lower()
@@ -3240,7 +3240,7 @@ def main() -> None:
                     if not line:
                         break
                     if '=' not in line:
-                        print("Ungültig. Beispiel: hair_description=blonde,brunette")
+                        print("Invalid. Example: hair_description=blonde,brunette")
                         continue
                     field, vals = line.split('=', 1)
                     field = field.strip()
@@ -3249,9 +3249,9 @@ def main() -> None:
                         global_rules[field]["override_candidates"] = values
                         global_rules[field]["variable"] = False # User mapped it manually, so we consider it fixed/stable now
                         global_rules[field]["mode"] = values[0] if values else ""
-                        print(f"OK -> {field} festgesetzt auf: {values[0] if values else ''} (variable=False)")
+                        print(f"OK -> {field} set to: {values[0] if values else ''} (variable=False)")
                     else:
-                        print("Unbekanntes Feld.")
+                        print("Unknown field.")
     except EOFError:
         pass
 
@@ -3321,7 +3321,7 @@ def main() -> None:
             try:
                 shutil.copy2(row["original_path"], img_out)
             except Exception as copy_err:
-                safe_print(f"   ⚠️ Reject-Kopie fehlgeschlagen: {row.get('original_filename','')} – {copy_err}")
+                safe_print(f"   ⚠️ Failed to copy reject image: {row.get('original_filename','')} – {copy_err}")
 
             # Reason-Datei: alle verfügbaren Quellen zusammenführen
             try:
@@ -3368,7 +3368,7 @@ def main() -> None:
                              f"type={row.get('shot_type', '')} | "
                              f"file={row.get('original_filename', '')}\n")
             except Exception as txt_err:
-                safe_print(f"   ⚠️ Reject-Textdatei fehlgeschlagen: {row.get('original_filename','')} – {txt_err}")
+                safe_print(f"   ⚠️ Failed to write reject text file: {row.get('original_filename','')} – {txt_err}")
 
     if len(review_items) > 100:
         SECOND_CHOICE_DIR = os.path.join(OUTPUT_ROOT, "08_train_ready_2nd_choice")
@@ -3384,7 +3384,7 @@ def main() -> None:
             pool.sort(key=lambda x: adjusted_pick_score(x, []), reverse=True)
             second_choice = pool[30:60]
             if not second_choice:
-                safe_print(f"   ⚠️  Second-Choice {st}: Pool zu klein (<30 Review-Bilder), keine Ausgabe.")
+                safe_print(f"   ⚠️  Second choice {st}: pool too small (<30 review images), nothing exported.")
                 continue
 
             for idx2, row in enumerate(second_choice, start=1):
@@ -3405,7 +3405,7 @@ def main() -> None:
 
     # PASS 5b: Smart-Crop Vergleichs-Export
     if EXPORT_SMART_CROP_COMPARISON and crop_pairs:
-        safe_print(f"\n📸 Exportiere {len(crop_pairs)} Smart-Crop-Vergleichspaare...")
+        safe_print(f"\n📸 Exporting {len(crop_pairs)} smart-crop comparison pairs...")
 
         # Gewinner aus crop_dedup_selected rueckwirkend eintragen
         for pair in crop_pairs:
@@ -3498,12 +3498,12 @@ def main() -> None:
                         f"HEADSHOT CROP | score={crop_score:.1f} | winner={crop_label}\n\n{crop_caption}"
                     )
 
-                safe_print(f"   Paar {pair_idx:03d}: {orig_fn[:35]} | Gewinner: {winner}")
+                safe_print(f"   Pair {pair_idx:03d}: {orig_fn[:35]} | winner: {winner}")
 
             except Exception as ep:
-                safe_print(f"   ⚠️ Vergleichs-Export Paar {pair_idx} fehlgeschlagen: {ep}")
+                safe_print(f"   ⚠️ Comparison export for pair {pair_idx} failed: {ep}")
 
-        safe_print(f"✅ Smart-Crop-Vergleiche: {SMART_CROP_COMPARISON_DIR}")
+        safe_print(f"✅ Smart-crop comparisons: {SMART_CROP_COMPARISON_DIR}")
 
 
     # PASS 6: Reports
@@ -3595,14 +3595,14 @@ def main() -> None:
 
     if len(selected_sorted) < TARGET_DATASET_SIZE:
         warnings.append(
-            f"Es wurden bewusst nur {len(selected_sorted)} statt {TARGET_DATASET_SIZE} Bilder ausgewählt, "
-            f"weil Qualität und/oder Balance wichtiger als Füllmaterial sind."
+            f"Intentionally selected only {len(selected_sorted)} instead of {TARGET_DATASET_SIZE} images, "
+            f"because quality and/or balance matter more than filler content."
         )
 
     if summary["selected_full_body"] == 0:
-        warnings.append("Keine finalen Full-Body-Bilder ausgewählt. Ganzkörper-Generierung wird wahrscheinlich schwächer.")
+        warnings.append("No final full-body images were selected. Full-body generation will likely be weaker.")
     if summary["selected_headshots"] < max(5, int(TARGET_DATASET_SIZE * 0.25)):
-        warnings.append("Es wurden relativ wenige Headshots ausgewählt. Identität/Gesicht könnte darunter leiden.")
+        warnings.append("Relatively few headshots were selected. Identity/face quality may suffer.")
 
     report = {
         "summary": summary,
@@ -3615,13 +3615,13 @@ def main() -> None:
 
     safe_print("")
     safe_print("=" * 70)
-    safe_print(f"FERTIG: {TRIGGER_WORD}")
+    safe_print(f"DONE: {TRIGGER_WORD}")
     safe_print("=" * 70)
     for k, v in summary.items():
         safe_print(f"{k}: {v}")
     safe_print("-" * 70)
     if warnings:
-        safe_print("WARNUNGEN:")
+        safe_print("WARNINGS:")
         for w in warnings:
             safe_print(f" - {w}")
         safe_print("-" * 70)
@@ -3630,7 +3630,7 @@ def main() -> None:
     safe_print(f"MD:    {md_path}")
     safe_print(f"Train-ready:     {TRAIN_READY_DIR}")
     if EXPORT_SMART_CROP_COMPARISON and crop_pairs:
-        safe_print(f"Crop-Vergleiche: {SMART_CROP_COMPARISON_DIR} ({len(crop_pairs)} Paare)")
+        safe_print(f"Crop comparisons: {SMART_CROP_COMPARISON_DIR} ({len(crop_pairs)} pairs)")
     safe_print(f"Caption-remove:  {CAPTION_REMOVE_DIR}")
     if EXPORT_REVIEW_IMAGES:
         safe_print(f"Review:          {REVIEW_DIR}")
