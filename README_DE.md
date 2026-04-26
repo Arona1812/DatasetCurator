@@ -72,6 +72,7 @@ pip install "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0" --index-u
 pip install open_clip_torch
 pip install opencv-python insightface onnxruntime scikit-learn
 pip install gradio
+pip install onnxruntime-gpu
 python dataset_curator_ui.py
 ```
 

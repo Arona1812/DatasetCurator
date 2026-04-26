@@ -55,6 +55,18 @@ try:
 except ImportError:
     HAVE_CLIP = False
 
+try:
+    # InsightFace + ONNX Runtime fuer ArcFace-basierten Identitaets-Konsistenz-Check.
+    # Beides optional: ohne diese Libraries wird der Check komplett uebersprungen.
+    # Lizenz-Hinweis: insightface-Code ist MIT, die vortrainierten Modelle
+    # (buffalo_l/buffalo_s/antelopev2) sind nur fuer non-commercial research use freigegeben.
+    # Siehe https://github.com/deepinsight/insightface fuer kommerzielle Lizenzierung.
+    import insightface  # type: ignore
+    import onnxruntime  # type: ignore
+    HAVE_INSIGHTFACE = True
+except ImportError:
+    HAVE_INSIGHTFACE = False
+
 
 #+#+#+#+############################################################
 # 1) KONFIGURATION
@@ -198,6 +210,49 @@ MAX_PER_SESSION_CLUSTER = 5  # Maximalzahl pro Session-Cluster im finalen Datens
 ENABLE_DIVERSITY_PENALTIES = True  # Bestraft zu ähnliche Kandidaten bei der Endauswahl
 
 # --------------------------------
+# Pose-Bucket-Diversity (ueber API ermittelt)
+# --------------------------------
+# Bestraft zu viele Bilder mit gleicher Kopfpose bei der Endauswahl.
+# Pose-Bucket wird vom API-Audit als head_pose_bucket geliefert und
+# fliesst in diversity_penalty() ein. Kein Hard-Reject - nur Punktabzug,
+# damit bei vielen frontalen Aufnahmen automatisch 3/4-Profile bevorzugt
+# werden, sofern qualitativ vergleichbar.
+ENABLE_POSE_DIVERSITY = True
+# Erlaubte Anzahl pro Pose-Bucket bevor Penalty einsetzt (gleiche Logik
+# wie expression_count): pose_count > 2 → Penalty.
+POSE_DIVERSITY_SOFT_LIMIT = 2
+# Penalty-Gewicht pro ueberzaehligem Bild im selben Bucket. Sitzt zwischen
+# Outfit (5.0) und Lighting (2.5), weil Pose wichtiger fuer Generalisierung
+# ist als Licht, aber weniger kritisch als Outfit-Wiederholung.
+POSE_DIVERSITY_PENALTY_WEIGHT = 4.0
+
+# --------------------------------
+# ArcFace Identitaets-Konsistenz-Check (nach Final-Pick)
+# --------------------------------
+# Berechnet pro Bild im Final-Set ein ArcFace-Embedding und vergleicht
+# es mit einem outlier-getrimmten Centroid des Sets. Bilder mit grosser
+# Distanz zur Set-Identitaet werden geflaggt:
+#   Hard-Flag (sim < HARD_THRESHOLD): wahrscheinlich andere Person -
+#     Bild wird aus 01_train_ready entfernt und mit Praefix in
+#     06_needs_manual_review kopiert. Captions bleiben unangetastet.
+#   Soft-Flag (HARD_THRESHOLD <= sim < SOFT_THRESHOLD): Grenzfall -
+#     Bild bleibt im Train-Set, wird aber im Markdown-Report markiert.
+#
+# Wertbereiche der ArcFace-Cosine-Similarity zum Centroid:
+#   gleiche Person, normale Variation:  0.65 - 0.95
+#   gleiche Person, Beauty-Filter/Maske: 0.50 - 0.70
+#   andere Person, aehnlich aussehend:  0.30 - 0.55
+#   eindeutig andere Person:            < 0.40
+USE_ARCFACE_IDENTITY_CHECK = True
+ARCFACE_HARD_THRESHOLD = 0.50      # unter diesem Wert -> Hard-Flag (raus aus Train-Set)
+ARCFACE_SOFT_THRESHOLD = 0.65      # zwischen Hard und Soft -> Markierung im Report
+ARCFACE_TRIM_FRACTION  = 0.10      # 10% schlechteste Embeddings vor Centroid-Neuberechnung verwerfen
+ARCFACE_MIN_FACES_FOR_CENTROID = 5 # weniger als 5 Gesichter -> Check skippen (nicht aussagekraeftig)
+ARCFACE_MODEL_PACK = "buffalo_l"   # buffalo_l (genauer) oder buffalo_s (schneller)
+ARCFACE_DET_SIZE = 640             # Detection-Eingabegroesse (kleinere Werte = schneller, weniger genau)
+ARCFACE_USE_CUDA = False           # Aus = CPU erzwingen. Verhindert ONNXRuntime-CUDA-DLL-Fehler bei fehlendem CUDA/cuDNN.
+
+# --------------------------------
 # Crop-Profile
 # --------------------------------
 USE_AI_TOOLKIT_CROP_PROFILES = True  # Nutzt bucket-taugliche Crop-Profile für das spätere Training
@@ -229,6 +284,7 @@ REJECT_DIR = os.path.join(OUTPUT_ROOT, "05_reject")
 MANUAL_REVIEW_DIR = os.path.join(OUTPUT_ROOT, "06_needs_manual_review")
 CACHE_DIR = os.path.join(OUTPUT_ROOT, "_cache")
 CLIP_CACHE_DIR = os.path.join(CACHE_DIR, "clip")
+ARCFACE_CACHE_DIR = os.path.join(CACHE_DIR, "arcface")
 TRIGGER_CACHE_DIR = os.path.join(CACHE_DIR, "trigger")
 SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "08_smart_crop_pairs")
 IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
@@ -266,7 +322,7 @@ INTERACTIVE_CAPTION_OVERRIDE = True        # Pausiert nach der Caption-Regel-Ana
 ENABLE_SMART_PRECROP = True                # Pre-Crop aktivieren
 SMART_PRECROP_MIN_FACE_PX = 120            # Mindest-Pixelgröße des Gesichts (min(fw, fh)) für Pre-Crop. Unter diesem Wert zu klein.
 SMART_PRECROP_TRIGGER_RATIO = 0.07         # Pre-Crop nur wenn Gesicht < 7% des Gesamtbildes. Größere Gesichter brauchen kein Zoom.
-SMART_PRECROP_PADDING_FACTOR = 1.5         # Wie viel Rahmen um das Gesicht herum (Faktor der Gesichtsgröße)
+SMART_PRECROP_PADDING_FACTOR = 0.6         # Padding pro Seite als Faktor der Gesichtsgroesse. 0.6 -> Gesamtbreite ~2.2x Gesicht (Gesicht + Haare + obere Schultern). Werte 0.4-0.8 sind sinnvoll; ueber 1.0 wird der Crop weit und naehert sich Halbkoerper-Bildaufbau an.
 SMART_PRECROP_MIN_GAIN = 8.0               # Mindestvorsprung des Crop-Scores gegenüber dem Original, damit der Crop übernommen wird
 SMART_PRECROP_ALLOW_DATASET_DUPLICATES = False  # False = Original und Crop dürfen NICHT beide ins finale Dataset
 
@@ -347,6 +403,7 @@ if os.path.exists(_UI_CONFIG_PATH):
     MANUAL_REVIEW_DIR = os.path.join(OUTPUT_ROOT, "06_needs_manual_review")
     CACHE_DIR = os.path.join(OUTPUT_ROOT, "_cache")
     CLIP_CACHE_DIR = os.path.join(CACHE_DIR, "clip")
+    ARCFACE_CACHE_DIR = os.path.join(CACHE_DIR, "arcface")
     TRIGGER_CACHE_DIR = os.path.join(CACHE_DIR, "trigger")
     SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "08_smart_crop_pairs")
     IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
@@ -369,6 +426,7 @@ for folder in [
     REVIEW_DIR,
     CACHE_DIR,
     CLIP_CACHE_DIR,
+    ARCFACE_CACHE_DIR,
     TRIGGER_CACHE_DIR,
 ]:
     os.makedirs(folder, exist_ok=True)
@@ -422,6 +480,13 @@ if USE_CLIP_DUPLICATE_SCORING and HAVE_CLIP:
     except Exception:
         CLIP_MODEL = None
         CLIP_PREPROCESS = None
+
+# ── ArcFace-Modell (lazy init) ────────────────────────────────────────
+# Wird erst beim ersten Gebrauch initialisiert, um Startup-Zeit zu sparen
+# wenn das Feature deaktiviert ist oder gar keine ArcFace-Library da ist.
+# Definition der Init-Funktion folgt weiter unten (nach safe_print).
+ARCFACE_APP = None
+ARCFACE_INIT_ATTEMPTED = False
 
 
 # ============================================================
@@ -582,17 +647,37 @@ def generate_headshot_crop(
     Erzeugt einen eng zugeschnittenen Headshot-Crop rund um die AI-erkannte
     Gesichts-BBox (in absoluten Pixel-Koordinaten des Originalbilds).
     Gibt einen Temp-Dateipfad zurueck. Caller muss die Datei via try/finally loeschen.
+
+    Geometrie ist identisch zur Smart-Crop-Branch in body_aware_crop():
+    Crop-Groesse = face + 2 * SMART_PRECROP_PADDING_FACTOR pro Seite.
+    Default 0.6 -> 2.2x face_size (echter Headshot mit Haaren + obere
+    Schultern). Damit bewerten wir API-seitig genau das Bild, das spaeter
+    auch in 01_train_ready landet, ohne zwei verschiedene Croppings.
     """
     if not ENABLE_SMART_PRECROP:
         return None
     try:
         import tempfile
         fx, fy, fw, fh = ai_face_bbox_abs
-        pad = int(max(fw, fh) * SMART_PRECROP_PADDING_FACTOR)
-        x1 = max(0, fx - pad)
-        y1 = max(0, fy - pad)
-        x2 = min(img_w, fx + fw + pad)
-        y2 = min(img_h, fy + fh + pad)
+        face_size = max(int(fw), int(fh))
+
+        size = int(round(face_size * (1.0 + 2.0 * SMART_PRECROP_PADDING_FACTOR)))
+        min_size = int(round(face_size * 1.5))
+        max_size = int(round(min(img_w, img_h) * 0.80))
+        size = max(min(size, max_size), min(min_size, max_size))
+
+        cx = int(fx) + int(fw) // 2
+        cy = int(fy) + int(fh) // 2
+        zoom_ratio = size / max(1, face_size)
+        v_offset_factor = max(0.35, min(0.50, 0.35 + (zoom_ratio - 1.5) * 0.10))
+
+        sq_x1 = max(0, min(cx - size // 2, img_w - size))
+        sq_y1 = max(0, min(cy - int(size * v_offset_factor), img_h - size))
+        x1 = sq_x1
+        y1 = sq_y1
+        x2 = sq_x1 + size
+        y2 = sq_y1 + size
+
         with Image.open(image_path) as pil_img:
             pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
             cropped = pil_img.crop((x1, y1, x2, y2))
@@ -1325,8 +1410,22 @@ def cache_path_for_file(file_hash: str) -> str:
     return os.path.join(CACHE_DIR, f"{file_hash}.json")
 
 
+# Versions-Tag fuer Audit-Caches. Wird in den Cache-Key eingewoben, damit
+# Caches aus inkompatiblen frueheren Versionen automatisch verworfen werden.
+# History:
+#   v1: implizit, Audit auf gemischter 0-10/0-100-Skala mit Heuristik in
+#       normalize_audit_scores. Konnte zu inkonsistenten Scores fuehren
+#       (z.B. quality_total = 321), ausserdem alte Smart-Crop-Geometrie
+#       (Padding wurde doppelt aufgeschlagen).
+#   v2: Audit explizit auf 0-10 (json_schema-strict erzwungen), interne
+#       Hochskalierung deterministisch *10. Smart-Crop-Geometrie neu:
+#       SMART_PRECROP_PADDING_FACTOR ist Padding-pro-Seite; Crop ist jetzt
+#       echt eng (~2.2x Gesicht statt ~5x Gesicht). Caches inkompatibel.
+AUDIT_CACHE_SCHEMA_VERSION = "v2"
+
+
 def audit_cache_key(base_hash: str, model: str, variant: str = "audit") -> str:
-    raw = f"{variant}|{base_hash}|{(model or '').strip().lower()}"
+    raw = f"{AUDIT_CACHE_SCHEMA_VERSION}|{variant}|{base_hash}|{(model or '').strip().lower()}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -1430,6 +1529,320 @@ def clip_cosine(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
     if denom <= 0:
         return -1.0
     return float(np.dot(a, b) / denom)
+
+
+# ============================================================
+# 5b) ARCFACE IDENTITAETS-EMBEDDING
+# ============================================================
+
+def _init_arcface_app():
+    """
+    Lazy-Initialisierung der InsightFace FaceAnalysis App. Idempotent.
+    Wird erst beim ersten Aufruf von compute_arcface_embedding() angetriggert,
+    damit Datasets ohne aktivierten Identity-Check nicht beim Start blockiert
+    werden (Modell-Download kann beim allerersten Lauf ~250 MB sein).
+    """
+    global ARCFACE_APP, ARCFACE_INIT_ATTEMPTED
+    if ARCFACE_INIT_ATTEMPTED:
+        return ARCFACE_APP
+    ARCFACE_INIT_ATTEMPTED = True
+    if not (USE_ARCFACE_IDENTITY_CHECK and HAVE_INSIGHTFACE):
+        return None
+    try:
+        providers = ["CPUExecutionProvider"]
+        if ARCFACE_USE_CUDA and HAVE_CLIP and torch.cuda.is_available():
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        from insightface.app import FaceAnalysis  # type: ignore
+        app = FaceAnalysis(name=ARCFACE_MODEL_PACK, providers=providers)
+        app.prepare(ctx_id=0 if "CUDAExecutionProvider" in providers else -1,
+                    det_size=(ARCFACE_DET_SIZE, ARCFACE_DET_SIZE))
+        ARCFACE_APP = app
+        safe_print(f"   ArcFace ready ({ARCFACE_MODEL_PACK}, providers={providers[0]})")
+    except Exception as e:
+        safe_print(f"   ⚠️ ArcFace init failed ({e}); identity check disabled.")
+        ARCFACE_APP = None
+    return ARCFACE_APP
+
+
+def get_arcface_cache_path(file_hash: str) -> str:
+    return os.path.join(ARCFACE_CACHE_DIR, f"{file_hash}.npy")
+
+
+def load_arcface_embedding_cached(file_hash: str) -> Optional[np.ndarray]:
+    path = get_arcface_cache_path(file_hash)
+    if not ENABLE_CACHE or not os.path.exists(path):
+        return None
+    try:
+        vec = np.load(path)
+        return vec.astype(np.float32)
+    except Exception:
+        return None
+
+
+def save_arcface_embedding_cached(file_hash: str, vec: np.ndarray) -> None:
+    if not ENABLE_CACHE:
+        return
+    path = get_arcface_cache_path(file_hash)
+    np.save(path, vec.astype(np.float32))
+
+
+def compute_arcface_embedding(image_path: str, file_hash: str) -> Optional[np.ndarray]:
+    """
+    Berechnet ein 512-dimensionales ArcFace-Embedding fuer das groesste
+    erkannte Gesicht im Bild. Liefert None, wenn:
+      - InsightFace/onnxruntime nicht installiert ist
+      - das Feature deaktiviert ist
+      - die Modell-Init fehlschlaegt
+      - kein Gesicht erkannt wurde
+    """
+    if not USE_ARCFACE_IDENTITY_CHECK or not HAVE_INSIGHTFACE:
+        return None
+
+    cached = load_arcface_embedding_cached(file_hash)
+    if cached is not None:
+        return cached
+
+    app = _init_arcface_app()
+    if app is None:
+        return None
+
+    try:
+        # InsightFace erwartet BGR (cv2-Konvention). Wir laden via PIL und
+        # konvertieren, um konsistent mit dem Rest des Tools zu bleiben.
+        with Image.open(image_path) as pil_img:
+            pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+            rgb_np = np.array(pil_img)
+        bgr_np = rgb_np[..., ::-1].copy()
+
+        faces = app.get(bgr_np)
+        if not faces:
+            return None
+
+        # Groesstes erkanntes Gesicht waehlen (Bbox-Flaeche)
+        def _bbox_area(face):
+            x1, y1, x2, y2 = face.bbox
+            return max(0.0, float(x2 - x1)) * max(0.0, float(y2 - y1))
+
+        main_face = max(faces, key=_bbox_area)
+
+        emb = getattr(main_face, "normed_embedding", None)
+        if emb is None:
+            emb = getattr(main_face, "embedding", None)
+            if emb is None:
+                return None
+            emb = np.asarray(emb, dtype=np.float32)
+            norm = float(np.linalg.norm(emb))
+            if norm <= 0:
+                return None
+            emb = emb / norm
+        else:
+            emb = np.asarray(emb, dtype=np.float32)
+
+        save_arcface_embedding_cached(file_hash, emb)
+        return emb
+    except Exception:
+        return None
+
+
+def arcface_cosine(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> float:
+    """Cosine-Similarity zwischen zwei Embeddings. -1.0 wenn ungueltig."""
+    if a is None or b is None:
+        return -1.0
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom <= 0:
+        return -1.0
+    return float(np.dot(a, b) / denom)
+
+
+def compute_trimmed_centroid(
+    embeddings: List[np.ndarray],
+    trim_fraction: float = ARCFACE_TRIM_FRACTION,
+) -> Optional[np.ndarray]:
+    """
+    Berechnet einen outlier-getrimmten Centroid:
+      1. Initialer Centroid = Mittelwert aller Embeddings
+      2. Cosine-Distanz zum Initial-Centroid pro Embedding
+      3. Schlechteste trim_fraction (z.B. 10%) verwerfen
+      4. Centroid auf den verbleibenden Embeddings neu berechnen
+
+    Damit zieht ein einzelnes "Schwester-Bild" den finalen Centroid nicht
+    in Richtung der falschen Identitaet, sondern wird beim Trimming entfernt.
+
+    Liefert ein L2-normalisiertes Centroid-Embedding oder None.
+    """
+    if not embeddings:
+        return None
+
+    arr = np.stack(embeddings, axis=0).astype(np.float32)
+
+    # Initialer Centroid + L2-Normierung
+    init_centroid = arr.mean(axis=0)
+    init_norm = float(np.linalg.norm(init_centroid))
+    if init_norm <= 0:
+        return None
+    init_centroid = init_centroid / init_norm
+
+    # Distanzen zum initialen Centroid
+    sims = arr @ init_centroid  # weil arr und init_centroid normiert sind
+    n = len(embeddings)
+    keep_n = max(1, int(round(n * (1.0 - trim_fraction))))
+
+    # Bei sehr kleinen Sets das Trimming deaktivieren - sonst koennte ein
+    # einziger Outlier 100% seines Einflusses ueber die verbleibenden Bilder
+    # ausueben, und das Ergebnis waere nicht stabiler als ohne Trimming.
+    if n < 8:
+        keep_n = n
+
+    # Top keep_n Embeddings nach Similarity behalten
+    keep_idx = np.argsort(-sims)[:keep_n]
+    trimmed = arr[keep_idx]
+
+    final_centroid = trimmed.mean(axis=0)
+    final_norm = float(np.linalg.norm(final_centroid))
+    if final_norm <= 0:
+        return None
+    return final_centroid / final_norm
+
+
+def run_identity_consistency_check(
+    selected_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Berechnet Identitaets-Konsistenz fuer die finalen Bilder:
+      - Embedding pro Bild (mit Cache)
+      - Outlier-getrimmter Centroid
+      - Cosine-Similarity jedes Embeddings zum Centroid
+      - Klassifikation in hard / soft / ok
+
+    Schreibt direkt in jeden Row:
+      arcface_distance_to_centroid: float (-1.0 wenn nicht berechenbar)
+      arcface_flag: "hard" | "soft" | "ok" | "no_face" | "skipped"
+
+    Gibt einen Summary-Dict zurueck mit Counts und der Liste der hard-flags.
+    Wenn das Feature aus oder die Library nicht verfuegbar ist, wird ein
+    "skipped"-Status auf alle Rows gesetzt und ein leerer Summary geliefert.
+    """
+    summary: Dict[str, Any] = {
+        "enabled": False,
+        "centroid_present": False,
+        "n_with_face": 0,
+        "n_no_face": 0,
+        "n_hard": 0,
+        "n_soft": 0,
+        "n_ok": 0,
+        "hard_flagged": [],   # filenames mit hard flag
+        "soft_flagged": [],   # filenames mit soft flag
+        "skipped_reason": "",
+    }
+
+    # Voraussetzungen pruefen
+    if not USE_ARCFACE_IDENTITY_CHECK:
+        summary["skipped_reason"] = "feature_disabled"
+        for r in selected_rows:
+            r["arcface_flag"] = "skipped"
+            r["arcface_distance_to_centroid"] = -1.0
+        return summary
+
+    if not HAVE_INSIGHTFACE:
+        summary["skipped_reason"] = "insightface_not_installed"
+        for r in selected_rows:
+            r["arcface_flag"] = "skipped"
+            r["arcface_distance_to_centroid"] = -1.0
+        return summary
+
+    summary["enabled"] = True
+    safe_print("\n🪪 Identity consistency check (ArcFace):")
+
+    # Embeddings sammeln
+    embeddings: List[np.ndarray] = []
+    rows_with_emb: List[Tuple[Dict[str, Any], np.ndarray]] = []
+    for row in selected_rows:
+        # Originalpfad oder gecropter Pfad - body_aware_crop wird hier nicht
+        # benutzt, weil ArcFace selber Face-Detection macht und das Original
+        # mehr Kontext bietet (Hintergrund schadet ArcFace nicht).
+        path = row.get("original_path", "")
+        file_hash = row.get("file_hash") or (file_sha1(path) if path and os.path.exists(path) else "")
+        if not file_hash or not os.path.exists(path):
+            row["arcface_flag"] = "no_face"
+            row["arcface_distance_to_centroid"] = -1.0
+            summary["n_no_face"] += 1
+            continue
+
+        emb = compute_arcface_embedding(path, file_hash)
+        if emb is None:
+            row["arcface_flag"] = "no_face"
+            row["arcface_distance_to_centroid"] = -1.0
+            summary["n_no_face"] += 1
+            continue
+
+        embeddings.append(emb)
+        rows_with_emb.append((row, emb))
+
+    summary["n_with_face"] = len(embeddings)
+
+    if len(embeddings) < ARCFACE_MIN_FACES_FOR_CENTROID:
+        summary["skipped_reason"] = (
+            f"too_few_faces_{len(embeddings)}_lt_{ARCFACE_MIN_FACES_FOR_CENTROID}"
+        )
+        safe_print(
+            f"   ⚠️ Only {len(embeddings)} faces detected; "
+            f"need at least {ARCFACE_MIN_FACES_FOR_CENTROID} for a meaningful centroid. "
+            f"Skipping consistency classification."
+        )
+        for row, _ in rows_with_emb:
+            row["arcface_flag"] = "skipped"
+            row["arcface_distance_to_centroid"] = -1.0
+        return summary
+
+    # Outlier-getrimmten Centroid berechnen
+    centroid = compute_trimmed_centroid(embeddings, ARCFACE_TRIM_FRACTION)
+    if centroid is None:
+        summary["skipped_reason"] = "centroid_computation_failed"
+        for row, _ in rows_with_emb:
+            row["arcface_flag"] = "skipped"
+            row["arcface_distance_to_centroid"] = -1.0
+        return summary
+
+    summary["centroid_present"] = True
+
+    # Klassifikation pro Row
+    for row, emb in rows_with_emb:
+        sim = arcface_cosine(emb, centroid)
+        row["arcface_distance_to_centroid"] = round(sim, 4)
+        if sim < ARCFACE_HARD_THRESHOLD:
+            row["arcface_flag"] = "hard"
+            summary["n_hard"] += 1
+            summary["hard_flagged"].append(row.get("original_filename", ""))
+        elif sim < ARCFACE_SOFT_THRESHOLD:
+            row["arcface_flag"] = "soft"
+            summary["n_soft"] += 1
+            summary["soft_flagged"].append(row.get("original_filename", ""))
+        else:
+            row["arcface_flag"] = "ok"
+            summary["n_ok"] += 1
+
+    safe_print(
+        f"   {summary['n_ok']} ok | {summary['n_soft']} soft-flag | "
+        f"{summary['n_hard']} hard-flag | {summary['n_no_face']} no face detected"
+    )
+    if summary["n_hard"]:
+        safe_print(
+            f"   ⚠️ Hard-flagged (likely different person, will be moved out of train_ready):"
+        )
+        for fn in summary["hard_flagged"]:
+            row = next((r for r in selected_rows if r.get("original_filename") == fn), None)
+            sim_str = f"sim={row['arcface_distance_to_centroid']:.3f}" if row else ""
+            safe_print(f"      - {fn} ({sim_str})")
+    if summary["n_soft"]:
+        safe_print(
+            f"   ℹ️ Soft-flagged (borderline, kept in train_ready, see report):"
+        )
+        for fn in summary["soft_flagged"]:
+            row = next((r for r in selected_rows if r.get("original_filename") == fn), None)
+            sim_str = f"sim={row['arcface_distance_to_centroid']:.3f}" if row else ""
+            safe_print(f"      - {fn} ({sim_str})")
+
+    return summary
 
 
 # ============================================================
@@ -1578,13 +1991,28 @@ def build_api_schema() -> Dict[str, Any]:
             "pose_description": {"type": "string"},
             "expression": {"type": "string"},
             "gaze_direction": {"type": "string"},
+            "head_pose_bucket": {
+                "type": "string",
+                "enum": [
+                    "frontal",
+                    "three_quarter_left",
+                    "three_quarter_right",
+                    "profile_left",
+                    "profile_right",
+                    "looking_up",
+                    "looking_down",
+                    "back",
+                    "unknown"
+                ],
+                "description": "Coarse classification of the main subject's head orientation. 'frontal' = facing camera, 'three_quarter' = ~30-60 degrees yaw, 'profile' = ~90 degrees yaw, 'looking_up'/'looking_down' = significant pitch, 'back' = head turned away, 'unknown' = not determinable."
+            },
             "background_description": {"type": "string"},
             "lighting_description": {"type": "string"},
-            "quality_sharpness": {"type": "number", "minimum": 0, "maximum": 100},
-            "quality_lighting": {"type": "number", "minimum": 0, "maximum": 100},
-            "quality_composition": {"type": "number", "minimum": 0, "maximum": 100},
-            "quality_identity_usefulness": {"type": "number", "minimum": 0, "maximum": 100},
-            "quality_total": {"type": "number", "minimum": 0, "maximum": 100},
+            "quality_sharpness": {"type": "number", "minimum": 0, "maximum": 10},
+            "quality_lighting": {"type": "number", "minimum": 0, "maximum": 10},
+            "quality_composition": {"type": "number", "minimum": 0, "maximum": 10},
+            "quality_identity_usefulness": {"type": "number", "minimum": 0, "maximum": 10},
+            "quality_total": {"type": "number", "minimum": 0, "maximum": 10},
             "issues": {
                 "type": "array",
                 "items": {
@@ -1625,6 +2053,7 @@ def build_api_schema() -> Dict[str, Any]:
             "pose_description",
             "expression",
             "gaze_direction",
+            "head_pose_bucket",
             "background_description",
             "lighting_description",
             "quality_sharpness",
@@ -1668,12 +2097,13 @@ Quality rules:
 - Use "reject" when the image is clearly harmful or useless for training.
 
 SCORING SYSTEM:
-You MUST score the image strictly out of 10 for each category! Use decimals if needed (e.g. 7.5 or 8.2).
-- quality_sharpness: 1 to 10 (allows decimals)
-- quality_lighting: 1 to 10 (allows decimals)
-- quality_composition: 1 to 10 (allows decimals)
-- quality_identity_usefulness: 1 to 10 (allows decimals)
-- quality_total: the simple sum of the 4 scores above
+You MUST score every quality dimension on a strict 0.00 to 10.00 scale.
+Use decimals for fine-grained scoring (e.g. 7.50 or 8.20). Do NOT use a 0-100 scale.
+- quality_sharpness: 0.00 to 10.00 (decimals required for nuance)
+- quality_lighting: 0.00 to 10.00 (decimals required for nuance)
+- quality_composition: 0.00 to 10.00 (decimals required for nuance)
+- quality_identity_usefulness: 0.00 to 10.00 (decimals required for nuance)
+- quality_total: weighted internal field; you may set it to the simple average of the 4 scores above (also 0.00 to 10.00). The host system will recompute the canonical weighted score.
 
 Important:
 - Flag prominent text, watermarks, overlays, or readable shirt/screen text.
@@ -1684,6 +2114,13 @@ Important:
 - Describe eye color PRECISELY if visible (e.g. "blue", "green", "gray-green", "hazel"). Return empty string only if eyes are not visible.
 - Describe skin_tone as a neutral factual value (e.g. "fair", "light", "medium", "olive", "dark"). Never return empty.
 - Describe beard/glasses/piercings/makeup only as visible raw facts.
+- Classify head_pose_bucket based on the main subject's head orientation:
+    'frontal' = directly facing camera (yaw < ~15 degrees);
+    'three_quarter_left' / 'three_quarter_right' = yaw between ~15 and ~75 degrees, named for which side of the face is more visible to camera;
+    'profile_left' / 'profile_right' = pure side view (yaw ~90 degrees);
+    'looking_up' / 'looking_down' = significant pitch (head clearly tilted up/down) regardless of yaw;
+    'back' = head fully turned away (face not visible);
+    'unknown' = head pose cannot be determined.
 """
 
     local_hint = (
@@ -1730,20 +2167,59 @@ Important:
 
 
 def normalize_audit_scores(audit: Dict[str, Any]) -> Dict[str, Any]:
-    qs = float(audit.get("quality_sharpness", 0))
-    ql = float(audit.get("quality_lighting", 0))
-    qc = float(audit.get("quality_composition", 0))
-    qi = float(audit.get("quality_identity_usefulness", 0))
+    """
+    Skaliert die KI-Bewertungen deterministisch von der API-Skala 0.00-10.00
+    auf die interne Anzeige-/Filter-Skala 0.0-100.0.
 
-    if qs <= 10.0 and ql <= 10.0 and qc <= 10.0 and qi <= 10.0:
-        audit["quality_sharpness"] = round(qs * 10.0, 1)
-        audit["quality_lighting"] = round(ql * 10.0, 1)
-        audit["quality_composition"] = round(qc * 10.0, 1)
-        audit["quality_identity_usefulness"] = round(qi * 10.0, 1)
-        total = (qs * 4.0) + (ql * 2.5) + (qc * 2.0) + (qi * 1.5)
-        audit["quality_total"] = round(min(100.0, total), 1)
-    else:
-        audit["quality_total"] = round(qs + ql + qc + qi, 1)
+    Hintergrund: ChatGPT-basierte Bewertungs-APIs sind aus dem Training
+    stark auf 0-10-Skalen konditioniert und produzieren auch bei explizit
+    abweichender Vorgabe gerne wieder 0-10. Statt mit Heuristiken zu
+    erraten, auf welcher Skala die Antwort kam, geben wir 0-10 als
+    expliziten Schema-Constraint vor und multiplizieren intern fest mit 10.
+    Damit sind Score-Outlier wie 321 mathematisch ausgeschlossen.
+
+    Werte ausserhalb [0, 10] werden defensiv geclampt, sodass selbst eine
+    durchgerutschte Schema-Verletzung nicht zu absurden Endwerten fuehrt.
+
+    quality_total wird neu berechnet als gewichtete Summe (intern auf
+    0-100), unabhaengig davon was die KI selbst dort einsetzt. So ist
+    quality_total konsistent mit allen Schwellenwerten (KEEP_SCORE_MIN,
+    HARD_REJECT_SCORE etc.), die historisch in der 0-100-Skala definiert
+    sind.
+
+    Gewichte fuer quality_total:
+      sharpness: 4.0   (kritisch fuer LoRA-Training)
+      lighting:  2.5
+      composition: 2.0
+      identity:  1.5
+    Summe der Gewichte = 10.0 -> max. quality_total = 10 * 10.0 = 100.0
+    """
+
+    def _to_unit(v: Any) -> float:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0.0
+        # Defensive: API-Skala 0-10. Werte ueber 10 werden geclampt.
+        # Negative Werte sind nicht definiert; auf 0 clampen.
+        return max(0.0, min(10.0, f))
+
+    qs10 = _to_unit(audit.get("quality_sharpness", 0))
+    ql10 = _to_unit(audit.get("quality_lighting", 0))
+    qc10 = _to_unit(audit.get("quality_composition", 0))
+    qi10 = _to_unit(audit.get("quality_identity_usefulness", 0))
+
+    # Auf interne 0-100-Skala hochskalieren (1 Dezimalstelle, wie bisher)
+    audit["quality_sharpness"] = round(qs10 * 10.0, 1)
+    audit["quality_lighting"] = round(ql10 * 10.0, 1)
+    audit["quality_composition"] = round(qc10 * 10.0, 1)
+    audit["quality_identity_usefulness"] = round(qi10 * 10.0, 1)
+
+    # Gewichtete Summe direkt auf den 0-10-Werten (einmal *10 indirekt
+    # ueber Gewichte). Ergebnis liegt garantiert in [0.0, 100.0].
+    weighted = (qs10 * 4.0) + (ql10 * 2.5) + (qc10 * 2.0) + (qi10 * 1.5)
+    audit["quality_total"] = round(min(100.0, max(0.0, weighted)), 1)
+
     return audit
 
 
@@ -2172,6 +2648,20 @@ def diversity_penalty(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> f
         penalty += max(0, outfit_count - 1) * 5.0
         penalty += max(0, session_count - 1) * 4.0
 
+    # ── Pose-Bucket-Diversity ──
+    # Wenn die KI head_pose_bucket geliefert hat, bestrafe Wiederholungen
+    # innerhalb des bereits gewaehlten Sets. "unknown" und leere Werte
+    # werden vom Penalty ausgenommen, damit nicht alle Bilder ohne klare
+    # Pose-Klassifikation gegeneinander abgewertet werden.
+    if ENABLE_POSE_DIVERSITY:
+        pose_key = normalize_text(item.get("head_pose_bucket")) or "unknown"
+        if pose_key not in {"unknown", ""}:
+            pose_count = sum(
+                1 for s in selected
+                if (normalize_text(s.get("head_pose_bucket")) or "unknown") == pose_key
+            )
+            penalty += max(0, pose_count - POSE_DIVERSITY_SOFT_LIMIT) * POSE_DIVERSITY_PENALTY_WEIGHT
+
     return penalty
 
 
@@ -2515,29 +3005,60 @@ def body_aware_crop(image_path: str, item: Dict[str, Any]) -> Image.Image:
     h, w = img.shape[:2]
 
     # Smart-Crop-Rows: Den Pre-Crop-Bereich (Face + Padding) direkt als
-    # quadratische Crop-Region verwenden, NICHT nochmal über die hohen
+    # quadratische Crop-Region verwenden, NICHT nochmal ueber die hohen
     # Multiplikatoren (4.5/5.0) des normalen Headshot-Branches gehen.
-    # Das sorgt für einen tatsächlich engeren Zoom als das Original.
+    # Das sorgt fuer einen tatsaechlich engeren Zoom als das Original.
+    #
+    # Geometrie-Konvention:
+    #   target_size_px = max(fw, fh) * (1 + 2 * SMART_PRECROP_PADDING_FACTOR_HALF)
+    # also bei PADDING_FACTOR_HALF=0.6: ~2.2x die Gesichtsgroesse.
+    # Damit kommt der Crop einem echten Headshot deutlich naeher als
+    # die alte Logik, bei der das Padding faelschlich auf jede Seite
+    # einzeln aufgeschlagen wurde (effektiv ~4-5x).
+    #
+    # Kompatibilitaet: SMART_PRECROP_PADDING_FACTOR bleibt der UI-Knopf,
+    # wird aber jetzt als HALBES Padding interpretiert (pro Seite).
+    # Default 0.6 -> Gesamtbreite = fw + 2*0.6*fw = 2.2 * fw.
+    # Alte UI-Werte ueber ~1.0 fuehren also nicht mehr zu absurd grossen
+    # Crops, sondern zu eng-bis-mittel-engen Headshots.
     if item.get("is_smart_crop") and item.get("smart_crop_bbox"):
         target_w, target_h = 1024, 1024
         fx, fy, fw, fh = item["smart_crop_bbox"]
-        # Dieselbe Padding-Logik wie in generate_headshot_crop()
-        pad = int(max(fw, fh) * SMART_PRECROP_PADDING_FACTOR)
-        sc_x1 = max(0, fx - pad)
-        sc_y1 = max(0, fy - pad)
-        sc_x2 = min(w, fx + fw + pad)
-        sc_y2 = min(h, fy + fh + pad)
-        # Quadratisch machen (1:1 für 1024x1024 Output)
-        sc_w = sc_x2 - sc_x1
-        sc_h = sc_y2 - sc_y1
-        size = max(sc_w, sc_h)
-        # Mindestgröße: min(w,h)//5 damit Crop nicht zu winzig wird
-        size = clamp_int(size, min(w, h) // 5, min(w, h))
-        # Zentrieren auf Face-Mitte, leicht nach oben versetzt (0.45)
+        face_size = max(int(fw), int(fh))
+
+        # Crop-Groesse: face + padding pro Seite. Ein Faktor von 0.6 pro
+        # Seite gibt ~2.2x face_size als Gesamtgroesse, was Gesicht +
+        # Haare + obere Schultern erfasst (klassischer Headshot-Bildaufbau).
+        size = int(round(face_size * (1.0 + 2.0 * SMART_PRECROP_PADDING_FACTOR)))
+
+        # Untere Schranke: mindestens 1.5x face_size, sonst wird selbst
+        # bei winzigen PADDING_FACTOR-Werten kein Headroom mehr fuer Haare
+        # gelassen.
+        min_size = int(round(face_size * 1.5))
+        # Obere Schranke: 80% der kleineren Bilddimension, damit der "Crop"
+        # nicht zur Kopie des Originals degeneriert. Das war der Hauptgrund
+        # warum vorher Crops fast wie Originale aussahen.
+        max_size = int(round(min(w, h) * 0.80))
+
+        size = clamp_int(size, min(min_size, max_size), max_size)
+
+        # Zentrieren auf Face-Mitte, leicht nach oben versetzt damit der
+        # Schwerpunkt des Bildes auf den Augen liegt (klassisch: Augen
+        # bei ~38% der Bildhoehe von oben). Bei size weit ueber face_size
+        # reicht 0.45; bei size knapp ueber face_size brauchen wir mehr
+        # Headroom, damit die Haare nicht abgeschnitten werden.
         cx = fx + fw // 2
         cy = fy + fh // 2
+        # Vertikale Versetzung: zwischen 0.35 (eng, Headroom-betont) und
+        # 0.50 (locker, mittig) je nach Crop-Groesse relativ zum Gesicht.
+        # Bei size = 1.5*face -> 0.35 (Stirn ggf. knapp, aber Haare drin)
+        # Bei size = 3.0*face -> 0.50 (mittig, wie alte Logik)
+        zoom_ratio = size / max(1, face_size)
+        # Linear interpolieren von 0.35 (zoom=1.5) bis 0.50 (zoom=3.0+)
+        v_offset_factor = max(0.35, min(0.50, 0.35 + (zoom_ratio - 1.5) * 0.10))
+
         sq_x1 = max(0, min(cx - size // 2, w - size))
-        sq_y1 = max(0, min(cy - int(size * 0.45), h - size))
+        sq_y1 = max(0, min(cy - int(size * v_offset_factor), h - size))
         x1, y1, x2, y2 = sq_x1, sq_y1, sq_x1 + size, sq_y1 + size
         return pil_img.crop((x1, y1, x2, y2)).resize((target_w, target_h), Image.Resampling.LANCZOS)
 
@@ -2697,6 +3218,33 @@ def save_report_md(path: str, report: Dict[str, Any]) -> None:
             lines.append(f"- {field}: mode=`{info.get('mode','')}`, variable={info.get('variable', False)}")
         lines.append("")
 
+    # Identity-Check-Sektion
+    ic = report.get("identity_check", {})
+    if ic and ic.get("enabled"):
+        lines.append("## Identity consistency check (ArcFace)")
+        lines.append("")
+        if not ic.get("centroid_present"):
+            lines.append(f"- Skipped: {ic.get('skipped_reason', 'unknown')}")
+        else:
+            lines.append(f"- Faces detected: {ic.get('n_with_face', 0)}")
+            lines.append(f"- No face detected: {ic.get('n_no_face', 0)}")
+            lines.append(f"- OK (sim >= {ARCFACE_SOFT_THRESHOLD}): {ic.get('n_ok', 0)}")
+            lines.append(f"- Soft-flagged ({ARCFACE_HARD_THRESHOLD} <= sim < {ARCFACE_SOFT_THRESHOLD}): {ic.get('n_soft', 0)}")
+            lines.append(f"- Hard-flagged (sim < {ARCFACE_HARD_THRESHOLD}, moved to 06_needs_manual_review): {ic.get('n_hard', 0)}")
+            if ic.get("hard_flagged"):
+                lines.append("")
+                lines.append("### Hard-flagged (removed from train_ready)")
+                lines.append("")
+                for fn in ic["hard_flagged"]:
+                    lines.append(f"- `{fn}`")
+            if ic.get("soft_flagged"):
+                lines.append("")
+                lines.append("### Soft-flagged (kept in train_ready, verify visually)")
+                lines.append("")
+                for fn in ic["soft_flagged"]:
+                    lines.append(f"- `{fn}`")
+        lines.append("")
+
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
@@ -2752,6 +3300,27 @@ def generate_dashboard(all_rows: List[Dict[str, Any]], selected: List[Dict[str, 
     sc = Counter([s.get("shot_type", "unknown") for s in selected])
     for k, v in sc.items():
         lines.append(f" - {k.capitalize()}: {v} Bilder")
+
+    # Pose-Bucket-Verteilung im Final-Set
+    pose_counter = Counter([
+        (normalize_text(s.get("head_pose_bucket")) or "unknown")
+        for s in selected
+    ])
+    if pose_counter:
+        lines.append("\n🧭 KOPFPOSE-VERTEILUNG (Final-Set)")
+        for k, v in pose_counter.most_common():
+            lines.append(f" - {k}: {v}")
+
+    # Identity-Konsistenz-Verteilung im Final-Set
+    flag_counter = Counter([
+        s.get("arcface_flag", "skipped")
+        for s in selected
+    ])
+    if flag_counter and any(k in flag_counter for k in ("ok", "soft", "hard", "no_face")):
+        lines.append("\n🪪 IDENTITY-CHECK (Final-Set)")
+        for k in ("ok", "soft", "hard", "no_face", "skipped"):
+            if k in flag_counter:
+                lines.append(f" - {k}: {flag_counter[k]}")
 
     lines.append("============================================================\n")
     return "\n".join(lines)
@@ -3002,6 +3571,12 @@ def main() -> None:
                 save_cached_audit(primary_audit_cache_key, {"audit": audit, "model": AI_MODEL})
 
             row.update(audit)
+            # CSV-Audit: primaeren Score separat behalten. Falls spaeter eine
+            # Review-Eskalation greift, wird quality_total durch das staerkere
+            # Modell ueberschrieben; grundscore bleibt der Score der ersten
+            # Bewertung.
+            row["grundscore"] = row.get("quality_total", "")
+            row["score_nach_eskalation"] = ""
 
             local_status, local_reasons = local_status_override(row)
             api_status = row.get("suggested_status", "review")
@@ -3021,6 +3596,7 @@ def main() -> None:
 
                 if not escalated_audit.get("NSFW_BLOCKED"):
                     row.update(escalated_audit)
+                    row["score_nach_eskalation"] = row.get("quality_total", "")
                     row.setdefault("status_notes", []).append("review_escalation_applied")
                     row["audit_model_used"] = REVIEW_ESCALATION_MODEL
                     local_status, local_reasons = local_status_override(row)
@@ -3099,6 +3675,8 @@ def main() -> None:
                                     save_cached_audit(crop_primary_cache_key, {"audit": crop_audit, "model": AI_MODEL})
 
                                 crop_score = float(crop_audit.get("quality_total", 0))
+                                crop_grundscore = crop_score
+                                crop_score_nach_eskalation: Any = ""
                                 orig_score = float(row.get("quality_total", 0))
 
                                 if (
@@ -3119,6 +3697,7 @@ def main() -> None:
                                             crop_audit = normalize_audit_scores(escalated_crop_audit)
                                             save_cached_audit(crop_escalation_cache_key, {"audit": crop_audit, "model": REVIEW_ESCALATION_MODEL})
                                     crop_score = float(crop_audit.get("quality_total", 0))
+                                    crop_score_nach_eskalation = crop_score
 
                                 safe_print(
                                         f"   ↳ Crop {crop_score:.1f} vs. original {orig_score:.1f} "
@@ -3153,6 +3732,8 @@ def main() -> None:
                                         ),
                                     }
                                     crop_row.update(crop_audit)
+                                    crop_row["grundscore"] = crop_grundscore
+                                    crop_row["score_nach_eskalation"] = crop_score_nach_eskalation
                                     # Shot-Type immer Headshot, BBox auf Original-Koordinaten zuruecksetzen
                                     crop_row["shot_type"] = "headshot"
                                     crop_row["main_face_bbox"] = ai_bbox
@@ -3244,6 +3825,80 @@ def main() -> None:
     # Wenn sowohl Original als auch sein Smart-Crop ausgewählt wurden,
     # behalte nur den besseren von beiden.
     selected = crop_dedup_selected(selected)
+
+    # ── Identity-Konsistenz-Check (ArcFace) ──────────────────────────────
+    # Berechnet pro Bild die Aehnlichkeit zur "Set-Identitaet" (outlier-
+    # getrimmter Centroid). Hard-Flags werden aus dem Train-Set entfernt
+    # und gehen in 06_needs_manual_review; Soft-Flags bleiben drin und
+    # werden im Markdown-Report markiert. Captions werden NIE veraendert.
+    identity_summary = run_identity_consistency_check(selected)
+
+    # Hard-Flags physisch entfernen und in MANUAL_REVIEW_DIR kopieren.
+    # Das passiert VOR dem Train-Ready-Export, sodass die rausgefilterten
+    # Bilder gar nicht erst in 01_train_ready landen.
+    hard_flagged_rows: List[Dict[str, Any]] = []
+    if identity_summary.get("centroid_present"):
+        hard_flagged_rows = [r for r in selected if r.get("arcface_flag") == "hard"]
+    if hard_flagged_rows:
+        hard_flag_counter = 1
+        for hf_row in hard_flagged_rows:
+            try:
+                src_path = hf_row.get("original_path", "")
+                if not src_path or not os.path.exists(src_path):
+                    continue
+                src_name = hf_row.get("original_filename", os.path.basename(src_path))
+                # Naming-Schema analog zu NSFW_<filename>: IDCHECK_<filename>
+                # Praefix-Counter zusaetzlich, damit auch mehrere Hard-Flags
+                # eindeutig sortiert sind.
+                idcheck_name = f"IDCHECK_{hard_flag_counter:03d}_{src_name}"
+                review_path = os.path.join(MANUAL_REVIEW_DIR, idcheck_name)
+                shutil.copy2(src_path, review_path)
+
+                # Begleitende .txt mit Distanzwert + Kontext.
+                # Die ORIGINAL-Caption bleibt unangetastet (haengt am Bild
+                # in 01_train_ready, wenn ueberhaupt - hier wird das Bild
+                # aber rausgenommen). Diese .txt ist eine Diagnose-Datei,
+                # KEINE Trainings-Caption.
+                idcheck_txt = os.path.join(
+                    MANUAL_REVIEW_DIR,
+                    f"IDCHECK_{hard_flag_counter:03d}_{os.path.splitext(src_name)[0]}.txt"
+                )
+                sim_val = float(hf_row.get("arcface_distance_to_centroid", -1.0))
+                with open(idcheck_txt, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        "ArcFace identity mismatch detected.\n"
+                        f"original_filename: {src_name}\n"
+                        f"cosine_similarity_to_set_centroid: {sim_val:.4f}\n"
+                        f"hard_threshold: {ARCFACE_HARD_THRESHOLD}\n"
+                        f"soft_threshold: {ARCFACE_SOFT_THRESHOLD}\n"
+                        f"shot_type: {hf_row.get('shot_type', '')}\n"
+                        f"quality_total: {hf_row.get('quality_total', 0)}\n"
+                        "\n"
+                        "This image was selected for the training set but the face "
+                        "embedding is unusually far from the rest of the dataset's "
+                        "identity centroid. Possible causes:\n"
+                        " - it's actually a different person (e.g. a sibling or "
+                        "look-alike that got mixed in)\n"
+                        " - it's the same person under heavy filter / make-up / "
+                        "occlusion that breaks ArcFace\n"
+                        " - it's a much older or younger photo of the same person\n"
+                        "\n"
+                        "Please verify visually. If it's the right person, you can "
+                        "manually move it back into 01_train_ready.\n"
+                    )
+                hard_flag_counter += 1
+            except Exception as e:
+                safe_print(f"   ⚠️ Failed to move hard-flagged image {hf_row.get('original_filename','')}: {e}")
+
+        # Aus dem selected-Set entfernen, damit der Train-Ready-Export
+        # diese Bilder nicht mehr exportiert.
+        hard_names = {r.get("original_filename") for r in hard_flagged_rows}
+        selected = [r for r in selected if r.get("original_filename") not in hard_names]
+        safe_print(
+            f"   🛂 Removed {len(hard_flagged_rows)} hard-flagged image(s) from train_ready; "
+            f"copies in 06_needs_manual_review."
+        )
+
     selected_names = {r["original_filename"] for r in selected}
     for row in all_rows:
         if row["original_filename"] in selected_names:
@@ -3593,6 +4248,8 @@ def main() -> None:
         "output_bucket",
         "new_basename",
         "quality_total",
+        "grundscore",
+        "score_nach_eskalation",
         "quality_sharpness",
         "quality_lighting",
         "quality_composition",
@@ -3619,6 +4276,7 @@ def main() -> None:
         "pose_description",
         "expression",
         "gaze_direction",
+        "head_pose_bucket",
         "background_description",
         "lighting_description",
         "issues",
@@ -3632,6 +4290,8 @@ def main() -> None:
         "width",
         "height",
         "file_size_mb",
+        "arcface_distance_to_centroid",
+        "arcface_flag",
         "final_caption",
     ]
 
@@ -3671,6 +4331,13 @@ def main() -> None:
         "smart_crop_pairs_evaluated": len(crop_pairs),
         "smart_crop_pairs_accepted": sum(1 for p in crop_pairs if p.get("crop_row") is not None),
         "smart_crop_pairs_won": sum(1 for p in crop_pairs if p.get("winner","").startswith("crop") and "not" not in p.get("winner","")),
+        "identity_check_enabled": identity_summary.get("enabled", False),
+        "identity_check_centroid_present": identity_summary.get("centroid_present", False),
+        "identity_check_n_with_face": identity_summary.get("n_with_face", 0),
+        "identity_check_n_no_face": identity_summary.get("n_no_face", 0),
+        "identity_check_n_ok": identity_summary.get("n_ok", 0),
+        "identity_check_n_soft_flagged": identity_summary.get("n_soft", 0),
+        "identity_check_n_hard_flagged_removed": identity_summary.get("n_hard", 0),
     }
 
     if len(selected_sorted) < TARGET_DATASET_SIZE:
@@ -3684,10 +4351,30 @@ def main() -> None:
     if summary["selected_headshots"] < max(5, int(TARGET_DATASET_SIZE * 0.25)):
         warnings.append("Relatively few headshots were selected. Identity/face quality may suffer.")
 
+    # Identity-Check-Warnings
+    if identity_summary.get("enabled") and identity_summary.get("centroid_present"):
+        if identity_summary.get("n_hard", 0) > 0:
+            hard_list = ", ".join(identity_summary.get("hard_flagged", []))
+            warnings.append(
+                f"Identity check: {identity_summary['n_hard']} image(s) hard-flagged "
+                f"and moved to 06_needs_manual_review (likely different person): {hard_list}"
+            )
+        if identity_summary.get("n_soft", 0) > 0:
+            soft_list = ", ".join(identity_summary.get("soft_flagged", []))
+            warnings.append(
+                f"Identity check: {identity_summary['n_soft']} image(s) soft-flagged "
+                f"(borderline identity match, kept in train_ready - please verify visually): {soft_list}"
+            )
+    elif identity_summary.get("skipped_reason"):
+        warnings.append(
+            f"Identity check skipped: {identity_summary['skipped_reason']}"
+        )
+
     report = {
         "summary": summary,
         "warnings": warnings,
         "global_rules": global_rules,
+        "identity_check": identity_summary,
     }
 
     md_path = os.path.join(OUTPUT_ROOT, f"dataset_report_{SAFE_TRIGGER}.md")

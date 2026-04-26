@@ -17,6 +17,7 @@ FRAMES_PER_MINUTE = 5                     # Anzahl der Bilder pro Video-Minute
 SAMPLE_FPS = 2                            # Wie viele Frames pro Sekunde geprüft werden (spart Leistung)
 SIMILARITY_THRESHOLD = 0.45               # Ab wann ein Gesicht als "richtige Person" gilt (0.4 bis 0.6 ist gut)
 MIN_SHARPNESS = 50.0                      # Mindestschärfe (Laplace-Varianz), um Blur direkt zu verwerfen
+INSIGHTFACE_USE_CUDA = False              # Aus = CPU erzwingen. Verhindert ONNXRuntime-CUDA-DLL-Fehler bei fehlendem CUDA/cuDNN.
 
 # ── UI-Config Override ────────────────────────────────────────────────────────
 _UI_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_video_config.json")
@@ -76,8 +77,9 @@ def main():
     
     # InsightFace initialisieren
     print("Loading InsightFace model...")
-    app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    app.prepare(ctx_id=0, det_size=(640, 640))
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if INSIGHTFACE_USE_CUDA else ['CPUExecutionProvider']
+    app = FaceAnalysis(name='buffalo_l', providers=providers)
+    app.prepare(ctx_id=0 if INSIGHTFACE_USE_CUDA else -1, det_size=(640, 640))
     
     # Referenzbild laden
     print(f"Loading reference image: {REFERENCE_IMAGE}")
