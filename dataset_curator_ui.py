@@ -117,7 +117,7 @@ DEFAULTS: Dict[str, Any] = {
     "c_use_review_escalation": True,
     "c_review_escalation_model": "",
     "c_review_escalation_score_min": 50,
-    "c_review_escalation_score_max": 65,
+    "c_review_escalation_score_max": 58,
     "c_escalate_on_review": True,
     "c_escalate_on_conflict": True,
     "c_escalate_smart_crop": True,
@@ -1045,8 +1045,8 @@ def build_ui() -> gr.Blocks:
                             step=1,
                             value=S["c_review_escalation_score_max"],
                             info=tr(
-                                "Obere Grenze des Score-Fensters. Bilder über diesem Wert sind 'eindeutig gut' und werden nicht eskaliert. Empfohlen: 65.",
-                                "Upper bound of the score window. Images above this are 'clearly good' and won't be escalated. Recommended: 65.",
+                                "Obere Grenze des Score-Fensters. Bilder über diesem Wert sind 'eindeutig gut' und werden nicht eskaliert. Empfohlen: 58.",
+                                "Upper bound of the score window. Images above this are 'clearly good' and won't be escalated. Recommended: 58.",
                             ),
                         )
                     with gr.Row():
