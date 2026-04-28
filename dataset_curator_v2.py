@@ -1448,6 +1448,15 @@ def save_cached_audit(file_hash: str, payload: Dict[str, Any]) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def audit_cache_payload(audit: Dict[str, Any], model: str, variant: str) -> Dict[str, Any]:
+    return {
+        "audit": audit,
+        "model": model,
+        "variant": variant,
+        "schema_version": AUDIT_CACHE_SCHEMA_VERSION,
+    }
+
+
 def trigger_cache_path(trigger_word: str) -> str:
     key = slugify_filename(trigger_word.lower())
     return os.path.join(TRIGGER_CACHE_DIR, f"{key}.json")
@@ -2178,8 +2187,11 @@ def normalize_audit_scores(audit: Dict[str, Any]) -> Dict[str, Any]:
     expliziten Schema-Constraint vor und multiplizieren intern fest mit 10.
     Damit sind Score-Outlier wie 321 mathematisch ausgeschlossen.
 
-    Werte ausserhalb [0, 10] werden defensiv geclampt, sodass selbst eine
-    durchgerutschte Schema-Verletzung nicht zu absurden Endwerten fuehrt.
+    Werte ausserhalb [0, 10] werden defensiv behandelt. Werte >10 werden als
+    bereits normalisierte 0-100-Cache-Werte interpretiert und auf 0-10
+    zurueckgerechnet; danach wird geclampt. Dadurch ist die Funktion auch fuer
+    Cache-Hits idempotent und alte normalisierte Caches werden nicht auf 100
+    hochgezogen.
 
     quality_total wird neu berechnet als gewichtete Summe (intern auf
     0-100), unabhaengig davon was die KI selbst dort einsetzt. So ist
@@ -2200,8 +2212,13 @@ def normalize_audit_scores(audit: Dict[str, Any]) -> Dict[str, Any]:
             f = float(v)
         except (TypeError, ValueError):
             return 0.0
-        # Defensive: API-Skala 0-10. Werte ueber 10 werden geclampt.
-        # Negative Werte sind nicht definiert; auf 0 clampen.
+        # Defensive: API-Skala 0-10. Cache-Hits koennen bereits auf 0-100
+        # normalisiert sein; dann zurueck auf 0-10 rechnen, damit erneutes
+        # Normalisieren idempotent bleibt.
+        if f > 10.0:
+            f = f / 10.0
+        # Negative Werte sind nicht definiert; auf 0 clampen. Extreme Ausreisser
+        # werden nach der optionalen Rueckrechnung weiterhin auf 10 begrenzt.
         return max(0.0, min(10.0, f))
 
     qs10 = _to_unit(audit.get("quality_sharpness", 0))
@@ -3568,7 +3585,10 @@ def main() -> None:
             # ---------------------------------------------------------
             if not cached:
                 audit = normalize_audit_scores(audit)
-                save_cached_audit(primary_audit_cache_key, {"audit": audit, "model": AI_MODEL})
+                save_cached_audit(
+                    primary_audit_cache_key,
+                    audit_cache_payload(audit, AI_MODEL, "primary_audit"),
+                )
 
             row.update(audit)
             # CSV-Audit: primaeren Score separat behalten. Falls spaeter eine
@@ -3586,13 +3606,17 @@ def main() -> None:
                 cached_escalation = load_cached_audit(escalation_cache_key)
                 if cached_escalation:
                     escalated_audit = cached_escalation.get("audit", cached_escalation)
+                    escalated_audit = normalize_audit_scores(escalated_audit)
                     safe_print(f"   ↳ Escalation cache used ({REVIEW_ESCALATION_MODEL})")
                 else:
                     safe_print(f"   ↳ Escalating with {REVIEW_ESCALATION_MODEL}...")
                     escalated_audit = openai_audit_image(image_path, local_meta, model=REVIEW_ESCALATION_MODEL)
                     if not escalated_audit.get("NSFW_BLOCKED"):
                         escalated_audit = normalize_audit_scores(escalated_audit)
-                        save_cached_audit(escalation_cache_key, {"audit": escalated_audit, "model": REVIEW_ESCALATION_MODEL})
+                        save_cached_audit(
+                            escalation_cache_key,
+                            audit_cache_payload(escalated_audit, REVIEW_ESCALATION_MODEL, "escalation_audit"),
+                        )
 
                 if not escalated_audit.get("NSFW_BLOCKED"):
                     row.update(escalated_audit)
@@ -3672,7 +3696,10 @@ def main() -> None:
                                 crop_audit = normalize_audit_scores(crop_audit)
 
                                 if not cached_crop:
-                                    save_cached_audit(crop_primary_cache_key, {"audit": crop_audit, "model": AI_MODEL})
+                                    save_cached_audit(
+                                        crop_primary_cache_key,
+                                        audit_cache_payload(crop_audit, AI_MODEL, "primary_crop_audit"),
+                                    )
 
                                 crop_score = float(crop_audit.get("quality_total", 0))
                                 crop_grundscore = crop_score
@@ -3695,7 +3722,10 @@ def main() -> None:
                                         escalated_crop_audit = openai_audit_image(crop_path, crop_local_meta, model=REVIEW_ESCALATION_MODEL)
                                         if not escalated_crop_audit.get("NSFW_BLOCKED"):
                                             crop_audit = normalize_audit_scores(escalated_crop_audit)
-                                            save_cached_audit(crop_escalation_cache_key, {"audit": crop_audit, "model": REVIEW_ESCALATION_MODEL})
+                                            save_cached_audit(
+                                                crop_escalation_cache_key,
+                                                audit_cache_payload(crop_audit, REVIEW_ESCALATION_MODEL, "escalation_crop_audit"),
+                                            )
                                     crop_score = float(crop_audit.get("quality_total", 0))
                                     crop_score_nach_eskalation = crop_score
 
