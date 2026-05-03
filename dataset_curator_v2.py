@@ -315,6 +315,38 @@ CAPTION_POLICY = {
 SEND_TEXT_IMAGES_TO_CAPTION_REMOVE = True  # Bilder mit sichtbarem Text/Watermark -> 03_caption_remove statt train_ready
 INTERACTIVE_CAPTION_OVERRIDE = True        # Pausiert nach der Caption-Regel-Analyse und fragt dich nach optionalen Overrides
 
+# ============================================================
+# SUBJECT PROFILE PIPELINE (Phase 2/3)
+# ============================================================
+# Pipeline-Modus:
+#   "single_pass"          : Audit -> direkt Caption (klassisches Verhalten,
+#                            Phase 2 wendet Profile automatisch an, ohne UI)
+#   "profile_then_caption" : Audit -> Profile-Build -> UI-Pause -> Caption
+#                            (in Phase 3 vom UI gesetzt)
+PIPELINE_MODE = "single_pass"
+
+# Subject-Profile-Cache (zentral, pro Trigger-Word)
+SUBJECT_PROFILE_CACHE_DIR = os.path.join(
+    os.path.expanduser("~"), ".dataset_curator", "profiles"
+)
+
+# Stratified Sampling fuer Profile-Normalizer:
+# Wenn die Anzahl gueltiger Audits > PROFILE_SAMPLE_THRESHOLD ist, wird ein
+# stratifiziertes Sample von PROFILE_SAMPLE_SIZE Bildern verwendet, um den
+# Normalizer-Context-Window nicht zu sprengen. Sonst gehen alle rein.
+PROFILE_SAMPLE_THRESHOLD = 100   # ueberschreibbar via UI / _ui_config.json
+PROFILE_SAMPLE_SIZE = 80         # ueberschreibbar via UI / _ui_config.json
+
+# UI-Modus-Schwelle: bei N <= dieser Schwelle zeigt die UI Per-Bild-Dropdowns,
+# sonst die aggregierte Spot-Check-Sicht.
+PROFILE_UI_PER_IMAGE_THRESHOLD = 30   # ueberschreibbar via UI
+
+# Profile-Builder verwendet welche Buckets als Input:
+PROFILE_INPUT_BUCKETS = ["train_ready", "keep_unused"]   # rejects/reviews aus
+
+# Normalizer-Modell (gpt-5.4-mini empfohlen wegen Context-Window)
+PROFILE_NORMALIZER_MODEL = "gpt-5.4-mini"
+
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
 # wird ein enger Headshot-Crop erzeugt und SEPARAT zur API geschickt.
@@ -539,6 +571,259 @@ def normalize_compact_text(value: Optional[str]) -> str:
     v = re.sub(r"[,;:]+", " ", v)
     v = re.sub(r"\s+", " ", v).strip()
     return v
+
+
+# ============================================================
+# 5b) VOCABULARY & NORMALIZATION
+# ============================================================
+# Diese Sektion zentralisiert das Vokabular fuer Caption-Felder
+# und stellt deterministische Normalisierungs-Helfer bereit, die
+# Muelltext (Hedge-Phrasen, "none visible", "moderate or no") aus
+# Audit-Antworten herausfiltern.
+#
+# Phase 1 verwendet diese Helfer nur defensiv (also: was reinkommt,
+# wird gesaeubert). Phase 2 baut darauf den Profile-Normalizer auf,
+# der per LLM-Call die Per-Image-Audits zu kanonischen Tokens
+# konsolidiert.
+# ============================================================
+
+# --- Hedge-Phrasen (werden vor Verwertung aus Strings entfernt) ----------
+# Wenn ein Audit "possibly blue eyes" liefert, soll die Caption
+# "blue eyes" sagen, nicht "possibly blue eyes". Diese Phrasen werden
+# als Substring entfernt, der Rest des Strings bleibt erhalten.
+HEDGE_PHRASES: List[str] = [
+    "possibly", "perhaps", "maybe", "appears to be", "appears",
+    "looks like", "looks to be", "kind of", "sort of",
+    "somewhat", "slightly", "approximately", "roughly",
+    "presumably", "likely", "probably", "seemingly",
+]
+
+# --- Verbotene Trait-Phrasen ---------------------------------------------
+# Wenn ein Feldwert NUR aus einer dieser Phrasen besteht (oder klar damit
+# beginnt), wird das Feld auf Leerstring gesetzt. Damit landet
+# "none visible" nicht in Captions.
+INVALID_TRAIT_PHRASES: set = {
+    "none", "no", "n/a", "na", "unknown", "not visible", "not applicable",
+    "none visible", "no visible", "not clearly visible", "not clearly",
+    "minimal or no", "moderate or no", "subtle or no",
+    "nothing visible", "nothing", "no makeup", "no piercings",
+    "no glasses", "no tattoos", "no beard", "minimal or",
+    "subtle or", "moderate or", "slight or", "light or",
+}
+
+# --- Prioritaets-Mapping fuer "X or Y"-Aufloesung ------------------------
+# Wenn das Audit "moderate or full makeup" liefert, splitten wir an " or "
+# und behalten den Wert mit hoeherer Prioritaet (intensiver/spezifischer).
+# Default ist die rechte Seite, ausser eine Seite ist in dieser Map mit
+# hoeherem Score eingetragen.
+OR_PRIORITY_MAP: Dict[str, int] = {
+    # Makeup
+    "none": 0, "minimal": 1, "subtle": 1, "light": 1, "natural": 2,
+    "moderate": 3, "defined": 4, "full": 5, "heavy": 5, "dramatic": 6,
+    "bold": 6,
+    # Generic intensity
+    "slight": 1, "soft": 1, "medium": 3, "strong": 5,
+}
+
+# --- Kanonische Vokabular-Buckets fuer LLM-Normalizer (Phase 2) ----------
+# Diese Listen werden im Audit-Prompt als Hinweise mitgegeben (nicht als
+# strikte ENUMs - der User wollte Freitext mit nachgelagerter LLM-Norm).
+HAIR_FORM_VOCAB: List[str] = [
+    "loose_straight", "loose_wavy", "loose_curly", "loose_coily",
+    "afro_natural", "ponytail", "pigtails", "two_braids", "single_braid",
+    "box_braids", "knotless_braids", "cornrows", "bun", "updo",
+    "half_up", "pulled_back", "short_cut",
+]
+
+HAIR_COLOR_VOCAB: List[str] = [
+    "black", "dark_brown", "brown", "light_brown", "blonde", "platinum",
+    "red", "auburn", "burgundy", "gray", "white", "dyed_other",
+]
+
+EYE_COLOR_VOCAB: List[str] = [
+    "blue", "green", "hazel", "brown", "dark_brown", "gray", "amber",
+]
+
+SKIN_TONE_VOCAB: List[str] = [
+    "fair", "light", "medium", "tan", "olive", "dark", "deep",
+]
+
+BODY_BUILD_VOCAB: List[str] = [
+    "slim", "average", "athletic", "curvy", "plus_size", "muscular",
+]
+
+MAKEUP_INTENSITY_VOCAB: List[str] = [
+    "none", "minimal", "natural", "defined", "full", "dramatic",
+]
+
+LIGHTING_TYPE_VOCAB: List[str] = [
+    "studio_softbox", "studio_ringlight", "studio_other",
+    "natural_outdoor_sun", "natural_outdoor_overcast",
+    "natural_indoor_window", "indoor_artificial", "mixed", "low_light",
+]
+
+BACKGROUND_TYPE_VOCAB: List[str] = [
+    "studio_plain", "studio_textured", "indoor_room", "indoor_bathroom",
+    "outdoor_urban", "outdoor_nature", "outdoor_beach", "outdoor_other",
+    "vehicle_interior", "transparent_or_isolated", "other",
+]
+
+GLASSES_FRAME_SHAPE_VOCAB: List[str] = [
+    "round", "square", "rectangular", "oval", "aviator", "cat_eye",
+    "oversized", "rimless", "browline", "geometric", "other",
+]
+
+# --- Tattoo-Locations als kontrolliertes ENUM ----------------------------
+# Wird im Audit-Schema als Strict-ENUM verwendet, weil Tattoo-Lokationen
+# fuer die Inventar-Deduplizierung in Phase 2 deterministisch gleich
+# benannt sein muessen.
+TATTOO_LOCATION_ENUM: List[str] = [
+    "forearm_left", "forearm_right",
+    "upper_arm_left", "upper_arm_right",
+    "hand_left", "hand_right",
+    "wrist_left", "wrist_right",
+    "shoulder_left", "shoulder_right",
+    "neck_left", "neck_right", "neck_back",
+    "chest_upper", "chest_sternum",
+    "collarbone_left", "collarbone_right",
+    "ribcage_left", "ribcage_right",
+    "abdomen", "back_upper", "back_lower",
+    "thigh_left", "thigh_right",
+    "calf_left", "calf_right",
+    "ankle_left", "ankle_right",
+    "foot_left", "foot_right",
+    "finger_left", "finger_right",
+    "behind_ear_left", "behind_ear_right",
+    "face", "scalp",
+    "other",
+]
+
+PIERCING_LOCATION_ENUM: List[str] = [
+    "ear_lobe_left", "ear_lobe_right",
+    "ear_helix_left", "ear_helix_right",
+    "ear_tragus_left", "ear_tragus_right",
+    "ear_gauge_left", "ear_gauge_right",
+    "nose_left", "nose_right", "nose_septum",
+    "nose_bridge", "eyebrow_left", "eyebrow_right",
+    "lip_upper", "lip_lower", "lip_corner_left", "lip_corner_right",
+    "tongue", "navel", "other",
+]
+
+
+def strip_hedge_phrases(text: str) -> str:
+    """Entfernt Hedge-Woerter wie 'possibly', 'appears to be' aus einem String.
+    Der Rest des Strings bleibt unveraendert. Mehrfach-Whitespace wird
+    kollabiert.
+    """
+    if not text:
+        return ""
+    out = " " + text.lower() + " "
+    for hedge in HEDGE_PHRASES:
+        # Wort-Boundary-aehnliche Ersetzung (mit Leerzeichen drumherum)
+        out = out.replace(f" {hedge} ", " ")
+    out = re.sub(r"\s+", " ", out).strip(" ,.;:")
+    return out
+
+
+def is_invalid_trait_value(text: str) -> bool:
+    """True, wenn der String nur aus 'none visible', 'moderate or no',
+    'not applicable' o.ae. besteht und damit als Feldwert wertlos ist.
+    """
+    if not text:
+        return True
+    t = text.strip().lower().rstrip(".,;:")
+    if t in INVALID_TRAIT_PHRASES:
+        return True
+    # Phrasen, die mit einem verbotenen Praefix beginnen, abfangen:
+    # "none visible, minimal or no makeup" -> True
+    for prefix in ("none visible", "not visible", "no visible",
+                   "minimal or no", "moderate or no", "subtle or no"):
+        if t.startswith(prefix):
+            # ... aber nur wenn nichts Substanzielles drauf folgt,
+            # was selbst gueltig waere (z.B. "none visible, light makeup"
+            # -> sollte NICHT verworfen werden, weil "light makeup" gueltig ist).
+            tail = t[len(prefix):].lstrip(",; .")
+            if not tail or is_invalid_trait_value(tail):
+                return True
+    return False
+
+
+def resolve_or_phrase(text: str) -> str:
+    """Loest 'X or Y'-Phrasen auf, indem die Seite mit hoeherer
+    Intensitaets-Prioritaet behalten wird.
+
+    'moderate or full makeup' -> 'full makeup'
+    'minimal or no makeup'    -> '' (beide Seiten ungueltig oder leer)
+    'blue or green eyes'      -> 'blue or green eyes' (kein klarer Sieger -> Original)
+    """
+    if not text or " or " not in text.lower():
+        return text
+
+    parts = re.split(r"\s+or\s+", text, flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return text
+
+    left, right = parts[0].strip(), parts[1].strip()
+
+    # Erstes Token jeder Seite extrahieren (das ist der Intensitaets-Indikator)
+    def first_token(s: str) -> str:
+        m = re.match(r"\s*([a-zA-Z\-]+)", s)
+        return m.group(1).lower() if m else ""
+
+    left_token = first_token(left)
+    right_token = first_token(right)
+
+    left_score = OR_PRIORITY_MAP.get(left_token, -1)
+    right_score = OR_PRIORITY_MAP.get(right_token, -1)
+
+    # Wenn keine Seite in der Map ist, Original behalten
+    if left_score < 0 and right_score < 0:
+        return text
+
+    # Bei Gleichstand: rechten Teil nehmen (haeufiger das spezifischere)
+    if right_score >= left_score:
+        # Den linken Token durch den rechten ersetzen, Rest behalten
+        # "moderate or full makeup" -> "full makeup"
+        # Wir nehmen den rechten Teil samt seinem Suffix (das ist der vollstaendige Begriff)
+        return right
+    else:
+        return left
+
+
+def clean_audit_string(text: Optional[str]) -> str:
+    """Vollstaendige Saeuberung eines Audit-Freitext-Strings.
+    Reihenfolge:
+      1. Strip + Lowercase fuer Vergleiche (Original-Casing wird beibehalten)
+      2. Hedge-Woerter entfernen
+      3. 'X or Y'-Aufloesung
+      4. Invalid-Phrase-Check -> ggf. Leerstring
+      5. Whitespace normalisieren
+    """
+    if not text:
+        return ""
+    t = str(text).strip()
+    if not t:
+        return ""
+
+    # 1. Hedge-Woerter raus (Funktion arbeitet auf lowercase-Buffer,
+    #    gibt aber lowercase zurueck - was fuer Trait-Tokens okay ist).
+    t = strip_hedge_phrases(t)
+
+    # 2. 'X or Y'-Aufloesung
+    t = resolve_or_phrase(t)
+
+    # 3. Invalid-Check
+    if is_invalid_trait_value(t):
+        return ""
+
+    # 4. Restliche Reinigung
+    t = re.sub(r"\s+", " ", t).strip(" ,.;:")
+    return t
+
+
+# ============================================================
+# 5b-end) END VOCABULARY & NORMALIZATION
+# ============================================================
 
 
 def normalize_caption_profile(value: Optional[str]) -> str:
@@ -1421,7 +1706,12 @@ def cache_path_for_file(file_hash: str) -> str:
 #       Hochskalierung deterministisch *10. Smart-Crop-Geometrie neu:
 #       SMART_PRECROP_PADDING_FACTOR ist Padding-pro-Seite; Crop ist jetzt
 #       echt eng (~2.2x Gesicht statt ~5x Gesicht). Caches inkompatibel.
-AUDIT_CACHE_SCHEMA_VERSION = "v2"
+#   v3: Phase 1 - Schema um kategoriale Aux-Felder erweitert (lighting_type,
+#       background_type, hair_texture, makeup_intensity, has_glasses_now,
+#       glasses_frame_shape) und strukturierte Inventur-Listen
+#       (tattoo_inventory_now, piercing_inventory_now). Anti-Hedge-Regeln
+#       im Audit-Prompt erzwingen sauberere Trait-Werte. Caches inkompatibel.
+AUDIT_CACHE_SCHEMA_VERSION = "v3"
 
 
 def audit_cache_key(base_hash: str, model: str, variant: str = "audit") -> str:
@@ -2017,6 +2307,94 @@ def build_api_schema() -> Dict[str, Any]:
             },
             "background_description": {"type": "string"},
             "lighting_description": {"type": "string"},
+
+            # --- NEU (Phase 1): kategoriale Aux-Felder fuer Profile-Stage ---
+            "lighting_type": {
+                "type": "string",
+                "description": (
+                    "Categorical lighting label. Allowed values: studio_softbox, "
+                    "studio_ringlight, studio_other, natural_outdoor_sun, "
+                    "natural_outdoor_overcast, natural_indoor_window, "
+                    "indoor_artificial, mixed, low_light. "
+                    "Use empty string only if truly indeterminable. "
+                    "This is critical for studio-bias correction in skin-tone profiling."
+                )
+            },
+            "background_type": {
+                "type": "string",
+                "description": (
+                    "Categorical background label. Allowed values: studio_plain, "
+                    "studio_textured, indoor_room, indoor_bathroom, outdoor_urban, "
+                    "outdoor_nature, outdoor_beach, outdoor_other, vehicle_interior, "
+                    "transparent_or_isolated, other. Empty string only if no background visible."
+                )
+            },
+            "hair_texture": {
+                "type": "string",
+                "description": (
+                    "Hair texture (separate from style). Use one of: straight, wavy, "
+                    "curly, coily, afro_textured. If hair is in protective styling "
+                    "(braids, locs) use the underlying natural texture if discernible, "
+                    "else empty string."
+                )
+            },
+            "makeup_intensity": {
+                "type": "string",
+                "description": (
+                    "Makeup intensity classification. Use exactly one of: none, "
+                    "minimal, natural, defined, full, dramatic. "
+                    "NEVER use 'or'-phrases like 'minimal or no'. If unclear, pick the "
+                    "closest single value."
+                )
+            },
+            "has_glasses_now": {
+                "type": "boolean",
+                "description": "True if eyeglasses are visible in this image."
+            },
+            "glasses_frame_shape": {
+                "type": "string",
+                "description": (
+                    "If has_glasses_now is true: shape of the frame. One of: round, "
+                    "square, rectangular, oval, aviator, cat_eye, oversized, rimless, "
+                    "browline, geometric, other. Empty string if no glasses."
+                )
+            },
+            "tattoo_inventory_now": {
+                "type": "array",
+                "description": (
+                    "Structured list of tattoos VISIBLE in this image. Each entry "
+                    "has a controlled location and a freetext description. Only "
+                    "include tattoos actually visible; do NOT speculate about hidden ones."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string", "enum": TATTOO_LOCATION_ENUM},
+                        "description": {
+                            "type": "string",
+                            "description": "Short freetext description, e.g. 'rose tattoo', 'script tattoo', 'small heart'."
+                        }
+                    },
+                    "required": ["location", "description"],
+                    "additionalProperties": False,
+                }
+            },
+            "piercing_inventory_now": {
+                "type": "array",
+                "description": "Structured list of piercings VISIBLE in this image.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string", "enum": PIERCING_LOCATION_ENUM},
+                        "description": {
+                            "type": "string",
+                            "description": "Short description like 'small hoop', 'stud', 'plug/gauge'."
+                        }
+                    },
+                    "required": ["location", "description"],
+                    "additionalProperties": False,
+                }
+            },
             "quality_sharpness": {"type": "number", "minimum": 0, "maximum": 10},
             "quality_lighting": {"type": "number", "minimum": 0, "maximum": 10},
             "quality_composition": {"type": "number", "minimum": 0, "maximum": 10},
@@ -2065,6 +2443,14 @@ def build_api_schema() -> Dict[str, Any]:
             "head_pose_bucket",
             "background_description",
             "lighting_description",
+            "lighting_type",
+            "background_type",
+            "hair_texture",
+            "makeup_intensity",
+            "has_glasses_now",
+            "glasses_frame_shape",
+            "tattoo_inventory_now",
+            "piercing_inventory_now",
             "quality_sharpness",
             "quality_lighting",
             "quality_composition",
@@ -2130,6 +2516,85 @@ Important:
     'looking_up' / 'looking_down' = significant pitch (head clearly tilted up/down) regardless of yaw;
     'back' = head fully turned away (face not visible);
     'unknown' = head pose cannot be determined.
+
+============================================================
+CONTROLLED VOCABULARY (Phase 1)
+============================================================
+For the categorical aux fields (lighting_type, background_type, hair_texture,
+makeup_intensity, glasses_frame_shape), use ONLY these values:
+
+lighting_type:
+  studio_softbox | studio_ringlight | studio_other |
+  natural_outdoor_sun | natural_outdoor_overcast |
+  natural_indoor_window | indoor_artificial | mixed | low_light
+
+background_type:
+  studio_plain | studio_textured | indoor_room | indoor_bathroom |
+  outdoor_urban | outdoor_nature | outdoor_beach | outdoor_other |
+  vehicle_interior | transparent_or_isolated | other
+
+hair_texture (the natural texture of the hair, separate from style):
+  straight | wavy | curly | coily | afro_textured
+
+makeup_intensity (pick exactly ONE):
+  none | minimal | natural | defined | full | dramatic
+
+glasses_frame_shape (only if has_glasses_now is true):
+  round | square | rectangular | oval | aviator | cat_eye |
+  oversized | rimless | browline | geometric | other
+
+If a value truly does not fit any of the above, use empty string "" for the
+auxiliary field, but still fill the freetext field (e.g. lighting_description).
+
+============================================================
+ANTI-HEDGE RULES — STRICT
+============================================================
+NEVER use any of the following phrases anywhere in your output:
+  - "possibly", "perhaps", "maybe", "appears to be", "looks like"
+  - "kind of", "sort of", "somewhat", "approximately"
+  - "X or Y" constructions like "moderate or full makeup", "minimal or no makeup",
+    "blue or green eyes". Pick ONE value. If you cannot decide, pick the more
+    intense / specific one.
+  - "none visible", "not visible", "minimal or no", "moderate or no" as the
+    ENTIRE value of any descriptive field. If a feature is absent, return an
+    empty string "" instead.
+
+Examples of WRONG vs RIGHT:
+  WRONG: makeup_description = "minimal or no makeup"
+  RIGHT: makeup_description = "minimal makeup with subtle lip color"
+         (or "" if truly no makeup is visible)
+
+  WRONG: eye_color = "possibly blue"
+  RIGHT: eye_color = "blue"
+
+  WRONG: piercings_description = "none visible"
+  RIGHT: piercings_description = ""    (and piercing_inventory_now = [])
+
+============================================================
+STUDIO LIGHTING & SKIN-TONE GUIDANCE
+============================================================
+Studio softbox / ringlight illumination tends to lighten the perceived skin
+tone of dark-skinned subjects by one or two perceptual steps. When labeling
+skin_tone, judge by the actual pigmentation visible in the SHADOWED side of
+the face (under the chin, in the neck), NOT by the brightest highlight.
+
+Provide lighting_type accurately so downstream profile-building can correct
+for studio-induced lightening.
+
+============================================================
+TATTOO & PIERCING INVENTORY
+============================================================
+Fill tattoo_inventory_now and piercing_inventory_now ONLY with items VISIBLE
+in this image. Do not speculate about hidden ones. Use the controlled
+location enum exactly. If a tattoo crosses two zones, pick the dominant one.
+If you cannot place it precisely, use "other".
+
+For each tattoo, give a short freetext description ("rose tattoo", "small
+script", "linework florals on forearm"). Avoid repeating the location in the
+description.
+
+If no tattoos are visible: tattoo_inventory_now = [].
+If no piercings are visible: piercing_inventory_now = [].
 """
 
     local_hint = (
@@ -2163,7 +2628,7 @@ Important:
                 "strict": True,
             }
         },
-        "max_output_tokens": 1400,
+        "max_output_tokens": 1800,  # leicht erhoeht wegen neuer Felder
         "store": False,
         "temperature": 0.1,
     }
@@ -2259,9 +2724,15 @@ def should_escalate_audit(api_status: str, local_status: str, score: float) -> b
 # ============================================================
 
 def normalize_feature_value(val: Optional[str]) -> str:
+    """Normalisiert einen API-Audit-Feldwert auf einen sauberen, captionierbaren
+    String. Filtert 'none visible', 'moderate or no makeup' und Hedge-Woerter.
+    Gibt Leerstring zurueck, wenn der Wert wertlos ist.
+    """
     v = normalize_text(val)
-    if v in {"", "none", "no", "n/a", "unknown", "not visible", "not applicable"}:
+    if not v:
         return ""
+    # Volle Saeuberung durch das Vokabular-Modul
+    v = clean_audit_string(v)
     return v
 
 
@@ -2786,10 +3257,17 @@ def photo_type_phrase(shot_type: str, mirror_selfie: bool) -> str:
 
 
 def compact_trait(text: str) -> str:
+    """Kompakte Form eines Trait-Strings fuer Caption-Einbau.
+    Entfernt das Wort 'visible' (das im Caption-Kontext redundant ist)
+    und nutzt clean_audit_string fuer die Vorreinigung.
+    """
     t = normalize_feature_value(text)
     if not t:
         return ""
-    t = t.replace("visible ", "").strip()
+    # 'visible tattoos on the left arm' -> 'tattoos on the left arm'
+    t = re.sub(r"\bvisible\s+", "", t).strip()
+    if is_invalid_trait_value(t):
+        return ""
     return t
 
 
