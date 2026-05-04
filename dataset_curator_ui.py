@@ -182,6 +182,12 @@ DEFAULTS: Dict[str, Any] = {
     # Captions
     "c_caption_profile": "shared_compact",
     "c_captions": list(SHARED_COMPACT_CAPTION_FIELDS),
+    # Subject Profile / Phase 2
+    "c_pipeline_mode": "single_pass",
+    "c_profile_normalizer_model": "gpt-5.4-mini",
+    "c_profile_sample_threshold": 100,
+    "c_profile_sample_size": 80,
+    "c_profile_ui_per_image_threshold": 30,
     # Export
     "c_exp_review": True,
     "c_exp_reject": True,
@@ -371,6 +377,8 @@ def save_settings_fn(
     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
     c_caption_profile,
     c_captions,
+    c_pipeline_mode, c_profile_normalizer_model,
+    c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
     c_exp_review, c_exp_reject, c_exp_compare,
     # Video
     v_source, v_target, v_ref, v_fpm, v_fps, v_sim, v_sharp,
@@ -424,6 +432,11 @@ def save_settings_fn(
         "c_arcface_det_size": c_arcface_det_size,
         "c_caption_profile": normalize_caption_profile(c_caption_profile),
         "c_captions": c_captions,
+        "c_pipeline_mode": c_pipeline_mode,
+        "c_profile_normalizer_model": c_profile_normalizer_model,
+        "c_profile_sample_threshold": int(c_profile_sample_threshold),
+        "c_profile_sample_size": int(c_profile_sample_size),
+        "c_profile_ui_per_image_threshold": int(c_profile_ui_per_image_threshold),
         "c_exp_review": c_exp_review, "c_exp_reject": c_exp_reject,
         "c_exp_compare": c_exp_compare,
         "v_source": v_source, "v_target": v_target, "v_ref": v_ref,
@@ -501,6 +514,87 @@ def output_root_for(input_folder: str, trigger_word: str) -> str:
     safe = re.sub(r"[^\w\-]+", "_", trigger_word.strip(), flags=re.UNICODE).strip("_") or "subject"
     return os.path.join(input_folder, f"curated_{safe}")
 
+
+
+
+def caption_stage_path_for(input_folder: str, trigger_word: str) -> str:
+    return os.path.join(output_root_for(input_folder, trigger_word), "_caption_stage.json")
+
+
+def subject_profile_path_for(input_folder: str, trigger_word: str) -> str:
+    return os.path.join(output_root_for(input_folder, trigger_word), "_subject_profile.json")
+
+
+def _profile_summary_markdown(profile: Dict[str, Any]) -> str:
+    if not profile:
+        return tr("Kein Profil geladen.", "No profile loaded.")
+    stable = profile.get("stable_identity", {}) or {}
+    markers = profile.get("identity_markers", {}) or {}
+    glasses = markers.get("glasses", {}) or {}
+    tattoos = markers.get("tattoo_inventory", []) or []
+    piercings = markers.get("piercing_baseline", []) or []
+    per_image = profile.get("per_image_traits", {}) or {}
+    lines = [
+        f"### {profile.get('subject_id', '') or 'Subject'}",
+        "",
+        f"**Gender:** {stable.get('gender', '-')}",
+        f"**Skin tone:** {stable.get('skin_tone', '-')}",
+        f"**Eye color:** {stable.get('eye_color', '-')}",
+        f"**Hair texture:** {stable.get('hair_texture', '-')}",
+        f"**Body build:** {stable.get('body_build', '-')}",
+        "",
+        f"**Glasses:** {glasses.get('canonical_description', '-') if glasses.get('wears_regularly') else 'not regular'}",
+        f"**Tattoos in inventory:** {len(tattoos)}",
+        f"**Baseline piercings:** {len(piercings)}",
+        f"**Per-image trait rows:** {len(per_image)}",
+        f"**Force only when visible:** {profile.get('force_only_when_visible', True)}",
+    ]
+    notes = profile.get("normalizer_notes", []) or []
+    if notes:
+        lines.append("")
+        lines.append("**Notes:**")
+        for note in notes[:8]:
+            lines.append(f"- {note}")
+    return "\n".join(lines)
+
+
+def load_subject_profile_ui(trigger_word: str, input_folder: str) -> Tuple[str, str, str]:
+    path = subject_profile_path_for(input_folder, trigger_word)
+    stage_path = caption_stage_path_for(input_folder, trigger_word)
+    if not os.path.exists(path):
+        return "", tr(
+            f"Kein _subject_profile.json gefunden. Erwarteter Pfad: `{path}`",
+            f"No _subject_profile.json found. Expected path: `{path}`",
+        ), tr("⚠️ Kein Profil geladen.", "⚠️ No profile loaded.")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+        text = json.dumps(profile, ensure_ascii=False, indent=2)
+        summary = _profile_summary_markdown(profile)
+        if os.path.exists(stage_path):
+            status = tr("✅ Profil und Caption-Stage geladen.", "✅ Profile and caption stage loaded.")
+        else:
+            status = tr("⚠️ Profil geladen, aber _caption_stage.json fehlt.", "⚠️ Profile loaded, but _caption_stage.json is missing.")
+        return text, summary, status
+    except Exception as e:
+        return "", tr(f"Profil konnte nicht gelesen werden: {e}", f"Could not read profile: {e}"), tr("❌ Fehler", "❌ Error")
+
+
+def save_subject_profile_ui(trigger_word: str, input_folder: str, profile_json_text: str) -> str:
+    path = subject_profile_path_for(input_folder, trigger_word)
+    if not profile_json_text.strip():
+        return tr("⚠️ Kein JSON zum Speichern vorhanden.", "⚠️ No JSON to save.")
+    try:
+        profile = json.loads(profile_json_text)
+        if not isinstance(profile, dict):
+            return tr("❌ Profil muss ein JSON-Objekt sein.", "❌ Profile must be a JSON object.")
+        profile["force_only_when_visible"] = True
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
+        return tr(f"✅ Profil gespeichert: {path}", f"✅ Profile saved: {path}")
+    except Exception as e:
+        return tr(f"❌ Speichern fehlgeschlagen: {e}", f"❌ Save failed: {e}")
 
 def parse_progress(line: str) -> Optional[Tuple[int, int]]:
     m = re.search(r"\[(\d+)/(\d+)\]", line)
@@ -651,6 +745,8 @@ def start_curator(
     arcface_min_faces, arcface_model, arcface_det_size,
     caption_profile,
     caption_options,
+    c_pipeline_mode, c_profile_normalizer_model,
+    c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
     export_review, export_reject, export_crop_compare,
 ):
     if not trigger_word.strip():
@@ -731,6 +827,11 @@ def start_curator(
         "ARCFACE_DET_SIZE": int(arcface_det_size),
         "CAPTION_PROFILE": normalize_caption_profile(caption_profile),
         "CAPTION_POLICY": caption_policy,
+        "PIPELINE_MODE": c_pipeline_mode,
+        "PROFILE_NORMALIZER_MODEL": c_profile_normalizer_model.strip() or "gpt-5.4-mini",
+        "PROFILE_SAMPLE_THRESHOLD": int(c_profile_sample_threshold),
+        "PROFILE_SAMPLE_SIZE": int(c_profile_sample_size),
+        "PROFILE_UI_PER_IMAGE_THRESHOLD": int(c_profile_ui_per_image_threshold),
         "EXPORT_REVIEW_IMAGES": export_review,
         "EXPORT_REJECT_IMAGES": export_reject,
         "EXPORT_SMART_CROP_COMPARISON": export_crop_compare,
@@ -741,6 +842,94 @@ def start_curator(
     train_dir = os.path.join(output_root_for(input_folder, trigger_word), "01_train_ready")
     yield from run_script(CURATOR_SCRIPT, CURATOR_CONFIG, config, train_dir)
 
+
+
+
+def start_caption_from_profile(
+    trigger_word, input_folder, target_size, api_key, ai_model, use_trigger_check, trigger_check_model,
+    use_review_escalation, review_escalation_model,
+    review_escalation_score_min, review_escalation_score_max,
+    escalate_on_review, escalate_on_conflict, escalate_smart_crop, smart_crop_escalation_delta,
+    ratio_h, ratio_m, ratio_f,
+    keep_score_min, hard_reject_score, hard_min_side,
+    use_filesize_filter, min_filesize_kb,
+    use_blur_filter, min_blur_variance, face_min_blur_variance, blur_norm_edge,
+    use_early_phash,
+    use_early_phash_loop1, early_phash_threshold_1, early_phash_keep_per_group_1,
+    use_early_phash_loop2, early_phash_threshold_2, early_phash_keep_per_group_2,
+    subject_sanity, subject_min_torso,
+    ig_frame_crop, ig_two_stage_bar,
+    use_clip, use_phash, phash_threshold, clip_threshold,
+    enable_smart_crop, crop_min_gain, crop_padding,
+    use_clustering, max_outfit, max_session, use_diversity,
+    use_pose_diversity, pose_soft_limit, pose_penalty_weight,
+    use_arcface, arcface_hard, arcface_soft, arcface_trim,
+    arcface_min_faces, arcface_model, arcface_det_size,
+    caption_profile,
+    caption_options,
+    c_pipeline_mode, c_profile_normalizer_model,
+    c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
+    export_review, export_reject, export_crop_compare,
+):
+    """Phase 3: nur Caption-/Bildexport aus bereits gebautem Profil starten."""
+    if not trigger_word.strip():
+        yield tr("Bitte ein Triggerwort eingeben.", "Please enter a trigger word."), [], 0, tr("❌ Fehler", "❌ Error")
+        return
+    if not os.path.isdir(input_folder):
+        yield tr(
+            f"Input-Ordner existiert nicht: {input_folder}",
+            f"Input folder does not exist: {input_folder}",
+        ), [], 0, tr("❌ Fehler", "❌ Error")
+        return
+
+    stage_path = caption_stage_path_for(input_folder, trigger_word)
+    profile_path = subject_profile_path_for(input_folder, trigger_word)
+    if not os.path.exists(stage_path):
+        yield tr(
+            f"_caption_stage.json fehlt. Starte zuerst den Curator im Modus 'Profile then Caption'. Erwartet: {stage_path}",
+            f"_caption_stage.json is missing. First run the curator in 'Profile then Caption' mode. Expected: {stage_path}",
+        ), [], 0, tr("❌ Fehler", "❌ Error")
+        return
+    if not os.path.exists(profile_path):
+        yield tr(
+            f"_subject_profile.json fehlt. Erwartet: {profile_path}",
+            f"_subject_profile.json is missing. Expected: {profile_path}",
+        ), [], 0, tr("❌ Fehler", "❌ Error")
+        return
+
+    all_caption_keys = list(CAPTION_FIELD_CHOICES)
+    caption_policy = {k: (k in caption_options) for k in all_caption_keys}
+
+    config = {
+        "TRIGGER_WORD": trigger_word.strip(),
+        "INPUT_FOLDER": input_folder.strip(),
+        "TARGET_DATASET_SIZE": int(target_size),
+        "API_KEY": api_key.strip(),
+        "AI_MODEL": ai_model.strip(),
+        "CAPTION_PROFILE": normalize_caption_profile(caption_profile),
+        "CAPTION_POLICY": caption_policy,
+        "PIPELINE_MODE": "profile_then_caption",
+        "CONTINUE_FROM_PROFILE": True,
+        "PROFILE_NORMALIZER_MODEL": c_profile_normalizer_model.strip() or "gpt-5.4-mini",
+        "PROFILE_SAMPLE_THRESHOLD": int(c_profile_sample_threshold),
+        "PROFILE_SAMPLE_SIZE": int(c_profile_sample_size),
+        "PROFILE_UI_PER_IMAGE_THRESHOLD": int(c_profile_ui_per_image_threshold),
+        "EXPORT_REVIEW_IMAGES": export_review,
+        "EXPORT_REJECT_IMAGES": export_reject,
+        "EXPORT_SMART_CROP_COMPARISON": export_crop_compare,
+        "SEND_TEXT_IMAGES_TO_CAPTION_REMOVE": True,
+        "INTERACTIVE_CAPTION_OVERRIDE": False,
+        "ENABLE_SMART_PRECROP": enable_smart_crop,
+        "SMART_PRECROP_MIN_GAIN": float(crop_min_gain),
+        "SMART_PRECROP_PADDING_FACTOR": float(crop_padding),
+        "HARD_MIN_SIDE_PX": int(hard_min_side),
+        "RATIO_HEADSHOT": round(ratio_h, 2),
+        "RATIO_MEDIUM": round(ratio_m, 2),
+        "RATIO_FULL_BODY": round(ratio_f, 2),
+    }
+
+    train_dir = os.path.join(output_root_for(input_folder, trigger_word), "01_train_ready")
+    yield from run_script(CURATOR_SCRIPT, CURATOR_CONFIG, config, train_dir)
 
 # ============================================================
 # VIDEO PROCESSOR LAUNCHER
@@ -2196,6 +2385,113 @@ def build_ui() -> gr.Blocks:
                         outputs=[c_caption_profile],
                     )
 
+                    with gr.Accordion(tr("🧬 Subject Profile / Caption-Normalisierung", "🧬 Subject Profile / caption normalization"), open=False):
+                        gr.Markdown(tr(
+                            "Phase 2 baut nach dem Bild-Audit ein zentrales Profil des Models. "
+                            "Reject- und Review-Bilder werden dafür ausgeschlossen. Bei großen Datasets "
+                            "wird ein stratifiziertes Sample an den Normalizer geschickt und die Regeln "
+                            "werden lokal auf alle verwertbaren Bilder angewendet. Marker wie Brille, "
+                            "Tattoos und Piercings bleiben strikt force-only-when-visible.",
+                            "Phase 2 builds a central subject profile after image audit. Reject and review "
+                            "images are excluded. For large datasets, a stratified sample is sent to the "
+                            "normalizer and the rules are applied locally to all usable images. Markers "
+                            "such as glasses, tattoos and piercings remain strictly force-only-when-visible.",
+                        ))
+                        c_pipeline_mode = gr.Dropdown(
+                            label=tr("Pipeline-Modus", "Pipeline mode"),
+                            choices=[
+                                (tr("Single Pass – Profil automatisch nutzen", "Single pass – use profile automatically"), "single_pass"),
+                                (tr("Profile then Caption – UI-Gate vorbereitet", "Profile then caption – UI gate prepared"), "profile_then_caption"),
+                            ],
+                            value=S["c_pipeline_mode"],
+                            info=tr(
+                                "Single Pass nutzt das Profil automatisch. Profile then Caption pausiert nach dem Profil-Build, zeigt das Profil unten zur Bearbeitung und exportiert Captions erst nach dem separaten Button.",
+                                "Single pass uses the profile automatically. Profile then Caption pauses after profile build, lets you edit the profile below, and exports captions only after the separate button.",
+                            ),
+                        )
+                        c_profile_normalizer_model = gr.Textbox(
+                            label=tr("Profile-Normalizer-Modell", "Profile normalizer model"),
+                            value=S["c_profile_normalizer_model"],
+                            max_lines=1,
+                            info=tr(
+                                "Modell für den einen zusätzlichen Profil-Call pro Lauf. Empfehlung: gpt-5.4-mini.",
+                                "Model for the single additional profile call per run. Recommended: gpt-5.4-mini.",
+                            ),
+                        )
+                        with gr.Row():
+                            c_profile_sample_threshold = gr.Slider(
+                                label=tr("Sampling ab N Bildern", "Sample when above N images"),
+                                minimum=20,
+                                maximum=2000,
+                                step=10,
+                                value=S["c_profile_sample_threshold"],
+                                info=tr(
+                                    "Bis zu dieser Anzahl gehen alle verwertbaren Bilder in den Profil-Normalizer. Darüber wird gesampelt.",
+                                    "Up to this number, all usable images go into the profile normalizer. Above this, stratified sampling is used.",
+                                ),
+                            )
+                            c_profile_sample_size = gr.Slider(
+                                label=tr("Profil-Sample-Größe", "Profile sample size"),
+                                minimum=20,
+                                maximum=300,
+                                step=5,
+                                value=S["c_profile_sample_size"],
+                                info=tr(
+                                    "Wie viele Bilder bei großen Datasets maximal für den Normalizer ausgewählt werden. Empfehlung: 80.",
+                                    "Maximum number of images selected for the normalizer on large datasets. Recommended: 80.",
+                                ),
+                            )
+                            c_profile_ui_per_image_threshold = gr.Slider(
+                                label=tr("UI-Einzelsicht bis N Bilder", "Per-image UI up to N images"),
+                                minimum=5,
+                                maximum=200,
+                                step=5,
+                                value=S["c_profile_ui_per_image_threshold"],
+                                info=tr(
+                                    "Bis zu dieser Größe ist die spätere Einzelbild-Detailprüfung sinnvoll. Große Datasets werden zunächst über JSON/Bucket-Werte bearbeitet.",
+                                    "Up to this size, later per-image detail review is useful. Large datasets are edited via JSON/bucket values first.",
+                                ),
+                            )
+
+                        gr.Markdown(tr(
+                            "### Profil bearbeiten und Captioning starten\n"
+                            "Workflow für Phase 3: 1. Pipeline-Modus auf `profile_then_caption` stellen und normalen Curator starten. "
+                            "2. Nach der Pause Profil laden, bei Bedarf JSON korrigieren und speichern. "
+                            "3. `Captioning aus bestätigtem Profil starten` klicken. Es läuft dann kein neues Audit, sondern nur Export + Caption-Build.",
+                            "### Edit profile and start captioning\n"
+                            "Phase 3 workflow: 1. Set pipeline mode to `profile_then_caption` and start the curator normally. "
+                            "2. After the pause, load the profile, edit JSON if needed, and save. "
+                            "3. Click `Start captioning from confirmed profile`. No new audit is run; only export + caption build happens.",
+                        ))
+                        with gr.Row():
+                            c_profile_load_btn = gr.Button(tr("Profil laden", "Load profile"))
+                            c_profile_save_btn = gr.Button(tr("Profil speichern", "Save profile"))
+                            c_caption_from_profile_btn = gr.Button(
+                                tr("Captioning aus bestätigtem Profil starten", "Start captioning from confirmed profile"),
+                                variant="primary",
+                            )
+                        c_profile_status = gr.Textbox(
+                            label=tr("Profil-Status", "Profile status"),
+                            value="",
+                            interactive=False,
+                            max_lines=2,
+                        )
+                        c_profile_summary = gr.Markdown(
+                            value=tr("Noch kein Profil geladen.", "No profile loaded yet."),
+                        )
+                        c_profile_json = gr.Textbox(
+                            label=tr("_subject_profile.json", "_subject_profile.json"),
+                            value="",
+                            lines=18,
+                            max_lines=28,
+                            interactive=True,
+                            elem_classes=["log-box"],
+                            info=tr(
+                                "Hier kannst du stabile Traits direkt korrigieren. Wichtig: JSON gültig lassen. Brille/Tattoos/Piercings bleiben force-only-when-visible.",
+                                "You can directly correct stable traits here. Important: keep valid JSON. Glasses/tattoos/piercings remain force-only-when-visible.",
+                            ),
+                        )
+
                 with gr.Accordion(tr("💾 Export-Optionen", "💾 Export options"), open=False):
                     gr.Markdown(tr(
                         "<details>"
@@ -2319,10 +2615,27 @@ def build_ui() -> gr.Blocks:
                     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
                     c_caption_profile,
                     c_captions,
+                    c_pipeline_mode, c_profile_normalizer_model,
+                    c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
                     c_exp_review, c_exp_reject, c_exp_compare,
                 ]
 
+                c_profile_load_btn.click(
+                    fn=load_subject_profile_ui,
+                    inputs=[c_trigger, c_input],
+                    outputs=[c_profile_json, c_profile_summary, c_profile_status],
+                )
+                c_profile_save_btn.click(
+                    fn=save_subject_profile_ui,
+                    inputs=[c_trigger, c_input, c_profile_json],
+                    outputs=[c_profile_status],
+                )
                 c_start_btn.click(fn=start_curator, inputs=curator_inputs, outputs=[c_log, c_gallery, c_progress, c_status])
+                c_caption_from_profile_btn.click(
+                    fn=start_caption_from_profile,
+                    inputs=curator_inputs,
+                    outputs=[c_log, c_gallery, c_progress, c_status],
+                )
                 c_stop_btn.click(fn=kill_process, outputs=[c_status])
 
             # ==============================================================

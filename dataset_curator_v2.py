@@ -313,7 +313,7 @@ CAPTION_POLICY = {
 
 # Bilder mit Text / Wasserzeichen bei Bedarf separat ausgeben
 SEND_TEXT_IMAGES_TO_CAPTION_REMOVE = True  # Bilder mit sichtbarem Text/Watermark -> 03_caption_remove statt train_ready
-INTERACTIVE_CAPTION_OVERRIDE = True        # Pausiert nach der Caption-Regel-Analyse und fragt dich nach optionalen Overrides
+INTERACTIVE_CAPTION_OVERRIDE = False       # Phase 2: UI-Subprocess darf nicht auf input() warten; Overrides laufen ueber _profile_override.json
 
 # ============================================================
 # SUBJECT PROFILE PIPELINE (Phase 2/3)
@@ -324,6 +324,14 @@ INTERACTIVE_CAPTION_OVERRIDE = True        # Pausiert nach der Caption-Regel-Ana
 #   "profile_then_caption" : Audit -> Profile-Build -> UI-Pause -> Caption
 #                            (in Phase 3 vom UI gesetzt)
 PIPELINE_MODE = "single_pass"
+
+# Phase 3: Wenn True, wird kein neues Audit ausgefuehrt. Das Skript laedt
+# den zuvor gespeicherten Caption-Stage-Zustand und exportiert nur Bilder +
+# Captions mit dem aktuell bestaetigten _subject_profile.json.
+CONTINUE_FROM_PROFILE = False
+
+# Dateiname fuer den pausierten Zustand zwischen Profile-Build und Caption-Export.
+CAPTION_STAGE_FILENAME = "_caption_stage.json"
 
 # Subject-Profile-Cache (zentral, pro Trigger-Word)
 SUBJECT_PROFILE_CACHE_DIR = os.path.join(
@@ -346,6 +354,10 @@ PROFILE_INPUT_BUCKETS = ["train_ready", "keep_unused"]   # rejects/reviews aus
 
 # Normalizer-Modell (gpt-5.4-mini empfohlen wegen Context-Window)
 PROFILE_NORMALIZER_MODEL = "gpt-5.4-mini"
+
+# Cache-Version fuer zentrale Subject-Profile. Bei Aenderungen am
+# Profile-Schema oder an der Normalizer-Logik inkrementieren.
+PROFILE_CACHE_SCHEMA_VERSION = "v1"
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
@@ -2788,6 +2800,1089 @@ def get_caption_rule_overview(global_rules: Dict[str, Any]) -> Dict[str, Any]:
             }
     return {"fixed": fixed, "override": override}
 
+
+# ============================================================
+# 7b) SUBJECT PROFILE BUILDER (Phase 2)
+# ============================================================
+
+def subject_profile_cache_path(trigger_word: Optional[str] = None) -> str:
+    safe = slugify_filename((trigger_word or TRIGGER_WORD or "subject").strip())
+    return os.path.join(SUBJECT_PROFILE_CACHE_DIR, f"{safe}.profile.json")
+
+
+def output_subject_profile_path() -> str:
+    return os.path.join(OUTPUT_ROOT, "_subject_profile.json")
+
+
+def output_profile_override_path() -> str:
+    return os.path.join(OUTPUT_ROOT, "_profile_override.json")
+
+
+def output_caption_stage_path() -> str:
+    return os.path.join(OUTPUT_ROOT, CAPTION_STAGE_FILENAME)
+
+
+def profile_image_id(row: Dict[str, Any]) -> str:
+    """Stabiler Bild-Key fuer Subject-Profile und per-image Tokens."""
+    h = str(row.get("file_hash") or "").strip()
+    if h:
+        return h
+    src = str(row.get("original_path") or row.get("original_filename") or "")
+    return hashlib.sha1(src.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _profile_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "ja", "y"}
+
+
+def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
+    """Hash ueber die relevanten Audit-Felder, nicht ueber Captions/Outputnamen."""
+    relevant: List[Dict[str, Any]] = []
+    for row in rows:
+        relevant.append({
+            "image_id": profile_image_id(row),
+            "file_hash": row.get("file_hash", ""),
+            "original_filename": row.get("original_filename", ""),
+            "base_status": row.get("base_status", ""),
+            "shot_type": row.get("shot_type", ""),
+            "quality_total": row.get("quality_total", ""),
+            "gender_class": row.get("gender_class", ""),
+            "skin_tone": row.get("skin_tone", ""),
+            "eye_color": row.get("eye_color", ""),
+            "body_build": row.get("body_build", ""),
+            "hair_description": row.get("hair_description", ""),
+            "hair_texture": row.get("hair_texture", ""),
+            "beard_description": row.get("beard_description", ""),
+            "glasses_description": row.get("glasses_description", ""),
+            "has_glasses_now": row.get("has_glasses_now", False),
+            "glasses_frame_shape": row.get("glasses_frame_shape", ""),
+            "makeup_description": row.get("makeup_description", ""),
+            "makeup_intensity": row.get("makeup_intensity", ""),
+            "tattoos_visible": row.get("tattoos_visible", False),
+            "tattoos_description": row.get("tattoos_description", ""),
+            "tattoo_inventory_now": row.get("tattoo_inventory_now", []),
+            "piercings_description": row.get("piercings_description", ""),
+            "piercing_inventory_now": row.get("piercing_inventory_now", []),
+            "lighting_description": row.get("lighting_description", ""),
+            "lighting_type": row.get("lighting_type", ""),
+            "background_description": row.get("background_description", ""),
+            "background_type": row.get("background_type", ""),
+            "head_pose_bucket": row.get("head_pose_bucket", ""),
+        })
+    relevant.sort(key=lambda x: (str(x.get("image_id", "")), str(x.get("original_filename", ""))))
+    payload = {
+        "schema": PROFILE_CACHE_SCHEMA_VERSION,
+        "trigger": SAFE_TRIGGER,
+        "items": relevant,
+    }
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _quality_tier(row: Dict[str, Any]) -> str:
+    try:
+        q = float(row.get("quality_total", 0))
+    except Exception:
+        q = 0.0
+    if q >= 75:
+        return "high"
+    if q >= 55:
+        return "mid"
+    return "low"
+
+
+def stratified_sample_for_profile(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deterministisches Sample fuer grosse Datasets.
+    Strata: lighting_type × shot_type × quality-tier.
+    """
+    if len(rows) <= int(PROFILE_SAMPLE_THRESHOLD):
+        return list(rows)
+
+    target = max(1, int(PROFILE_SAMPLE_SIZE))
+    groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        key = (
+            normalize_text(row.get("lighting_type")) or "unknown_lighting",
+            normalize_text(row.get("shot_type")) or "unknown_shot",
+            _quality_tier(row),
+        )
+        groups[key].append(row)
+
+    for key in groups:
+        groups[key].sort(key=lambda r: profile_image_id(r))
+
+    selected: List[Dict[str, Any]] = []
+    for key in sorted(groups.keys()):
+        if len(selected) >= target:
+            break
+        if groups[key]:
+            selected.append(groups[key].pop(0))
+
+    while len(selected) < target:
+        progressed = False
+        for key in sorted(groups.keys()):
+            if len(selected) >= target:
+                break
+            if groups[key]:
+                selected.append(groups[key].pop(0))
+                progressed = True
+        if not progressed:
+            break
+
+    return selected
+
+
+def subject_profile_schema() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "subject_id": {"type": "string"},
+            "stable_identity": {
+                "type": "object",
+                "properties": {
+                    "gender": {"type": "string"},
+                    "skin_tone": {"type": "string"},
+                    "eye_color": {"type": "string"},
+                    "hair_texture": {"type": "string"},
+                    "body_build": {"type": "string"},
+                },
+                "required": ["gender", "skin_tone", "eye_color", "hair_texture", "body_build"],
+                "additionalProperties": False,
+            },
+            "confidence": {
+                "type": "object",
+                "properties": {
+                    "gender": {"type": "string"},
+                    "skin_tone": {"type": "string"},
+                    "eye_color": {"type": "string"},
+                    "hair_texture": {"type": "string"},
+                    "body_build": {"type": "string"},
+                },
+                "required": ["gender", "skin_tone", "eye_color", "hair_texture", "body_build"],
+                "additionalProperties": False,
+            },
+            "identity_markers": {
+                "type": "object",
+                "properties": {
+                    "glasses": {
+                        "type": "object",
+                        "properties": {
+                            "wears_regularly": {"type": "boolean"},
+                            "canonical_description": {"type": "string"},
+                            "frequency": {"type": "string"},
+                        },
+                        "required": ["wears_regularly", "canonical_description", "frequency"],
+                        "additionalProperties": False,
+                    },
+                    "tattoo_inventory": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "canonical_description": {"type": "string"},
+                                "frequency": {"type": "string"},
+                            },
+                            "required": ["location", "canonical_description", "frequency"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "piercing_baseline": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "canonical_description": {"type": "string"},
+                                "frequency": {"type": "string"},
+                            },
+                            "required": ["location", "canonical_description", "frequency"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["glasses", "tattoo_inventory", "piercing_baseline"],
+                "additionalProperties": False,
+            },
+            "normalizer_notes": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["subject_id", "stable_identity", "confidence", "identity_markers", "normalizer_notes"],
+        "additionalProperties": False,
+    }
+
+
+def _profile_sample_payload(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    payload_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        payload_rows.append({
+            "image_id": profile_image_id(row),
+            "filename": row.get("original_filename", ""),
+            "quality_total": row.get("quality_total", 0),
+            "shot_type": row.get("shot_type", ""),
+            "head_pose_bucket": row.get("head_pose_bucket", ""),
+            "lighting_type": row.get("lighting_type", ""),
+            "background_type": row.get("background_type", ""),
+            "raw": {
+                "gender_class": row.get("gender_class", ""),
+                "skin_tone": row.get("skin_tone", ""),
+                "eye_color": row.get("eye_color", ""),
+                "body_build": row.get("body_build", ""),
+                "hair_description": row.get("hair_description", ""),
+                "hair_texture": row.get("hair_texture", ""),
+                "glasses_description": row.get("glasses_description", ""),
+                "has_glasses_now": row.get("has_glasses_now", False),
+                "glasses_frame_shape": row.get("glasses_frame_shape", ""),
+                "makeup_description": row.get("makeup_description", ""),
+                "makeup_intensity": row.get("makeup_intensity", ""),
+                "tattoo_inventory_now": row.get("tattoo_inventory_now", []),
+                "piercing_inventory_now": row.get("piercing_inventory_now", []),
+                "lighting_description": row.get("lighting_description", ""),
+                "background_description": row.get("background_description", ""),
+            },
+        })
+    return payload_rows
+
+
+def call_subject_profile_normalizer(rows: List[Dict[str, Any]], input_hash: str, total_count: int) -> Dict[str, Any]:
+    instructions = """
+You consolidate raw per-image audits into one Subject Identity Profile for a person LoRA dataset.
+All input images are intended to show the same subject. Some outliers may exist.
+
+Important:
+- Stable identity traits must be canonical and consistent across captions.
+- Use single, clean tokens or short phrases. No hedge words, no 'or'-phrases, no 'none visible'.
+- For skin tone, account for studio-lighting bias: studio or ring-light images can make darker skin read lighter.
+- For eye color, treat mirror selfies, filters, and extreme lighting as possible outliers.
+- Body build should be inferred only from medium/full-body observations when possible.
+- Glasses are regular only if visible in at least about 60% of sampled usable images.
+- Piercing baseline includes locations visible in at least about 40% of sampled usable images.
+- Tattoo inventory is the union of visible tattoos, grouped by location. Mention only visible markers later.
+- Force-only-when-visible policy: markers like glasses, tattoos and piercings must not be captioned in images where they are not visible.
+Return JSON only.
+"""
+
+    user_payload = {
+        "trigger_word": TRIGGER_WORD,
+        "safe_trigger": SAFE_TRIGGER,
+        "total_usable_images": total_count,
+        "sampled_images": len(rows),
+        "input_hash": input_hash,
+        "vocab_hints": {
+            "skin_tone": SKIN_TONE_VOCAB,
+            "eye_color": EYE_COLOR_VOCAB,
+            "hair_texture": ["straight", "wavy", "curly", "coily", "afro_textured"],
+            "body_build": BODY_BUILD_VOCAB,
+            "makeup_intensity": MAKEUP_INTENSITY_VOCAB,
+            "hair_form": HAIR_FORM_VOCAB,
+            "hair_color": HAIR_COLOR_VOCAB,
+            "tattoo_locations": TATTOO_LOCATION_ENUM,
+            "piercing_locations": PIERCING_LOCATION_ENUM,
+        },
+        "images": _profile_sample_payload(rows),
+    }
+
+    payload = {
+        "instructions": instructions,
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": json.dumps(user_payload, ensure_ascii=False),
+            }],
+        }],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "subject_profile",
+                "schema": subject_profile_schema(),
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 2400,
+        "store": False,
+        "temperature": 0.1,
+    }
+
+    data = responses_api_call(PROFILE_NORMALIZER_MODEL, payload)
+    parsed = json.loads(extract_response_text(data))
+    parsed["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
+    parsed["input_hash"] = input_hash
+    parsed["normalizer_model"] = PROFILE_NORMALIZER_MODEL
+    parsed["sample_size"] = len(rows)
+    parsed["total_usable_images"] = total_count
+    parsed["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    return parsed
+
+
+def _mode_clean(rows: List[Dict[str, Any]], field: str) -> str:
+    vals = [compact_trait(r.get(field)) for r in rows]
+    vals = [v for v in vals if v]
+    if not vals:
+        return ""
+    return Counter(vals).most_common(1)[0][0]
+
+
+def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason: str = "") -> Dict[str, Any]:
+    """Deterministischer Fallback, falls der Normalizer-Call fehlschlaegt."""
+    n = max(1, len(rows))
+
+    glasses_rows = [r for r in rows if _profile_bool(r.get("has_glasses_now")) or compact_trait(r.get("glasses_description"))]
+    glasses_descs = [compact_trait(r.get("glasses_description")) for r in glasses_rows]
+    glasses_descs = [d for d in glasses_descs if d]
+    glasses_mode = Counter(glasses_descs).most_common(1)[0][0] if glasses_descs else ""
+
+    tattoos_by_loc: Dict[str, List[str]] = defaultdict(list)
+    piercings_by_loc: Dict[str, List[str]] = defaultdict(list)
+    for row in rows:
+        for t in row.get("tattoo_inventory_now") or []:
+            loc = normalize_text(t.get("location")) or "other"
+            desc = compact_trait(t.get("description")) or "tattoo"
+            tattoos_by_loc[loc].append(desc)
+        for p in row.get("piercing_inventory_now") or []:
+            loc = normalize_text(p.get("location")) or "other"
+            desc = compact_trait(p.get("description")) or "piercing"
+            piercings_by_loc[loc].append(desc)
+
+    def inv_items(grouped: Dict[str, List[str]], min_fraction: float = 0.0) -> List[Dict[str, str]]:
+        out = []
+        for loc, descs in sorted(grouped.items()):
+            if (len(descs) / n) < min_fraction:
+                continue
+            c = Counter(descs)
+            desc = max(c.keys(), key=lambda s: (c[s], len(s)))
+            out.append({
+                "location": loc,
+                "canonical_description": desc,
+                "frequency": f"{len(descs)}/{n}",
+            })
+        return out
+
+    profile = {
+        "subject_id": SAFE_TRIGGER,
+        "profile_schema_version": PROFILE_CACHE_SCHEMA_VERSION,
+        "input_hash": input_hash,
+        "normalizer_model": "fallback_local",
+        "sample_size": len(rows),
+        "total_usable_images": len(rows),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "stable_identity": {
+            "gender": _mode_clean(rows, "gender_class") or "person",
+            "skin_tone": _mode_clean(rows, "skin_tone"),
+            "eye_color": _mode_clean(rows, "eye_color"),
+            "hair_texture": _mode_clean(rows, "hair_texture"),
+            "body_build": _mode_clean(rows, "body_build"),
+        },
+        "confidence": {
+            "gender": "fallback",
+            "skin_tone": "fallback",
+            "eye_color": "fallback",
+            "hair_texture": "fallback",
+            "body_build": "fallback",
+        },
+        "identity_markers": {
+            "glasses": {
+                "wears_regularly": (len(glasses_rows) / n) >= 0.60,
+                "canonical_description": glasses_mode,
+                "frequency": f"{len(glasses_rows)}/{n}",
+            },
+            "tattoo_inventory": inv_items(tattoos_by_loc, min_fraction=0.0),
+            "piercing_baseline": inv_items(piercings_by_loc, min_fraction=0.40),
+        },
+        "normalizer_notes": [f"Fallback profile used. {reason}".strip()],
+    }
+    return profile
+
+
+def _contains_any(text: str, needles: List[str]) -> bool:
+    t = text.lower()
+    return any(n in t for n in needles)
+
+
+def canonical_hair_color(row: Dict[str, Any]) -> str:
+    text = normalize_text(" ".join([
+        str(row.get("hair_description", "")),
+        str(row.get("hair_texture", "")),
+    ]))
+    if not text:
+        return ""
+    if _contains_any(text, ["platinum", "white-blonde", "white blonde", "very light blonde", "very light ash", "silver blonde"]):
+        return "platinum"
+    if _contains_any(text, ["burgundy", "wine-red", "wine red", "deep red", "dark red"]):
+        return "burgundy"
+    if _contains_any(text, ["auburn", "copper"]):
+        return "auburn"
+    if _contains_any(text, ["red hair", "red-haired", "reddish"]):
+        return "red"
+    if _contains_any(text, ["black hair", "jet black", "raven", "black braided", "black braids", "dark black"]):
+        return "black"
+    if _contains_any(text, ["dark brown", "deep brown", "brunette"]):
+        return "dark_brown"
+    if _contains_any(text, ["light brown", "dirty blonde"]):
+        return "light_brown"
+    if _contains_any(text, ["blonde", "blond", "ash-blonde", "ash blonde"]):
+        return "blonde"
+    if _contains_any(text, ["brown hair", "brown wavy", "brown straight"]):
+        return "brown"
+    if _contains_any(text, ["gray", "grey"]):
+        return "gray"
+    if "white" in text:
+        return "white"
+    return ""
+
+
+def canonical_hair_form(row: Dict[str, Any]) -> str:
+    text = normalize_text(" ".join([
+        str(row.get("hair_description", "")),
+        str(row.get("hair_texture", "")),
+    ]))
+    if not text:
+        return ""
+    if _contains_any(text, ["knotless braid", "knotless braids"]):
+        return "knotless_braids"
+    if _contains_any(text, ["box braid", "box braids", "individual braid", "individual braids", "small braids", "rope-like braid"]):
+        return "box_braids"
+    if "cornrow" in text:
+        return "cornrows"
+    if _contains_any(text, ["two braids", "pigtail braids", "double braids"]):
+        return "two_braids"
+    if _contains_any(text, ["single braid", "one braid"]):
+        return "single_braid"
+    if "pigtail" in text:
+        return "pigtails"
+    if "ponytail" in text:
+        return "ponytail"
+    if _contains_any(text, ["bun", "top knot", "chignon"]):
+        return "bun"
+    if _contains_any(text, ["updo", "up-do"]):
+        return "updo"
+    if _contains_any(text, ["half up", "half-up"]):
+        return "half_up"
+    if _contains_any(text, ["pulled back", "tied back", "slicked back"]):
+        return "pulled_back"
+    if _contains_any(text, ["short hair", "pixie", "short cut"]):
+        return "short_cut"
+    if _contains_any(text, ["afro", "rounded shape", "voluminous rounded", "afro-textured"]):
+        return "afro_natural"
+    if _contains_any(text, ["coily"]):
+        return "loose_coily"
+    if _contains_any(text, ["curly", "ringlet"]):
+        return "loose_curly"
+    if _contains_any(text, ["wavy", "wave"]):
+        return "loose_wavy"
+    if _contains_any(text, ["straight"]):
+        return "loose_straight"
+    return ""
+
+
+def canonical_makeup_intensity(row: Dict[str, Any]) -> str:
+    explicit = normalize_text(row.get("makeup_intensity"))
+    if explicit in MAKEUP_INTENSITY_VOCAB:
+        return explicit
+    text = normalize_text(row.get("makeup_description"))
+    if not text:
+        return ""
+    if _contains_any(text, ["dramatic", "bold", "heavy glam"]):
+        return "dramatic"
+    if _contains_any(text, ["full makeup", "heavy makeup", "glam makeup"]):
+        return "full"
+    if _contains_any(text, ["defined", "eyeliner", "eyeshadow", "contour", "bold eye"]):
+        return "defined"
+    if _contains_any(text, ["natural", "soft makeup"]):
+        return "natural"
+    if _contains_any(text, ["minimal", "light makeup", "subtle"]):
+        return "minimal"
+    if _contains_any(text, ["no makeup", "none"]):
+        return "none"
+    return ""
+
+
+def _phrase_from_token(token: str) -> str:
+    return (token or "").replace("_", " ").strip()
+
+
+def profile_hair_caption(hair_color: str, hair_form: str) -> str:
+    """Build a grammatical hair phrase from normalized profile tokens.
+
+    Phase 2 originally produced artifacts such as "blonde pulled back" because
+    style tokens like pulled_back were concatenated without the word "hair".
+    This helper keeps compact LoRA-friendly tokens, but always returns a phrase
+    that can safely follow "with" in the first caption sentence.
+    """
+    color = _phrase_from_token(hair_color)
+    form_token = normalize_text(hair_form)
+    form = _phrase_from_token(hair_form)
+
+    if not color and not form_token:
+        return ""
+
+    def color_prefix() -> str:
+        return (color + " ") if color else ""
+
+    if form_token.startswith("loose_"):
+        texture = _phrase_from_token(form_token.replace("loose_", ""))
+        return " ".join([p for p in [color, texture, "hair"] if p]).strip()
+
+    phrase_map = {
+        "pulled_back": f"{color_prefix()}hair pulled back",
+        "half_up": f"{color_prefix()}hair in a half-up style",
+        "ponytail": f"{color_prefix()}hair in a ponytail",
+        "pigtails": f"{color_prefix()}hair in pigtails",
+        "bun": f"{color_prefix()}hair in a bun",
+        "updo": f"{color_prefix()}hair in an updo",
+        "two_braids": f"{color_prefix()}hair in two braids",
+        "single_braid": f"{color_prefix()}hair in a single braid",
+        "box_braids": f"{color_prefix()}box braids",
+        "knotless_braids": f"{color_prefix()}knotless braids",
+        "cornrows": f"{color_prefix()}cornrows",
+        "short_cut": f"short {color_prefix()}hair".strip(),
+        "afro_natural": f"{color_prefix()}natural afro-textured hair",
+    }
+    if form_token in phrase_map:
+        return re.sub(r"\s+", " ", phrase_map[form_token]).strip()
+
+    if form:
+        # Unknown profile token: keep it, but make the phrase grammatical.
+        return " ".join([p for p in [color, form, "hair"] if p]).strip()
+
+    return " ".join([p for p in [color, "hair"] if p]).strip()
+
+
+def _inventory_map(profile: Dict[str, Any], marker_key: str) -> Dict[str, str]:
+    markers = (profile or {}).get("identity_markers", {})
+    if marker_key == "tattoos":
+        items = markers.get("tattoo_inventory", [])
+    elif marker_key == "piercings":
+        items = markers.get("piercing_baseline", [])
+    else:
+        items = []
+    out: Dict[str, str] = {}
+    for item in items or []:
+        loc = normalize_text(item.get("location"))
+        desc = compact_trait(item.get("canonical_description"))
+        if loc and desc:
+            out[loc] = desc
+    return out
+
+
+def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+    tattoos_visible = []
+    for t in row.get("tattoo_inventory_now") or []:
+        loc = normalize_text(t.get("location"))
+        if loc:
+            tattoos_visible.append(loc)
+
+    piercings_visible = []
+    for p in row.get("piercing_inventory_now") or []:
+        loc = normalize_text(p.get("location"))
+        if loc:
+            piercings_visible.append(loc)
+
+    return {
+        "hair_color_base": canonical_hair_color(row),
+        "hair_form": canonical_hair_form(row),
+        "makeup_intensity": canonical_makeup_intensity(row),
+        "glasses_visible": _profile_bool(row.get("has_glasses_now")) or bool(compact_trait(row.get("glasses_description"))),
+        "tattoo_locations_visible": sorted(set(tattoos_visible)),
+        "piercing_locations_visible": sorted(set(piercings_visible)),
+    }
+
+
+def deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = deep_merge_dict(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_profile_override() -> Dict[str, Any]:
+    path = output_profile_override_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        safe_print(f"   ⚠️ Could not read profile override file: {e}")
+        return {}
+
+
+def save_subject_profile(profile: Dict[str, Any]) -> None:
+    os.makedirs(SUBJECT_PROFILE_CACHE_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+    with open(subject_profile_cache_path(), "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+    with open(output_subject_profile_path(), "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+    example_path = os.path.join(OUTPUT_ROOT, "_profile_override.example.json")
+    if not os.path.exists(example_path):
+        example = {
+            "stable_identity": {
+                "skin_tone": "",
+                "eye_color": "",
+                "hair_texture": "",
+                "body_build": "",
+            },
+            "identity_markers": {
+                "glasses": {
+                    "wears_regularly": False,
+                    "canonical_description": "",
+                }
+            },
+            "per_image_traits": {}
+        }
+        with open(example_path, "w", encoding="utf-8") as f:
+            json.dump(example, f, ensure_ascii=False, indent=2)
+
+
+def load_subject_profile_cache(input_hash: str) -> Optional[Dict[str, Any]]:
+    path = subject_profile_cache_path()
+    if not ENABLE_CACHE or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+        if (
+            profile.get("profile_schema_version") == PROFILE_CACHE_SCHEMA_VERSION
+            and profile.get("input_hash") == input_hash
+        ):
+            return profile
+    except Exception:
+        return None
+    return None
+
+
+def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Baut/lädt das zentrale Subject-Profile und erzeugt per-image Tokens.
+    Reject- und Review-Bilder sollen upstream ausgeschlossen werden.
+    """
+    rows = [r for r in profile_rows if r.get("base_status") == "keep" and r.get("arcface_flag") != "hard"]
+    if not rows:
+        safe_print("   ⚠️ Subject profile skipped: no usable keep rows.")
+        return {}
+
+    input_hash = profile_input_hash(rows)
+    cached = load_subject_profile_cache(input_hash)
+    if cached:
+        profile = cached
+        safe_print(
+            f"   🧬 Subject profile cache used: {SAFE_TRIGGER} "
+            f"({len(rows)} usable images)"
+        )
+    else:
+        sample = stratified_sample_for_profile(rows)
+        safe_print(
+            f"   🧬 Building subject profile with {PROFILE_NORMALIZER_MODEL}: "
+            f"{len(sample)}/{len(rows)} sampled usable images"
+        )
+        try:
+            profile = call_subject_profile_normalizer(sample, input_hash, total_count=len(rows))
+        except Exception as e:
+            safe_print(f"   ⚠️ Subject profile normalizer failed; using local fallback: {e}")
+            profile = fallback_subject_profile(sample if sample else rows, input_hash, reason=str(e))
+            profile["total_usable_images"] = len(rows)
+
+    per_image: Dict[str, Any] = {}
+    for row in rows:
+        image_id = profile_image_id(row)
+        row["profile_image_id"] = image_id
+        per_image[image_id] = per_image_profile_traits(row, profile)
+
+    profile["per_image_traits"] = per_image
+    profile["input_hash"] = input_hash
+    profile["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
+    profile["subject_id"] = profile.get("subject_id") or SAFE_TRIGGER
+    profile["force_only_when_visible"] = True
+
+    override = load_profile_override()
+    if override:
+        profile = deep_merge_dict(profile, override)
+        profile.setdefault("normalizer_notes", []).append("Local _profile_override.json was applied.")
+
+    save_subject_profile(profile)
+
+    stable = profile.get("stable_identity", {})
+    safe_print(
+        "   🧬 Subject profile ready: "
+        f"skin={stable.get('skin_tone','') or '-'} | "
+        f"eyes={stable.get('eye_color','') or '-'} | "
+        f"hair_texture={stable.get('hair_texture','') or '-'} | "
+        f"body={stable.get('body_build','') or '-'}"
+    )
+    return profile
+
+
+def subject_profile_report_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
+    if not profile:
+        return {}
+    return {
+        "subject_id": profile.get("subject_id", ""),
+        "profile_schema_version": profile.get("profile_schema_version", ""),
+        "normalizer_model": profile.get("normalizer_model", ""),
+        "sample_size": profile.get("sample_size", 0),
+        "total_usable_images": profile.get("total_usable_images", 0),
+        "force_only_when_visible": profile.get("force_only_when_visible", True),
+        "stable_identity": profile.get("stable_identity", {}),
+        "confidence": profile.get("confidence", {}),
+        "identity_markers": profile.get("identity_markers", {}),
+        "normalizer_notes": profile.get("normalizer_notes", []),
+    }
+
+
+
+
+# ============================================================
+# 7c) SUBJECT PROFILE UI-GATE / CAPTION STAGE (Phase 3)
+# ============================================================
+
+def make_json_safe(value: Any) -> Any:
+    """Konvertiert Row-/Report-Daten so, dass sie in _caption_stage.json
+    gespeichert werden koennen. Grosse Embeddings werden bewusst entfernt.
+    """
+    if isinstance(value, np.ndarray):
+        return None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return float(value)
+    if isinstance(value, (np.bool_,)):
+        return bool(value)
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k in {"clip_embedding", "arcface_embedding"}:
+                continue
+            out[str(k)] = make_json_safe(v)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(v) for v in value]
+    return value
+
+
+def save_caption_stage(
+    *,
+    all_rows: List[Dict[str, Any]],
+    selected_sorted: List[Dict[str, Any]],
+    review_items: List[Dict[str, Any]],
+    unselected_keep: List[Dict[str, Any]],
+    reject_items: List[Dict[str, Any]],
+    global_rules: Dict[str, Any],
+    subject_profile: Dict[str, Any],
+    identity_summary: Dict[str, Any],
+    warnings: List[str],
+    valid_candidate_count: int,
+) -> None:
+    """Speichert den Zustand nach Audit + Profil-Build, aber vor Caption-Export.
+
+    Phase 3 nutzt diese Datei, damit der User das Profil in der UI bearbeiten
+    kann und danach nur der Caption-/Bildexport laeuft, ohne neues Audit.
+    """
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    stage = {
+        "stage_schema_version": "v1",
+        "trigger_word": TRIGGER_WORD,
+        "safe_trigger": SAFE_TRIGGER,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "all_rows": all_rows,
+        "selected_sorted": selected_sorted,
+        "review_items": review_items,
+        "unselected_keep": unselected_keep,
+        "reject_items": reject_items,
+        "global_rules": global_rules,
+        "subject_profile": subject_profile,
+        "identity_summary": identity_summary,
+        "warnings": warnings,
+        "valid_candidate_count": valid_candidate_count,
+    }
+    with open(output_caption_stage_path(), "w", encoding="utf-8") as f:
+        json.dump(make_json_safe(stage), f, ensure_ascii=False, indent=2)
+
+
+def load_caption_stage() -> Dict[str, Any]:
+    path = output_caption_stage_path()
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Caption stage file not found: {path}. Run profile_then_caption first."
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Invalid caption stage file: root is not an object.")
+    return data
+
+
+def load_confirmed_subject_profile(stage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Laedt das vom User bestaetigte/bearbeitete Profil aus dem Output-Ordner.
+    Falls es fehlt, wird das im Stage-File gespeicherte Profil verwendet.
+    """
+    path = output_subject_profile_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data["force_only_when_visible"] = True
+                return data
+        except Exception as e:
+            safe_print(f"   ⚠️ Could not read confirmed subject profile: {e}")
+    profile = (stage or {}).get("subject_profile", {}) if isinstance(stage, dict) else {}
+    return profile if isinstance(profile, dict) else {}
+
+
+def clean_caption_output_dirs() -> None:
+    """Entfernt alte Bild-/Caption-Exports vor dem Continue-Export.
+    Cache, Profile und Audit-Zwischenstaende bleiben erhalten.
+    """
+    for folder in [TRAIN_READY_DIR, KEEP_UNUSED_DIR, CAPTION_REMOVE_DIR, REVIEW_DIR]:
+        os.makedirs(folder, exist_ok=True)
+        for name in os.listdir(folder):
+            if name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".txt")):
+                try:
+                    os.remove(os.path.join(folder, name))
+                except Exception:
+                    pass
+
+
+def _sync_row_update(row_index: Dict[str, Dict[str, Any]], row: Dict[str, Any]) -> None:
+    key = row.get("original_filename")
+    if key and key in row_index:
+        row_index[key].update({
+            "selected": row.get("selected", row_index[key].get("selected")),
+            "output_bucket": row.get("output_bucket", ""),
+            "new_basename": row.get("new_basename", ""),
+            "final_caption": row.get("final_caption", ""),
+        })
+
+
+def _write_captioned_image(row: Dict[str, Any], out_dir: str, new_basename: str, global_rules: Dict[str, Any], subject_profile: Dict[str, Any]) -> None:
+    row["new_basename"] = new_basename
+    row["final_caption"] = build_caption(row, global_rules, subject_profile)
+    cropped = body_aware_crop(row["original_path"], row)
+    img_out = os.path.join(out_dir, f"{new_basename}.jpg")
+    txt_out = os.path.join(out_dir, f"{new_basename}.txt")
+    cropped.save(img_out, "JPEG", quality=100)
+    with open(txt_out, "w", encoding="utf-8") as f:
+        f.write(row["final_caption"])
+
+
+def write_caption_stage_reports(
+    *,
+    all_rows: List[Dict[str, Any]],
+    selected_sorted: List[Dict[str, Any]],
+    review_items: List[Dict[str, Any]],
+    unselected_keep: List[Dict[str, Any]],
+    reject_items: List[Dict[str, Any]],
+    global_rules: Dict[str, Any],
+    subject_profile: Dict[str, Any],
+    identity_summary: Dict[str, Any],
+    warnings: List[str],
+    valid_candidate_count: int,
+) -> None:
+    csv_fields = [
+        "original_filename", "base_status", "selected", "output_bucket", "new_basename",
+        "quality_total", "grundscore", "score_nach_eskalation", "quality_sharpness",
+        "quality_lighting", "quality_composition", "quality_identity_usefulness", "shot_type",
+        "gender_class", "face_visible", "face_occlusion", "multiple_people",
+        "main_subject_clear", "watermark_or_overlay", "prominent_readable_text",
+        "mirror_selfie", "hair_description", "beard_description", "glasses_description",
+        "piercings_description", "makeup_description", "skin_tone", "eye_color", "body_build",
+        "tattoos_visible", "tattoos_description", "clothing_description", "pose_description",
+        "expression", "gaze_direction", "head_pose_bucket", "background_description",
+        "lighting_description", "lighting_type", "background_type", "hair_texture",
+        "makeup_intensity", "has_glasses_now", "glasses_frame_shape", "issues",
+        "short_reason", "local_override_reasons", "duplicate_of", "duplicate_method",
+        "duplicate_distance", "main_face_ratio", "face_count_local", "width", "height",
+        "file_size_mb", "arcface_distance_to_centroid", "arcface_flag", "final_caption",
+    ]
+
+    csv_path = os.path.join(OUTPUT_ROOT, f"dataset_audit_{SAFE_TRIGGER}.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in all_rows:
+            row_copy = dict(row)
+            row_copy["issues"] = ", ".join(row_copy.get("issues", [])) if isinstance(row_copy.get("issues"), list) else row_copy.get("issues", "")
+            row_copy["local_override_reasons"] = ", ".join(row_copy.get("local_override_reasons", [])) if isinstance(row_copy.get("local_override_reasons"), list) else row_copy.get("local_override_reasons", "")
+            writer.writerow(row_copy)
+
+    jsonl_path = os.path.join(OUTPUT_ROOT, f"dataset_audit_{SAFE_TRIGGER}.jsonl")
+    write_jsonl(jsonl_path, make_json_safe(all_rows))
+
+    summary = {
+        "input_images": len(all_rows),
+        "kept_clean_candidates_before_selection": valid_candidate_count,
+        "review_candidates": len(review_items),
+        "keep_unused_overflow": len(unselected_keep),
+        "rejected": len(reject_items),
+        "selected_total": len(selected_sorted),
+        "selected_train_ready": sum(1 for r in selected_sorted if r.get("output_bucket") == "train_ready"),
+        "selected_caption_remove": sum(1 for r in selected_sorted if r.get("output_bucket") == "caption_remove"),
+        "selected_headshots": sum(1 for r in selected_sorted if r.get("shot_type") == "headshot"),
+        "selected_medium": sum(1 for r in selected_sorted if r.get("shot_type") == "medium"),
+        "selected_full_body": sum(1 for r in selected_sorted if r.get("shot_type") == "full_body"),
+        "smart_crop_pairs_evaluated": 0,
+        "smart_crop_pairs_accepted": 0,
+        "smart_crop_pairs_won": 0,
+        "identity_check_enabled": identity_summary.get("enabled", False),
+        "identity_check_centroid_present": identity_summary.get("centroid_present", False),
+        "identity_check_n_with_face": identity_summary.get("n_with_face", 0),
+        "identity_check_n_no_face": identity_summary.get("n_no_face", 0),
+        "identity_check_n_ok": identity_summary.get("n_ok", 0),
+        "identity_check_n_soft_flagged": identity_summary.get("n_soft", 0),
+        "identity_check_n_hard_flagged_removed": identity_summary.get("n_hard", 0),
+        "subject_profile_enabled": bool(subject_profile),
+        "subject_profile_normalizer_model": (subject_profile or {}).get("normalizer_model", ""),
+        "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
+        "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
+        "caption_stage_continued_from_profile": True,
+    }
+
+    report = {
+        "summary": summary,
+        "warnings": warnings,
+        "global_rules": global_rules,
+        "identity_check": identity_summary,
+        "subject_profile": subject_profile_report_summary(subject_profile),
+    }
+
+    md_path = os.path.join(OUTPUT_ROOT, f"dataset_report_{SAFE_TRIGGER}.md")
+    save_report_md(md_path, report)
+
+    safe_print("")
+    safe_print("=" * 70)
+    safe_print(f"DONE: {TRIGGER_WORD}")
+    safe_print("=" * 70)
+    for k, v in summary.items():
+        safe_print(f"{k}: {v}")
+    safe_print("-" * 70)
+    if warnings:
+        safe_print("WARNINGS:")
+        for w in warnings:
+            safe_print(f" - {w}")
+        safe_print("-" * 70)
+    safe_print(f"CSV:   {csv_path}")
+    safe_print(f"JSONL: {jsonl_path}")
+    safe_print(f"MD:    {md_path}")
+    safe_print(f"Train-ready:     {TRAIN_READY_DIR}")
+    if unselected_keep:
+        safe_print(f"Keep-unused:     {KEEP_UNUSED_DIR} ({len(unselected_keep)} overflow)")
+    safe_print(f"Caption-remove:  {CAPTION_REMOVE_DIR}")
+    if EXPORT_REVIEW_IMAGES:
+        safe_print(f"Review:          {REVIEW_DIR}")
+    safe_print("=" * 70)
+
+
+def continue_caption_from_profile() -> None:
+    """Phase 3 Continue-Pfad: exportiert Captions/Bilder aus _caption_stage.json.
+    Kein Audit, kein Dedup, kein ArcFace-Neulauf.
+    """
+    safe_print("🧬 Continuing from confirmed subject profile...")
+    stage = load_caption_stage()
+    subject_profile = load_confirmed_subject_profile(stage)
+    if not subject_profile:
+        raise RuntimeError("No subject profile available. Load/edit _subject_profile.json first.")
+
+    all_rows = stage.get("all_rows", []) or []
+    selected_sorted = stage.get("selected_sorted", []) or []
+    review_items = stage.get("review_items", []) or []
+    unselected_keep = stage.get("unselected_keep", []) or []
+    reject_items = stage.get("reject_items", []) or []
+    global_rules = stage.get("global_rules", {}) or {}
+    identity_summary = stage.get("identity_summary", {}) or {}
+    warnings = stage.get("warnings", []) or []
+    valid_candidate_count = int(stage.get("valid_candidate_count", 0) or 0)
+
+    clean_caption_output_dirs()
+    row_index = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
+
+    counters = {"train_ready": 1, "keep_unused": 1, "caption_remove": 1, "review": 1}
+
+    for row in selected_sorted:
+        needs_text_cleanup = bool(row.get("watermark_or_overlay") or row.get("prominent_readable_text"))
+        if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
+            bucket = "caption_remove"
+            out_dir = CAPTION_REMOVE_DIR
+            new_basename = f"{SAFE_TRIGGER}-caption_remove_{counters[bucket]:03d}"
+        else:
+            bucket = "train_ready"
+            out_dir = TRAIN_READY_DIR
+            new_basename = f"{SAFE_TRIGGER}_{counters[bucket]:03d}"
+        counters[bucket] += 1
+        row["output_bucket"] = bucket
+        row["selected"] = True
+        _write_captioned_image(row, out_dir, new_basename, global_rules, subject_profile)
+        _sync_row_update(row_index, row)
+
+    if EXPORT_REVIEW_IMAGES:
+        review_export = sorted(review_items, key=lambda r: -int(r.get("quality_total", 0)))
+        for row in review_export:
+            needs_text_cleanup = bool(row.get("watermark_or_overlay") or row.get("prominent_readable_text"))
+            if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
+                bucket = "caption_remove"
+                out_dir = CAPTION_REMOVE_DIR
+                new_basename = f"{SAFE_TRIGGER}-caption_remove_{counters['caption_remove']:03d}"
+            else:
+                bucket = "review"
+                out_dir = REVIEW_DIR
+                new_basename = f"{SAFE_TRIGGER}_review_{counters['review']:03d}"
+            counters[bucket] += 1
+            row["output_bucket"] = bucket
+            try:
+                _write_captioned_image(row, out_dir, new_basename, global_rules, subject_profile)
+                _sync_row_update(row_index, row)
+            except Exception as e:
+                safe_print(f"   ⚠️ Review export failed for {row.get('original_filename','')}: {e}")
+
+    keep_unused_sorted = sorted(unselected_keep, key=lambda r: -int(r.get("quality_total", 0)))
+    for row in keep_unused_sorted:
+        new_basename = f"{SAFE_TRIGGER}_unused_{counters['keep_unused']:03d}"
+        counters["keep_unused"] += 1
+        row["output_bucket"] = "keep_unused"
+        try:
+            _write_captioned_image(row, KEEP_UNUSED_DIR, new_basename, global_rules, subject_profile)
+            _sync_row_update(row_index, row)
+        except Exception as e:
+            safe_print(f"   ⚠️ Keep-unused export failed for {row.get('original_filename','')}: {e}")
+
+    if EXPORT_REJECT_IMAGES:
+        reject_export = sorted(reject_items, key=lambda r: -int(r.get("quality_total", 0)))
+        for idx, row in enumerate(reject_export, start=1):
+            new_basename = f"{SAFE_TRIGGER}_reject_{idx:03d}"
+            img_out = os.path.join(REJECT_DIR, f"{new_basename}.jpg")
+            txt_out = os.path.join(REJECT_DIR, f"{new_basename}.txt")
+            try:
+                shutil.copy2(row["original_path"], img_out)
+                with open(txt_out, "w", encoding="utf-8") as ft:
+                    ft.write(f"REJECTED REASON: {row.get('short_reason','unknown')}\n")
+                    ft.write(f"score={row.get('quality_total', 0)} | type={row.get('shot_type', '')} | file={row.get('original_filename', '')}\n")
+            except Exception as e:
+                safe_print(f"   ⚠️ Reject export failed for {row.get('original_filename','')}: {e}")
+
+    write_caption_stage_reports(
+        all_rows=all_rows,
+        selected_sorted=selected_sorted,
+        review_items=review_items,
+        unselected_keep=unselected_keep,
+        reject_items=reject_items,
+        global_rules=global_rules,
+        subject_profile=subject_profile,
+        identity_summary=identity_summary,
+        warnings=warnings,
+        valid_candidate_count=valid_candidate_count,
+    )
+
 def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     reasons = []
 
@@ -3362,23 +4457,92 @@ def build_hair_caption_tag(item: Dict[str, Any], global_rules: Dict[str, Any]) -
     return " ".join(parts) + " hair"
 
 
-def build_caption(item: Dict[str, Any], global_rules: Dict[str, Any]) -> str:
+def build_caption(
+    item: Dict[str, Any],
+    global_rules: Dict[str, Any],
+    subject_profile: Optional[Dict[str, Any]] = None,
+) -> str:
     shot_type = item.get("shot_type", "headshot")
     mirror_selfie = bool(item.get("mirror_selfie", False))
     photo_type = photo_type_phrase(shot_type, mirror_selfie)
     caption_profile = normalize_caption_profile(globals().get("CAPTION_PROFILE", "ernie"))
 
-    gender_class = normalize_feature_value(item.get("gender_class")) or "person"
-    hair_desc = compact_trait(item.get("hair_description"))
+    profile = subject_profile or {}
+    stable_identity = profile.get("stable_identity", {}) if isinstance(profile, dict) else {}
+    per_image_traits = profile.get("per_image_traits", {}) if isinstance(profile, dict) else {}
+    image_id = item.get("profile_image_id") or profile_image_id(item)
+    image_traits = per_image_traits.get(image_id, {}) if isinstance(per_image_traits, dict) else {}
+
+    gender_class = normalize_feature_value(stable_identity.get("gender")) or normalize_feature_value(item.get("gender_class")) or "person"
     beard_desc = compact_trait(item.get("beard_description"))
-    glasses_desc = compact_trait(item.get("glasses_description"))
-    piercings_desc = compact_trait(item.get("piercings_description"))
-    makeup_desc = compact_trait(item.get("makeup_description"))
-    skin_tone = compact_trait(item.get("skin_tone"))
-    eye_color = compact_trait(item.get("eye_color"))          # ← NEU
-    body_build = compact_trait(item.get("body_build"))
-    tattoos_visible = bool(item.get("tattoos_visible", False))
-    tattoos_desc = compact_trait(item.get("tattoos_description"))
+
+    skin_tone = compact_trait(stable_identity.get("skin_tone")) or compact_trait(item.get("skin_tone"))
+    eye_color = compact_trait(stable_identity.get("eye_color")) or compact_trait(item.get("eye_color"))
+    body_build = compact_trait(stable_identity.get("body_build")) or compact_trait(item.get("body_build"))
+
+    hair_color = image_traits.get("hair_color_base", "")
+    hair_form = image_traits.get("hair_form", "")
+    profile_hair_tag = profile_hair_caption(hair_color, hair_form)
+
+    hair_desc = compact_trait(item.get("hair_description"))
+    if profile_hair_tag:
+        hair_tag = profile_hair_tag
+    elif CAPTION_POLICY["include_hair_always"] and hair_desc:
+        hair_tag = hair_desc
+    elif CAPTION_POLICY["include_hair_when_variable"]:
+        hair_tag = build_hair_caption_tag(item, global_rules)
+    else:
+        hair_tag = None
+
+    makeup_token = image_traits.get("makeup_intensity", "")
+    makeup_desc = ""
+    if makeup_token and makeup_token not in {"none", "no"}:
+        makeup_desc = f"{_phrase_from_token(makeup_token)} makeup"
+    else:
+        makeup_desc = compact_trait(item.get("makeup_description"))
+
+    markers = profile.get("identity_markers", {}) if isinstance(profile, dict) else {}
+    glasses_profile = markers.get("glasses", {}) if isinstance(markers, dict) else {}
+    glasses_visible = bool(image_traits.get("glasses_visible")) or _profile_bool(item.get("has_glasses_now"))
+    glasses_desc = ""
+    if glasses_visible:
+        glasses_desc = compact_trait(glasses_profile.get("canonical_description")) or compact_trait(item.get("glasses_description"))
+
+    tattoo_map = _inventory_map(profile, "tattoos")
+    piercing_map = _inventory_map(profile, "piercings")
+
+    tattoo_bits: List[str] = []
+    visible_tattoo_locations = image_traits.get("tattoo_locations_visible", [])
+    if visible_tattoo_locations:
+        for loc in visible_tattoo_locations:
+            desc = tattoo_map.get(loc, "")
+            if not desc:
+                for t in item.get("tattoo_inventory_now") or []:
+                    if normalize_text(t.get("location")) == loc:
+                        desc = compact_trait(t.get("description")) or "tattoo"
+                        break
+            if desc:
+                tattoo_bits.append(desc)
+    elif bool(item.get("tattoos_visible", False)):
+        tattoo_bits.append(compact_trait(item.get("tattoos_description")) or "visible tattoos")
+
+    piercing_bits: List[str] = []
+    visible_piercing_locations = image_traits.get("piercing_locations_visible", [])
+    if visible_piercing_locations:
+        for loc in visible_piercing_locations:
+            desc = piercing_map.get(loc, "")
+            if not desc:
+                for p in item.get("piercing_inventory_now") or []:
+                    if normalize_text(p.get("location")) == loc:
+                        desc = compact_trait(p.get("description")) or "piercing"
+                        break
+            if desc:
+                piercing_bits.append(desc)
+    else:
+        fallback_piercing = compact_trait(item.get("piercings_description"))
+        if fallback_piercing:
+            piercing_bits.append(fallback_piercing)
+
     clothing = normalize_feature_value(item.get("clothing_description"))
     pose = normalize_feature_value(item.get("pose_description"))
     expression = normalize_feature_value(item.get("expression"))
@@ -3386,21 +4550,11 @@ def build_caption(item: Dict[str, Any], global_rules: Dict[str, Any]) -> str:
     background = normalize_feature_value(item.get("background_description"))
     lighting = normalize_feature_value(item.get("lighting_description"))
 
-    hair_tag = None
-    if CAPTION_POLICY["include_hair_always"] and hair_desc:
-        hair_tag = hair_desc
-    elif CAPTION_POLICY["include_hair_when_variable"]:
-        hair_tag = build_hair_caption_tag(item, global_rules)
-
-    # ── ERNIE-kompatibler Personen-Anker ────────────────────────────────
-    # Haar, Augenfarbe und Hautton werden direkt nach dem Trigger-Word
-    # als feste Anker eingebaut, damit ERNIE seinen Modell-Bias nicht
-    # überschreibt. Reihenfolge: Haar → Augen → Haut.
     anchor_parts: List[str] = []
     if caption_profile == "ernie":
         if hair_tag:
             anchor_parts.append(hair_tag)
-        if CAPTION_POLICY.get("include_eye_color") and eye_color:  # ← NEU
+        if CAPTION_POLICY.get("include_eye_color") and eye_color:
             anchor_parts.append(f"{eye_color} eyes")
         if CAPTION_POLICY["include_skin_tone"] and skin_tone:
             anchor_parts.append(f"{skin_tone} skin")
@@ -3409,19 +4563,18 @@ def build_caption(item: Dict[str, Any], global_rules: Dict[str, Any]) -> str:
     if CAPTION_POLICY["include_gender_class"] and gender_class:
         first += f", a {gender_class}"
 
-    # Anker direkt nach dem Personentyp, vor den variablen Traits
     if anchor_parts:
-        first += " with " + ", ".join(anchor_parts)
+        first += " with " + ", ".join(dict.fromkeys([p for p in anchor_parts if p]))
 
     trait_bits: List[str] = []
 
     if shot_type in {"medium", "full_body"} and CAPTION_POLICY["include_body_build"] and body_build:
-        trait_bits.append(body_build)
+        # Grammatical compact tag: "slim build" instead of a dangling "slim".
+        trait_bits.append(body_build if "build" in body_build else f"{body_build} build")
 
     if caption_profile != "ernie" and hair_tag:
         trait_bits.append(hair_tag)
 
-    # ── Bart-Tag ──────────────────────────────────────────────────────────
     beard_rule = global_rules.get("beard_description", {})
     beard_variable = beard_rule.get("variable", False)
     beard_mode = normalize_compact_text(beard_rule.get("mode", ""))
@@ -3436,23 +4589,22 @@ def build_caption(item: Dict[str, Any], global_rules: Dict[str, Any]) -> str:
             if item_beard and item_beard != beard_mode:
                 trait_bits.append(beard_desc)
 
-    if CAPTION_POLICY["include_glasses"] and glasses_desc and glasses_desc not in {"none", "no glasses"}:
+    if CAPTION_POLICY["include_glasses"] and glasses_desc:
         trait_bits.append(glasses_desc)
 
-    if CAPTION_POLICY["include_piercings"] and piercings_desc and piercings_desc not in {"none", "no piercings"}:
-        trait_bits.append(piercings_desc)
+    if CAPTION_POLICY["include_piercings"]:
+        trait_bits.extend(piercing_bits)
 
-    if CAPTION_POLICY["include_makeup"] and makeup_desc and makeup_desc not in {"none", "no makeup"}:
+    if CAPTION_POLICY["include_makeup"] and makeup_desc:
         trait_bits.append(makeup_desc)
 
-    if CAPTION_POLICY["include_tattoos"] and tattoos_visible:
-        trait_bits.append(tattoos_desc or "visible tattoos")
+    if CAPTION_POLICY["include_tattoos"]:
+        trait_bits.extend(tattoo_bits)
 
     if trait_bits:
         first += ", " + ", ".join(dict.fromkeys([t for t in trait_bits if t]))
     first += "."
 
-    # ── Rest der Funktion bleibt unverändert ─────────────────────────────
     sentences = [first]
     pronoun = "They"
     if gender_class in ["woman", "girl"]:
@@ -3479,10 +4631,6 @@ def build_caption(item: Dict[str, Any], global_rules: Dict[str, Any]) -> str:
 
     if CAPTION_POLICY["include_background"] and background:
         sentences.append(f"{background.capitalize()}.")
-
-    # Watermark/Text-Bilder gehen konsequent nach caption_remove.
-    # Kein "Watermark, text on image." in der Caption, da das Modell sonst
-    # den Zusammenhang von Wasserzeichen und Identitaet lernt.
 
     caption = " ".join(sentences)
     caption = re.sub(r"\s+", " ", caption).strip()
@@ -3626,40 +4774,46 @@ def body_aware_crop(image_path: str, item: Dict[str, Any]) -> Image.Image:
     elif shot_type == "full_body":
         target_w, target_h = 832, 1216
         aspect = target_w / target_h
+
+        # Phase 2.1: Full-body exports must be conservative. The previous
+        # pose_bbox branch used crop_h = ph * 1.12, which can zoom into an
+        # incomplete MediaPipe torso/leg bbox and cut away context that was
+        # still present in the original image. For LoRA curation it is safer
+        # to preserve almost the entire original frame and only crop as much
+        # as required by the target aspect ratio.
+        crop_h = h
+        crop_w = int(round(crop_h * aspect))
+        if crop_w > w:
+            crop_w = w
+            crop_h = int(round(crop_w / aspect))
+
+        # X: center on the detected body if available, otherwise on face or image.
         if pose_bbox:
             px, py, pw, ph = pose_bbox
-            crop_h = int(ph * 1.12)
-            crop_w = int(crop_h * aspect)
-            if crop_w > w:
-                crop_w = w
-                crop_h = int(crop_w / aspect)
             cx = px + pw // 2
-            cy = py + ph // 2
-            x1, y1, x2, y2 = crop_box(cx - crop_w // 2, cy - crop_h // 2, crop_w, crop_h)
+        elif face_bbox:
+            fx, fy, fw, fh = face_bbox
+            cx = fx + fw // 2
         else:
-            crop_h = h
-            crop_w = int(h * aspect)
-            if crop_w > w:
-                crop_w = w
-                crop_h = int(crop_w / aspect)
-            # X: face-aware wenn BBox vorhanden, sonst Bildmitte
-            if face_bbox:
-                fx, fy, fw, fh = face_bbox
-                cx = fx + fw // 2
-                x_start = clamp_int(cx - crop_w // 2, 0, w - crop_w)
-            else:
-                x_start = (w - crop_w) // 2
-            # Y: Gesichts-OBERKANTE + Haarpuffer als Crop-Start.
-            # Ziel: Gesicht+Haare knapp oben im Crop, kein unnötiger Hintergrund darüber.
-            if face_bbox:
-                fy_top = face_bbox[1]        # obere Kante des Gesichts
-                fh_val = face_bbox[3]
-                # Puffer oberhalb des Gesichts: 0.8× Gesichtshöhe für Haare/Scheitel
-                hair_headroom = int(fh_val * 0.8)
-                y_start = clamp_int(fy_top - hair_headroom, 0, h - crop_h)
-            else:
-                y_start = (h - crop_h) // 2
-            x1, y1, x2, y2 = crop_box(x_start, y_start, crop_w, crop_h)
+            cx = w // 2
+        x_start = clamp_int(cx - crop_w // 2, 0, w - crop_w)
+
+        # Y: preserve full frame whenever possible. If the aspect-ratio crop
+        # forces vertical trimming, bias toward keeping the top because raised
+        # arms, phones, hair, and heads are more often lost there.
+        if crop_h >= h - 2:
+            y_start = 0
+        elif face_bbox:
+            fy_top = face_bbox[1]
+            fh_val = face_bbox[3]
+            y_start = clamp_int(fy_top - int(fh_val * 1.0), 0, h - crop_h)
+        elif pose_bbox:
+            px, py, pw, ph = pose_bbox
+            # Keep a generous headroom above the detected pose box.
+            y_start = clamp_int(py - int(ph * 0.12), 0, h - crop_h)
+        else:
+            y_start = 0
+        x1, y1, x2, y2 = crop_box(x_start, y_start, crop_w, crop_h)
 
     else:
         # Fallback: API-Schema erlaubt nur headshot/medium/full_body.
@@ -3822,6 +4976,10 @@ def generate_dashboard(all_rows: List[Dict[str, Any]], selected: List[Dict[str, 
 
 def main() -> None:
     warnings: List[str] = []
+
+    if CONTINUE_FROM_PROFILE:
+        continue_caption_from_profile()
+        return
 
     if USE_AI_TRIGGERWORD_CHECK:
         try:
@@ -4421,9 +5579,17 @@ def main() -> None:
         r for r in all_rows
         if r.get("base_status") == "keep"
         and r["original_filename"] not in selected_names
+        and r.get("arcface_flag") != "hard"
     ]
     for r in unselected_keep:
         r.setdefault("status_notes", []).append("keep_not_selected_by_diversity")
+
+    # PASS 4b: Subject Profile (Phase 2)
+    # Nur verwertbare Keep-Bilder: train_ready + keep_unused. Reject/Review
+    # beeinflussen das Profil nicht, weil sie oft genau die fehlerhaften
+    # Audit-Werte enthalten, die wir herausfiltern wollen.
+    profile_source_rows = list(selected) + list(unselected_keep)
+    subject_profile = build_subject_profile(profile_source_rows)
 
     # PASS 5: Speichern
     shot_order = {"headshot": 0, "medium": 1, "full_body": 2}
@@ -4431,6 +5597,30 @@ def main() -> None:
         selected,
         key=lambda r: (shot_order.get(r.get("shot_type"), 9), -int(r.get("quality_total", 0)))
     )
+
+    if PIPELINE_MODE == "profile_then_caption":
+        save_caption_stage(
+            all_rows=all_rows,
+            selected_sorted=selected_sorted,
+            review_items=review_items,
+            unselected_keep=unselected_keep,
+            reject_items=reject_items,
+            global_rules=global_rules,
+            subject_profile=subject_profile,
+            identity_summary=identity_summary,
+            warnings=warnings,
+            valid_candidate_count=len(valid_candidates),
+        )
+        safe_print("")
+        safe_print("=" * 70)
+        safe_print("PROFILE READY - CAPTION EXPORT PAUSED")
+        safe_print("=" * 70)
+        safe_print(f"Subject profile: {output_subject_profile_path()}")
+        safe_print(f"Caption stage:   {output_caption_stage_path()}")
+        safe_print("Review or edit the profile in the UI, then click 'Start captioning from profile'.")
+        safe_print("No train-ready captions were exported yet.")
+        safe_print("=" * 70)
+        return
 
     counters = {
         "train_ready": 1,
@@ -4490,7 +5680,7 @@ def main() -> None:
 
         row["output_bucket"] = bucket
         row["new_basename"] = new_basename
-        caption = build_caption(row, global_rules)
+        caption = build_caption(row, global_rules, subject_profile)
         row["final_caption"] = caption
 
         cropped = body_aware_crop(row["original_path"], row)
@@ -4518,7 +5708,7 @@ def main() -> None:
             counters[bucket] += 1
             row["output_bucket"] = bucket
             row["new_basename"] = new_basename
-            row["final_caption"] = build_caption(row, global_rules)
+            row["final_caption"] = build_caption(row, global_rules, subject_profile)
 
             try:
                 cropped = body_aware_crop(row["original_path"], row)
@@ -4540,7 +5730,7 @@ def main() -> None:
         counters["keep_unused"] += 1
         row["output_bucket"] = "keep_unused"
         row["new_basename"] = new_basename
-        row["final_caption"] = build_caption(row, global_rules)
+        row["final_caption"] = build_caption(row, global_rules, subject_profile)
 
         try:
             cropped = body_aware_crop(row["original_path"], row)
@@ -4846,6 +6036,10 @@ def main() -> None:
         "identity_check_n_ok": identity_summary.get("n_ok", 0),
         "identity_check_n_soft_flagged": identity_summary.get("n_soft", 0),
         "identity_check_n_hard_flagged_removed": identity_summary.get("n_hard", 0),
+        "subject_profile_enabled": bool(subject_profile),
+        "subject_profile_normalizer_model": (subject_profile or {}).get("normalizer_model", ""),
+        "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
+        "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
     }
 
     if len(selected_sorted) < TARGET_DATASET_SIZE:
@@ -4883,6 +6077,7 @@ def main() -> None:
         "warnings": warnings,
         "global_rules": global_rules,
         "identity_check": identity_summary,
+        "subject_profile": subject_profile_report_summary(subject_profile),
     }
 
     md_path = os.path.join(OUTPUT_ROOT, f"dataset_report_{SAFE_TRIGGER}.md")
