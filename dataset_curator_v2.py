@@ -11,10 +11,11 @@ import math
 import base64
 import hashlib
 import shutil
+import threading
 import traceback
 import warnings
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 HF_HUB_UNAUTH_WARNING = "You are sending unauthenticated requests to the HF Hub"
@@ -264,6 +265,7 @@ ENABLE_CACHE = True  # Nutzt vorhandene API-/Analyse-Ergebnisse wieder, spart Ze
 MAX_RETRIES = 8
 RETRY_BASE_SECONDS = 5.0
 SLEEP_BETWEEN_CALLS = 1.0
+HEARTBEAT_INTERVAL_SECONDS = 15.0
 
 # --------------------------------
 # Export
@@ -547,6 +549,58 @@ def safe_print(msg: str) -> None:
         print(msg)
     except UnicodeEncodeError:
         print(msg.encode("utf-8", errors="replace").decode("utf-8"))
+
+
+def format_elapsed(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rest = seconds - (minutes * 60)
+    return f"{minutes}m {rest:.1f}s"
+
+
+def start_phase_heartbeat(label: str, interval: float = HEARTBEAT_INTERVAL_SECONDS):
+    started_at = time.time()
+    stop_event = threading.Event()
+
+    safe_print(f"   ⏱️  START {label}")
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(interval):
+            elapsed = format_elapsed(time.time() - started_at)
+            safe_print(f"   ⏳ still working: {label} | elapsed={elapsed}")
+
+    thread = threading.Thread(target=_heartbeat, daemon=True)
+    thread.start()
+    return started_at, stop_event, thread
+
+
+def stop_phase_heartbeat(
+    label: str,
+    started_at: float,
+    stop_event: threading.Event,
+    thread: threading.Thread,
+    success: bool = True,
+) -> None:
+    stop_event.set()
+    if thread.is_alive():
+        thread.join(timeout=0.2)
+    elapsed = format_elapsed(time.time() - started_at)
+    status = "DONE" if success else "FAILED"
+    icon = "✅" if success else "❌"
+    safe_print(f"   {icon} {status} {label} | elapsed={elapsed}")
+
+
+def run_with_heartbeat(label: str, func: Callable[..., Any], *args, **kwargs) -> Any:
+    started_at, stop_event, thread = start_phase_heartbeat(label)
+    try:
+        result = func(*args, **kwargs)
+        stop_phase_heartbeat(label, started_at, stop_event, thread, success=True)
+        return result
+    except Exception:
+        stop_phase_heartbeat(label, started_at, stop_event, thread, success=False)
+        raise
 
 
 def slugify_filename(text: str) -> str:
@@ -2181,7 +2235,7 @@ def extract_response_text(response_json: Dict[str, Any]) -> str:
     raise ValueError("Kein output_text in Responses-Antwort gefunden.")
 
 
-def responses_api_call(model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "responses_api") -> Dict[str, Any]:
     if not API_KEY or not str(API_KEY).strip():
         raise RuntimeError(
             "OpenAI API key fehlt. Bitte in der UI im Feld 'OpenAI API Key' eintragen "
@@ -2195,6 +2249,8 @@ def responses_api_call(model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
+        attempt_label = f"{phase_label} | model={model} | attempt={attempt}/{MAX_RETRIES}"
+        started_at, stop_event, thread = start_phase_heartbeat(attempt_label)
         try:
             response = requests.post(
                 "https://api.openai.com/v1/responses",
@@ -2209,13 +2265,18 @@ def responses_api_call(model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                     err = {"error": {"message": response.text}}
                 message = err.get("error", {}).get("message", f"HTTP {response.status_code}")
                 raise RuntimeError(message)
+            stop_phase_heartbeat(attempt_label, started_at, stop_event, thread, success=True)
+            safe_print(f"   ↳ API response ok: status={response.status_code} | phase={phase_label}")
             return response.json()
         except Exception as e:
+            stop_phase_heartbeat(attempt_label, started_at, stop_event, thread, success=False)
             last_error = e
             if attempt >= MAX_RETRIES:
                 break
             sleep_s = RETRY_BASE_SECONDS * attempt
-            safe_print(f"   ↳ API error, retry {attempt}/{MAX_RETRIES} in {sleep_s:.1f}s: {e}")
+            safe_print(
+                f"   ↳ API error in {phase_label}, retry {attempt}/{MAX_RETRIES} in {sleep_s:.1f}s: {e}"
+            )
             time.sleep(sleep_s)
     raise RuntimeError(f"Responses-API fehlgeschlagen: {last_error}")
 
@@ -2485,7 +2546,12 @@ def build_api_schema() -> Dict[str, Any]:
     }
 
 
-def openai_audit_image(image_path: str, local_meta: Dict[str, Any], model: Optional[str] = None) -> Dict[str, Any]:
+def openai_audit_image(
+    image_path: str,
+    local_meta: Dict[str, Any],
+    model: Optional[str] = None,
+    phase_label: Optional[str] = None,
+) -> Dict[str, Any]:
     schema = build_api_schema()
     image_b64 = resize_and_encode_for_api(image_path)
     chosen_model = (model or AI_MODEL).strip() or AI_MODEL
@@ -2661,7 +2727,11 @@ If no piercings are visible: piercing_inventory_now = [].
         "temperature": 0.1,
     }
 
-    data = responses_api_call(chosen_model, payload)
+    data = responses_api_call(
+        chosen_model,
+        payload,
+        phase_label=phase_label or f"audit:{os.path.basename(image_path)}",
+    )
     if data.get("NSFW_BLOCKED"):
         return {"NSFW_BLOCKED": True}
     text = extract_response_text(data)
@@ -3896,6 +3966,13 @@ def write_caption_stage_reports(
 def continue_caption_from_profile() -> None:
     """Phase 3 Continue-Pfad: exportiert Captions/Bilder aus _caption_stage.json.
     Kein Audit, kein Dedup, kein ArcFace-Neulauf.
+
+    Wichtige Bucket-Regel fuer Subject-Profile-Captioning:
+    - train_ready und keep_unused werden immer mit Profil-Captions exportiert
+    - caption_remove und review sind explizit als Caption-Buckets vorbereitet
+      und erhalten beim Export ebenfalls Caption-Dateien
+    - caption_remove/review bleiben weiterhin aus der Subject-Profile-Auswertung
+      ausgeschlossen; PROFILE_INPUT_BUCKETS steuert die Profilbildung separat
     """
     safe_print("🧬 Continuing from confirmed subject profile...")
     stage = load_caption_stage()
@@ -3916,6 +3993,9 @@ def continue_caption_from_profile() -> None:
     clean_caption_output_dirs()
     row_index = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
 
+    # Auch die Non-Training-Buckets werden hier bewusst mit Captions aus dem
+    # bestaetigten Subject Profile exportiert. So sind 03_caption_remove und
+    # 04_review fuer spaetere manuelle Bearbeitung bereits captioned.
     counters = {"train_ready": 1, "keep_unused": 1, "caption_remove": 1, "review": 1}
 
     for row in selected_sorted:
@@ -5205,7 +5285,11 @@ def main() -> None:
             # gecropte Bild, damit alle folgenden Schritte (Blur, Exposure,
             # API, Metriken, Hashing) auf dem bereinigten Bild arbeiten.
             if ENABLE_IG_FRAME_CROP:
-                ig_cropped_path = detect_and_crop_ig_frame(image_path)
+                ig_cropped_path = run_with_heartbeat(
+                    f"[{idx}/{len(image_paths)}] ig_frame_detect {original_filename}",
+                    detect_and_crop_ig_frame,
+                    image_path,
+                )
                 if ig_cropped_path:
                     # Dimensionen und Hash des bereinigten Bildes übernehmen
                     width, height = image_dimensions(ig_cropped_path)
@@ -5255,20 +5339,35 @@ def main() -> None:
 
             primary_audit_cache_key = audit_cache_key(file_hash, AI_MODEL, "primary_audit")
             cached = load_cached_audit(primary_audit_cache_key)
-            local_meta = local_subject_metrics(image_path, phash_cache=phash_cache)
+            local_meta = run_with_heartbeat(
+                f"[{idx}/{len(image_paths)}] local_subject_metrics {original_filename}",
+                local_subject_metrics,
+                image_path,
+                phash_cache=phash_cache,
+            )
             row.update(local_meta)
             row["file_hash"] = file_hash
 
             clip_embedding = None
             if USE_CLIP_DUPLICATE_SCORING:
-                clip_embedding = compute_clip_embedding(image_path, file_hash)
+                clip_embedding = run_with_heartbeat(
+                    f"[{idx}/{len(image_paths)}] clip_embedding {original_filename}",
+                    compute_clip_embedding,
+                    image_path,
+                    file_hash,
+                )
             row["clip_embedding"] = clip_embedding
 
             if cached:
                 audit = cached["audit"] if "audit" in cached else cached
-                safe_print("   ↳ Cache used")
+                safe_print(f"   ↳ Primary audit cache used ({AI_MODEL})")
             else:
-                audit = openai_audit_image(image_path, local_meta, model=AI_MODEL)
+                audit = openai_audit_image(
+                    image_path,
+                    local_meta,
+                    model=AI_MODEL,
+                    phase_label=f"[{idx}/{len(image_paths)}] primary_audit {original_filename}",
+                )
 
             if audit.get("NSFW_BLOCKED"):
                 safe_print(f"      🔞 NSFW BLOCKED: {original_filename} -> needs manual review.")
@@ -5361,7 +5460,12 @@ def main() -> None:
                     safe_print(f"   ↳ Escalation cache used ({REVIEW_ESCALATION_MODEL})")
                 else:
                     safe_print(f"   ↳ Escalating with {REVIEW_ESCALATION_MODEL}...")
-                    escalated_audit = openai_audit_image(image_path, local_meta, model=REVIEW_ESCALATION_MODEL)
+                    escalated_audit = openai_audit_image(
+                        image_path,
+                        local_meta,
+                        model=REVIEW_ESCALATION_MODEL,
+                        phase_label=f"[{idx}/{len(image_paths)}] escalation_audit {original_filename}",
+                    )
                     if not escalated_audit.get("NSFW_BLOCKED"):
                         escalated_audit = normalize_audit_scores(escalated_audit)
                         save_cached_audit(
@@ -5436,12 +5540,21 @@ def main() -> None:
                             cached_crop = load_cached_audit(crop_primary_cache_key)
                             # Lokale Metriken (pHash, Pose etc.) IMMER berechnen,
                             # auch bei Cache-Hit, damit Duplikaterkennung funktioniert.
-                            crop_local_meta = local_subject_metrics(crop_path)
+                            crop_local_meta = run_with_heartbeat(
+                                f"[{idx}/{len(image_paths)}] crop_local_subject_metrics {original_filename}",
+                                local_subject_metrics,
+                                crop_path,
+                            )
                             if cached_crop:
                                 crop_audit = cached_crop["audit"] if "audit" in cached_crop else cached_crop
-                                safe_print("   ↳ Crop cache used")
+                                safe_print(f"   ↳ Crop audit cache used ({AI_MODEL})")
                             else:
-                                crop_audit = openai_audit_image(crop_path, crop_local_meta, model=AI_MODEL)
+                                crop_audit = openai_audit_image(
+                                    crop_path,
+                                    crop_local_meta,
+                                    model=AI_MODEL,
+                                    phase_label=f"[{idx}/{len(image_paths)}] primary_crop_audit {original_filename}",
+                                )
 
                             if not crop_audit.get("NSFW_BLOCKED"):
                                 crop_audit = normalize_audit_scores(crop_audit)
@@ -5470,7 +5583,12 @@ def main() -> None:
                                         safe_print(f"   ↳ Crop escalation cache used ({REVIEW_ESCALATION_MODEL})")
                                     else:
                                         safe_print(f"   ↳ Escalating crop with {REVIEW_ESCALATION_MODEL}...")
-                                        escalated_crop_audit = openai_audit_image(crop_path, crop_local_meta, model=REVIEW_ESCALATION_MODEL)
+                                        escalated_crop_audit = openai_audit_image(
+                                            crop_path,
+                                            crop_local_meta,
+                                            model=REVIEW_ESCALATION_MODEL,
+                                            phase_label=f"[{idx}/{len(image_paths)}] escalation_crop_audit {original_filename}",
+                                        )
                                         if not escalated_crop_audit.get("NSFW_BLOCKED"):
                                             crop_audit = normalize_audit_scores(escalated_crop_audit)
                                             save_cached_audit(
@@ -5507,7 +5625,12 @@ def main() -> None:
                                         # pHash/CLIP des Crops (immer berechnet)
                                         "phash": crop_local_meta.get("phash"),
                                         "clip_embedding": (
-                                            compute_clip_embedding(crop_path, crop_hash)
+                                            run_with_heartbeat(
+                                                f"[{idx}/{len(image_paths)}] crop_clip_embedding {original_filename}",
+                                                compute_clip_embedding,
+                                                crop_path,
+                                                crop_hash,
+                                            )
                                             if USE_CLIP_DUPLICATE_SCORING
                                             else None
                                         ),

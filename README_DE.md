@@ -1,7 +1,7 @@
 # LoRA Dataset Curator (DE)
 
 Interaktive Toolchain zur automatischen Kuratierung von LoRA-Trainingsdaten aus Bildordnern und Videos.
-Der Curator kombiniert lokale Filter (Schärfe, Auflösung, pHash), MediaPipe, CLIP und eine OpenAI-gestützte Bildanalyse, um einen kleinen, hochwertigen Datensatz mit konsistenten Captions zu erzeugen.
+Der Curator kombiniert lokale Filter (Schärfe, Auflösung, pHash), MediaPipe, CLIP und eine OpenAI-gestützte Bildanalyse, um einen kleinen, hochwertigen Datensatz zu erzeugen. Zusätzlich kann er aus geprüften Bildern ein zentrales Subject Profile erstellen und dieses nutzen, um Captions über den gesamten Datensatz hinweg konsistenter zu normalisieren.
 
 > Hinweis: Dieses Projekt stellt nur den **Code** zur Verfügung. Für die Nutzung externer Modelle und APIs (z. B. InsightFace-Modelle, OpenAI-API) gelten deren eigenen Lizenzbedingungen.
 
@@ -28,6 +28,8 @@ Viele Prüfungen und Review-Schritte sind optional oder in der UI konfigurierbar
 - Web-UI mit gespeicherten Einstellungen und Englisch/Deutsch-Umschaltung
 - Lokale Vorfilter und Duplikaterkennung vor teuren API-Aufrufen
 - OpenAI-gestützte Bildprüfung und automatisches Captioning
+- Erstellung eines zentralen Subject Profiles aus geprüften Bildern
+- Profilgestützte Caption-Normalisierung für konsistentere Captions im gesamten Datensatz
 - Optionale Smart-Crops, Subject-Checks und Diversity-Steuerung
 - Strukturierte Ausgabe für train-ready, Review und manuelle Nacharbeit
 - Export von Captions, CSV, JSONL und einem Markdown-Dataset-Report
@@ -94,12 +96,17 @@ python dataset_curator_ui.py
    - `Ziel-Datensatzgröße`: gewünschte Anzahl finaler Trainingsbilder.
    - `OpenAI API Key`: dein eigener OpenAI-API-Schlüssel.
    - Qualitäts-Schwellen, Shot-Verteilung, Vorfilter, Duplikaterkennung, Smart-Crop, Clustering und Caption-Optionen nach Bedarf einstellen.
+   - Den Pipeline-Modus wählen:
+     - `Single Pass`: Das Subject Profile wird während des Laufs automatisch erstellt und direkt verwendet.
+     - `Profile then Caption`: Der Lauf pausiert nach der Profilerstellung, damit du das Profil im Tab `🧬 Subject Profile` prüfen oder bearbeiten kannst, bevor das Captioning startet.
 
 3. Der Curator schreibt temporäre Config-Dateien (`_ui_config.json`) und startet `dataset_curator_v2.py` im Hintergrund.
 
-4. Ergebnisse liegen in `curated_<trigger>/` mit Ordnern wie `01_train_ready`, `02_caption_remove`, `03_review`, `04_reject`, `05_needs_manual_review`, `_cache` und `07_smart_crop_pairs`.
+4. In profilbasierten Workflows wird zusätzlich eine `_subject_profile.json` erzeugt, die die normalisierten Subject-Informationen für die Captions speichert.
 
-5. Nutze die Dateien aus `01_train_ready` und ausgewählte Bilder aus `03_review` für dein LoRA-Training. Prüfe zusätzlich `02_caption_remove` und `05_needs_manual_review`, falls Lieblingsbilder nur noch kleine manuelle Nacharbeit oder eine angepasste Caption brauchen.
+5. Ergebnisse liegen in `curated_<trigger>/` mit Ordnern wie `01_train_ready`, `02_caption_remove`, `03_review`, `04_reject`, `05_needs_manual_review`, `_cache` und `07_smart_crop_pairs`.
+
+6. Nutze die Dateien aus `01_train_ready` und ausgewählte Bilder aus `03_review` für dein LoRA-Training. Prüfe zusätzlich `02_caption_remove` und `05_needs_manual_review`, falls Lieblingsbilder nur noch kleine manuelle Nacharbeit oder eine angepasste Caption brauchen.
 
 ### 2. Video Processor
 

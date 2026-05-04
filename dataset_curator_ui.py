@@ -1360,16 +1360,14 @@ def load_results(input_folder, trigger_word, subfolder):
     # Use stable internal values so UI labels can be translated.
     folder_map = {
         "train_ready": "01_train_ready",
-        "caption_remove": "02_caption_remove",
-        "review": "03_review",
-        "reject": "04_reject",
+        "caption_remove": "03_caption_remove",
+        "review": "04_review",
+        "reject": "05_reject",
         "smart_crop_pairs": "07_smart_crop_pairs",
 
-        # Backward compatibility (older UI values)
-        "Train Ready": "01_train_ready",
-        "Caption Remove": "02_caption_remove",
-        "Review": "03_review",
-        "Reject": "04_reject",
+        "Caption Remove": "03_caption_remove",
+        "Review": "04_review",
+        "Reject": "05_reject",
         "Smart Crop Paare": "07_smart_crop_pairs",
     }
     target = os.path.join(root, folder_map.get(subfolder, "01_train_ready"))

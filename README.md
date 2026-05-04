@@ -1,7 +1,7 @@
 # LoRA Dataset Curator
 
 Interactive toolchain for automatic curation of LoRA training data from image folders and videos.
-The curator combines local filters (sharpness, resolution, pHash), MediaPipe, CLIP and an OpenAI-powered image audit to produce a small, high-quality dataset with consistent captions.
+The curator combines local filters (sharpness, resolution, pHash), MediaPipe, CLIP and an OpenAI-powered image audit to produce a small, high-quality dataset. It can also build a centralized subject profile from audited images and use it to normalize captions for more consistent identity and trait tagging across the dataset.
 
 > Note: This project only ships the **code**. The use of external models and APIs (e.g. InsightFace models, OpenAI API) is subject to their own license terms.
 
@@ -26,6 +26,8 @@ Many checks and review steps are optional or configurable in the UI. The main fe
 - Web UI with saved settings and English/German language switching
 - Local pre-filtering and duplicate detection before expensive API calls
 - OpenAI-assisted image review and automatic captioning
+- Centralized subject profile generation from audited images
+- Profile-guided caption normalization for more consistent dataset-wide captions
 - Optional smart crop, subject checks and diversity balancing
 - Structured outputs for train-ready, review and manual cleanup workflows
 - Export of captions, CSV, JSONL and a markdown dataset report
@@ -68,7 +70,7 @@ pip install requests pillow numpy
 pip install mediapipe==0.10.33
 pip install "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0" --index-url https://download.pytorch.org/whl/cu130
 pip install open_clip_torch
-pip install opencv-python insightface onnxruntime scikit-learn
+pip install opencv-python ignsightface onnxruntime scikit-learn
 pip install gradio
 pip install onnxruntime-gpu
 python dataset_curator_ui.py
@@ -92,12 +94,17 @@ python dataset_curator_ui.py
    - `Target dataset size`: desired number of final training images.
    - `OpenAI API Key`: your own OpenAI API key.
    - Tune quality scores, shot ratios, pre-filters, duplicate detection, smart-crop, clustering and caption options.
+   - Choose the pipeline mode:
+     - `Single Pass`: the subject profile is built and applied automatically during the run.
+     - `Profile then Caption`: the run pauses after profile creation so you can review or edit it in the `🧬 Subject Profile` tab before starting captioning.
 
 3. The curator writes temporary config files (`_ui_config.json`) and uses them to start `dataset_curator_v2.py` in the background.
 
-4. Results are written into `curated_<trigger>/` with folders such as `01_train_ready`, `02_caption_remove`, `03_review`, `04_reject`, `05_needs_manual_review`, `_cache` and `07_smart_crop_pairs`.
+4. During profile-based workflows, the curator also writes a `_subject_profile.json`, which stores the normalized subject information used for caption generation.
 
-5. Use the `01_train_ready` files and selected pictures from `03_review` for your LoRA training. Also check `02_caption_remove` and `05_needs_manual_review` for shots that may only need minor manual cleanup or recaptioning.
+5. Results are written into `curated_<trigger>/` with folders such as `01_train_ready`, `02_caption_remove`, `03_review`, `04_reject`, `05_needs_manual_review`, `_cache` and `07_smart_crop_pairs`.
+
+6. Use the `01_train_ready` files and selected pictures from `03_review` for your LoRA training. Also check `02_caption_remove` and `05_needs_manual_review` for shots that may only need minor manual cleanup or recaptioning.
 
 ### 2. Video Processor
 
