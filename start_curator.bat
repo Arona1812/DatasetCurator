@@ -11,6 +11,13 @@ setlocal
 ::   v1: initial
 ::   v2: switched onnxruntime -> onnxruntime-gpu for ArcFace
 ::       identity check on CUDA. Auto-migrates from v1.
+::   v3: removed unused torchaudio dependency. Auto-handled by
+::       the verify check; existing installs simply have an
+::       extra package that no longer hurts.
+::
+:: Important: the marker is only a cache hint. The launcher always performs
+:: real Python import checks before starting the UI and repairs missing
+:: packages automatically.
 :: ============================================================
 
 cd /d "%~dp0"
@@ -34,24 +41,62 @@ if exist "curator_env\Scripts\activate.bat" (
 call curator_env\Scripts\activate.bat
 
 :: --- Step 2: Dependencies ---
-if exist "curator_env\_install_done.marker_v2" (
-    echo Step 2 of 3: Dependencies already installed
-) else (
+echo Step 2 of 3: Checking dependencies
+call :verify_dependencies
+if errorlevel 1 (
+    echo       Missing or broken core dependencies detected
+    echo.
     if exist "curator_env\_install_done.marker" (
         echo Step 2 of 3: Migrating from v1 install
         echo.
         call :do_migrate_v1_to_v2
         if errorlevel 1 goto err_install
     ) else (
-        echo Step 2 of 3: Installing dependencies
+        echo Step 2 of 3: Installing/repairing dependencies
         echo       This may take a few minutes
         echo.
         call :do_install
         if errorlevel 1 goto err_install
     )
+
+    echo.
+    echo       Re-checking core dependencies
+    call :verify_dependencies
+    if errorlevel 1 goto err_verify
+
     echo done > "curator_env\_install_done.marker_v2"
     echo.
-    echo       Installation complete
+    echo       Dependencies ready
+) else (
+    if exist "curator_env\_install_done.marker_v2" (
+        echo       Dependencies verified
+    ) else (
+        echo done > "curator_env\_install_done.marker_v2"
+        echo       Dependencies verified and marker created
+    )
+)
+
+echo       Checking optional InsightFace support
+call :verify_optional_dependencies
+if errorlevel 1 (
+    echo       Optional InsightFace support is missing. Trying repair...
+    call :do_install_optional
+    call :verify_optional_dependencies
+    if errorlevel 1 (
+        echo.
+        echo WARNING: InsightFace is still not available.
+        echo          The UI and image curator can start, but ArcFace identity
+        echo          check and Video Processor face recognition will be disabled
+        echo          or fail until InsightFace is installed.
+        echo          On Windows, InsightFace may require Microsoft C++ Build Tools:
+        echo          https://visualstudio.microsoft.com/visual-cpp-build-tools/
+        echo.
+    )
+)
+
+if /I "%~1"=="--check-only" (
+    echo Check-only mode complete. UI was not started.
+    exit /b 0
 )
 
 :: --- Step 3: Start UI ---
@@ -82,6 +127,26 @@ exit /b 0
 
 
 :: ============================================================
+:: Dependency verification subroutine
+:: ============================================================
+:verify_dependencies
+
+python -c "import importlib.util, sys; mods=['requests','PIL','numpy','scipy','mediapipe','torch','torchvision','open_clip','cv2','onnxruntime','sklearn','gradio']; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print('      Python ' + sys.version.split()[0]); print('      Missing core: ' + (', '.join(missing) if missing else 'none')); sys.exit(1 if missing else 0)"
+
+exit /b %errorlevel%
+
+
+:: ============================================================
+:: Optional dependency verification subroutine
+:: ============================================================
+:verify_optional_dependencies
+
+python -c "import importlib.util, sys; mods=['insightface']; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print('      Missing optional: ' + (', '.join(missing) if missing else 'none')); sys.exit(1 if missing else 0)"
+
+exit /b %errorlevel%
+
+
+:: ============================================================
 :: Full installation subroutine
 :: ============================================================
 :do_install
@@ -96,19 +161,36 @@ echo       - MediaPipe
 python -m pip install mediapipe==0.10.33
 
 echo       - PyTorch + CUDA
-python -m pip install torch==2.10.0 torchvision==0.25.0 torchaudio==2.10.0 --index-url https://download.pytorch.org/whl/cu130
+python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu130
 
 echo       - OpenCLIP
 python -m pip install open_clip_torch
 
-echo       - OpenCV, InsightFace, scikit-learn
-python -m pip install opencv-python insightface scikit-learn
+echo       - OpenCV, scikit-learn
+python -m pip install opencv-python scikit-learn
 
 echo       - ONNX Runtime (GPU)
 python -m pip install onnxruntime-gpu
 
 echo       - Gradio UI
 python -m pip install gradio
+
+call :do_install_optional
+
+exit /b 0
+
+
+:: ============================================================
+:: Optional installation subroutine
+:: ============================================================
+:do_install_optional
+
+echo       - Optional InsightFace
+python -m pip install insightface
+if errorlevel 1 (
+    echo       InsightFace installation failed; continuing without optional support
+    exit /b 0
+)
 
 exit /b 0
 
@@ -143,6 +225,15 @@ exit /b 1
 :err_install
 echo.
 echo ERROR during installation. See output above
+pause
+exit /b 1
+
+:err_verify
+echo.
+echo ERROR: Dependencies are still missing after installation/repair.
+echo Please check the output above. Common fixes:
+echo   curator_env\Scripts\python.exe -m pip install scikit-learn
+echo   curator_env\Scripts\python.exe -m pip install opencv-python
 pause
 exit /b 1
 

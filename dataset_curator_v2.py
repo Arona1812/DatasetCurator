@@ -51,8 +51,13 @@ except ImportError:
 
 try:
     import torch
+    HAVE_TORCH = True
+except ImportError:
+    HAVE_TORCH = False
+
+try:
     import open_clip
-    HAVE_CLIP = True
+    HAVE_CLIP = HAVE_TORCH  # CLIP needs torch; open_clip alone is meaningless
 except ImportError:
     HAVE_CLIP = False
 
@@ -92,7 +97,7 @@ TRIGGER_CHECK_MODEL = "gpt-5.4-nano"
 USE_REVIEW_ESCALATION = False
 REVIEW_ESCALATION_MODEL = ""
 REVIEW_ESCALATION_SCORE_MIN = 50
-REVIEW_ESCALATION_SCORE_MAX = 65
+REVIEW_ESCALATION_SCORE_MAX = 58
 ESCALATE_ON_REVIEW_STATUS = True
 ESCALATE_ON_STATUS_CONFLICT = True
 ESCALATE_SMART_CROP_CLOSE_CALLS = True
@@ -210,7 +215,7 @@ CLIP_COSINE_THRESHOLD = 0.985
 # CLIP Setup – ViT-L-14 ist deutlich besser für Person-Similarity als ViT-B-32
 CLIP_MODEL_NAME = "ViT-L-14"
 CLIP_PRETRAINED = "laion2b_s32b_b82k"
-CLIP_DEVICE = "cuda" if HAVE_CLIP and torch.cuda.is_available() else "cpu"
+CLIP_DEVICE = "cuda" if HAVE_TORCH and torch.cuda.is_available() else "cpu"
 
 # --------------------------------
 # Session-/Outfit-Clusterung
@@ -432,9 +437,10 @@ _UI_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_
 # Interne Konstanten, die nie von der UI ueberschrieben werden duerfen.
 # IG_FRAME_CACHE_VERSION insbesondere: wenn der User eine alte UI-Config mit
 # einer veralteten Version auf den Curator losliesse, wuerden alte Caches
-# faelschlich wiederverwendet. Diese Liste wachst mit jedem internen Feld,
-# das aus strukturellen Gruenden keine UI-Kontrolle haben soll.
-_UI_PROTECTED_KEYS = {"IG_FRAME_CACHE_VERSION"}
+# faelschlich wiederverwendet. Gleiche Logik gilt fuer PROFILE_CACHE_SCHEMA_VERSION.
+# Diese Liste wachst mit jedem internen Feld, das aus strukturellen Gruenden
+# keine UI-Kontrolle haben soll.
+_UI_PROTECTED_KEYS = {"IG_FRAME_CACHE_VERSION", "PROFILE_CACHE_SCHEMA_VERSION"}
 if os.path.exists(_UI_CONFIG_PATH):
     try:
         with open(_UI_CONFIG_PATH, "r", encoding="utf-8") as _f:
@@ -1985,7 +1991,7 @@ def _init_arcface_app():
         return None
     try:
         providers = ["CPUExecutionProvider"]
-        if ARCFACE_USE_CUDA and HAVE_CLIP and torch.cuda.is_available():
+        if ARCFACE_USE_CUDA and HAVE_TORCH and torch.cuda.is_available():
             providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         from insightface.app import FaceAnalysis  # type: ignore
         app = FaceAnalysis(name=ARCFACE_MODEL_PACK, providers=providers)

@@ -1,10 +1,25 @@
 import os
+import sys
 import json
 import cv2
 import numpy as np
 from glob import glob
-from insightface.app import FaceAnalysis
-from sklearn.cluster import KMeans
+
+try:
+    from insightface.app import FaceAnalysis
+except ImportError:
+    print("ERROR: InsightFace is required for the Video Processor.")
+    print("       Install it via: pip install insightface")
+    print("       On Windows, this may also require Microsoft C++ Build Tools:")
+    print("       https://visualstudio.microsoft.com/visual-cpp-build-tools/")
+    sys.exit(1)
+
+try:
+    from sklearn.cluster import KMeans
+except ImportError:
+    print("ERROR: scikit-learn is required for the Video Processor.")
+    print("       Install it via: pip install scikit-learn")
+    sys.exit(1)
 
 # ==========================================
 # 1. KONFIGURATION
@@ -69,8 +84,13 @@ def process_minute_chunk(chunk_frames, video_name, minute_idx):
         out_name = f"{video_name}_min{minute_idx:03d}_{idx+1}.jpg"
         out_path = os.path.join(TARGET_FOLDER, out_name)
         # 100% Qualität erzwingen, passend zum dataset_curator
-        cv2.imwrite(out_path, item['frame'], [int(cv2.IMWRITE_JPEG_QUALITY), 100])
-        print(f"  -> Saved: {out_name} (sharpness: {item['sharpness']:.1f})")
+        ok = cv2.imwrite(out_path, item['frame'], [int(cv2.IMWRITE_JPEG_QUALITY), 100])
+        if ok and os.path.exists(out_path):
+            print(f"  -> Saved: {out_name} (sharpness: {item['sharpness']:.1f})")
+        else:
+            print(f"  -> WARNING: Failed to save {out_name} (path: {out_path}). "
+                  f"Check folder permissions and that the path contains no characters "
+                  f"unsupported by the local filesystem encoding.")
 
 def main():
     os.makedirs(TARGET_FOLDER, exist_ok=True)

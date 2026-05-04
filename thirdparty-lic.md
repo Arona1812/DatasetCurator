@@ -8,6 +8,7 @@ This project uses several third-party libraries. Please review their respective 
 | Gradio                             | Apache-2.0            | https://github.com/gradio-app/gradio/blob/main/LICENSE          |
 | MediaPipe                          | Apache-2.0            | https://github.com/google/mediapipe/blob/master/LICENSE         |
 | PyTorch                            | BSD-3-Clause          | https://github.com/pytorch/pytorch/blob/main/LICENSE            |
+| torchvision                        | BSD-3-Clause          | https://github.com/pytorch/vision/blob/main/LICENSE             |
 | NumPy                              | BSD-3-Clause          | https://numpy.org/doc/stable/license.html                       |
 | SciPy                              | BSD-3-Clause          | https://github.com/scipy/scipy/blob/main/LICENSE.txt            |
 | scikit-learn                       | BSD-3-Clause          | https://scikit-learn.org/stable/about.html#license              |

@@ -55,28 +55,46 @@ cd <your-repo-folder>
 
 The launcher will:
 - create the `curator_env` virtual environment,
-- install all required packages (requests, pillow, numpy, mediapipe, torch, torchvision, torchaudio, open_clip_torch, opencv-python, insightface, onnxruntime, scikit-learn, gradio),
+- verify and install the required core packages (requests, pillow, numpy, scipy, mediapipe, torch, torchvision, open_clip_torch, opencv-python, onnxruntime-gpu, scikit-learn, gradio),
+- try to install optional InsightFace support for the Video Processor and ArcFace identity check,
 - start the Gradio UI in your browser.
+
+> The Windows quick start installs the **CUDA 13.0 builds** of PyTorch and ONNX Runtime by default (pinned in the .bat). The tool still runs without an NVIDIA GPU — it simply falls back to CPU execution — but you will install several hundred MB of CUDA wheels you will not actually use. If you do not have a CUDA-capable GPU, prefer the manual installation below with the CPU-only commands.
+
+> InsightFace is optional for the image curator but **required for the Video Processor** and the ArcFace identity check. On Windows, installing InsightFace may require Microsoft C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
 
 ### Manual installation (example Linux/macOS)
 
-Adjust versions to your preferred CUDA/PyTorch setup:
+Adjust versions to your preferred CUDA/PyTorch setup. The commands below use CPU-friendly defaults where possible:
 
 ```bash
 python3.10 -m venv curator_env
 source curator_env/bin/activate
 pip install --upgrade pip setuptools wheel
-pip install requests pillow numpy
+
+pip install requests pillow numpy scipy
 pip install mediapipe==0.10.33
-pip install "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0" --index-url https://download.pytorch.org/whl/cu130
+
+# Choose the PyTorch command that matches your system.
+# CPU example:
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
 pip install open_clip_torch
-pip install opencv-python insightface onnxruntime scikit-learn
-pip install gradio
-pip install onnxruntime-gpu
+pip install opencv-python scikit-learn gradio
+
+# ONNX Runtime: install exactly one of these variants.
+# CPU/default:
+pip install onnxruntime
+# GPU alternative for suitable NVIDIA/CUDA setups:
+# pip install onnxruntime-gpu
+
+# Optional: required for the Video Processor and ArcFace identity check.
+pip install insightface
+
 python dataset_curator_ui.py
 ```
 
-> Please adapt the concrete versions to match your `start_curator.bat` setup and your CUDA driver.
+> For NVIDIA/CUDA acceleration, replace the PyTorch and ONNX Runtime commands with versions matching your driver/CUDA setup. See https://pytorch.org/get-started/locally/. On Windows, `insightface` may require Microsoft C++ Build Tools.
 
 ---
 
