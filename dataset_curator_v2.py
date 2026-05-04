@@ -313,7 +313,9 @@ CAPTION_POLICY = {
 
 # Bilder mit Text / Wasserzeichen bei Bedarf separat ausgeben
 SEND_TEXT_IMAGES_TO_CAPTION_REMOVE = True  # Bilder mit sichtbarem Text/Watermark -> 03_caption_remove statt train_ready
-INTERACTIVE_CAPTION_OVERRIDE = False       # Phase 2: UI-Subprocess darf nicht auf input() warten; Overrides laufen ueber _profile_override.json
+# Bug 1 fix: INTERACTIVE_CAPTION_OVERRIDE wurde komplett entfernt. Console-basiertes
+# Override per input() ist im UI-Subprocess-Modus nicht moeglich. Overrides erfolgen
+# ueber den Subject-Profile-Tab in der UI bzw. ueber _profile_override.json.
 
 # ============================================================
 # SUBJECT PROFILE PIPELINE (Phase 2/3)
@@ -357,7 +359,10 @@ PROFILE_NORMALIZER_MODEL = "gpt-5.4-mini"
 
 # Cache-Version fuer zentrale Subject-Profile. Bei Aenderungen am
 # Profile-Schema oder an der Normalizer-Logik inkrementieren.
-PROFILE_CACHE_SCHEMA_VERSION = "v1"
+#   v1: initial (Phase 2)
+#   v2: confidence ist jetzt ein Objekt {level, reasoning, outliers}
+#       statt nur ein String. Alte Cache-Eintraege werden invalidiert.
+PROFILE_CACHE_SCHEMA_VERSION = "v2"
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
@@ -1723,7 +1728,11 @@ def cache_path_for_file(file_hash: str) -> str:
 #       glasses_frame_shape) und strukturierte Inventur-Listen
 #       (tattoo_inventory_now, piercing_inventory_now). Anti-Hedge-Regeln
 #       im Audit-Prompt erzwingen sauberere Trait-Werte. Caches inkompatibel.
-AUDIT_CACHE_SCHEMA_VERSION = "v3"
+#   v4: Body-Build-Bias-Hotfix: Audit-Prompt zwingt body_build auf "" bei
+#       Headshots und draengt das Modell, Curvy/Plus_size/Muscular nicht
+#       weichzuspuelen. Aenderung der Antwortverteilung -> Cache-Bump,
+#       damit alte 'slim'-Antworten auf Headshots neu erhoben werden.
+AUDIT_CACHE_SCHEMA_VERSION = "v4"
 
 
 def audit_cache_key(base_hash: str, model: str, variant: str = "audit") -> str:
@@ -2521,6 +2530,13 @@ Important:
 - Describe eye color PRECISELY if visible (e.g. "blue", "green", "gray-green", "hazel"). Return empty string only if eyes are not visible.
 - Describe skin_tone as a neutral factual value (e.g. "fair", "light", "medium", "olive", "dark"). Never return empty.
 - Describe beard/glasses/piercings/makeup only as visible raw facts.
+- body_build: ONLY judge body build when the body is actually visible.
+    * On HEADSHOTS (only head and shoulders visible): body_build MUST be empty string "". Do not guess.
+    * On medium shots: only fill body_build if torso shape is clearly readable.
+    * On full_body shots: judge accurately.
+    * Resist the tendency to default to "slim" or "average". Use "curvy", "plus_size",
+      "athletic", "muscular" when the body actually shows those traits. Do not soften.
+    * Allowed values: slim | average | athletic | curvy | plus_size | muscular | "" (empty for headshots).
 - Classify head_pose_bucket based on the main subject's head orientation:
     'frontal' = directly facing camera (yaw < ~15 degrees);
     'three_quarter_left' / 'three_quarter_right' = yaw between ~15 and ~75 degrees, named for which side of the face is more visible to camera;
@@ -2935,6 +2951,37 @@ def stratified_sample_for_profile(rows: List[Dict[str, Any]]) -> List[Dict[str, 
     return selected
 
 
+def _confidence_field_schema() -> Dict[str, Any]:
+    """Schema fuer einen Confidence-Eintrag (per Stable-Trait).
+
+    Bug 3 fix (additiv, nicht-breaking): zusaetzlich zu 'level' werden
+    'reasoning' und 'outliers' (image_ids) optional erfasst, damit die UI
+    spaeter Outlier-Listen anzeigen kann ('Welche Bilder weichen vom Mode
+    ab?'). Alte Profile mit string-only Confidence werden in der UI
+    transparent als {level: <string>} interpretiert.
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "level": {
+                "type": "string",
+                "description": "Confidence label, e.g. high | medium | low | fallback.",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "One short sentence explaining the verdict. May be empty.",
+            },
+            "outliers": {
+                "type": "array",
+                "description": "image_ids that disagreed with the chosen value. Empty array if none.",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["level", "reasoning", "outliers"],
+        "additionalProperties": False,
+    }
+
+
 def subject_profile_schema() -> Dict[str, Any]:
     return {
         "type": "object",
@@ -2954,12 +3001,19 @@ def subject_profile_schema() -> Dict[str, Any]:
             },
             "confidence": {
                 "type": "object",
+                "description": (
+                    "Per-field confidence info. Each entry is an object with "
+                    "the canonical level plus an optional reasoning string and "
+                    "outlier image_ids. Backward compatible: legacy profiles "
+                    "where the value is just a string are still accepted by "
+                    "the UI, which falls back to {level: <string>}."
+                ),
                 "properties": {
-                    "gender": {"type": "string"},
-                    "skin_tone": {"type": "string"},
-                    "eye_color": {"type": "string"},
-                    "hair_texture": {"type": "string"},
-                    "body_build": {"type": "string"},
+                    "gender":       _confidence_field_schema(),
+                    "skin_tone":    _confidence_field_schema(),
+                    "eye_color":    _confidence_field_schema(),
+                    "hair_texture": _confidence_field_schema(),
+                    "body_build":   _confidence_field_schema(),
                 },
                 "required": ["gender", "skin_tone", "eye_color", "hair_texture", "body_build"],
                 "additionalProperties": False,
@@ -3059,11 +3113,22 @@ Important:
 - Use single, clean tokens or short phrases. No hedge words, no 'or'-phrases, no 'none visible'.
 - For skin tone, account for studio-lighting bias: studio or ring-light images can make darker skin read lighter.
 - For eye color, treat mirror selfies, filters, and extreme lighting as possible outliers.
-- Body build should be inferred only from medium/full-body observations when possible.
+- Body build is unreliable on headshots. If less than ~30% of input images are medium/full_body,
+  set body_build to "" (empty string) and confidence.body_build.level = "low" with reasoning
+  "few full-body observations". Vision models tend to over-label women as 'slim' on headshots
+  due to RLHF politeness bias - resist this tendency.
 - Glasses are regular only if visible in at least about 60% of sampled usable images.
 - Piercing baseline includes locations visible in at least about 40% of sampled usable images.
 - Tattoo inventory is the union of visible tattoos, grouped by location. Mention only visible markers later.
 - Force-only-when-visible policy: markers like glasses, tattoos and piercings must not be captioned in images where they are not visible.
+
+Confidence object format (REQUIRED for each stable trait):
+  {
+    "level":     "high" | "medium" | "low" | "fallback",
+    "reasoning": "<one short sentence; may be empty>",
+    "outliers":  ["<image_id>", ...]   // image_ids that disagreed with the chosen value; [] if none
+  }
+
 Return JSON only.
 """
 
@@ -3163,6 +3228,19 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
             })
         return out
 
+    # Body-Build-Demotion: Wenn der Anteil aussagekraeftiger Shots
+    # (medium / full_body) zu klein ist, ist body_build unzuverlaessig.
+    body_eligible = sum(1 for r in rows if normalize_text(r.get("shot_type")) in {"medium", "full_body"})
+    body_eligible_fraction = body_eligible / n
+    body_build_value = _mode_clean(rows, "body_build")
+    body_build_reason = ""
+    if body_eligible_fraction < 0.30:
+        body_build_value = ""  # Headshot-Dominanz: lieber leer als raten
+        body_build_reason = (
+            f"Only {body_eligible}/{n} medium-or-full-body shots; body_build "
+            f"unreliable on headshots (fallback)."
+        )
+
     profile = {
         "subject_id": SAFE_TRIGGER,
         "profile_schema_version": PROFILE_CACHE_SCHEMA_VERSION,
@@ -3176,14 +3254,18 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
             "skin_tone": _mode_clean(rows, "skin_tone"),
             "eye_color": _mode_clean(rows, "eye_color"),
             "hair_texture": _mode_clean(rows, "hair_texture"),
-            "body_build": _mode_clean(rows, "body_build"),
+            "body_build": body_build_value,
         },
         "confidence": {
-            "gender": "fallback",
-            "skin_tone": "fallback",
-            "eye_color": "fallback",
-            "hair_texture": "fallback",
-            "body_build": "fallback",
+            "gender":       {"level": "fallback", "reasoning": "", "outliers": []},
+            "skin_tone":    {"level": "fallback", "reasoning": "", "outliers": []},
+            "eye_color":    {"level": "fallback", "reasoning": "", "outliers": []},
+            "hair_texture": {"level": "fallback", "reasoning": "", "outliers": []},
+            "body_build":   {
+                "level": "low" if body_eligible_fraction < 0.30 else "fallback",
+                "reasoning": body_build_reason,
+                "outliers": [],
+            },
         },
         "identity_markers": {
             "glasses": {
@@ -3493,6 +3575,33 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             safe_print(f"   ⚠️ Subject profile normalizer failed; using local fallback: {e}")
             profile = fallback_subject_profile(sample if sample else rows, input_hash, reason=str(e))
             profile["total_usable_images"] = len(rows)
+
+    # Body-Build-Bias-Wachposten: auch wenn der Normalizer einen Wert liefert,
+    # ueberpruefen wir lokal die Datenbasis. Bei <30% medium/full_body-Shots
+    # ist body_build unzuverlaessig (Vision-Modelle defaulten auf 'slim'/'average'
+    # bei Headshots wegen RLHF-Bias).
+    body_eligible = sum(1 for r in rows if normalize_text(r.get("shot_type")) in {"medium", "full_body"})
+    body_eligible_fraction = body_eligible / max(1, len(rows))
+    if body_eligible_fraction < 0.30:
+        stable = profile.setdefault("stable_identity", {})
+        prev_body = stable.get("body_build", "")
+        if prev_body:
+            stable["body_build"] = ""
+            conf = profile.setdefault("confidence", {})
+            existing = conf.get("body_build", {})
+            if not isinstance(existing, dict):
+                existing = {"level": str(existing or ""), "reasoning": "", "outliers": []}
+            existing["level"] = "low"
+            existing["reasoning"] = (
+                f"Demoted: only {body_eligible}/{len(rows)} medium-or-full-body shots; "
+                f"normalizer suggested '{prev_body}' but headshots are unreliable for body build."
+            )
+            existing.setdefault("outliers", [])
+            conf["body_build"] = existing
+            profile.setdefault("normalizer_notes", []).append(
+                f"Body build demoted to empty (was '{prev_body}'): only "
+                f"{body_eligible}/{len(rows)} medium/full-body images. Override in UI if known."
+            )
 
     per_image: Dict[str, Any] = {}
     for row in rows:
@@ -4478,7 +4587,13 @@ def build_caption(
 
     skin_tone = compact_trait(stable_identity.get("skin_tone")) or compact_trait(item.get("skin_tone"))
     eye_color = compact_trait(stable_identity.get("eye_color")) or compact_trait(item.get("eye_color"))
-    body_build = compact_trait(stable_identity.get("body_build")) or compact_trait(item.get("body_build"))
+    # Body-Build-Sticky-Empty: Wenn das Profile bewusst body_build = "" gesetzt hat
+    # (z.B. wegen Headshot-Dominanz oder User-Override im UI), darf NICHT auf den
+    # per-image Audit-Wert zurueckgefallen werden. Sonst wuerde die Demotion sinnlos.
+    if "body_build" in stable_identity:
+        body_build = compact_trait(stable_identity.get("body_build"))
+    else:
+        body_build = compact_trait(item.get("body_build"))
 
     hair_color = image_traits.get("hair_color_base", "")
     hair_form = image_traits.get("hair_form", "")
@@ -5629,38 +5744,10 @@ def main() -> None:
         "review": 1,
     }
 
-    try:
-        caption_rule_overview = get_caption_rule_overview(global_rules) if 'get_caption_rule_overview' in globals() else {"fixed": {}, "override": {}}
-        if INTERACTIVE_CAPTION_OVERRIDE:
-            print("\n================ CAPTION RULE OVERVIEW ================")
-            print("FIXED (stabil erkannt, normalerweise nicht jedes Mal explizit captionen):")
-            for k, v in caption_rule_overview.get("fixed", {}).items():
-                print(f" - {k}: {v.get('mode','')} | counts={v.get('counts',{})}")
-            print("OVERRIDE CANDIDATES (frequent, but not stable enough):")
-            for k, v in caption_rule_overview.get("override", {}).items():
-                print(f" - {k}: mode={v.get('mode','')} | candidates={v.get('candidates',[])} | counts={v.get('counts',{})}")
-            ans = input("\nOverride jetzt anpassen? (j/n): ").strip().lower()
-            if ans in {"j", "ja", "y", "yes"}:
-                print("Format: feld=wert1,wert2   | leer = weiter")
-                while True:
-                    line = input("Override: ").strip()
-                    if not line:
-                        break
-                    if '=' not in line:
-                        print("Invalid. Example: hair_description=blonde,brunette")
-                        continue
-                    field, vals = line.split('=', 1)
-                    field = field.strip()
-                    values = [v.strip() for v in vals.split(',') if v.strip()]
-                    if field in global_rules and isinstance(global_rules[field], dict):
-                        global_rules[field]["override_candidates"] = values
-                        global_rules[field]["variable"] = False # User mapped it manually, so we consider it fixed/stable now
-                        global_rules[field]["mode"] = values[0] if values else ""
-                        print(f"OK -> {field} set to: {values[0] if values else ''} (variable=False)")
-                    else:
-                        print("Unknown field.")
-    except EOFError:
-        pass
+    # Bug 1 fix: Der frueher hier befindliche Console-Override-Block (input()-basiert)
+    # wurde entfernt, weil er im UI-Subprocess-Modus nie greifen konnte. Overrides
+    # laufen jetzt ausschliesslich ueber den Subject-Profile-Tab in der UI bzw.
+    # ueber _profile_override.json (deep-merged in build_subject_profile).
 
     for row in selected_sorted:
         needs_text_cleanup = bool(row.get("watermark_or_overlay") or row.get("prominent_readable_text"))

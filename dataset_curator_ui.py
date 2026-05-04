@@ -596,6 +596,392 @@ def save_subject_profile_ui(trigger_word: str, input_folder: str, profile_json_t
     except Exception as e:
         return tr(f"❌ Speichern fehlgeschlagen: {e}", f"❌ Save failed: {e}")
 
+
+# ============================================================
+# SUBJECT PROFILE TAB - VOCAB & HELPERS
+# ============================================================
+# Diese Listen spiegeln die kanonischen Vocabs aus dataset_curator_v2.py.
+# Bei Aenderungen dort auch hier anpassen.
+
+PROFILE_VOCAB_GENDER: List[str] = ["woman", "man", "girl", "boy", "person"]
+PROFILE_VOCAB_SKIN: List[str] = ["fair", "light", "medium", "tan", "olive", "dark", "deep"]
+PROFILE_VOCAB_EYES: List[str] = ["blue", "green", "hazel", "brown", "dark_brown", "gray", "amber"]
+PROFILE_VOCAB_HAIR_TEXTURE: List[str] = ["straight", "wavy", "curly", "coily", "afro_textured"]
+PROFILE_VOCAB_BODY: List[str] = ["", "slim", "average", "athletic", "curvy", "plus_size", "muscular"]
+PROFILE_VOCAB_HAIR_COLOR: List[str] = [
+    "black", "dark_brown", "brown", "light_brown", "blonde", "platinum",
+    "red", "auburn", "burgundy", "gray", "white", "dyed_other",
+]
+PROFILE_VOCAB_HAIR_FORM: List[str] = [
+    "loose_straight", "loose_wavy", "loose_curly", "loose_coily",
+    "afro_natural", "ponytail", "pigtails", "two_braids", "single_braid",
+    "box_braids", "knotless_braids", "cornrows", "bun", "updo",
+    "half_up", "pulled_back", "short_cut",
+]
+PROFILE_VOCAB_MAKEUP: List[str] = ["none", "minimal", "natural", "defined", "full", "dramatic"]
+
+
+def _conf_level(profile: Dict[str, Any], field: str) -> str:
+    """Liest den Confidence-Level robust aus.
+    Akzeptiert sowohl das neue Object-Format ({level, reasoning, outliers})
+    als auch das alte String-only-Format.
+    """
+    conf = (profile or {}).get("confidence", {})
+    val = conf.get(field, "")
+    if isinstance(val, dict):
+        return str(val.get("level", "") or "")
+    return str(val or "")
+
+
+def _conf_reasoning(profile: Dict[str, Any], field: str) -> str:
+    conf = (profile or {}).get("confidence", {})
+    val = conf.get(field, "")
+    if isinstance(val, dict):
+        return str(val.get("reasoning", "") or "")
+    return ""
+
+
+def _conf_emoji(level: str) -> str:
+    l = (level or "").strip().lower()
+    if l == "high":
+        return "✅"
+    if l == "medium":
+        return "🟡"
+    if l == "low":
+        return "⚠️"
+    if l == "fallback":
+        return "🔁"
+    return "⚪"
+
+
+def _normalize_dropdown_choices(vocab: List[str], current: str) -> List[str]:
+    """Sortiert das Vocab so, dass der aktuelle Wert ganz oben steht,
+    gefolgt von den uebrigen Tokens in stabiler Reihenfolge.
+    """
+    cur = (current or "").strip()
+    if cur and cur in vocab:
+        return [cur] + [v for v in vocab if v != cur]
+    if cur and cur not in vocab:
+        return [cur] + list(vocab)
+    return list(vocab)
+
+
+def aggregate_per_image_traits(profile: Dict[str, Any]) -> Dict[str, List[Tuple[str, int]]]:
+    """Bucket-Counts ueber per_image_traits, sortiert nach Haeufigkeit absteigend."""
+    per_image = (profile or {}).get("per_image_traits", {}) or {}
+    fields = ["hair_color_base", "hair_form", "makeup_intensity"]
+    result: Dict[str, List[Tuple[str, int]]] = {}
+    for field in fields:
+        counts: Dict[str, int] = {}
+        for traits in per_image.values():
+            v = (traits or {}).get(field, "") or ""
+            v = str(v).strip()
+            if not v:
+                continue
+            counts[v] = counts.get(v, 0) + 1
+        sorted_counts = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        result[field] = sorted_counts
+    return result
+
+
+def _bucket_summary_markdown(label: str, counts: List[Tuple[str, int]], vocab: List[str]) -> str:
+    if not counts:
+        return f"**{label}:** _keine Daten_"
+    total = sum(c for _, c in counts)
+    lines = [f"**{label}** (N={total})"]
+    for value, n in counts:
+        marker = "" if value in vocab else " 🟠"
+        lines.append(f"  • `{value}`{marker} — **{n}**")
+    return "\n".join(lines)
+
+
+def _empty_editor_payload(status_msg: str) -> Tuple:
+    """Liefert eine leere Editor-Payload mit dem gegebenen Status."""
+    empty_dropdown = gr.update(choices=[], value="")
+    empty_info = "—"
+    return (
+        {}, "",  # state, raw_json
+        empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown,
+        empty_info, empty_info, empty_info, empty_info, empty_info,
+        False, "",  # glasses
+        "_kein Profil_", "_kein Profil_", "_kein Profil_",
+        "_kein Profil_", "_kein Profil_", "_kein Profil_",
+        # Bucket-edit dropdowns (3x from + 3x to)
+        empty_dropdown, empty_dropdown, empty_dropdown,
+        empty_dropdown, empty_dropdown, empty_dropdown,
+        status_msg,
+    )
+
+
+def load_profile_for_editor(trigger_word: str, input_folder: str):
+    """Laedt ein Profil und fuellt alle UI-Komponenten."""
+    path = subject_profile_path_for(input_folder, trigger_word)
+    if not os.path.exists(path):
+        return _empty_editor_payload(
+            tr(f"⚠️ Kein _subject_profile.json gefunden: {path}",
+               f"⚠️ No _subject_profile.json found: {path}"),
+        )
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+        if not isinstance(profile, dict):
+            raise ValueError("profile is not a JSON object")
+    except Exception as e:
+        return _empty_editor_payload(
+            tr(f"❌ Profil-Lesefehler: {e}", f"❌ Profile read error: {e}"),
+        )
+
+    stable = profile.get("stable_identity", {}) or {}
+    markers = profile.get("identity_markers", {}) or {}
+    glasses = markers.get("glasses", {}) or {}
+
+    def info(field: str) -> str:
+        level = _conf_level(profile, field)
+        reasoning = _conf_reasoning(profile, field)
+        emoji = _conf_emoji(level)
+        if reasoning:
+            return f"{emoji} {level} — {reasoning}"
+        return f"{emoji} {level}" if level else "—"
+
+    gender_val = (stable.get("gender") or "").strip()
+    skin_val = (stable.get("skin_tone") or "").strip()
+    eyes_val = (stable.get("eye_color") or "").strip()
+    hair_tex_val = (stable.get("hair_texture") or "").strip()
+    body_val = (stable.get("body_build") or "").strip()
+
+    gender_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_GENDER, gender_val), value=gender_val)
+    skin_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_SKIN, skin_val), value=skin_val)
+    eyes_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_EYES, eyes_val), value=eyes_val)
+    hair_tex_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_HAIR_TEXTURE, hair_tex_val), value=hair_tex_val)
+    body_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_BODY, body_val), value=body_val)
+
+    counts = aggregate_per_image_traits(profile)
+    hair_color_md = _bucket_summary_markdown(
+        tr("Haarfarbe (per Bild)", "Hair color (per image)"),
+        counts.get("hair_color_base", []),
+        PROFILE_VOCAB_HAIR_COLOR,
+    )
+    hair_form_md = _bucket_summary_markdown(
+        tr("Frisur / Form (per Bild)", "Hair form (per image)"),
+        counts.get("hair_form", []),
+        PROFILE_VOCAB_HAIR_FORM,
+    )
+    makeup_md = _bucket_summary_markdown(
+        tr("Makeup-Intensität (per Bild)", "Makeup intensity (per image)"),
+        counts.get("makeup_intensity", []),
+        PROFILE_VOCAB_MAKEUP,
+    )
+
+    # Re-bucket dropdowns: from-Werte sind die im Profil vorkommenden Tokens
+    color_present = [v for v, _ in counts.get("hair_color_base", [])]
+    form_present = [v for v, _ in counts.get("hair_form", [])]
+    makeup_present = [v for v, _ in counts.get("makeup_intensity", [])]
+
+    color_from_dd = gr.update(choices=color_present, value=(color_present[-1] if color_present else ""))
+    form_from_dd = gr.update(choices=form_present, value=(form_present[-1] if form_present else ""))
+    makeup_from_dd = gr.update(choices=makeup_present, value=(makeup_present[-1] if makeup_present else ""))
+
+    color_to_dd = gr.update(choices=PROFILE_VOCAB_HAIR_COLOR, value=(color_present[0] if color_present else PROFILE_VOCAB_HAIR_COLOR[0]))
+    form_to_dd = gr.update(choices=PROFILE_VOCAB_HAIR_FORM, value=(form_present[0] if form_present else PROFILE_VOCAB_HAIR_FORM[0]))
+    makeup_to_dd = gr.update(choices=PROFILE_VOCAB_MAKEUP, value=(makeup_present[0] if makeup_present else PROFILE_VOCAB_MAKEUP[0]))
+
+    tattoo_inv = markers.get("tattoo_inventory", []) or []
+    piercing_inv = markers.get("piercing_baseline", []) or []
+    if tattoo_inv:
+        tattoo_md = "**" + tr("Tattoo-Inventar", "Tattoo inventory") + f"** ({len(tattoo_inv)})\n\n"
+        for t in tattoo_inv:
+            tattoo_md += f"- `{t.get('location','')}` — {t.get('canonical_description','')} _({t.get('frequency','')})_\n"
+    else:
+        tattoo_md = tr("**Tattoo-Inventar:** _keine erfasst_", "**Tattoo inventory:** _none recorded_")
+
+    if piercing_inv:
+        piercing_md = "**" + tr("Baseline-Piercings", "Baseline piercings") + f"** ({len(piercing_inv)})\n\n"
+        for p in piercing_inv:
+            piercing_md += f"- `{p.get('location','')}` — {p.get('canonical_description','')} _({p.get('frequency','')})_\n"
+    else:
+        piercing_md = tr("**Baseline-Piercings:** _keine erfasst_", "**Baseline piercings:** _none recorded_")
+
+    notes = profile.get("normalizer_notes", []) or []
+    if notes:
+        notes_md = "**" + tr("Normalizer-Notizen", "Normalizer notes") + ":**\n\n" + "\n".join(f"- {n}" for n in notes[:12])
+    else:
+        notes_md = tr("_Keine Normalizer-Notizen._", "_No normalizer notes._")
+
+    raw_json = json.dumps(profile, ensure_ascii=False, indent=2)
+
+    sample = profile.get("sample_size", "?")
+    total = profile.get("total_usable_images", "?")
+    model = profile.get("normalizer_model", "?")
+    schema = profile.get("profile_schema_version", "?")
+    status = tr(
+        f"✅ Profil geladen — Sample {sample}/{total} | {model} | schema {schema}",
+        f"✅ Profile loaded — sample {sample}/{total} | {model} | schema {schema}",
+    )
+
+    return (
+        profile, raw_json,
+        gender_dd, skin_dd, eyes_dd, hair_tex_dd, body_dd,
+        info("gender"), info("skin_tone"), info("eye_color"), info("hair_texture"), info("body_build"),
+        bool(glasses.get("wears_regularly", False)),
+        str(glasses.get("canonical_description", "") or ""),
+        hair_color_md, hair_form_md, makeup_md,
+        tattoo_md, piercing_md, notes_md,
+        color_from_dd, form_from_dd, makeup_from_dd,
+        color_to_dd, form_to_dd, makeup_to_dd,
+        status,
+    )
+
+
+def save_profile_from_editor(
+    trigger_word: str,
+    input_folder: str,
+    raw_profile_json: str,
+    gender: str,
+    skin_tone: str,
+    eye_color: str,
+    hair_texture: str,
+    body_build: str,
+    glasses_regular: bool,
+    glasses_desc: str,
+) -> str:
+    """Speichert die Editor-Werte zurueck ins _subject_profile.json.
+
+    Wir behalten den Rest des Profils (per_image_traits, identity_markers,
+    confidence, notes) und ueberschreiben gezielt die vom User bearbeiteten
+    Felder. raw_profile_json ist der Backup-Zustand fuer den Fall, dass die
+    Datei zwischenzeitlich geloescht wurde.
+    """
+    path = subject_profile_path_for(input_folder, trigger_word)
+    profile: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                profile = json.load(f) or {}
+        except Exception:
+            profile = {}
+    if not isinstance(profile, dict):
+        profile = {}
+
+    if not profile and raw_profile_json.strip():
+        try:
+            backup = json.loads(raw_profile_json)
+            if isinstance(backup, dict):
+                profile = backup
+        except Exception:
+            pass
+
+    if not profile:
+        return tr("❌ Kein Profil zum Speichern vorhanden.", "❌ No profile to save.")
+
+    stable = profile.setdefault("stable_identity", {})
+    stable["gender"] = (gender or "").strip()
+    stable["skin_tone"] = (skin_tone or "").strip()
+    stable["eye_color"] = (eye_color or "").strip()
+    stable["hair_texture"] = (hair_texture or "").strip()
+    stable["body_build"] = (body_build or "").strip()  # explicit "" erlaubt
+
+    markers = profile.setdefault("identity_markers", {})
+    glasses = markers.setdefault("glasses", {"wears_regularly": False, "canonical_description": "", "frequency": ""})
+    glasses["wears_regularly"] = bool(glasses_regular)
+    glasses["canonical_description"] = (glasses_desc or "").strip()
+
+    profile["force_only_when_visible"] = True
+
+    notes = profile.setdefault("normalizer_notes", [])
+    if isinstance(notes, list):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        notes.append(f"User-edited via UI at {stamp}.")
+        profile["normalizer_notes"] = notes[-20:]
+
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
+        return tr(f"✅ Profil gespeichert: {path}", f"✅ Profile saved: {path}")
+    except Exception as e:
+        return tr(f"❌ Speichern fehlgeschlagen: {e}", f"❌ Save failed: {e}")
+
+
+def rebucket_per_image_field(
+    trigger_word: str,
+    input_folder: str,
+    field_name: str,
+    from_value: str,
+    to_value: str,
+) -> str:
+    """Verschiebt alle Per-Image-Eintraege eines Buckets in einen anderen.
+    Anwendungsfall: Normalizer hat 3 Bilder als 'red' klassifiziert, in
+    Wahrheit ist es Lichtartefakt -> alle auf 'blonde' setzen.
+    """
+    if field_name not in {"hair_color_base", "hair_form", "makeup_intensity"}:
+        return tr("❌ Unbekanntes Feld.", "❌ Unknown field.")
+
+    from_value = (from_value or "").strip()
+    to_value = (to_value or "").strip()
+    if not from_value or not to_value:
+        return tr("⚠️ Quell- und Zielwert müssen gesetzt sein.", "⚠️ From and to values required.")
+    if from_value == to_value:
+        return tr("ℹ️ Quelle und Ziel sind identisch.", "ℹ️ Source and target are identical.")
+
+    path = subject_profile_path_for(input_folder, trigger_word)
+    if not os.path.exists(path):
+        return tr(f"❌ Kein Profil unter {path}", f"❌ No profile at {path}")
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+    except Exception as e:
+        return tr(f"❌ Lesefehler: {e}", f"❌ Read error: {e}")
+
+    per_image = profile.get("per_image_traits", {}) or {}
+    moved = 0
+    for image_id, traits in per_image.items():
+        if not isinstance(traits, dict):
+            continue
+        if str(traits.get(field_name, "")).strip() == from_value:
+            traits[field_name] = to_value
+            moved += 1
+
+    if moved == 0:
+        return tr(f"ℹ️ Keine Bilder mit {field_name}={from_value} gefunden.",
+                  f"ℹ️ No images with {field_name}={from_value} found.")
+
+    notes = profile.setdefault("normalizer_notes", [])
+    if isinstance(notes, list):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        notes.append(f"User-rebucket via UI at {stamp}: {field_name} '{from_value}' -> '{to_value}' ({moved} images).")
+        profile["normalizer_notes"] = notes[-20:]
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
+        return tr(f"✅ {moved} Bilder umgebuchtet ({field_name}: {from_value} → {to_value}).",
+                  f"✅ {moved} images re-bucketed ({field_name}: {from_value} → {to_value}).")
+    except Exception as e:
+        return tr(f"❌ Schreibfehler: {e}", f"❌ Write error: {e}")
+
+
+def reset_profile_from_backup(trigger_word: str, input_folder: str, raw_profile_json: str) -> str:
+    """Stellt das Profile aus dem Editor-Textfeld wieder her (Reset-Button)."""
+    if not raw_profile_json.strip():
+        return tr("⚠️ Kein Backup verfügbar.", "⚠️ No backup available.")
+    try:
+        profile = json.loads(raw_profile_json)
+        if not isinstance(profile, dict):
+            return tr("❌ Backup ist kein JSON-Objekt.", "❌ Backup is not a JSON object.")
+    except Exception as e:
+        return tr(f"❌ Backup-JSON ungültig: {e}", f"❌ Backup JSON invalid: {e}")
+
+    path = subject_profile_path_for(input_folder, trigger_word)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
+        return tr(f"↩️ Reset abgeschlossen: {path}", f"↩️ Reset complete: {path}")
+    except Exception as e:
+        return tr(f"❌ Schreibfehler: {e}", f"❌ Write error: {e}")
+
+
 def parse_progress(line: str) -> Optional[Tuple[int, int]]:
     m = re.search(r"\[(\d+)/(\d+)\]", line)
     if m:
@@ -2291,6 +2677,78 @@ def build_ui() -> gr.Blocks:
                             ),
                         )
 
+                with gr.Accordion(tr("🧬 Subject Profile / Pipeline-Modus", "🧬 Subject Profile / pipeline mode"), open=False):
+                    gr.Markdown(tr(
+                        "Phase 2 baut nach dem Bild-Audit ein zentrales Profil des Models. "
+                        "Reject- und Review-Bilder werden dafür ausgeschlossen. Bei großen Datasets "
+                        "wird ein stratifiziertes Sample an den Normalizer geschickt und die Regeln "
+                        "werden lokal auf alle verwertbaren Bilder angewendet. Marker wie Brille, "
+                        "Tattoos und Piercings bleiben strikt force-only-when-visible.\n\n"
+                        "👉 **Profil bearbeiten** und das anschließende Captioning aus dem Profil "
+                        "starten findest du im eigenen Tab `🧬 Subject Profile`.",
+                        "Phase 2 builds a central subject profile after image audit. Reject and review "
+                        "images are excluded. For large datasets, a stratified sample is sent to the "
+                        "normalizer and the rules are applied locally to all usable images. Markers "
+                        "such as glasses, tattoos and piercings remain strictly force-only-when-visible.\n\n"
+                        "👉 **Editing the profile** and starting captioning from the profile is done "
+                        "in the dedicated `🧬 Subject Profile` tab.",
+                    ))
+                    c_pipeline_mode = gr.Dropdown(
+                        label=tr("Pipeline-Modus", "Pipeline mode"),
+                        choices=[
+                            (tr("Single Pass – Profil automatisch nutzen", "Single pass – use profile automatically"), "single_pass"),
+                            (tr("Profile then Caption – UI-Gate (Profil-Tab nutzen)", "Profile then caption – UI gate (use Profile tab)"), "profile_then_caption"),
+                        ],
+                        value=S["c_pipeline_mode"],
+                        info=tr(
+                            "Single Pass nutzt das Profil automatisch. Profile then Caption pausiert nach dem Profil-Build, du gehst dann in den Profil-Tab und startest Captioning dort separat.",
+                            "Single pass uses the profile automatically. Profile then Caption pauses after the profile build; switch to the Profile tab to edit and start captioning separately.",
+                        ),
+                    )
+                    c_profile_normalizer_model = gr.Textbox(
+                        label=tr("Profile-Normalizer-Modell", "Profile normalizer model"),
+                        value=S["c_profile_normalizer_model"],
+                        max_lines=1,
+                        info=tr(
+                            "Modell für den einen zusätzlichen Profil-Call pro Lauf. Empfehlung: gpt-5.4-mini.",
+                            "Model for the single additional profile call per run. Recommended: gpt-5.4-mini.",
+                        ),
+                    )
+                    with gr.Row():
+                        c_profile_sample_threshold = gr.Slider(
+                            label=tr("Sampling ab N Bildern", "Sample when above N images"),
+                            minimum=20,
+                            maximum=2000,
+                            step=10,
+                            value=S["c_profile_sample_threshold"],
+                            info=tr(
+                                "Bis zu dieser Anzahl gehen alle verwertbaren Bilder in den Profil-Normalizer. Darüber wird gesampelt.",
+                                "Up to this number, all usable images go into the profile normalizer. Above this, stratified sampling is used.",
+                            ),
+                        )
+                        c_profile_sample_size = gr.Slider(
+                            label=tr("Profil-Sample-Größe", "Profile sample size"),
+                            minimum=20,
+                            maximum=300,
+                            step=5,
+                            value=S["c_profile_sample_size"],
+                            info=tr(
+                                "Wie viele Bilder bei großen Datasets maximal für den Normalizer ausgewählt werden. Empfehlung: 80.",
+                                "Maximum number of images selected for the normalizer on large datasets. Recommended: 80.",
+                            ),
+                        )
+                        c_profile_ui_per_image_threshold = gr.Slider(
+                            label=tr("UI-Einzelsicht bis N Bilder", "Per-image UI up to N images"),
+                            minimum=5,
+                            maximum=200,
+                            step=5,
+                            value=S["c_profile_ui_per_image_threshold"],
+                            info=tr(
+                                "Bis zu dieser Größe könnte die spätere Einzelbild-Detailprüfung sinnvoll sein. Aktuell wird im Profil-Tab eine aggregierte Bucket-Sicht verwendet.",
+                                "Up to this size, per-image detail review could be useful. Currently the Profile tab uses an aggregated bucket view.",
+                            ),
+                        )
+
                 with gr.Accordion(tr("📝 Caption-Regeln", "📝 Caption rules"), open=False):
                     gr.Markdown(tr(
                         "<details>"
@@ -2384,113 +2842,6 @@ def build_ui() -> gr.Blocks:
                         inputs=[c_captions],
                         outputs=[c_caption_profile],
                     )
-
-                    with gr.Accordion(tr("🧬 Subject Profile / Caption-Normalisierung", "🧬 Subject Profile / caption normalization"), open=False):
-                        gr.Markdown(tr(
-                            "Phase 2 baut nach dem Bild-Audit ein zentrales Profil des Models. "
-                            "Reject- und Review-Bilder werden dafür ausgeschlossen. Bei großen Datasets "
-                            "wird ein stratifiziertes Sample an den Normalizer geschickt und die Regeln "
-                            "werden lokal auf alle verwertbaren Bilder angewendet. Marker wie Brille, "
-                            "Tattoos und Piercings bleiben strikt force-only-when-visible.",
-                            "Phase 2 builds a central subject profile after image audit. Reject and review "
-                            "images are excluded. For large datasets, a stratified sample is sent to the "
-                            "normalizer and the rules are applied locally to all usable images. Markers "
-                            "such as glasses, tattoos and piercings remain strictly force-only-when-visible.",
-                        ))
-                        c_pipeline_mode = gr.Dropdown(
-                            label=tr("Pipeline-Modus", "Pipeline mode"),
-                            choices=[
-                                (tr("Single Pass – Profil automatisch nutzen", "Single pass – use profile automatically"), "single_pass"),
-                                (tr("Profile then Caption – UI-Gate vorbereitet", "Profile then caption – UI gate prepared"), "profile_then_caption"),
-                            ],
-                            value=S["c_pipeline_mode"],
-                            info=tr(
-                                "Single Pass nutzt das Profil automatisch. Profile then Caption pausiert nach dem Profil-Build, zeigt das Profil unten zur Bearbeitung und exportiert Captions erst nach dem separaten Button.",
-                                "Single pass uses the profile automatically. Profile then Caption pauses after profile build, lets you edit the profile below, and exports captions only after the separate button.",
-                            ),
-                        )
-                        c_profile_normalizer_model = gr.Textbox(
-                            label=tr("Profile-Normalizer-Modell", "Profile normalizer model"),
-                            value=S["c_profile_normalizer_model"],
-                            max_lines=1,
-                            info=tr(
-                                "Modell für den einen zusätzlichen Profil-Call pro Lauf. Empfehlung: gpt-5.4-mini.",
-                                "Model for the single additional profile call per run. Recommended: gpt-5.4-mini.",
-                            ),
-                        )
-                        with gr.Row():
-                            c_profile_sample_threshold = gr.Slider(
-                                label=tr("Sampling ab N Bildern", "Sample when above N images"),
-                                minimum=20,
-                                maximum=2000,
-                                step=10,
-                                value=S["c_profile_sample_threshold"],
-                                info=tr(
-                                    "Bis zu dieser Anzahl gehen alle verwertbaren Bilder in den Profil-Normalizer. Darüber wird gesampelt.",
-                                    "Up to this number, all usable images go into the profile normalizer. Above this, stratified sampling is used.",
-                                ),
-                            )
-                            c_profile_sample_size = gr.Slider(
-                                label=tr("Profil-Sample-Größe", "Profile sample size"),
-                                minimum=20,
-                                maximum=300,
-                                step=5,
-                                value=S["c_profile_sample_size"],
-                                info=tr(
-                                    "Wie viele Bilder bei großen Datasets maximal für den Normalizer ausgewählt werden. Empfehlung: 80.",
-                                    "Maximum number of images selected for the normalizer on large datasets. Recommended: 80.",
-                                ),
-                            )
-                            c_profile_ui_per_image_threshold = gr.Slider(
-                                label=tr("UI-Einzelsicht bis N Bilder", "Per-image UI up to N images"),
-                                minimum=5,
-                                maximum=200,
-                                step=5,
-                                value=S["c_profile_ui_per_image_threshold"],
-                                info=tr(
-                                    "Bis zu dieser Größe ist die spätere Einzelbild-Detailprüfung sinnvoll. Große Datasets werden zunächst über JSON/Bucket-Werte bearbeitet.",
-                                    "Up to this size, later per-image detail review is useful. Large datasets are edited via JSON/bucket values first.",
-                                ),
-                            )
-
-                        gr.Markdown(tr(
-                            "### Profil bearbeiten und Captioning starten\n"
-                            "Workflow für Phase 3: 1. Pipeline-Modus auf `profile_then_caption` stellen und normalen Curator starten. "
-                            "2. Nach der Pause Profil laden, bei Bedarf JSON korrigieren und speichern. "
-                            "3. `Captioning aus bestätigtem Profil starten` klicken. Es läuft dann kein neues Audit, sondern nur Export + Caption-Build.",
-                            "### Edit profile and start captioning\n"
-                            "Phase 3 workflow: 1. Set pipeline mode to `profile_then_caption` and start the curator normally. "
-                            "2. After the pause, load the profile, edit JSON if needed, and save. "
-                            "3. Click `Start captioning from confirmed profile`. No new audit is run; only export + caption build happens.",
-                        ))
-                        with gr.Row():
-                            c_profile_load_btn = gr.Button(tr("Profil laden", "Load profile"))
-                            c_profile_save_btn = gr.Button(tr("Profil speichern", "Save profile"))
-                            c_caption_from_profile_btn = gr.Button(
-                                tr("Captioning aus bestätigtem Profil starten", "Start captioning from confirmed profile"),
-                                variant="primary",
-                            )
-                        c_profile_status = gr.Textbox(
-                            label=tr("Profil-Status", "Profile status"),
-                            value="",
-                            interactive=False,
-                            max_lines=2,
-                        )
-                        c_profile_summary = gr.Markdown(
-                            value=tr("Noch kein Profil geladen.", "No profile loaded yet."),
-                        )
-                        c_profile_json = gr.Textbox(
-                            label=tr("_subject_profile.json", "_subject_profile.json"),
-                            value="",
-                            lines=18,
-                            max_lines=28,
-                            interactive=True,
-                            elem_classes=["log-box"],
-                            info=tr(
-                                "Hier kannst du stabile Traits direkt korrigieren. Wichtig: JSON gültig lassen. Brille/Tattoos/Piercings bleiben force-only-when-visible.",
-                                "You can directly correct stable traits here. Important: keep valid JSON. Glasses/tattoos/piercings remain force-only-when-visible.",
-                            ),
-                        )
 
                 with gr.Accordion(tr("💾 Export-Optionen", "💾 Export options"), open=False):
                     gr.Markdown(tr(
@@ -2620,26 +2971,343 @@ def build_ui() -> gr.Blocks:
                     c_exp_review, c_exp_reject, c_exp_compare,
                 ]
 
-                c_profile_load_btn.click(
-                    fn=load_subject_profile_ui,
-                    inputs=[c_trigger, c_input],
-                    outputs=[c_profile_json, c_profile_summary, c_profile_status],
-                )
-                c_profile_save_btn.click(
-                    fn=save_subject_profile_ui,
-                    inputs=[c_trigger, c_input, c_profile_json],
-                    outputs=[c_profile_status],
-                )
                 c_start_btn.click(fn=start_curator, inputs=curator_inputs, outputs=[c_log, c_gallery, c_progress, c_status])
-                c_caption_from_profile_btn.click(
-                    fn=start_caption_from_profile,
-                    inputs=curator_inputs,
-                    outputs=[c_log, c_gallery, c_progress, c_status],
-                )
                 c_stop_btn.click(fn=kill_process, outputs=[c_status])
 
             # ==============================================================
-            # TAB 2: VIDEO PROCESSOR
+            # TAB 2: SUBJECT PROFILE (Phase 3 UI gate)
+            # ==============================================================
+            with gr.TabItem(tr("🧬 Subject Profile", "🧬 Subject Profile")):
+                gr.Markdown(tr(
+                    "### Profil bearbeiten und Captioning starten\n\n"
+                    "Workflow:\n"
+                    "1. Im Curator-Tab `Pipeline-Modus = Profile then Caption` setzen und einen Lauf starten.\n"
+                    "2. Nach der Pause hier `Profil laden` klicken.\n"
+                    "3. Stable Identity prüfen (Dropdowns mit Confidence-Anzeige), bei Bedarf korrigieren. Speziell **Body Build** prüfen — bei Headshot-Dominanz wird er auf leer gesetzt, das ist Absicht.\n"
+                    "4. Variable Traits per Bucket-Sicht prüfen, Ausreißer per `Re-Bucket all` korrigieren.\n"
+                    "5. `Profil speichern` klicken.\n"
+                    "6. `Captioning aus bestätigtem Profil starten` — es läuft kein neues Audit, nur Export + Caption-Build.\n",
+                    "### Edit profile and start captioning\n\n"
+                    "Workflow:\n"
+                    "1. In the Curator tab set `Pipeline mode = Profile then Caption` and start a run.\n"
+                    "2. After the pause click `Load profile` here.\n"
+                    "3. Review stable identity (dropdowns with confidence indicators), correct if needed. Pay attention to **Body Build** — it is forced empty on headshot-dominated sets, by design.\n"
+                    "4. Review variable traits in the bucket view; fix outliers via `Re-bucket all`.\n"
+                    "5. Click `Save profile`.\n"
+                    "6. `Start captioning from confirmed profile` — no new audit runs, only export + caption build.\n",
+                ))
+
+                p_state = gr.State({})
+                p_raw_json = gr.State("")
+
+                with gr.Row():
+                    p_trigger = gr.Textbox(
+                        label=tr("Trigger Word", "Trigger Word"),
+                        value=S["c_trigger"],
+                        max_lines=1,
+                        scale=2,
+                    )
+                    p_input = gr.Textbox(
+                        label=tr("Input-Ordner", "Input folder"),
+                        value=S["c_input"],
+                        max_lines=1,
+                        scale=3,
+                    )
+                    p_load_btn = gr.Button(tr("📂 Profil laden", "📂 Load profile"), variant="secondary", scale=1)
+
+                p_status = gr.Textbox(
+                    label=tr("Status", "Status"),
+                    value=tr("Noch kein Profil geladen.", "No profile loaded yet."),
+                    interactive=False,
+                    max_lines=2,
+                )
+
+                with gr.Tabs():
+                    # ----- Subtab: Stable Identity -----
+                    with gr.TabItem(tr("👤 Stable Identity", "👤 Stable identity")):
+                        gr.Markdown(tr(
+                            "Diese Werte werden in **jeder** Caption verwendet. Confidence-Anzeige hilft "
+                            "bei der Beurteilung. Body Build ist bei Headshot-Sets bewusst leer.",
+                            "These values are used in **every** caption. Confidence indicators help judge "
+                            "reliability. Body build is intentionally empty on headshot-dominated sets.",
+                        ))
+                        with gr.Row():
+                            p_gender = gr.Dropdown(
+                                label=tr("Gender", "Gender"),
+                                choices=PROFILE_VOCAB_GENDER,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            p_gender_info = gr.Markdown("—")
+                        with gr.Row():
+                            p_skin = gr.Dropdown(
+                                label=tr("Skin Tone", "Skin tone"),
+                                choices=PROFILE_VOCAB_SKIN,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            p_skin_info = gr.Markdown("—")
+                        with gr.Row():
+                            p_eyes = gr.Dropdown(
+                                label=tr("Eye Color", "Eye color"),
+                                choices=PROFILE_VOCAB_EYES,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            p_eyes_info = gr.Markdown("—")
+                        with gr.Row():
+                            p_hair_texture = gr.Dropdown(
+                                label=tr("Hair Texture", "Hair texture"),
+                                choices=PROFILE_VOCAB_HAIR_TEXTURE,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            p_hair_texture_info = gr.Markdown("—")
+                        with gr.Row():
+                            p_body = gr.Dropdown(
+                                label=tr("Body Build", "Body build"),
+                                choices=PROFILE_VOCAB_BODY,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            p_body_info = gr.Markdown("—")
+
+                        gr.Markdown(tr("**Brille (Identity Marker)**", "**Glasses (identity marker)**"))
+                        with gr.Row():
+                            p_glasses_regular = gr.Checkbox(
+                                label=tr("Trägt regelmäßig Brille", "Wears glasses regularly"),
+                                value=False,
+                                interactive=True,
+                                scale=1,
+                            )
+                            p_glasses_desc = gr.Textbox(
+                                label=tr("Kanonische Beschreibung", "Canonical description"),
+                                value="",
+                                max_lines=1,
+                                interactive=True,
+                                scale=3,
+                            )
+                        gr.Markdown(tr(
+                            "_Force-only-when-visible bleibt aktiv: Brille wird nur in Captions gesetzt, "
+                            "wenn sie im Bild sichtbar ist._",
+                            "_Force-only-when-visible stays active: glasses are only captioned when visible in the image._",
+                        ))
+
+                    # ----- Subtab: Variable Traits -----
+                    with gr.TabItem(tr("🎨 Variable Traits", "🎨 Variable traits")):
+                        gr.Markdown(tr(
+                            "Per-Image-Tokens für Haarfarbe, Frisur und Makeup. Bei Ausreißern (z.B. "
+                            "Lichtartefakte als 'red' klassifiziert) kannst du Bilder eines Buckets "
+                            "bequem auf einen anderen Wert umbuchen.",
+                            "Per-image tokens for hair color, hair form and makeup. For outliers (e.g. "
+                            "lighting artifacts classified as 'red'), use Re-bucket to move all images "
+                            "of a bucket to another value.",
+                        ))
+
+                        with gr.Row():
+                            with gr.Column():
+                                p_hair_color_md = gr.Markdown("_kein Profil geladen_")
+                                with gr.Row():
+                                    p_color_from = gr.Dropdown(
+                                        label=tr("Quelle", "From"),
+                                        choices=[],
+                                        value="",
+                                        allow_custom_value=True,
+                                        scale=2,
+                                    )
+                                    p_color_to = gr.Dropdown(
+                                        label=tr("Ziel", "To"),
+                                        choices=PROFILE_VOCAB_HAIR_COLOR,
+                                        value=PROFILE_VOCAB_HAIR_COLOR[0],
+                                        allow_custom_value=True,
+                                        scale=2,
+                                    )
+                                    p_color_rebucket_btn = gr.Button(tr("Umbuchen", "Re-bucket"), scale=1)
+                            with gr.Column():
+                                p_hair_form_md = gr.Markdown("_kein Profil geladen_")
+                                with gr.Row():
+                                    p_form_from = gr.Dropdown(
+                                        label=tr("Quelle", "From"),
+                                        choices=[],
+                                        value="",
+                                        allow_custom_value=True,
+                                        scale=2,
+                                    )
+                                    p_form_to = gr.Dropdown(
+                                        label=tr("Ziel", "To"),
+                                        choices=PROFILE_VOCAB_HAIR_FORM,
+                                        value=PROFILE_VOCAB_HAIR_FORM[0],
+                                        allow_custom_value=True,
+                                        scale=2,
+                                    )
+                                    p_form_rebucket_btn = gr.Button(tr("Umbuchen", "Re-bucket"), scale=1)
+                            with gr.Column():
+                                p_makeup_md = gr.Markdown("_kein Profil geladen_")
+                                with gr.Row():
+                                    p_makeup_from = gr.Dropdown(
+                                        label=tr("Quelle", "From"),
+                                        choices=[],
+                                        value="",
+                                        allow_custom_value=True,
+                                        scale=2,
+                                    )
+                                    p_makeup_to = gr.Dropdown(
+                                        label=tr("Ziel", "To"),
+                                        choices=PROFILE_VOCAB_MAKEUP,
+                                        value=PROFILE_VOCAB_MAKEUP[0],
+                                        allow_custom_value=True,
+                                        scale=2,
+                                    )
+                                    p_makeup_rebucket_btn = gr.Button(tr("Umbuchen", "Re-bucket"), scale=1)
+
+                    # ----- Subtab: Inventur & Notizen -----
+                    with gr.TabItem(tr("🏷️ Tattoos & Piercings", "🏷️ Tattoos & piercings")):
+                        gr.Markdown(tr(
+                            "Inventur aller jemals gesehenen Tattoos und Piercings. In Captions werden "
+                            "nur die im jeweiligen Bild sichtbaren Marker erwähnt (Force-only-when-visible).",
+                            "Inventory of all ever-seen tattoos and piercings. In captions only the markers "
+                            "actually visible in each image are mentioned (force-only-when-visible).",
+                        ))
+                        with gr.Row():
+                            with gr.Column():
+                                p_tattoo_md = gr.Markdown("_kein Profil geladen_")
+                            with gr.Column():
+                                p_piercing_md = gr.Markdown("_kein Profil geladen_")
+
+                    # ----- Subtab: Diagnostics -----
+                    with gr.TabItem(tr("🔬 Diagnostik & Raw JSON", "🔬 Diagnostics & raw JSON")):
+                        p_notes_md = gr.Markdown("_kein Profil geladen_")
+                        p_raw_view = gr.Textbox(
+                            label=tr("_subject_profile.json (Read-only Backup)", "_subject_profile.json (read-only backup)"),
+                            value="",
+                            lines=18,
+                            max_lines=28,
+                            interactive=False,
+                            elem_classes=["log-box"],
+                            info=tr(
+                                "Snapshot beim Laden. Wird beim Reset zurückgespielt.",
+                                "Snapshot at load time. Used for reset.",
+                            ),
+                        )
+
+                # Action bar
+                with gr.Row():
+                    p_save_btn = gr.Button(tr("💾 Profil speichern", "💾 Save profile"), variant="secondary", scale=1)
+                    p_reset_btn = gr.Button(tr("↩️ Reset auf Backup", "↩️ Reset to backup"), variant="secondary", scale=1)
+                    p_continue_btn = gr.Button(
+                        tr("▶ Captioning aus bestätigtem Profil starten",
+                           "▶ Start captioning from confirmed profile"),
+                        variant="primary",
+                        scale=2,
+                    )
+
+                # Live log + gallery für Phase 3 Continue-Run
+                p_status_run = gr.Textbox(label=tr("Run-Status", "Run status"), interactive=False, max_lines=1)
+                p_progress = gr.Slider(label=tr("Fortschritt", "Progress"), minimum=0, maximum=1, step=0.01, value=0, interactive=False)
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        p_log = gr.Textbox(label=tr("Live-Log", "Live log"), lines=14, max_lines=14, interactive=False, elem_classes=["log-box"])
+                    with gr.Column(scale=2):
+                        p_gallery = gr.Gallery(label=tr("Train-Ready Vorschau", "Train-ready preview"), columns=3, rows=3, height=340, object_fit="cover")
+
+                # ---- Wiring ----
+                p_load_outputs = [
+                    p_state, p_raw_json,
+                    p_gender, p_skin, p_eyes, p_hair_texture, p_body,
+                    p_gender_info, p_skin_info, p_eyes_info, p_hair_texture_info, p_body_info,
+                    p_glasses_regular, p_glasses_desc,
+                    p_hair_color_md, p_hair_form_md, p_makeup_md,
+                    p_tattoo_md, p_piercing_md, p_notes_md,
+                    p_color_from, p_form_from, p_makeup_from,
+                    p_color_to, p_form_to, p_makeup_to,
+                    p_status,
+                ]
+                p_load_btn.click(
+                    fn=load_profile_for_editor,
+                    inputs=[p_trigger, p_input],
+                    outputs=p_load_outputs,
+                )
+
+                # Snapshot p_raw_json into the read-only diagnostics view
+                p_raw_json.change(
+                    fn=lambda s: s,
+                    inputs=[p_raw_json],
+                    outputs=[p_raw_view],
+                )
+
+                p_save_btn.click(
+                    fn=save_profile_from_editor,
+                    inputs=[
+                        p_trigger, p_input, p_raw_json,
+                        p_gender, p_skin, p_eyes, p_hair_texture, p_body,
+                        p_glasses_regular, p_glasses_desc,
+                    ],
+                    outputs=[p_status],
+                )
+
+                p_reset_btn.click(
+                    fn=reset_profile_from_backup,
+                    inputs=[p_trigger, p_input, p_raw_json],
+                    outputs=[p_status],
+                ).then(
+                    fn=load_profile_for_editor,
+                    inputs=[p_trigger, p_input],
+                    outputs=p_load_outputs,
+                )
+
+                # Re-bucket buttons
+                p_color_rebucket_btn.click(
+                    fn=lambda t, i, fr, to: rebucket_per_image_field(t, i, "hair_color_base", fr, to),
+                    inputs=[p_trigger, p_input, p_color_from, p_color_to],
+                    outputs=[p_status],
+                ).then(
+                    fn=load_profile_for_editor,
+                    inputs=[p_trigger, p_input],
+                    outputs=p_load_outputs,
+                )
+                p_form_rebucket_btn.click(
+                    fn=lambda t, i, fr, to: rebucket_per_image_field(t, i, "hair_form", fr, to),
+                    inputs=[p_trigger, p_input, p_form_from, p_form_to],
+                    outputs=[p_status],
+                ).then(
+                    fn=load_profile_for_editor,
+                    inputs=[p_trigger, p_input],
+                    outputs=p_load_outputs,
+                )
+                p_makeup_rebucket_btn.click(
+                    fn=lambda t, i, fr, to: rebucket_per_image_field(t, i, "makeup_intensity", fr, to),
+                    inputs=[p_trigger, p_input, p_makeup_from, p_makeup_to],
+                    outputs=[p_status],
+                ).then(
+                    fn=load_profile_for_editor,
+                    inputs=[p_trigger, p_input],
+                    outputs=p_load_outputs,
+                )
+
+                # Continue-Button: nutzt die bestehenden Curator-Inputs (shared state across tabs).
+                # Die Reihenfolge muss exakt zu start_caption_from_profile passen.
+                # p_trigger / p_input ueberschreiben c_trigger / c_input wenn der User sie hier
+                # geaendert hat - daher syncen wir sie zuerst zurueck in den Curator-Tab.
+                def _sync_trigger_input(trigger_value, input_value):
+                    return trigger_value, input_value
+
+                p_continue_btn.click(
+                    fn=_sync_trigger_input,
+                    inputs=[p_trigger, p_input],
+                    outputs=[c_trigger, c_input],
+                ).then(
+                    fn=start_caption_from_profile,
+                    inputs=curator_inputs,  # dieselbe Liste wie der ehemalige Continue-Button im Curator-Tab
+                    outputs=[p_log, p_gallery, p_progress, p_status_run],
+                )
+
+            # ==============================================================
+            # TAB 3: VIDEO PROCESSOR
             # ==============================================================
             with gr.TabItem(tr("🎬 Video Processor", "🎬 Video Processor")):
 
@@ -2742,7 +3410,7 @@ def build_ui() -> gr.Blocks:
                 v_stop_btn.click(fn=kill_process, outputs=[v_status])
 
             # ==============================================================
-            # TAB 3: ERGEBNISSE
+            # TAB 4: ERGEBNISSE
             # ==============================================================
             with gr.TabItem(tr("📊 Ergebnisse", "📊 Results")):
                 gr.Markdown(tr("### Datensatz durchsuchen", "### Browse dataset"))
