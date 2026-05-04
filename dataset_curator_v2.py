@@ -177,6 +177,14 @@ EARLY_PHASH_KEEP_PER_GROUP = 2
 USE_EARLY_PHASH_LOOP1 = True
 EARLY_PHASH_HAMMING_THRESHOLD_1 = 1
 EARLY_PHASH_KEEP_PER_GROUP_1 = 1
+# Bei Loop 1 (exact duplicates, threshold=1) wird der Survivor strikt nach
+# Auflösung/Größe gewählt: höchste Megapixel gewinnen, Dateigröße als
+# zweitwichtiges Kriterium, Schärfe nur als Tie-Breaker.
+# Begründung: bei nahezu pixelidentischen Bildern dominiert die technische
+# Variante (Original > Kompressionskopie > Resize) über minimale Schärfe-
+# Schwankungen durch JPEG-Recompression.
+# Loop 2 (Bulk-Frames, threshold=4) bleibt bei der Quality-First-Logik.
+EARLY_PHASH_LOOP1_PREFER_RESOLUTION = True
 USE_EARLY_PHASH_LOOP2 = True
 EARLY_PHASH_HAMMING_THRESHOLD_2 = 4
 EARLY_PHASH_KEEP_PER_GROUP_2 = 2
@@ -195,6 +203,46 @@ MIN_FACE_RATIO = {
     "medium": 0.015,
     "full_body": 0.004,
     }
+
+# --------------------------------
+# Multiple-People Dominance-Override
+# --------------------------------
+# Wenn die API multiple_people=True meldet, schaut der Curator zusaetzlich
+# auf das Groessenverhaeltnis zwischen Hauptgesicht und zweitgroesstem
+# lokal erkannten Gesicht. Wenn das zweite Gesicht winzig im Vergleich ist
+# (typisch: Reflexion in Brillenglaesern, Spiegelbild, Hintergrund-Statist
+# am Strand), wird das Bild NICHT hart als reject markiert, sondern in
+# 04_review verschoben - dort kannst du es manuell freigeben.
+#
+# Greift nur wenn:
+#   - lokal mindestens 2 Gesichter erkannt wurden (sonst kein Verhaeltnis)
+#   - secondary_face_area_ratio < CO_FACE_AREA_RATIO_THRESHOLD
+#   - quality_total >= MULTIPLE_PEOPLE_SOFT_SCORE_MIN
+ENABLE_MULTIPLE_PEOPLE_DOMINANCE_OVERRIDE = True
+CO_FACE_AREA_RATIO_THRESHOLD = 0.25      # 2. Gesicht muss < 25% des Hauptgesichts sein
+MULTIPLE_PEOPLE_SOFT_SCORE_MIN = 75      # Mindestscore fuer Downgrade reject -> review
+
+# --------------------------------
+# Body-Visibility-Bonus (LoRA-Body-Learning)
+# --------------------------------
+# Bei der Final-Auswahl wird Bildern mit gut sichtbarem Koerper ein Bonus
+# auf den Pick-Score gegeben - bei sonst gleicher Bildqualitaet gewinnen
+# die Body-Shots, die dem LoRA mehr Koerperinformation liefern (Bikini,
+# Tank Top + Shorts, Sportkleidung etc.).
+#
+# WICHTIG: Wirkt nur auf adjusted_pick_score (Final-Auswahl), NICHT auf
+# quality_total/keep/review/reject. Bilder mit viel Kleidung werden NICHT
+# bestraft - sie bekommen nur weniger Bonus.
+#
+# Geltungsbereich nach shot_type:
+#   - full_body: voller Bonus
+#   - medium:    halber Bonus (Torso teilweise sichtbar)
+#   - headshot:  0 (Koerper nicht im Frame, body_skin_visibility=n_a)
+ENABLE_BODY_VISIBILITY_BONUS = True
+BODY_VISIBILITY_BONUS_FULLBODY_HIGH = 6.0
+BODY_VISIBILITY_BONUS_FULLBODY_MEDIUM = 2.0
+BODY_VISIBILITY_BONUS_MEDIUM_SHOT_HIGH = 3.0
+BODY_VISIBILITY_BONUS_MEDIUM_SHOT_MEDIUM = 1.0
 
 # --------------------------------
 # Triggerwort-Prüfung
@@ -1240,6 +1288,59 @@ def early_duplicate_pick_score(image_path: str) -> Tuple[float, Dict[str, float]
     }
 
 
+def early_duplicate_pick_score_resolution_strict(image_path: str) -> Tuple[float, Dict[str, float]]:
+    """
+    Strikte Auswahl-Logik fuer Loop 1 (exact duplicates, threshold=1).
+
+    Bei nahezu pixelidentischen Bildern dominiert die technische Variante
+    (Original > Kompressionskopie > Resize) ueber minimale Schaerfe-
+    Schwankungen durch JPEG-Recompression. Daher:
+
+      1. Megapixel  - Hauptkriterium (klar dominant)
+      2. Dateigroesse in KB - bei gleicher Aufloesung gewinnt die
+         technisch unkomprimiertere Version
+      3. Schaerfe (Laplacian-Varianz) - reiner Tie-Breaker
+
+    Score so kalibriert, dass jeder Schritt eine eigene Groessenordnung
+    bekommt: Megapixel-Term ist immer groesser als der maximale
+    Filesize-Term, der wiederum immer groesser als der Schaerfe-Term ist.
+    """
+    width, height = image_dimensions(image_path)
+    pixel_count = max(1.0, float(width * height))
+    megapixels = pixel_count / 1_000_000.0
+    blur_variance = local_blur_variance(image_path)
+    blur_score = math.log1p(max(0.0, blur_variance))
+    filesize_kb = local_filesize_kb(image_path)
+
+    # Hierarchische Gewichtung:
+    #   Megapixel (×1000)   -> dominanter Term, jeder MP ist ~1000 Punkte
+    #   Filesize KB (×0.1)  -> bei 10 MB ~1024 Punkte, immer kleiner als 1 MP
+    #   Blur (×1.0)         -> log-Skala, Werte typisch 3-7, reiner Tie-Breaker
+    score = (
+        megapixels * 1000.0
+        + min(filesize_kb, 50_000.0) * 0.1
+        + blur_score * 1.0
+    )
+
+    # main_face_ratio wird nicht aktiv ins Scoring einbezogen, aber fuer
+    # die Sekundaer-Sortierung im Pass mitgeliefert (siehe _early_phash_dedup_pass).
+    main_face_ratio = 0.0
+    try:
+        metrics = local_subject_metrics(image_path, phash_cache=None)
+        main_face_ratio = float(metrics.get("main_face_ratio") or 0.0)
+    except Exception:
+        pass
+
+    return score, {
+        "blur_variance": blur_variance,
+        "megapixels": megapixels,
+        "main_face_ratio": main_face_ratio,
+        "face_count": 0.0,
+        "pose_ratio": 0.0,
+        "filesize_kb": filesize_kb,
+    }
+
+
 
 def local_filesize_kb(image_path: str) -> float:
     try:
@@ -1582,8 +1683,16 @@ def _early_phash_dedup_pass(
     threshold: int,
     keep_per_group: int,
     label: str,
+    prefer_resolution_strict: bool = False,
 ) -> Tuple[List[str], List[str]]:
-    """Run one deterministic early pHash grouping pass on already hashed images."""
+    """Run one deterministic early pHash grouping pass on already hashed images.
+
+    prefer_resolution_strict: wenn True, wird bei der Survivor-Auswahl strikt
+    nach Aufloesung/Dateigroesse priorisiert (siehe
+    early_duplicate_pick_score_resolution_strict). Gedacht fuer Loop 1
+    (exakte Duplikate), wo der Bildinhalt nahezu identisch ist und die
+    technische Variante das einzig sinnvolle Unterscheidungsmerkmal ist.
+    """
     survivor_set = set()
     duplicate_set = set()
     no_hash_paths = [path for path in image_paths if path not in phash_cache]
@@ -1608,24 +1717,46 @@ def _early_phash_dedup_pass(
     survivors = list(no_hash_paths)
     score_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
     keep_n = max(1, int(keep_per_group))
+    pick_fn = (
+        early_duplicate_pick_score_resolution_strict
+        if prefer_resolution_strict
+        else early_duplicate_pick_score
+    )
     for group in groups:
         members: List[Tuple[str, int]] = group["members"]
         ranked_members = []
         for member_path, _ in members:
-            score_cache[member_path] = early_duplicate_pick_score(member_path)
+            score_cache[member_path] = pick_fn(member_path)
             ranked_members.append((member_path, *score_cache[member_path]))
 
-        ranked_members.sort(
-            key=lambda item: (
-                item[1],
-                item[2].get("main_face_ratio", 0.0),
-                item[2].get("blur_variance", -1.0),
-                item[2].get("megapixels", 0.0),
-                item[2].get("filesize_kb", 0.0),
-                item[0].lower(),
-            ),
-            reverse=True,
-        )
+        if prefer_resolution_strict:
+            # Strikte Reihenfolge: Megapixel zuerst, dann Filesize, dann Schaerfe.
+            # Der primaere score enthaelt die Hierarchie bereits, aber wir
+            # legen die Einzelfelder nochmal als Tie-Breaker dahinter,
+            # damit identische Scores deterministisch aufloesen.
+            ranked_members.sort(
+                key=lambda item: (
+                    item[1],
+                    item[2].get("megapixels", 0.0),
+                    item[2].get("filesize_kb", 0.0),
+                    item[2].get("blur_variance", -1.0),
+                    item[2].get("main_face_ratio", 0.0),
+                    item[0].lower(),
+                ),
+                reverse=True,
+            )
+        else:
+            ranked_members.sort(
+                key=lambda item: (
+                    item[1],
+                    item[2].get("main_face_ratio", 0.0),
+                    item[2].get("blur_variance", -1.0),
+                    item[2].get("megapixels", 0.0),
+                    item[2].get("filesize_kb", 0.0),
+                    item[0].lower(),
+                ),
+                reverse=True,
+            )
 
         kept_members = ranked_members[:keep_n]
         removed_members = ranked_members[keep_n:]
@@ -1638,9 +1769,10 @@ def _early_phash_dedup_pass(
 
     survivors = [p for p in image_paths if p in survivor_set or (p in no_hash_paths and p not in duplicate_set)]
     duplicates = [p for p in image_paths if p in duplicate_set]
+    mode_label = "resolution-priority" if prefer_resolution_strict else "quality-priority"
     safe_print(
         f"   ↳ {label}: kept {len(survivors)}, removed {len(duplicates)} duplicates "
-        f"(threshold={threshold}, keep/group={keep_n})"
+        f"(threshold={threshold}, keep/group={keep_n}, mode={mode_label})"
     )
     return survivors, duplicates
 
@@ -1683,6 +1815,7 @@ def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dic
             int(globals().get("EARLY_PHASH_HAMMING_THRESHOLD_1", 1)),
             int(globals().get("EARLY_PHASH_KEEP_PER_GROUP_1", 1)),
             "Early pHash loop 1 (exact duplicates)",
+            prefer_resolution_strict=bool(globals().get("EARLY_PHASH_LOOP1_PREFER_RESOLUTION", True)),
         )
         all_duplicates.extend(duplicates)
 
@@ -1728,6 +1861,7 @@ def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]]
         "face_count_local": 0,
         "main_face_bbox": None,
         "main_face_ratio": 0.0,
+        "secondary_face_area_ratio": 0.0,  # 2.-grösstes Gesicht / grösstes Gesicht (0..1). 0.0 = nur ein Gesicht.
         "pose_bbox": None,
         "torso_landmark_count": -1,  # -1 = MediaPipe nicht gelaufen / nicht verfuegbar
         "phash": None,
@@ -1767,9 +1901,16 @@ def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]]
                     bh = clamp_int(int(bbox.height * h), 1, h)
                     boxes.append((x, y, bw, bh, float(det.score[0])))
                 metrics["face_count_local"] = len(boxes)
-                best = max(boxes, key=lambda b: b[2] * b[3] * max(0.001, b[4]))
+                # Boxes nach Area sortieren (groesstes zuerst), dann Verhaeltnis 2./1. berechnen.
+                # Genutzt von local_status_override fuer dominance-aware multiple_people-Override.
+                sorted_boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+                best = sorted_boxes[0]
                 metrics["main_face_bbox"] = [best[0], best[1], best[2], best[3]]
                 metrics["main_face_ratio"] = bbox_area_ratio(metrics["main_face_bbox"], w, h)
+                if len(sorted_boxes) >= 2:
+                    main_area = max(1, sorted_boxes[0][2] * sorted_boxes[0][3])
+                    sec_area = sorted_boxes[1][2] * sorted_boxes[1][3]
+                    metrics["secondary_face_area_ratio"] = round(sec_area / main_area, 4)
         except Exception:
             pass
 
@@ -1779,9 +1920,14 @@ def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]]
             faces = HAAR_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
             if len(faces) > 0:
                 metrics["face_count_local"] = len(faces)
-                x, y, bw, bh = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)[0]
+                sorted_faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+                x, y, bw, bh = sorted_faces[0]
                 metrics["main_face_bbox"] = [int(x), int(y), int(bw), int(bh)]
                 metrics["main_face_ratio"] = bbox_area_ratio(metrics["main_face_bbox"], w, h)
+                if len(sorted_faces) >= 2:
+                    main_area = max(1, sorted_faces[0][2] * sorted_faces[0][3])
+                    sec_area = sorted_faces[1][2] * sorted_faces[1][3]
+                    metrics["secondary_face_area_ratio"] = round(sec_area / main_area, 4)
         except Exception:
             pass
 
@@ -1853,7 +1999,12 @@ def cache_path_for_file(file_hash: str) -> str:
 #       Headshots und draengt das Modell, Curvy/Plus_size/Muscular nicht
 #       weichzuspuelen. Aenderung der Antwortverteilung -> Cache-Bump,
 #       damit alte 'slim'-Antworten auf Headshots neu erhoben werden.
-AUDIT_CACHE_SCHEMA_VERSION = "v4"
+#   v5: Schema um body_skin_visibility erweitert (low/medium/high/n_a).
+#       Neues Pflichtfeld im Audit, der Pick-Score nutzt es fuer einen
+#       Body-Shot-Bonus zugunsten von Bildern mit gut sichtbarem Koerper
+#       (LoRA-Body-Learning). Caches inkompatibel - alle Audits werden
+#       neu erhoben. Kein Heuristik-Fallback aus clothing_description.
+AUDIT_CACHE_SCHEMA_VERSION = "v5"
 
 
 def audit_cache_key(base_hash: str, model: str, variant: str = "audit") -> str:
@@ -2433,6 +2584,11 @@ def build_api_schema() -> Dict[str, Any]:
                 "description": "Eye color of the main subject, e.g. 'blue', 'green', 'gray-green', 'brown', 'dark brown'. Empty string if not visible."
             },
             "body_build": {"type": "string"},
+            "body_skin_visibility": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "n_a"],
+                "description": "Fraction of bare skin visible on the body (excluding face and neck). See prompt for criteria. Use 'n_a' for headshots where the body is not in frame."
+            },
             "tattoos_visible": {"type": "boolean"},
             "tattoos_description": {"type": "string"},
             "clothing_description": {"type": "string"},
@@ -2583,6 +2739,7 @@ def build_api_schema() -> Dict[str, Any]:
             "skin_tone",
             "eye_color",
             "body_build",
+            "body_skin_visibility",
             "tattoos_visible",
             "tattoos_description",
             "clothing_description",
@@ -2670,6 +2827,20 @@ Important:
     * Resist the tendency to default to "slim" or "average". Use "curvy", "plus_size",
       "athletic", "muscular" when the body actually shows those traits. Do not soften.
     * Allowed values: slim | average | athletic | curvy | plus_size | muscular | "" (empty for headshots).
+- body_skin_visibility: how much bare skin (body only, EXCLUDING face and neck)
+  is visible. Use exactly one of these values:
+    * "low": long sleeves, long pants/skirt below the knee, body almost fully
+      covered (winter coat, hoodie + jeans, full-length dress, business suit).
+    * "medium": short sleeves OR knee-length bottoms, forearms or lower legs
+      visible but not both extremities prominently bare (t-shirt + jeans,
+      polo + chinos, blouse + midi skirt).
+    * "high": tank top / sleeveless top / spaghetti straps, OR shorts above the
+      knee, OR swimwear (bikini, swimsuit, trunks), OR sportswear with
+      significant bare skin (athletic crop top, running shorts).
+    * "n_a": headshot where the body is not in frame, OR body fully obscured
+      (e.g. wrapped in a blanket, only silhouette visible, framing too tight).
+  Decide based on what is visible in THIS image only. Do not soften toward
+  "low" out of caution. This is a neutral factual classification.
 - Classify head_pose_bucket based on the main subject's head orientation:
     'frontal' = directly facing camera (yaw < ~15 degrees);
     'three_quarter_left' / 'three_quarter_right' = yaw between ~15 and ~75 degrees, named for which side of the face is more visible to camera;
@@ -3944,12 +4115,14 @@ def write_caption_stage_reports(
         "main_subject_clear", "watermark_or_overlay", "prominent_readable_text",
         "mirror_selfie", "hair_description", "beard_description", "glasses_description",
         "piercings_description", "makeup_description", "skin_tone", "eye_color", "body_build",
+        "body_skin_visibility",
         "tattoos_visible", "tattoos_description", "clothing_description", "pose_description",
         "expression", "gaze_direction", "head_pose_bucket", "background_description",
         "lighting_description", "lighting_type", "background_type", "hair_texture",
         "makeup_intensity", "has_glasses_now", "glasses_frame_shape", "issues",
         "short_reason", "local_override_reasons", "duplicate_of", "duplicate_method",
-        "duplicate_distance", "main_face_ratio", "face_count_local", "width", "height",
+        "duplicate_distance", "main_face_ratio", "secondary_face_area_ratio",
+        "face_count_local", "width", "height",
         "file_size_mb", "arcface_distance_to_centroid", "arcface_flag", "final_caption",
     ]
 
@@ -4153,6 +4326,21 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     issues = set(item.get("issues", []))
 
     if multiple_people:
+        # Dominance-Check: Wenn das Hauptgesicht klar dominiert, ist die
+        # API-Meldung wahrscheinlich ein Mismatch (Reflexion in Brille,
+        # Hintergrund-Statist, Spiegelbild). Dann statt hard reject -> review.
+        sec_ratio = float(item.get("secondary_face_area_ratio", 0.0))
+        if (ENABLE_MULTIPLE_PEOPLE_DOMINANCE_OVERRIDE
+                and face_count_local >= 2
+                and 0.0 < sec_ratio < CO_FACE_AREA_RATIO_THRESHOLD
+                and score >= MULTIPLE_PEOPLE_SOFT_SCORE_MIN):
+            reasons.append(
+                f"multiple_people_dominant_main_face(sec_ratio={sec_ratio:.2f},score={score})"
+            )
+            item.setdefault("status_notes", []).append(
+                f"multiple_people_downgraded_to_review_sec_ratio_{sec_ratio:.2f}"
+            )
+            return "review", reasons
         reasons.append("multiple_people")
         return "reject", reasons
 
@@ -4504,6 +4692,39 @@ def diversity_penalty(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> f
     return penalty
 
 
+def body_visibility_bonus(item: Dict[str, Any]) -> float:
+    """
+    Bonus auf den Pick-Score zugunsten von Bildern mit gut sichtbarem Koerper
+    (LoRA-Body-Learning). Wirkt nur auf die Final-Auswahl, nie auf
+    keep/review/reject.
+
+    Geltungsbereich nach shot_type:
+      - full_body: voller Bonus (FULLBODY_HIGH / FULLBODY_MEDIUM)
+      - medium:    halber Bonus (MEDIUM_SHOT_HIGH / MEDIUM_SHOT_MEDIUM)
+      - headshot:  0 (Koerper nicht im Frame)
+
+    body_skin_visibility-Werte 'low' und 'n_a' liefern 0 - kein Penalty,
+    nur weniger Bonus.
+    """
+    if not ENABLE_BODY_VISIBILITY_BONUS:
+        return 0.0
+    visibility = str(item.get("body_skin_visibility", "")).strip().lower()
+    shot = str(item.get("shot_type", "")).strip().lower()
+    if visibility in ("", "low", "n_a") or shot == "headshot":
+        return 0.0
+    if shot == "full_body":
+        if visibility == "high":
+            return float(BODY_VISIBILITY_BONUS_FULLBODY_HIGH)
+        if visibility == "medium":
+            return float(BODY_VISIBILITY_BONUS_FULLBODY_MEDIUM)
+    elif shot == "medium":
+        if visibility == "high":
+            return float(BODY_VISIBILITY_BONUS_MEDIUM_SHOT_HIGH)
+        if visibility == "medium":
+            return float(BODY_VISIBILITY_BONUS_MEDIUM_SHOT_MEDIUM)
+    return 0.0
+
+
 def adjusted_pick_score(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> float:
     # Identity ist das primäre Ziel – 3× stärker gewichtet als bisher
     base = float(item.get("quality_identity_usefulness", 0)) * 3.0
@@ -4520,6 +4741,10 @@ def adjusted_pick_score(item: Dict[str, Any], selected: List[Dict[str, Any]]) ->
     face_ratio = float(item.get("main_face_ratio", 0.0))
     base += (face_ratio * 100.0) * 0.5
     base += min(5.0, float(item.get("file_size_mb", 0.0)))
+
+    # Body-Visibility-Bonus: bevorzugt Body-Shots mit mehr sichtbarem Koerper
+    # bei gleicher Bildqualitaet. Nur fuer full_body und medium relevant.
+    base += body_visibility_bonus(item)
 
     if item.get("base_status") == "review":
         base -= 3.0
@@ -6245,6 +6470,7 @@ def main() -> None:
         "makeup_description",
         "skin_tone",
         "body_build",
+        "body_skin_visibility",
         "tattoos_visible",
         "tattoos_description",
         "clothing_description",
@@ -6261,6 +6487,7 @@ def main() -> None:
         "duplicate_method",
         "duplicate_distance",
         "main_face_ratio",
+        "secondary_face_area_ratio",
         "face_count_local",
         "width",
         "height",
