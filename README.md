@@ -70,7 +70,7 @@ pip install requests pillow numpy
 pip install mediapipe==0.10.33
 pip install "torch==2.10.0" "torchvision==0.25.0" "torchaudio==2.10.0" --index-url https://download.pytorch.org/whl/cu130
 pip install open_clip_torch
-pip install opencv-python ignsightface onnxruntime scikit-learn
+pip install opencv-python insightface onnxruntime scikit-learn
 pip install gradio
 pip install onnxruntime-gpu
 python dataset_curator_ui.py
@@ -102,9 +102,9 @@ python dataset_curator_ui.py
 
 4. During profile-based workflows, the curator also writes a `_subject_profile.json`, which stores the normalized subject information used for caption generation.
 
-5. Results are written into `curated_<trigger>/` with folders such as `01_train_ready`, `02_caption_remove`, `03_review`, `04_reject`, `05_needs_manual_review`, `_cache` and `07_smart_crop_pairs`.
+5. Results are written into `curated_<trigger>/` with folders such as `01_train_ready`, `02_keep_unused`, `03_caption_remove`, `04_review`, `05_reject`, `06_needs_manual_review`, `_cache` and `08_smart_crop_pairs`.
 
-6. Use the `01_train_ready` files and selected pictures from `03_review` for your LoRA training. Also check `02_caption_remove` and `05_needs_manual_review` for shots that may only need minor manual cleanup or recaptioning.
+6. Use the `01_train_ready` files and selected pictures from `04_review` for your LoRA training. Also check `02_keep_unused`, `03_caption_remove` and `06_needs_manual_review` for shots that may only need minor manual cleanup, manual selection or recaptioning.
 
 ### 2. Video Processor
 
@@ -130,8 +130,9 @@ This project can optionally use the OpenAI API to score images and generate stru
 - The API key is either:
   - provided via the UI field `OpenAI API Key`, or
   - read from the `OPENAI_API_KEY` environment variable.
-- The key is only used locally in the process environment and is **never** stored in the repository.
-  Runtime config files (like `_ui_config.json`, `_ui_video_config.json`, `_ui_settings.json`) are excluded via `.gitignore`.
+- The key is only used locally by the UI/subprocess workflow and is **never** stored in the repository.
+  For convenience, saved UI settings may persist it in local runtime files such as `_ui_settings.json`; transient run configs such as `_ui_config.json` pass it to the curator process.
+  These runtime config files (`_ui_config.json`, `_ui_video_config.json`, `_ui_settings.json`) are excluded via `.gitignore` and should not be shared.
 
 By using the OpenAI API you agree to the OpenAI Terms of Use and Services Agreement.
 

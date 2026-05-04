@@ -165,6 +165,16 @@ HARD_MIN_BRIGHT_MEDIAN    = 255       # Über 225/255 -> überbelichtet
 USE_EARLY_PHASH_DEDUP     = True
 EARLY_PHASH_HAMMING_THRESHOLD = 4
 EARLY_PHASH_KEEP_PER_GROUP = 2
+# Optional two-pass early pHash filtering, controlled by the UI:
+#   Loop 1: exact/near-exact duplicates, keep only the best one.
+#   Loop 2: bulk/video-frame near-duplicates, keep a little variation.
+# The legacy EARLY_PHASH_* values above remain as non-UI defaults/fallbacks.
+USE_EARLY_PHASH_LOOP1 = True
+EARLY_PHASH_HAMMING_THRESHOLD_1 = 1
+EARLY_PHASH_KEEP_PER_GROUP_1 = 1
+USE_EARLY_PHASH_LOOP2 = True
+EARLY_PHASH_HAMMING_THRESHOLD_2 = 4
+EARLY_PHASH_KEEP_PER_GROUP_2 = 2
 
 # Qualitätsschwellen (0-100, nach interner ×10-Normalisierung)
 # Bilder unter diesem Wert werden von "keep" auf "review" herabgestuft.
@@ -899,15 +909,17 @@ def clean_audit_string(text: Optional[str]) -> str:
 
 def normalize_caption_profile(value: Optional[str]) -> str:
     v = normalize_text(value)
-    if v in {"ernie", "z_image_base", "custom"}:
+    if v in {"ernie", "shared_compact"}:
+        return "shared_compact"
+    if v in {"z_image_base", "custom"}:
         return v
-    return "ernie"
+    return "shared_compact"
 
 
 def enforce_caption_policy_profile(profile: Optional[str], policy: Dict[str, Any]) -> Dict[str, Any]:
     """Ensure profile-specific caption fields stay enabled."""
     normalized = normalize_caption_profile(profile)
-    if normalized == "ernie":
+    if normalized in {"ernie", "shared_compact"}:
         policy["include_body_build"] = True
         policy["include_tattoos"] = True
         policy["include_eye_color"] = True
@@ -1558,6 +1570,75 @@ def local_quick_reject_post_crop(image_path: str, width: int, height: int) -> Op
     return None
 
 
+def _early_phash_dedup_pass(
+    image_paths: List[str],
+    phash_cache: Dict[str, int],
+    threshold: int,
+    keep_per_group: int,
+    label: str,
+) -> Tuple[List[str], List[str]]:
+    """Run one deterministic early pHash grouping pass on already hashed images."""
+    survivor_set = set()
+    duplicate_set = set()
+    no_hash_paths = [path for path in image_paths if path not in phash_cache]
+
+    hashed_items = sorted(
+        [(path, phash_cache[path]) for path in image_paths if path in phash_cache],
+        key=lambda x: os.path.basename(x[0]).lower(),
+    )
+
+    groups: List[Dict[str, Any]] = []
+    for path, phash in hashed_items:
+        assigned = False
+        for group in groups:
+            anchor_hash = group["anchor_hash"]
+            if hamming_distance(phash, anchor_hash) <= threshold:
+                group["members"].append((path, phash))
+                assigned = True
+                break
+        if not assigned:
+            groups.append({"anchor_hash": phash, "members": [(path, phash)]})
+
+    survivors = list(no_hash_paths)
+    score_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
+    keep_n = max(1, int(keep_per_group))
+    for group in groups:
+        members: List[Tuple[str, int]] = group["members"]
+        ranked_members = []
+        for member_path, _ in members:
+            score_cache[member_path] = early_duplicate_pick_score(member_path)
+            ranked_members.append((member_path, *score_cache[member_path]))
+
+        ranked_members.sort(
+            key=lambda item: (
+                item[1],
+                item[2].get("main_face_ratio", 0.0),
+                item[2].get("blur_variance", -1.0),
+                item[2].get("megapixels", 0.0),
+                item[2].get("filesize_kb", 0.0),
+                item[0].lower(),
+            ),
+            reverse=True,
+        )
+
+        kept_members = ranked_members[:keep_n]
+        removed_members = ranked_members[keep_n:]
+
+        for member_path, _, _ in kept_members:
+            survivor_set.add(member_path)
+            survivors.append(member_path)
+        for member_path, _, _ in removed_members:
+            duplicate_set.add(member_path)
+
+    survivors = [p for p in image_paths if p in survivor_set or (p in no_hash_paths and p not in duplicate_set)]
+    duplicates = [p for p in image_paths if p in duplicate_set]
+    safe_print(
+        f"   ↳ {label}: kept {len(survivors)}, removed {len(duplicates)} duplicates "
+        f"(threshold={threshold}, keep/group={keep_n})"
+    )
+    return survivors, duplicates
+
+
 def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dict[str, int]]:
     """
     Berechnet pHash für alle Bilder und entfernt nur nahezu identische,
@@ -1586,70 +1667,50 @@ def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dic
             h = None
         hashes.append((p, h))
 
-    survivor_set = set()
-    duplicate_set = set()
-    no_hash_paths = [path for path, phash in hashes if phash is None]
+    survivors = list(image_paths)
+    all_duplicates: List[str] = []
 
-    # pHash-fähige Bilder zuerst stabil nach Dateiname sortieren, damit die
-    # Gruppenbildung reproduzierbar bleibt. Die eigentliche Auswahl erfolgt
-    # anschließend über den lokalen Qualitätsscore.
-    hashed_items = sorted(
-        [(path, phash) for path, phash in hashes if phash is not None],
-        key=lambda x: os.path.basename(x[0]).lower(),
-    )
-
-    groups: List[Dict[str, Any]] = []
-    for path, phash in hashed_items:
-        assigned = False
-        for group in groups:
-            anchor_hash = group["anchor_hash"]
-            if hamming_distance(phash, anchor_hash) <= EARLY_PHASH_HAMMING_THRESHOLD:
-                group["members"].append((path, phash))
-                assigned = True
-                break
-        if not assigned:
-            groups.append({"anchor_hash": phash, "members": [(path, phash)]})
-
-    survivors = list(no_hash_paths)
-    score_cache: Dict[str, Tuple[float, Dict[str, float]]] = {}
-    keep_per_group = max(1, int(EARLY_PHASH_KEEP_PER_GROUP))
-    for group in groups:
-        members: List[Tuple[str, int]] = group["members"]
-        ranked_members = []
-        for member_path, _ in members:
-            score_cache[member_path] = early_duplicate_pick_score(member_path)
-            ranked_members.append((member_path, *score_cache[member_path]))
-
-        ranked_members.sort(
-            key=lambda item: (
-                item[1],
-                item[2].get("main_face_ratio", 0.0),
-                item[2].get("blur_variance", -1.0),
-                item[2].get("megapixels", 0.0),
-                item[2].get("filesize_kb", 0.0),
-                item[0].lower(),
-            ),
-            reverse=True,
+    if bool(globals().get("USE_EARLY_PHASH_LOOP1", True)):
+        survivors, duplicates = _early_phash_dedup_pass(
+            survivors,
+            phash_cache,
+            int(globals().get("EARLY_PHASH_HAMMING_THRESHOLD_1", 1)),
+            int(globals().get("EARLY_PHASH_KEEP_PER_GROUP_1", 1)),
+            "Early pHash loop 1 (exact duplicates)",
         )
+        all_duplicates.extend(duplicates)
 
-        kept_members = ranked_members[:keep_per_group]
-        removed_members = ranked_members[keep_per_group:]
+    if bool(globals().get("USE_EARLY_PHASH_LOOP2", True)):
+        survivors, duplicates = _early_phash_dedup_pass(
+            survivors,
+            phash_cache,
+            int(globals().get("EARLY_PHASH_HAMMING_THRESHOLD_2", EARLY_PHASH_HAMMING_THRESHOLD)),
+            int(globals().get("EARLY_PHASH_KEEP_PER_GROUP_2", EARLY_PHASH_KEEP_PER_GROUP)),
+            "Early pHash loop 2 (bulk near-duplicates)",
+        )
+        all_duplicates.extend(duplicates)
 
-        for member_path, _, _ in kept_members:
-            survivor_set.add(member_path)
-            survivors.append(member_path)
+    # Backward-compatible fallback if both UI loops are disabled but the legacy
+    # master switch is enabled: run the old single-pass configuration.
+    if not bool(globals().get("USE_EARLY_PHASH_LOOP1", True)) and not bool(globals().get("USE_EARLY_PHASH_LOOP2", True)):
+        survivors, duplicates = _early_phash_dedup_pass(
+            survivors,
+            phash_cache,
+            int(EARLY_PHASH_HAMMING_THRESHOLD),
+            int(EARLY_PHASH_KEEP_PER_GROUP),
+            "Early pHash legacy pass",
+        )
+        all_duplicates.extend(duplicates)
 
-        for member_path, _, _ in removed_members:
-            duplicate_set.add(member_path)
+    duplicate_seen = set()
+    unique_duplicates = []
+    for p in all_duplicates:
+        if p not in duplicate_seen:
+            duplicate_seen.add(p)
+            unique_duplicates.append(p)
 
-    survivors = [p for p in image_paths if p in survivor_set or (p in no_hash_paths and p not in duplicate_set)]
-    duplicates = [p for p in image_paths if p in duplicate_set]
-
-    safe_print(
-        f"   ↳ Early pHash: kept {len(survivors)}, removed {len(duplicates)} duplicates "
-        f"(threshold={EARLY_PHASH_HAMMING_THRESHOLD}, keep/group={keep_per_group})\n"
-    )
-    return survivors, duplicates, phash_cache
+    safe_print(f"   ↳ Early pHash total: kept {len(survivors)}, removed {len(unique_duplicates)} duplicates\n")
+    return survivors, unique_duplicates, phash_cache
 
 
 def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
@@ -4746,7 +4807,7 @@ def build_caption(
     lighting = normalize_feature_value(item.get("lighting_description"))
 
     anchor_parts: List[str] = []
-    if caption_profile == "ernie":
+    if caption_profile in {"ernie", "shared_compact"}:
         if hair_tag:
             anchor_parts.append(hair_tag)
         if CAPTION_POLICY.get("include_eye_color") and eye_color:
@@ -4767,7 +4828,7 @@ def build_caption(
         # Grammatical compact tag: "slim build" instead of a dangling "slim".
         trait_bits.append(body_build if "build" in body_build else f"{body_build} build")
 
-    if caption_profile != "ernie" and hair_tag:
+    if caption_profile not in {"ernie", "shared_compact"} and hair_tag:
         trait_bits.append(hair_tag)
 
     beard_rule = global_rules.get("beard_description", {})

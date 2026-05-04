@@ -1363,12 +1363,12 @@ def load_results(input_folder, trigger_word, subfolder):
         "caption_remove": "03_caption_remove",
         "review": "04_review",
         "reject": "05_reject",
-        "smart_crop_pairs": "07_smart_crop_pairs",
+        "smart_crop_pairs": "08_smart_crop_pairs",
 
         "Caption Remove": "03_caption_remove",
         "Review": "04_review",
         "Reject": "05_reject",
-        "Smart Crop Paare": "07_smart_crop_pairs",
+        "Smart Crop Paare": "08_smart_crop_pairs",
     }
     target = os.path.join(root, folder_map.get(subfolder, "01_train_ready"))
     image_paths = scan_images(target, limit=100)
@@ -1751,7 +1751,7 @@ def build_ui() -> gr.Blocks:
                         "`02_keep_unused` – sie sind nicht aussortiert, gehen aber nur ins "
                         "Trainings-Set, wenn sonst nicht genug Material da ist.\n\n"
                         "**Reject-Schwelle (unten):** Unter diesem Score wird das Bild "
-                        "**direkt verworfen** und landet in `03_rejected`. Keine zweite Chance.\n\n"
+                        "**direkt verworfen** und landet in `05_reject` (wenn Reject-Export aktiv ist). Keine zweite Chance.\n\n"
                         "**Faustregel:** Lass zwischen Reject und Keep einen Abstand von "
                         "mindestens 20 Punkten. Sonst gibt es kaum Bilder im Review-Bereich, "
                         "und wenn dein Material knapp wird, hast du keinen Puffer.\n\n"
@@ -1771,7 +1771,7 @@ def build_ui() -> gr.Blocks:
                         "rejected, but only used in the training set if there's a shortage of "
                         "better material.\n\n"
                         "**Reject threshold (lower):** Below this score, the image is "
-                        "**immediately rejected** and lands in `03_rejected`. No second chance.\n\n"
+                        "**immediately rejected** and lands in `05_reject` (if reject export is enabled). No second chance.\n\n"
                         "**Rule of thumb:** Leave at least 20 points between reject and keep. "
                         "Otherwise you'll have almost no images in the review range, and if "
                         "you run short on material later, you'll have no buffer.\n\n"
@@ -2854,11 +2854,11 @@ def build_ui() -> gr.Blocks:
                         "wären, aber wegen der Cluster-Limits oder Diversitäts-Regeln nicht "
                         "ins finale Set kamen. Falls dir später Material fehlt, kannst du "
                         "von hier nachschöpfen.\n\n"
-                        "**03_rejected** (optional): Verworfene Bilder mit Begründung in "
+                        "**05_reject** (optional): Verworfene Bilder mit Begründung in "
                         "der Caption-Datei (z. B. 'rejected: face_blur_too_low'). Nützlich "
                         "zum Debuggen, ob deine Schwellen zu streng sind. Bei großen "
                         "Datasets kann das viele MB werden.\n\n"
-                        "**05_review_candidates** (optional): Bilder die das Hauptmodell "
+                        "**04_review** (optional): Bilder die das Hauptmodell "
                         "als 'review' markiert hat – Grenzfälle, die du visuell prüfen "
                         "kannst. Wenn die Eskalation an ist, sind das die Bilder, die "
                         "zusätzlich vom stärkeren Modell entschieden wurden.\n\n"
@@ -2881,11 +2881,11 @@ def build_ui() -> gr.Blocks:
                         "good enough but didn't make the final set due to cluster limits "
                         "or diversity rules. If you later need more material, you can pull "
                         "from here.\n\n"
-                        "**03_rejected** (optional): Rejected images with reason in the "
+                        "**05_reject** (optional): Rejected images with reason in the "
                         "caption file (e.g. 'rejected: face_blur_too_low'). Useful for "
                         "debugging whether your thresholds are too strict. For large "
                         "datasets this can grow to many MB.\n\n"
-                        "**05_review_candidates** (optional): Images the main model "
+                        "**04_review** (optional): Images the main model "
                         "flagged as 'review' – borderline cases for visual inspection. "
                         "When escalation is on, these are the images additionally "
                         "decided by the stronger model.\n\n"
@@ -2904,16 +2904,16 @@ def build_ui() -> gr.Blocks:
                             label=tr("Review-Kandidaten exportieren", "Export review candidates"),
                             value=S["c_exp_review"],
                             info=tr(
-                                "Speichert Bilder im Grenzbereich in `05_review_candidates` zur manuellen Sichtung. Empfohlen: an, besonders wenn dir der Curator gerade neue Schwellen lernt.",
-                                "Saves borderline images to `05_review_candidates` for manual review. Recommended: on, especially while you're tuning the curator's thresholds.",
+                                "Speichert Bilder im Grenzbereich in `04_review` zur manuellen Sichtung. Empfohlen: an, besonders wenn dir der Curator gerade neue Schwellen lernt.",
+                                "Saves borderline images to `04_review` for manual review. Recommended: on, especially while you're tuning the curator's thresholds.",
                             ),
                         )
                         c_exp_reject = gr.Checkbox(
                             label=tr("Verworfene Bilder exportieren", "Export rejected images"),
                             value=S["c_exp_reject"],
                             info=tr(
-                                "Speichert verworfene Bilder mit Reject-Grund in `03_rejected`. Empfohlen: an für die ersten Läufe (zum Debuggen). Bei großen Produktions-Datasets kannst du es ausschalten, um Platz zu sparen.",
-                                "Saves rejected images with reject reason to `03_rejected`. Recommended: on for initial runs (for debugging). For large production datasets you can turn it off to save space.",
+                                "Speichert verworfene Bilder mit Reject-Grund in `05_reject`. Empfohlen: an für die ersten Läufe (zum Debuggen). Bei großen Produktions-Datasets kannst du es ausschalten, um Platz zu sparen.",
+                                "Saves rejected images with reject reason to `05_reject`. Recommended: on for initial runs (for debugging). For large production datasets you can turn it off to save space.",
                             ),
                         )
                         c_exp_compare = gr.Checkbox(

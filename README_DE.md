@@ -104,9 +104,9 @@ python dataset_curator_ui.py
 
 4. In profilbasierten Workflows wird zusätzlich eine `_subject_profile.json` erzeugt, die die normalisierten Subject-Informationen für die Captions speichert.
 
-5. Ergebnisse liegen in `curated_<trigger>/` mit Ordnern wie `01_train_ready`, `02_caption_remove`, `03_review`, `04_reject`, `05_needs_manual_review`, `_cache` und `07_smart_crop_pairs`.
+5. Ergebnisse liegen in `curated_<trigger>/` mit Ordnern wie `01_train_ready`, `02_keep_unused`, `03_caption_remove`, `04_review`, `05_reject`, `06_needs_manual_review`, `_cache` und `08_smart_crop_pairs`.
 
-6. Nutze die Dateien aus `01_train_ready` und ausgewählte Bilder aus `03_review` für dein LoRA-Training. Prüfe zusätzlich `02_caption_remove` und `05_needs_manual_review`, falls Lieblingsbilder nur noch kleine manuelle Nacharbeit oder eine angepasste Caption brauchen.
+6. Nutze die Dateien aus `01_train_ready` und ausgewählte Bilder aus `04_review` für dein LoRA-Training. Prüfe zusätzlich `02_keep_unused`, `03_caption_remove` und `06_needs_manual_review`, falls Lieblingsbilder nur noch kleine manuelle Auswahl, Nacharbeit oder eine angepasste Caption brauchen.
 
 ### 2. Video Processor
 
@@ -132,8 +132,9 @@ Dieses Projekt kann optional die OpenAI-API nutzen, um Bilder zu bewerten und st
 - Der API-Key wird entweder:
   - über das UI-Feld `OpenAI API Key` gesetzt oder
   - aus der Umgebungsvariablen `OPENAI_API_KEY` gelesen.
-- Der Key wird nur lokal im Prozessumfeld verwendet und **nicht** im Repository gespeichert.
-  Laufzeit-Konfigurationsdateien (wie `_ui_config.json`, `_ui_video_config.json`, `_ui_settings.json`) sind per `.gitignore` ausgeschlossen.
+- Der Key wird nur lokal im UI-/Subprozess-Workflow verwendet und **nicht** im Repository gespeichert.
+  Zur Bequemlichkeit können gespeicherte UI-Einstellungen ihn lokal in Laufzeitdateien wie `_ui_settings.json` persistieren; temporäre Run-Configs wie `_ui_config.json` übergeben ihn an den Curator-Prozess.
+  Diese Laufzeit-Konfigurationsdateien (`_ui_config.json`, `_ui_video_config.json`, `_ui_settings.json`) sind per `.gitignore` ausgeschlossen und sollten nicht geteilt werden.
 
 Mit der Nutzung der OpenAI-API erklärst du dich mit den OpenAI Terms of Use und dem OpenAI Services Agreement einverstanden.
 
