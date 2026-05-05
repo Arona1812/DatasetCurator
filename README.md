@@ -9,7 +9,8 @@ The curator combines local filters (sharpness, resolution, pHash), MediaPipe, CL
 
 ## Reason
 
-This project started from a very practical frustration: manually sorting, preparing, and captioning datasets had become unnecessarily time-consuming. What began as an experiment in automating that workflow through ChatGPT evolved, after roughly 300 prompts and input from 4 different LLMs, into the tool you see here. In the most literal sense, it was 100% vibe-coded.
+This project started from a very practical frustration: manually sorting, preparing, and captioning datasets had become unnecessarily time-consuming. What began as an experiment in automating that workflow through ChatGPT evolved, after roughly 400 prompts and input from 4 different LLMs, into the tool you see here. In the most literal sense, it was 100% vibe-coded.
+Please be also aware that this is still a work in progress. Every iteration makes it better, more detailed and harder to use. 
 
 ---
 

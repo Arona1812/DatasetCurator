@@ -9,7 +9,8 @@ Der Curator kombiniert lokale Filter (Schärfe, Auflösung, pHash), MediaPipe, C
 
 ## Hintergrund
 
-Dieses Projekt ist aus einem sehr praktischen Frust entstanden: Das manuelle Sortieren, Aufbereiten und Beschriften von Datensätzen war auf Dauer schlicht zu aufwendig. Also habe ich begonnen, gemeinsam mit ChatGPT nach Möglichkeiten zur Automatisierung dieses Workflows zu suchen. Nach rund 300 Prompts und dem Einsatz von 4 verschiedenen LLMs ist daraus das Tool entstanden, das du hier siehst. Im wahrsten Sinne des Wortes: 100 % vibe-coded.
+Dieses Projekt ist aus einem sehr praktischen Frust entstanden: Das manuelle Sortieren, Aufbereiten und Beschriften von Datensätzen war auf Dauer schlicht zu aufwendig. Also habe ich begonnen, gemeinsam mit ChatGPT nach Möglichkeiten zur Automatisierung dieses Workflows zu suchen. Nach rund 400 Prompts und dem Einsatz von 4 verschiedenen LLMs ist daraus das Tool entstanden, das du hier siehst. Im wahrsten Sinne des Wortes: 100 % vibe-coded.
+Bitte beachten: Das Projekt ist weiterhin in Arbeit und noch nicht perfekt. Jede Iteration macht es besser, detaillierter und schwieriger zu bedienen.
 
 ---
 

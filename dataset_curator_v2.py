@@ -245,6 +245,35 @@ BODY_VISIBILITY_BONUS_MEDIUM_SHOT_HIGH = 3.0
 BODY_VISIBILITY_BONUS_MEDIUM_SHOT_MEDIUM = 1.0
 
 # --------------------------------
+# Face-Orientation-Penalty (Anatomie im Bildrahmen)
+# --------------------------------
+# Bewertet, wie das Gesicht im 2D-FRAME orientiert ist - nicht die Pose
+# der Person im 3D-Raum. Ein liegendes Selfie kann 'upright' sein, wenn
+# das Foto so gehalten wurde dass die Augen weiterhin oben sind. Wenn
+# die Kamera dagegen aus extremer Unter-/Aufsicht aufgenommen wurde
+# und im Frame die Augen UNTER dem Mund liegen, lernt das LoRA die
+# Anatomie umgekehrt - das ist toxisch fuer's Training.
+#
+# Werte (aus dem Audit):
+#   upright   : Augen klar ueber Mund, Kopf vertikal (Rotation bis ~30°)
+#   tilted    : Schraege ~30-60°, Augen noch im oberen Gesichtsbereich
+#   sideways  : ~60-120° rotiert, Augen seitlich neben dem Mund
+#   inverted  : Augen UNTER dem Mund, Frame quasi auf-dem-Kopf (>~120°)
+#   n_a       : Kein Gesicht im Frame (Rueckansicht, Occlusion)
+#
+# Wirkung:
+#   - Pick-Score-Penalty (sofort, nur Final-Auswahl)
+#   - Status-Downgrade keep -> review fuer 'inverted' immer,
+#     fuer 'sideways' nur wenn quality_composition < 70
+ENABLE_FACE_ORIENTATION_PENALTY = True
+FACE_ORIENTATION_PENALTY_TILTED = 3.0
+FACE_ORIENTATION_PENALTY_SIDEWAYS = 10.0
+FACE_ORIENTATION_PENALTY_INVERTED = 20.0
+FACE_ORIENTATION_DOWNGRADE_INVERTED_TO_REVIEW = True
+FACE_ORIENTATION_DOWNGRADE_SIDEWAYS_TO_REVIEW = True
+FACE_ORIENTATION_SIDEWAYS_DOWNGRADE_COMPOSITION_MAX = 70
+
+# --------------------------------
 # Triggerwort-Prüfung
 # --------------------------------
 USE_AI_TRIGGERWORD_CHECK = False  # Prüft das Triggerwort per KI auf Kollisionen / problematische Namensähnlichkeit
@@ -2004,7 +2033,14 @@ def cache_path_for_file(file_hash: str) -> str:
 #       Body-Shot-Bonus zugunsten von Bildern mit gut sichtbarem Koerper
 #       (LoRA-Body-Learning). Caches inkompatibel - alle Audits werden
 #       neu erhoben. Kein Heuristik-Fallback aus clothing_description.
-AUDIT_CACHE_SCHEMA_VERSION = "v5"
+#   v6: Schema um face_orientation_in_frame erweitert
+#       (upright/tilted/sideways/inverted/n_a). Bewertet die Orientierung
+#       des Gesichts im 2D-Bildrahmen, nicht die Pose im 3D-Raum: ein
+#       liegendes Selfie aus Aug-Hoehe ist 'upright'; ein liegendes
+#       Selfie aus extremer Untersicht (Augen unter dem Mund im Frame)
+#       ist 'inverted' und fuer LoRA-Training toxisch, weil das Modell
+#       die Anatomie umgekehrt lernt. Caches inkompatibel.
+AUDIT_CACHE_SCHEMA_VERSION = "v6"
 
 
 def audit_cache_key(base_hash: str, model: str, variant: str = "audit") -> str:
@@ -2589,6 +2625,11 @@ def build_api_schema() -> Dict[str, Any]:
                 "enum": ["low", "medium", "high", "n_a"],
                 "description": "Fraction of bare skin visible on the body (excluding face and neck). See prompt for criteria. Use 'n_a' for headshots where the body is not in frame."
             },
+            "face_orientation_in_frame": {
+                "type": "string",
+                "enum": ["upright", "tilted", "sideways", "inverted", "n_a"],
+                "description": "Orientation of the face within the 2D image frame, NOT the person's pose in 3D space. Judge what a viewer sees in the frame. See prompt for criteria. Use 'n_a' if no face is in the frame."
+            },
             "tattoos_visible": {"type": "boolean"},
             "tattoos_description": {"type": "string"},
             "clothing_description": {"type": "string"},
@@ -2740,6 +2781,7 @@ def build_api_schema() -> Dict[str, Any]:
             "eye_color",
             "body_build",
             "body_skin_visibility",
+            "face_orientation_in_frame",
             "tattoos_visible",
             "tattoos_description",
             "clothing_description",
@@ -2841,6 +2883,31 @@ Important:
       (e.g. wrapped in a blanket, only silhouette visible, framing too tight).
   Decide based on what is visible in THIS image only. Do not soften toward
   "low" out of caution. This is a neutral factual classification.
+- face_orientation_in_frame: orientation of the face within the 2D IMAGE
+  FRAME as a viewer sees it. This is NOT the person's pose in 3D space - a
+  person lying on a bed can still appear "upright" in the frame if the
+  photo was taken so the eyes are above the mouth in the picture. Judge
+  the rendered image, NOT what you imagine the real-world scene looks like.
+  CRITICAL: do not mentally rotate the image to "fix" it. If a viewer
+  scrolling on a phone would see the face upside-down without rotating
+  their device, classify it as 'inverted'. Use exactly one value:
+    * "upright": eyes clearly above mouth in the frame, head roughly
+      vertical (rotation up to ~30 degrees from vertical). Standard
+      portraits, normal selfies, walking shots etc.
+    * "tilted": noticeable rotation ~30-60 degrees, head visibly leaning
+      but eyes still in the upper region of the face area in the frame.
+    * "sideways": face rotated ~60-120 degrees in the frame, eyes appear
+      LEFT or RIGHT of the mouth rather than above it. Typical for
+      selfies of someone lying on their side where the camera is held
+      level with the body.
+    * "inverted": face is upside-down in the frame, eyes appear BELOW the
+      mouth. Typical for selfies of someone lying on their back where the
+      camera is held above and pointed down toward their feet, or for
+      photos that were taken upside-down and not corrected.
+    * "n_a": no face is in the frame at all (back of head visible, face
+      fully occluded by an object).
+  This classification is critical for LoRA training: 'sideways' and
+  'inverted' images teach the model wrong anatomy unless rotated first.
 - Classify head_pose_bucket based on the main subject's head orientation:
     'frontal' = directly facing camera (yaw < ~15 degrees);
     'three_quarter_left' / 'three_quarter_right' = yaw between ~15 and ~75 degrees, named for which side of the face is more visible to camera;
@@ -4094,6 +4161,56 @@ def _write_captioned_image(row: Dict[str, Any], out_dir: str, new_basename: str,
         f.write(row["final_caption"])
 
 
+def build_reject_reason_string(row: Dict[str, Any]) -> str:
+    """
+    Baut den vollstaendigen REJECTED REASON-String aus allen verfuegbaren
+    Reject-Quellen einer Row. Wird sowohl im Single-Pass-Modus (main()) als
+    auch im Profile-Then-Caption-Modus (continue_caption_from_profile)
+    verwendet, damit beide Pfade konsistente .txt-Dateien produzieren.
+
+    Reihenfolge der Quellen:
+      1. local_override_reasons (Liste oder String aus CSV-Roundtrip)
+      2. status_notes (Duplikat-Marker, Smart-Crop-Marker etc.)
+      3. short_reason (hart vergebener Grund: too_small, NSFW, script_error,
+         oder bei API-Reject die Audit-Beschreibung)
+      4. duplicate_method/duplicate_of explizit
+      5. API suggested_status=reject mit short_reason als api_reject:
+    """
+    reason_parts: List[str] = []
+
+    lor = row.get("local_override_reasons", [])
+    if isinstance(lor, str):
+        lor = [x.strip() for x in lor.split(",") if x.strip()]
+    reason_parts.extend(lor)
+
+    sn = row.get("status_notes", [])
+    if isinstance(sn, str):
+        sn = [x.strip() for x in sn.split(",") if x.strip()]
+    for note in sn:
+        if note not in reason_parts:
+            reason_parts.append(note)
+
+    sr = row.get("short_reason", "")
+    if sr and sr not in reason_parts:
+        reason_parts.append(sr)
+
+    dup_method = row.get("duplicate_method", "")
+    dup_of = row.get("duplicate_of", "")
+    if dup_method and dup_of:
+        dup_info = f"duplicate_of:{dup_of} (method:{dup_method})"
+        if dup_info not in reason_parts:
+            reason_parts.append(dup_info)
+
+    api_status = row.get("suggested_status", "")
+    api_reason = row.get("short_reason", "")
+    if api_status == "reject" and api_reason:
+        api_label = f"api_reject: {api_reason}"
+        if api_label not in reason_parts:
+            reason_parts.append(api_label)
+
+    return ", ".join(reason_parts) if reason_parts else "unknown"
+
+
 def write_caption_stage_reports(
     *,
     all_rows: List[Dict[str, Any]],
@@ -4116,6 +4233,7 @@ def write_caption_stage_reports(
         "mirror_selfie", "hair_description", "beard_description", "glasses_description",
         "piercings_description", "makeup_description", "skin_tone", "eye_color", "body_build",
         "body_skin_visibility",
+        "face_orientation_in_frame",
         "tattoos_visible", "tattoos_description", "clothing_description", "pose_description",
         "expression", "gaze_direction", "head_pose_bucket", "background_description",
         "lighting_description", "lighting_type", "background_type", "hair_texture",
@@ -4293,8 +4411,9 @@ def continue_caption_from_profile() -> None:
             txt_out = os.path.join(REJECT_DIR, f"{new_basename}.txt")
             try:
                 shutil.copy2(row["original_path"], img_out)
+                reasons_str = build_reject_reason_string(row)
                 with open(txt_out, "w", encoding="utf-8") as ft:
-                    ft.write(f"REJECTED REASON: {row.get('short_reason','unknown')}\n")
+                    ft.write(f"REJECTED REASON: {reasons_str}\n")
                     ft.write(f"score={row.get('quality_total', 0)} | type={row.get('shot_type', '')} | file={row.get('original_filename', '')}\n")
             except Exception as e:
                 safe_print(f"   ⚠️ Reject export failed for {row.get('original_filename','')}: {e}")
@@ -4465,6 +4584,28 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
         reasons.append("extreme_angle_unusable")
     if "cropped_limbs" in issues and not face_visible:
         reasons.append("isolated_limbs_no_face")
+
+    # ── Face-Orientation-im-Frame: Anti-LoRA-Toxin ──
+    # Bilder mit auf-dem-Kopf oder seitlich liegendem Gesicht im 2D-Frame
+    # vergiften das LoRA-Training (Modell lernt verkehrte Anatomie).
+    # 'inverted'  -> immer Downgrade keep -> review
+    # 'sideways'  -> Downgrade nur bei niedriger Komposition (< Threshold)
+    # Bei beiden wird zusaetzlich der Pick-Score in adjusted_pick_score
+    # bestraft. Hier nur die Status-Logik.
+    if ENABLE_FACE_ORIENTATION_PENALTY:
+        face_orient = str(item.get("face_orientation_in_frame", "")).strip().lower()
+        if face_orient == "inverted" and FACE_ORIENTATION_DOWNGRADE_INVERTED_TO_REVIEW:
+            reasons.append("face_inverted_in_frame")
+            item.setdefault("status_notes", []).append("face_orientation_inverted_downgrade_to_review")
+        elif face_orient == "sideways" and FACE_ORIENTATION_DOWNGRADE_SIDEWAYS_TO_REVIEW:
+            comp_val = float(item.get("quality_composition", 0))
+            if comp_val < float(FACE_ORIENTATION_SIDEWAYS_DOWNGRADE_COMPOSITION_MAX):
+                reasons.append(
+                    f"face_sideways_in_frame(composition={comp_val:.0f})"
+                )
+                item.setdefault("status_notes", []).append(
+                    f"face_orientation_sideways_downgrade_to_review_composition_{comp_val:.0f}"
+                )
 
     if not reasons:
         return "keep", reasons
@@ -4725,6 +4866,33 @@ def body_visibility_bonus(item: Dict[str, Any]) -> float:
     return 0.0
 
 
+def face_orientation_penalty(item: Dict[str, Any]) -> float:
+    """
+    Pick-Score-Malus fuer Bilder, in denen das Gesicht im Frame nicht
+    aufrecht orientiert ist. Bewertet ausschliesslich die 2D-Frame-
+    Orientierung (siehe Audit-Prompt fuer face_orientation_in_frame),
+    nicht die Pose der Person im Raum.
+
+    Begruendung: Nicht-aufrechte Gesichter sind fuer's LoRA-Training
+    toxisch, weil das Modell die Anatomie umgekehrt lernt. Inverted
+    ist am schlimmsten (Augen unter Mund), sideways ebenfalls schwer,
+    tilted noch tolerierbar.
+
+    Status-Downgrade fuer 'inverted' und 'sideways' wird separat in
+    local_status_override gehandhabt - hier nur der Pick-Score-Anteil.
+    """
+    if not ENABLE_FACE_ORIENTATION_PENALTY:
+        return 0.0
+    orient = str(item.get("face_orientation_in_frame", "")).strip().lower()
+    if orient == "tilted":
+        return float(FACE_ORIENTATION_PENALTY_TILTED)
+    if orient == "sideways":
+        return float(FACE_ORIENTATION_PENALTY_SIDEWAYS)
+    if orient == "inverted":
+        return float(FACE_ORIENTATION_PENALTY_INVERTED)
+    return 0.0
+
+
 def adjusted_pick_score(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> float:
     # Identity ist das primäre Ziel – 3× stärker gewichtet als bisher
     base = float(item.get("quality_identity_usefulness", 0)) * 3.0
@@ -4745,6 +4913,10 @@ def adjusted_pick_score(item: Dict[str, Any], selected: List[Dict[str, Any]]) ->
     # Body-Visibility-Bonus: bevorzugt Body-Shots mit mehr sichtbarem Koerper
     # bei gleicher Bildqualitaet. Nur fuer full_body und medium relevant.
     base += body_visibility_bonus(item)
+
+    # Face-Orientation-Penalty: bestraft Bilder mit gekippten/seitlichen/
+    # umgekehrten Gesichtern im Frame (LoRA-Anti-Toxin).
+    base -= face_orientation_penalty(item)
 
     if item.get("base_status") == "review":
         base -= 3.0
@@ -6257,45 +6429,9 @@ def main() -> None:
             except Exception as copy_err:
                 safe_print(f"   ⚠️ Failed to copy reject image: {row.get('original_filename','')} – {copy_err}")
 
-            # Reason-Datei: alle verfügbaren Quellen zusammenführen
+            # Reason-Datei: gemeinsamer Helper baut den vollstaendigen String
             try:
-                reason_parts = []
-
-                # 1) local_override_reasons (Liste oder String aus CSV-Roundtrip)
-                lor = row.get("local_override_reasons", [])
-                if isinstance(lor, str):
-                    lor = [x.strip() for x in lor.split(",") if x.strip()]
-                reason_parts.extend(lor)
-
-                # 2) status_notes (Duplikat-Marker, Smart-Crop-Marker etc.)
-                sn = row.get("status_notes", [])
-                if isinstance(sn, str):
-                    sn = [x.strip() for x in sn.split(",") if x.strip()]
-                for note in sn:
-                    if note not in reason_parts:
-                        reason_parts.append(note)
-
-                # 3) short_reason (hart vergebener Grund: too_small, NSFW, script_error …)
-                sr = row.get("short_reason", "")
-                if sr and sr not in reason_parts:
-                    reason_parts.append(sr)
-
-                # 4) Duplikat-Infos explizit
-                dup_method = row.get("duplicate_method", "")
-                dup_of = row.get("duplicate_of", "")
-                if dup_method and dup_of:
-                    dup_info = f"duplicate_of:{dup_of} (method:{dup_method})"
-                    if dup_info not in reason_parts:
-                        reason_parts.append(dup_info)
-
-                # 5) API-Vorschlag wenn vorhanden
-                api_status = row.get("suggested_status", "")
-                api_reason = row.get("short_reason", "")
-                if api_status == "reject" and api_reason and api_reason not in reason_parts:
-                    reason_parts.append(f"api_reject: {api_reason}")
-
-                reasons_str = ", ".join(reason_parts) if reason_parts else "unknown"
-
+                reasons_str = build_reject_reason_string(row)
                 with open(txt_out, "w", encoding="utf-8") as ft:
                     ft.write(f"REJECTED REASON: {reasons_str}\n")
                     ft.write(f"score={row.get('quality_total', 0)} | "
@@ -6471,6 +6607,7 @@ def main() -> None:
         "skin_tone",
         "body_build",
         "body_skin_visibility",
+        "face_orientation_in_frame",
         "tattoos_visible",
         "tattoos_description",
         "clothing_description",
