@@ -111,10 +111,10 @@ DEFAULTS: Dict[str, Any] = {
     "c_input": r"",
     "c_target": 30,
     "c_api_key": "",
-    "c_model": "gpt-5.4-nano",
+    "c_model": "gpt-5.4-mini",
     "c_use_trigger_check": False,
-    "c_trigger_model": "gpt-5.4-nano",
-    "c_use_review_escalation": True,
+    "c_trigger_model": "gpt-5.4-mini",
+    "c_use_review_escalation": False,
     "c_review_escalation_model": "",
     "c_review_escalation_score_min": 50,
     "c_review_escalation_score_max": 58,
@@ -983,10 +983,31 @@ def reset_profile_from_backup(trigger_word: str, input_folder: str, raw_profile_
 
 
 def parse_progress(line: str) -> Optional[Tuple[int, int]]:
-    m = re.search(r"\[(\d+)/(\d+)\]", line)
+    # Nur echte Bildstart-Zeilen zaehlen, nicht Heartbeats/Subphasen wie
+    # "START [12/80] local_subject_metrics ...". Dadurch bleiben Fortschritt,
+    # Sekunden/Bild und ETA stabil.
+    m = re.match(r"^\[(\d+)/(\d+)\]", line)
     if m:
         return int(m.group(1)), int(m.group(2))
     return None
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(float(seconds))))
+    if seconds < 60:
+        return f"{seconds}s"
+
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s"
+
+    hours, mins = divmod(minutes, 60)
+    if secs >= 30:
+        mins += 1
+        if mins == 60:
+            hours += 1
+            mins = 0
+    return f"{hours}h {mins}m"
 
 
 def kill_process():
@@ -1051,6 +1072,11 @@ def run_script(
     progress = 0.0
     last_gallery_update = 0
     images: List[Any] = []
+    run_started_at = time.time()
+    last_progress_idx = 0
+    last_progress_total = 0
+    seconds_per_item: Optional[float] = None
+    eta_seconds: Optional[float] = None
 
     try:
         for line in _active_process.stdout:
@@ -1061,6 +1087,14 @@ def run_script(
             if p:
                 idx, total = p
                 progress = idx / max(1, total)
+                last_progress_idx = idx
+                last_progress_total = total
+
+                elapsed = max(0.0, time.time() - run_started_at)
+                if idx > 0:
+                    seconds_per_item = elapsed / idx
+                    remaining_items = max(0, total - idx)
+                    eta_seconds = remaining_items * seconds_per_item
 
             processed_count = sum(1 for l in log_lines if re.match(r"\s*\[\d+/\d+\]", l))
             if image_scan_folder and processed_count - last_gallery_update >= 5:
@@ -1068,9 +1102,28 @@ def run_script(
                 last_gallery_update = processed_count
 
             log_text = "\n".join(log_lines[-500:])
+            if last_progress_total > 0:
+                status_de = (
+                    f"⏳ Läuft... {last_progress_idx}/{last_progress_total} "
+                    f"({int(progress*100)}%)"
+                )
+                status_en = (
+                    f"⏳ Running... {last_progress_idx}/{last_progress_total} "
+                    f"({int(progress*100)}%)"
+                )
+                if seconds_per_item is not None:
+                    status_de += f" | {seconds_per_item:.1f} s/Bild"
+                    status_en += f" | {seconds_per_item:.1f} s/image"
+                if eta_seconds is not None and last_progress_idx < last_progress_total:
+                    status_de += f" | Rest ca. {format_duration(eta_seconds)}"
+                    status_en += f" | ETA {format_duration(eta_seconds)}"
+            else:
+                status_de = f"⏳ Läuft... ({int(progress*100)}%)"
+                status_en = f"⏳ Running... ({int(progress*100)}%)"
+
             yield log_text, images, progress, tr(
-                f"⏳ Läuft... ({int(progress*100)}%)",
-                f"⏳ Running... ({int(progress*100)}%)",
+                status_de,
+                status_en,
             )
 
     except Exception as e:
@@ -1094,10 +1147,25 @@ def run_script(
         images = load_gallery_images(scan_images(image_scan_folder))
 
     log_text = "\n".join(log_lines[-500:])
+    total_elapsed = max(0.0, time.time() - run_started_at)
+    avg_seconds_per_item = None
+    if last_progress_idx > 0:
+        avg_seconds_per_item = total_elapsed / last_progress_idx
+
     status = (
         tr(
-            f"✅ Fertig! ({len(log_lines)} Zeilen)",
-            f"✅ Done! ({len(log_lines)} lines)",
+            (
+                f"✅ Fertig! {last_progress_idx}/{last_progress_total} Bilder | "
+                f"Ø {avg_seconds_per_item:.1f} s/Bild | Gesamt {format_duration(total_elapsed)}"
+            )
+            if avg_seconds_per_item is not None and last_progress_total > 0
+            else f"✅ Fertig! ({len(log_lines)} Zeilen)",
+            (
+                f"✅ Done! {last_progress_idx}/{last_progress_total} images | "
+                f"avg {avg_seconds_per_item:.1f} s/image | total {format_duration(total_elapsed)}"
+            )
+            if avg_seconds_per_item is not None and last_progress_total > 0
+            else f"✅ Done! ({len(log_lines)} lines)",
         )
         if rc == 0
         else tr(f"❌ Fehlercode {rc}", f"❌ Exit code {rc}")
@@ -1541,9 +1609,12 @@ def build_ui() -> gr.Blocks:
                         "<details>"
                         "<summary><b>ℹ️ Was bedeutet Eskalation und wann brauche ich das?</b></summary>"
                         "\n\n"
-                        "Standardmäßig bewertet ein einziges, günstiges Modell (z. B. `gpt-5.4-nano`) "
-                        "alle Bilder. Das ist für 80–90 % der Fälle völlig ausreichend. Bei "
-                        "**Grenzfällen** – also Bildern, die das Hauptmodell nicht klar als "
+                        "Standardmäßig bewertet ein einziges Modell (`gpt-5.4-mini` empfohlen) "
+                        "alle Bilder. `gpt-5.4-nano` wäre günstiger, hat sich aber als zu "
+                        "ungenau für die Erkennung von Filter-Hauttextur und extremen "
+                        "Kamerawinkeln erwiesen – diese Bilder rutschten regelmäßig fälschlich "
+                        "in 'train_ready'. Bei **Grenzfällen** – also Bildern, die das "
+                        "Hauptmodell nicht klar als "
                         "'gut genug' oder 'rauswerfen' einordnen kann – kann der Curator diese "
                         "Bilder optional an ein **stärkeres zweites Modell** weiterleiten "
                         "(z. B. `gpt-5.4` oder `claude-opus-4.7`).\n\n"
@@ -1563,9 +1634,12 @@ def build_ui() -> gr.Blocks:
                         "<details>"
                         "<summary><b>ℹ️ What is escalation and when do I need it?</b></summary>"
                         "\n\n"
-                        "By default, a single cheap model (e.g. `gpt-5.4-nano`) scores all "
-                        "images. That's enough for 80–90 % of cases. For **borderline cases** – "
-                        "images the main model can't clearly classify as 'keep' or 'reject' – "
+                        "By default, a single model (`gpt-5.4-mini` recommended) scores all "
+                        "images. `gpt-5.4-nano` is cheaper but proved too inaccurate at "
+                        "spotting filter-smoothed skin and extreme camera angles - those "
+                        "images regularly slipped into 'train_ready' incorrectly. For "
+                        "**borderline cases** - "
+                        "images the main model can't clearly classify as 'keep' or 'reject' - "
                         "the curator can optionally forward these images to a **stronger second "
                         "model** (e.g. `gpt-5.4` or `claude-opus-4.7`).\n\n"
                         "**Three escalation triggers:**\n\n"
@@ -1585,8 +1659,15 @@ def build_ui() -> gr.Blocks:
                         label=tr("Eskalation für schwierige Fälle aktivieren", "Enable escalation for difficult cases"),
                         value=S["c_use_review_escalation"],
                         info=tr(
-                            "Empfohlen: an. Erhöht die Qualität bei Grenzfällen merklich, kostet aber pro eskaliertem Bild einen zusätzlichen API-Call zum stärkeren Modell.",
-                            "Recommended: on. Noticeably improves quality on borderline cases, but each escalated image costs an extra API call to the stronger model.",
+                            "Empfohlen: aus. Wenn das Hauptmodell `gpt-5.4-mini` (oder höher) ist, "
+                            "ist die Eskalation in der Regel überflüssig und verdoppelt nur die "
+                            "API-Kosten. Nur einschalten, wenn ein bewusst schwächeres Hauptmodell "
+                            "(z. B. `gpt-5.4-nano`) gewählt wurde und die Bewertungsqualität bei "
+                            "Grenzfällen unbedingt nachgebessert werden soll.",
+                            "Recommended: off. When the main model is `gpt-5.4-mini` (or higher), "
+                            "escalation is usually unnecessary and just doubles API cost. Only "
+                            "enable when intentionally using a weaker main model (e.g. `gpt-5.4-nano`) "
+                            "and you want to improve borderline-case quality.",
                         ),
                     )
                     with gr.Row():
@@ -1594,8 +1675,8 @@ def build_ui() -> gr.Blocks:
                             label=tr("Eskalationsmodell", "Escalation model"),
                             value=S["c_review_escalation_model"],
                             info=tr(
-                                "Stärkeres Modell für die Eskalation. Leer = Eskalation effektiv aus, auch wenn der Schalter oben an ist. Empfohlen: ein Modell der nächsthöheren Klasse (z. B. `gpt-5.4` wenn das Hauptmodell `gpt-5.4-nano` ist).",
-                                "Stronger model for escalation. Empty = escalation effectively off, even if the switch above is on. Recommended: a model from the next-higher tier (e.g. `gpt-5.4` if the main model is `gpt-5.4-nano`).",
+                                "Stärkeres Modell für die Eskalation. Leer = Eskalation effektiv aus, auch wenn der Schalter oben an ist. Empfohlen: ein Modell der nächsthöheren Klasse (z. B. `gpt-5.4` wenn das Hauptmodell `gpt-5.4-mini` ist).",
+                                "Stronger model for escalation. Empty = escalation effectively off, even if the switch above is on. Recommended: a model from the next-higher tier (e.g. `gpt-5.4` if the main model is `gpt-5.4-mini`).",
                             ),
                             max_lines=1,
                         )

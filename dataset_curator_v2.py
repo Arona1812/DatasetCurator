@@ -87,8 +87,14 @@ except ImportError:
 API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 # Hauptmodell für Bildaudit + Triggerwortprüfung
-AI_MODEL = "gpt-5.4-nano"
-TRIGGER_CHECK_MODEL = "gpt-5.4-nano"
+# gpt-5.4-mini liefert deutlich treffsicherere Audits als nano:
+# - erkennt Filter-induzierte Ueberbelichtung (Wachshaut/blown highlights)
+# - bewertet Body-Camera-Winkel realistischer
+# - vergibt seltener vorsichtiges 'review' fuer harmlose Bilder
+# Im Gegenzug ist mini ~5-10x teurer pro Audit als nano. Bei typischen
+# Datasetgroessen (<200 Bildern) ist das vernachlaessigbar.
+AI_MODEL = "gpt-5.4-mini"
+TRIGGER_CHECK_MODEL = "gpt-5.4-mini"
 
 # Optionale Eskalation für schwierige Fälle:
 # Erstes Audit läuft mit AI_MODEL. Falls ein Bild im Grenzbereich liegt,
@@ -205,22 +211,34 @@ MIN_FACE_RATIO = {
     }
 
 # --------------------------------
-# Multiple-People Dominance-Override
+# Multiple-People-Behandlung
 # --------------------------------
-# Wenn die API multiple_people=True meldet, schaut der Curator zusaetzlich
-# auf das Groessenverhaeltnis zwischen Hauptgesicht und zweitgroesstem
-# lokal erkannten Gesicht. Wenn das zweite Gesicht winzig im Vergleich ist
-# (typisch: Reflexion in Brillenglaesern, Spiegelbild, Hintergrund-Statist
-# am Strand), wird das Bild NICHT hart als reject markiert, sondern in
-# 04_review verschoben - dort kannst du es manuell freigeben.
+# Wenn die API multiple_people=True meldet, gibt es zwei Strategien:
 #
-# Greift nur wenn:
-#   - lokal mindestens 2 Gesichter erkannt wurden (sonst kein Verhaeltnis)
-#   - secondary_face_area_ratio < CO_FACE_AREA_RATIO_THRESHOLD
-#   - quality_total >= MULTIPLE_PEOPLE_SOFT_SCORE_MIN
+# 1. ALWAYS_DOWNGRADE_TO_REVIEW=True (Default, empfohlen):
+#    Jedes Bild mit API multiple_people=True wird auf review degradiert
+#    statt rejected - du sichtest manuell. Hintergrund: MediaPipe als
+#    lokaler Cross-Check ist auf Brillenträger-Selfies und Innenräumen
+#    unzuverlässig (Phantom-Gesichter durch Reflexionen, Hintergrund-
+#    Details), und auch die secondary_face_area_ratio reflektiert dann
+#    nur, wie groß der größte Phantom-Detect ist. In der Praxis hat
+#    sich gezeigt: lieber 20-30 Bilder einmal manuell sichten als
+#    systematische Falsch-Rejects bei Einzelpersonen-Bildern.
+#
+# 2. ALWAYS_DOWNGRADE_TO_REVIEW=False:
+#    Klassischer Pfad mit Dominance-Check. Wenn das lokale Hauptgesicht
+#    klar dominiert (sec_ratio klein), wird das Bild auf review degradiert,
+#    sonst rejected. Greift nur wenn:
+#      - lokal mindestens 2 Gesichter erkannt wurden
+#      - secondary_face_area_ratio < CO_FACE_AREA_RATIO_THRESHOLD
+#      - quality_total >= MULTIPLE_PEOPLE_SOFT_SCORE_MIN
+#
+# Beide Pfade ergänzen den Pick-Score nicht - die Behandlung erfolgt
+# rein über den Status (keep/review/reject).
 ENABLE_MULTIPLE_PEOPLE_DOMINANCE_OVERRIDE = True
-CO_FACE_AREA_RATIO_THRESHOLD = 0.25      # 2. Gesicht muss < 25% des Hauptgesichts sein
-MULTIPLE_PEOPLE_SOFT_SCORE_MIN = 75      # Mindestscore fuer Downgrade reject -> review
+MULTIPLE_PEOPLE_ALWAYS_DOWNGRADE_TO_REVIEW = True   # Empfohlen: True
+CO_FACE_AREA_RATIO_THRESHOLD = 0.25                 # nur relevant wenn ALWAYS_DOWNGRADE=False
+MULTIPLE_PEOPLE_SOFT_SCORE_MIN = 75                 # nur relevant wenn ALWAYS_DOWNGRADE=False
 
 # --------------------------------
 # Body-Visibility-Bonus (LoRA-Body-Learning)
@@ -272,6 +290,13 @@ FACE_ORIENTATION_PENALTY_INVERTED = 20.0
 FACE_ORIENTATION_DOWNGRADE_INVERTED_TO_REVIEW = True
 FACE_ORIENTATION_DOWNGRADE_SIDEWAYS_TO_REVIEW = True
 FACE_ORIENTATION_SIDEWAYS_DOWNGRADE_COMPOSITION_MAX = 70
+# Bei 'tilted' ist die Schraege moderat - Downgrade nur wenn die
+# Komposition zusaetzlich schwach ist. Setzt damit eine doppelte
+# Schwelle: Schraege + schlechte Komposition = wahrscheinlich
+# untrainierbarer Untersicht-/Aufsicht-Shot. Liegt auf einer
+# strikten Skala unter dem sideways-Threshold von 70.
+FACE_ORIENTATION_DOWNGRADE_TILTED_TO_REVIEW = True
+FACE_ORIENTATION_TILTED_DOWNGRADE_COMPOSITION_MAX = 65
 
 # --------------------------------
 # Triggerwort-Prüfung
@@ -514,10 +539,18 @@ _UI_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_
 # Interne Konstanten, die nie von der UI ueberschrieben werden duerfen.
 # IG_FRAME_CACHE_VERSION insbesondere: wenn der User eine alte UI-Config mit
 # einer veralteten Version auf den Curator losliesse, wuerden alte Caches
-# faelschlich wiederverwendet. Gleiche Logik gilt fuer PROFILE_CACHE_SCHEMA_VERSION.
+# faelschlich wiederverwendet. Gleiche Logik gilt fuer PROFILE_CACHE_SCHEMA_VERSION
+# und AUDIT_CACHE_SCHEMA_VERSION - letzteres ist besonders kritisch, weil ein
+# falscher Wert dazu fuehrt, dass alte Audits aus inkompatiblen Schemas
+# wiederverwendet werden, statt neu erhoben zu werden (genau das passiert,
+# wenn alte v6-Caches mit einer v7-Schema-Logik gelesen werden).
 # Diese Liste wachst mit jedem internen Feld, das aus strukturellen Gruenden
 # keine UI-Kontrolle haben soll.
-_UI_PROTECTED_KEYS = {"IG_FRAME_CACHE_VERSION", "PROFILE_CACHE_SCHEMA_VERSION"}
+_UI_PROTECTED_KEYS = {
+    "IG_FRAME_CACHE_VERSION",
+    "PROFILE_CACHE_SCHEMA_VERSION",
+    "AUDIT_CACHE_SCHEMA_VERSION",
+}
 if os.path.exists(_UI_CONFIG_PATH):
     try:
         with open(_UI_CONFIG_PATH, "r", encoding="utf-8") as _f:
@@ -2040,7 +2073,25 @@ def cache_path_for_file(file_hash: str) -> str:
 #       Selfie aus extremer Untersicht (Augen unter dem Mund im Frame)
 #       ist 'inverted' und fuer LoRA-Training toxisch, weil das Modell
 #       die Anatomie umgekehrt lernt. Caches inkompatibel.
-AUDIT_CACHE_SCHEMA_VERSION = "v6"
+#   v7: Audit-Prompt fuer 'issues' geschaerft - explizite Anweisungen
+#       fuer 'strong_filter' (Filter-induzierter Hauttextur-Verlust,
+#       Wachshaut, blown highlights auf Wangen) und 'extreme_angle'
+#       (Worm's-Eye / Bird's-Eye / Selfie-from-below mit verzerrten
+#       Koerperproportionen). Erkennung von Bildern wie ueberbelichtete
+#       Filter-Selfies und Untersicht-Bett-Selfies wird systematischer.
+#       Default-Modell von gpt-5.4-nano auf gpt-5.4-mini gewechselt -
+#       nano hat Filter-Hauttextur und extreme Kamerawinkel zuverlaessig
+#       falsch bewertet. Caches inkompatibel.
+#   v8: Audit-Prompt fuer 'prominent_readable_text' und
+#       'watermark_or_overlay' geschaerft. prominent_readable_text wird
+#       nun nur fuer GROSSEN, dominanten Text vergeben - kleine Logos
+#       auf Kleidung oder winzige Schilder im Hintergrund triggern es
+#       nicht mehr. watermark_or_overlay bleibt fuer trainings-toxische
+#       Faelle reserviert (Datumsstempel, Wasserzeichen, harte Overlays).
+#       Trigger-Logik fuer caption_remove parallel angepasst:
+#       prominent_readable_text alleine triggert nicht mehr, nur
+#       watermark_or_overlay oder mirror_selfie. Caches inkompatibel.
+AUDIT_CACHE_SCHEMA_VERSION = "v8"
 
 
 def audit_cache_key(base_hash: str, model: str, variant: str = "audit") -> str:
@@ -2854,7 +2905,40 @@ Use decimals for fine-grained scoring (e.g. 7.50 or 8.20). Do NOT use a 0-100 sc
 - quality_total: weighted internal field; you may set it to the simple average of the 4 scores above (also 0.00 to 10.00). The host system will recompute the canonical weighted score.
 
 Important:
-- Flag prominent text, watermarks, overlays, or readable shirt/screen text.
+- TEXT/WATERMARK/OVERLAY DETECTION (critical for LoRA training cleanliness):
+  Two separate fields with DIFFERENT thresholds. Read carefully.
+
+  watermark_or_overlay: set True ONLY when there is a TRAINING-TOXIC overlay
+  burned into or laid over the image. These are elements that did not exist
+  in the original scene and would be reproduced by the LoRA as part of the
+  person's "look" if not flagged. Trigger cases:
+    * Visible date stamps (e.g. "'21 09 24" in a corner)
+    * Photographer/site watermarks (e.g. "© Photographer", "shutterstock")
+    * App/filter overlays (Snapchat date, Instagram-style stickers, GIF text)
+    * Heavy frame borders, polaroid-style frames added in post
+  Do NOT trigger for: text on physical objects in the scene (shirt prints,
+  helmet logos, signs in the background), text that is part of the photo
+  content rather than added on top of it.
+
+  prominent_readable_text: set True ONLY when text is LARGE and DOMINANT
+  enough to occupy a noticeable portion of the frame and would meaningfully
+  compete with the subject for visual attention. Threshold: text must be at
+  least 8-10% of the frame area, OR centrally placed and clearly legible at
+  a glance, OR repeated multiple times in the frame. Trigger cases:
+    * Large slogan or text on the front of a shirt/sweater filling much of
+      the chest
+    * Big neon/advertising signs prominently behind the subject
+    * Large book/magazine/poster covers held up by the subject
+  Do NOT trigger for: small brand logos under ~5% of frame (helmet logos,
+  small embroidery on jackets, tiny clothing tags), distant signage in the
+  background, license plates or street signs not central to composition,
+  faint reflections, blurred background text. When in doubt, DO NOT flag -
+  this field has been over-triggered in the past and needs a high bar.
+
+  Both fields independent: a date stamp is watermark_or_overlay=True even
+  if it is small. A huge shirt slogan is prominent_readable_text=True even
+  if it is not an overlay. They can both be True simultaneously.
+
 - Flag multiple prominent people.
 - Ignore brand names and exact text content. Just flag the presence.
 - Describe visible tattoos only as a raw fact.
@@ -2908,6 +2992,39 @@ Important:
       fully occluded by an object).
   This classification is critical for LoRA training: 'sideways' and
   'inverted' images teach the model wrong anatomy unless rotated first.
+- ISSUES TAGGING (critical for training data quality):
+  Be aggressive about tagging the following issues - missing them
+  pollutes the training set. The 'issues' array should contain ALL
+  applicable values, not just one:
+    * "strong_filter": apply this whenever the subject's skin or face
+      shows clear signs of beauty-filter processing - poreless or
+      wax-like skin, blown-out highlights on cheeks/forehead/nose
+      such that natural skin texture is lost, unnaturally smooth or
+      glowing complexion, plastic-looking face. Do NOT use 'strong_filter'
+      only for color filters or vintage looks - it is specifically for
+      skin-smoothing/whitening artifacts that would teach the model wrong
+      facial anatomy. When in doubt about whether skin is filter-smoothed
+      or just well-lit: if you cannot see realistic pore structure on the
+      cheeks at viewing distance, it is filter-smoothed - tag it.
+    * "extreme_angle": apply this whenever the camera angle SEVERELY
+      distorts body proportions in a way that would teach wrong anatomy.
+      Trigger cases include: extreme worm's-eye view (camera below feet
+      pointing up so legs look enormously long, head looks tiny), extreme
+      bird's-eye view (camera above head pointing straight down so the
+      torso is foreshortened beyond recognition), and selfie-from-below
+      shots where the body parts closest to camera (knees/legs/torso)
+      dwarf the face/head in the frame. A normal selfie at arm's length
+      with slight angle is NOT extreme_angle. Only use this when the
+      proportions in the rendered frame are clearly anatomically wrong
+      relative to a standing portrait.
+    * "overexposed": general scene overexposure (background blown out,
+      not specifically the face/skin). Use 'strong_filter' instead when
+      the issue is skin-specific.
+    * Other issues from the enum follow their plain meaning.
+  When unsure between 'strong_filter' and 'overexposed' for face
+  skin: pick 'strong_filter' if the skin looks unnaturally smooth,
+  pick 'overexposed' if highlights are blown but texture is still
+  visible.
 - Classify head_pose_bucket based on the main subject's head orientation:
     'frontal' = directly facing camera (yaw < ~15 degrees);
     'three_quarter_left' / 'three_quarter_right' = yaw between ~15 and ~75 degrees, named for which side of the face is more visible to camera;
@@ -4211,6 +4328,39 @@ def build_reject_reason_string(row: Dict[str, Any]) -> str:
     return ", ".join(reason_parts) if reason_parts else "unknown"
 
 
+def needs_caption_remove(row: Dict[str, Any]) -> bool:
+    """
+    Entscheidet, ob ein Bild in den 03_caption_remove-Bucket gehoert.
+
+    Trigger-Logik (ab v8 Update 2):
+      - watermark_or_overlay=True: trainings-toxische Overlays (Datumsstempel,
+        Wasserzeichen, App-Filter-Stickers, eingebrannte Texte). Immer
+        caption_remove.
+
+    NICHT mehr Trigger:
+      - mirror_selfie=True: hat sich in der Praxis als zu aggressiv erwiesen.
+        Mirror-Selfies sind meistens harmlose Outfit-Shots ohne lesbare
+        Spiegelschrift. Wenn doch echte Spiegelschrift auf Kleidung
+        prominent zu sehen ist, faengt das geschaerfte
+        prominent_readable_text-Kriterium - falls die KI das uebersieht,
+        bleibt 04_review als Korrektur-Pfad. 16+ Bilder pro typischem
+        Datensatz waren False-Positives.
+      - prominent_readable_text=True: alleine NICHT Trigger - das Feld
+        wurde in der Praxis zu aggressiv vergeben (kleine Helmlogos,
+        Bootsnamen im Hintergrund). Im neuen v8-Audit-Prompt ist das Feld
+        deutlich strenger definiert (8-10% Frame-Anteil oder zentral
+        platziert), aber wir verlassen uns nicht alleine darauf.
+
+    Diese Funktion ist die SINGLE SOURCE OF TRUTH fuer caption_remove-
+    Entscheidungen - alle vier Output-Pfade (Single-Pass main + Smart-Crop,
+    Profile-Then-Caption + Smart-Crop) rufen sie auf, damit die Logik
+    nicht divergieren kann.
+    """
+    if bool(row.get("watermark_or_overlay")):
+        return True
+    return False
+
+
 def write_caption_stage_reports(
     *,
     all_rows: List[Dict[str, Any]],
@@ -4357,7 +4507,7 @@ def continue_caption_from_profile() -> None:
     counters = {"train_ready": 1, "keep_unused": 1, "caption_remove": 1, "review": 1}
 
     for row in selected_sorted:
-        needs_text_cleanup = bool(row.get("watermark_or_overlay") or row.get("prominent_readable_text"))
+        needs_text_cleanup = needs_caption_remove(row)
         if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
             bucket = "caption_remove"
             out_dir = CAPTION_REMOVE_DIR
@@ -4375,7 +4525,7 @@ def continue_caption_from_profile() -> None:
     if EXPORT_REVIEW_IMAGES:
         review_export = sorted(review_items, key=lambda r: -int(r.get("quality_total", 0)))
         for row in review_export:
-            needs_text_cleanup = bool(row.get("watermark_or_overlay") or row.get("prominent_readable_text"))
+            needs_text_cleanup = needs_caption_remove(row)
             if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
                 bucket = "caption_remove"
                 out_dir = CAPTION_REMOVE_DIR
@@ -4445,9 +4595,21 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     issues = set(item.get("issues", []))
 
     if multiple_people:
-        # Dominance-Check: Wenn das Hauptgesicht klar dominiert, ist die
-        # API-Meldung wahrscheinlich ein Mismatch (Reflexion in Brille,
-        # Hintergrund-Statist, Spiegelbild). Dann statt hard reject -> review.
+        # Strategie 1 (Default, empfohlen): immer auf review degradieren.
+        # Begruendung: lokaler MediaPipe-Cross-Check ist nicht zuverlaessig
+        # genug, um echte vs. halluzinierte Co-Faces zu trennen. Lieber
+        # einmal manuell sichten als systematische Falsch-Rejects.
+        if MULTIPLE_PEOPLE_ALWAYS_DOWNGRADE_TO_REVIEW:
+            reasons.append("multiple_people_downgraded_to_review")
+            item.setdefault("status_notes", []).append(
+                "multiple_people_always_downgrade_to_review"
+            )
+            return "review", reasons
+
+        # Strategie 2 (Legacy): Dominance-Check. Wenn das Hauptgesicht klar
+        # dominiert, ist die API-Meldung wahrscheinlich ein Mismatch (Reflexion
+        # in Brille, Hintergrund-Statist, Spiegelbild). Dann statt hard reject
+        # -> review. Sonst -> reject.
         sec_ratio = float(item.get("secondary_face_area_ratio", 0.0))
         if (ENABLE_MULTIPLE_PEOPLE_DOMINANCE_OVERRIDE
                 and face_count_local >= 2
@@ -4590,7 +4752,9 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     # vergiften das LoRA-Training (Modell lernt verkehrte Anatomie).
     # 'inverted'  -> immer Downgrade keep -> review
     # 'sideways'  -> Downgrade nur bei niedriger Komposition (< Threshold)
-    # Bei beiden wird zusaetzlich der Pick-Score in adjusted_pick_score
+    # 'tilted'    -> Downgrade nur bei deutlich schwacher Komposition,
+    #                strikterer Threshold als sideways
+    # Bei allen drei wird zusaetzlich der Pick-Score in adjusted_pick_score
     # bestraft. Hier nur die Status-Logik.
     if ENABLE_FACE_ORIENTATION_PENALTY:
         face_orient = str(item.get("face_orientation_in_frame", "")).strip().lower()
@@ -4605,6 +4769,15 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
                 )
                 item.setdefault("status_notes", []).append(
                     f"face_orientation_sideways_downgrade_to_review_composition_{comp_val:.0f}"
+                )
+        elif face_orient == "tilted" and FACE_ORIENTATION_DOWNGRADE_TILTED_TO_REVIEW:
+            comp_val = float(item.get("quality_composition", 0))
+            if comp_val < float(FACE_ORIENTATION_TILTED_DOWNGRADE_COMPOSITION_MAX):
+                reasons.append(
+                    f"face_tilted_in_frame(composition={comp_val:.0f})"
+                )
+                item.setdefault("status_notes", []).append(
+                    f"face_orientation_tilted_downgrade_to_review_composition_{comp_val:.0f}"
                 )
 
     if not reasons:
@@ -5636,6 +5809,18 @@ def generate_dashboard(all_rows: List[Dict[str, Any]], selected: List[Dict[str, 
 def main() -> None:
     warnings: List[str] = []
 
+    # Konfig-Banner: zeigt aktiv geladenes Modell + Cache-Schema-Version.
+    # Dient zum schnellen Debug-Check, ob UI-Config-Overrides oder
+    # Schema-Bumps wirklich gegriffen haben (alte Caches bei v6 vs v7
+    # haben in der Vergangenheit zu Verwirrung gefuehrt).
+    safe_print("=" * 60)
+    safe_print(f"  Audit model:        {AI_MODEL}")
+    safe_print(f"  Trigger model:      {TRIGGER_CHECK_MODEL}")
+    safe_print(f"  Escalation:         {'ON (' + REVIEW_ESCALATION_MODEL + ')' if USE_REVIEW_ESCALATION and REVIEW_ESCALATION_MODEL else 'OFF'}")
+    safe_print(f"  Audit cache schema: {AUDIT_CACHE_SCHEMA_VERSION}")
+    safe_print(f"  Pipeline mode:      {PIPELINE_MODE}")
+    safe_print("=" * 60)
+
     if CONTINUE_FROM_PROFILE:
         continue_caption_from_profile()
         return
@@ -6337,7 +6522,7 @@ def main() -> None:
     # ueber _profile_override.json (deep-merged in build_subject_profile).
 
     for row in selected_sorted:
-        needs_text_cleanup = bool(row.get("watermark_or_overlay") or row.get("prominent_readable_text"))
+        needs_text_cleanup = needs_caption_remove(row)
 
         if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
             bucket = "caption_remove"
@@ -6368,7 +6553,7 @@ def main() -> None:
     if EXPORT_REVIEW_IMAGES:
         review_export = sorted(review_items, key=lambda r: -int(r.get("quality_total", 0)))
         for row in review_export:
-            needs_text_cleanup = bool(row.get("watermark_or_overlay") or row.get("prominent_readable_text"))
+            needs_text_cleanup = needs_caption_remove(row)
 
             if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
                 bucket = "caption_remove"
