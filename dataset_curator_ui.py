@@ -98,6 +98,7 @@ SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
     "include_expression",
     "include_hair_always",
     "include_hair_when_variable",
+    "include_beard_always",
     "include_beard_when_variable",
     "include_mirror_selfie_marker",
     "include_eye_color",

@@ -5350,6 +5350,178 @@ def normalize_hair_tag(raw: str) -> dict:
     return {"color": color, "style": style, "visible": True}
 
 
+def normalize_beard_tag(raw: str) -> dict:
+    """
+    Normalisiert eine rohe KI-Bart-Beschreibung auf saubere Tags:
+
+    pattern: einer der 15 gaengigen Bart-Varianten (oder None bei nicht sichtbar)
+      clean_shaven        - komplett glatt rasiert
+      stubble             - kurze Stoppeln, 5-o-clock-shadow
+      designer_stubble    - leicht laenger als stubble, gestylt
+      short_beard         - gepflegter kurzer Vollbart, ~1cm
+      full_beard          - voller Vollbart, mittellang bis lang
+      long_beard          - sehr langer Bart (deutlich unter Kinn hinaus)
+      goatee              - Spitzbart / Kinnbart
+      mustache_only       - nur Schnurrbart, sonst rasiert
+      mustache_goatee     - Schnurrbart + Kinnbart kombiniert (van dyke)
+      chin_strap          - schmaler Bart entlang Kieferlinie
+      mutton_chops        - voller Backenbart ohne Kinnbart
+      soul_patch          - kleiner Fleck unter der Unterlippe
+      circle_beard        - Schnurrbart + runder Kinnbart geschlossen
+      handlebar_mustache  - gezwirbelter Schnurrbart
+      neckbeard           - Bart nur am Hals, nicht im Gesicht
+      other               - erkennbarer Bart, aber kein Pattern matcht
+
+    color: Bartfarbe (oder None bei clean_shaven / nicht sichtbar):
+      black/dark | brown | blonde | red | gray | white | salt_pepper | other
+
+    visible: bool - True wenn der Bart sichtbar bewertbar war.
+    """
+    d = raw.strip().lower() if raw else ""
+
+    not_visible_markers = [
+        "not visible", "not clearly", "n/a", "not applicable",
+        "covered by mask", "obscured", "cannot be determined",
+    ]
+    if not d or d in {"none"} or any(m in d for m in not_visible_markers):
+        return {"pattern": None, "color": None, "visible": False}
+
+    # ─── Clean-shaven Marker ───
+    clean_shaven_markers = [
+        "no beard", "clean shaven", "clean-shaven", "shaved", "no facial hair",
+        "beard absent", "without beard",
+    ]
+    if any(m in d for m in clean_shaven_markers):
+        return {"pattern": "clean_shaven", "color": None, "visible": True}
+
+    # ─── Pattern-Erkennung (von spezifisch zu generisch) ───
+    pattern = "other"
+
+    if "handlebar" in d:
+        pattern = "handlebar_mustache"
+    elif "neckbeard" in d or "neck beard" in d:
+        pattern = "neckbeard"
+    elif "mutton chop" in d or "muttonchop" in d:
+        pattern = "mutton_chops"
+    elif "soul patch" in d and not any(x in d for x in ["beard", "goatee", "mustache", "moustache"]):
+        pattern = "soul_patch"
+    elif "chin strap" in d or "chinstrap" in d:
+        pattern = "chin_strap"
+    elif "circle beard" in d or "van dyke" in d or "vandyke" in d:
+        pattern = "circle_beard"
+    elif ("mustache" in d or "moustache" in d) and ("goatee" in d or "chin beard" in d):
+        pattern = "mustache_goatee"
+    elif "goatee" in d:
+        pattern = "goatee"
+    elif ("mustache" in d or "moustache" in d) and not any(x in d for x in ["beard", "stubble", "shadow"]):
+        pattern = "mustache_only"
+    elif "designer stubble" in d or "stylized stubble" in d:
+        pattern = "designer_stubble"
+    elif any(x in d for x in ["stubble", "5 o'clock shadow", "5-o-clock", "five o'clock",
+                                "scruff", "scruffy", "facial shadow"]):
+        pattern = "stubble"
+    elif any(x in d for x in ["long beard", "very long beard", "lengthy beard"]):
+        pattern = "long_beard"
+    elif any(x in d for x in ["full beard", "thick beard", "bushy beard", "dense beard",
+                                "heavy beard"]):
+        pattern = "full_beard"
+    elif any(x in d for x in ["short beard", "trimmed beard", "groomed beard",
+                                "well-groomed beard", "neat beard", "tidy beard",
+                                "short trimmed", "short groomed"]):
+        pattern = "short_beard"
+    elif "beard" in d:
+        pattern = "short_beard"  # konservativer Fallback
+
+    # ─── Farbe-Erkennung (Token-basiert) ───
+    # Erfordert Bart-Kontext, damit "white shirt" oder "dark room" nicht
+    # als Bartfarbe missdeutet werden. Reihenfolge: spezifisch -> generisch.
+    if pattern == "clean_shaven":
+        color = None
+    else:
+        beard_words = ["beard", "stubble", "mustache", "moustache", "goatee",
+                        "facial hair", "shadow", "scruff", "patch", "chops"]
+        has_beard_context = any(w in d for w in beard_words)
+
+        if not has_beard_context:
+            color = "other"
+        elif "salt and pepper" in d or "salt-and-pepper" in d:
+            color = "salt_pepper"
+        elif re.search(r"\b(graying|greying|gray|grey)\b", d):
+            color = "gray"
+        elif "white" in d and "beard" in d and re.search(r"\bwhite\b", d):
+            color = "white"
+        elif re.search(r"\b(red|reddish|ginger|auburn)\b", d):
+            color = "red"
+        elif re.search(r"\b(blonde|blond)\b", d):
+            color = "blonde"
+        elif re.search(r"\bblack\b", d):
+            color = "dark"
+        elif re.search(r"\bdark\b", d):
+            color = "dark"
+        elif re.search(r"\b(brown|light brown)\b", d):
+            color = "brown"
+        else:
+            color = "other"
+
+    return {"pattern": pattern, "color": color, "visible": True}
+
+
+def build_beard_caption_tag(item: Dict[str, Any], global_rules: Dict[str, Any]) -> Optional[str]:
+    """
+    Entscheidet ob und wie der Bart in die Caption kommt:
+    - Bart-Pattern wird in eine kurze Caption-Phrase uebersetzt
+    - Bartfarbe nur bei Abweichung vom Datensatz-Modus (analog zu Hair)
+    - Bei clean_shaven wird kein Tag erzeugt (Default-Annahme, nicht erwaehnt)
+    - Bei not visible wird kein Tag erzeugt
+    """
+    raw_beard = item.get("beard_description", "")
+    parsed = normalize_beard_tag(raw_beard)
+
+    if not parsed["visible"]:
+        return None
+    if parsed["pattern"] == "clean_shaven":
+        return None
+
+    beard_rule = global_rules.get("beard_description", {})
+    stable_mode_raw = beard_rule.get("mode", "")
+    stable_color = normalize_beard_tag(stable_mode_raw).get("color") if stable_mode_raw else None
+
+    item_pattern = parsed["pattern"]
+    item_color = parsed["color"]
+
+    pattern_phrases = {
+        "stubble": "stubble",
+        "designer_stubble": "designer stubble",
+        "short_beard": "short beard",
+        "full_beard": "full beard",
+        "long_beard": "long beard",
+        "goatee": "goatee",
+        "mustache_only": "mustache",
+        "mustache_goatee": "mustache and goatee",
+        "chin_strap": "chin strap beard",
+        "mutton_chops": "mutton chops",
+        "soul_patch": "soul patch",
+        "circle_beard": "circle beard",
+        "handlebar_mustache": "handlebar mustache",
+        "neckbeard": "neckbeard",
+        "other": "beard",
+    }
+    pattern_tag = pattern_phrases.get(item_pattern, "")
+    if not pattern_tag:
+        return None
+
+    # Farbe: nur bei Abweichung vom Modus oder wenn kein Modus bekannt
+    color_tag = ""
+    if stable_color and item_color and item_color not in {"other"} and item_color != stable_color:
+        color_tag = item_color.replace("_", " ")
+    elif not stable_color and item_color and item_color not in {"other"}:
+        color_tag = item_color.replace("_", " ")
+
+    if color_tag:
+        return f"{color_tag} {pattern_tag}"
+    return pattern_tag
+
+
 def build_hair_caption_tag(item: Dict[str, Any], global_rules: Dict[str, Any]) -> Optional[str]:
     """
     Entscheidet ob und wie Haare in die Caption kommen:
@@ -5520,15 +5692,29 @@ def build_caption(
     beard_variable = beard_rule.get("variable", False)
     beard_mode = normalize_compact_text(beard_rule.get("mode", ""))
 
-    if CAPTION_POLICY["include_beard_always"] and beard_desc:
-        trait_bits.append(beard_desc)
-    elif CAPTION_POLICY["include_beard_when_variable"]:
-        if beard_variable and beard_desc:
+    # Normalisierter Beard-Tag (15 Patterns + Farbe). Konsistenter ueber den
+    # Datensatz hinweg als der KI-Rohtext: "light stubble", "5 o'clock shadow"
+    # und "scruff" werden alle zum gleichen Tag "stubble".
+    beard_caption_tag = build_beard_caption_tag(item, global_rules)
+
+    if CAPTION_POLICY["include_beard_always"]:
+        if beard_caption_tag:
+            trait_bits.append(beard_caption_tag)
+        elif beard_desc:
+            # Fallback wenn der Tag-Builder None liefert (clean_shaven oder
+            # nicht sichtbar) aber User explizit immer captionen will.
             trait_bits.append(beard_desc)
-        elif not beard_variable and beard_desc and beard_mode:
-            item_beard = normalize_compact_text(item.get("beard_description", ""))
-            if item_beard and item_beard != beard_mode:
+    elif CAPTION_POLICY["include_beard_when_variable"]:
+        if beard_variable:
+            if beard_caption_tag:
+                trait_bits.append(beard_caption_tag)
+            elif beard_desc:
                 trait_bits.append(beard_desc)
+        elif not beard_variable and beard_caption_tag and beard_mode:
+            # Stable Mode + Abweichung vom Modus -> Tag rein
+            item_beard_mode = normalize_compact_text(item.get("beard_description", ""))
+            if item_beard_mode and item_beard_mode != beard_mode:
+                trait_bits.append(beard_caption_tag)
 
     if CAPTION_POLICY["include_glasses"] and glasses_desc:
         trait_bits.append(glasses_desc)
