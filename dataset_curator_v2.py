@@ -160,6 +160,17 @@ HARD_MIN_BLUR_VARIANCE     = 25.0      # Stufe 1: Totalausfall-Schwelle auf Gesa
 # faelschlich gerejectet werden: in UI auf 25-30 runterdrehen und spaeter die
 # geloggte face_blur_variance pro Bild in der Report-Auswertung ansehen.
 FACE_MIN_BLUR_VARIANCE     = 45.0
+# Shot-type-spezifische Schwellen fuer den Face-Blur-Check.
+# Hintergrund: die Laplacian-Variance ueber die ganze Face-Bbox misst die
+# Detail-Dichte. Bei Closeups (Headshots) ist die Bbox sehr gross und die
+# glatten Wangenflaechen drueken die Variance mit, selbst wenn das Bild
+# perfekt scharf ist. Daher braucht der Headshot-Threshold eine niedrigere
+# Schwelle als full_body, wo das Gesicht klein und detailreich ist.
+# Werte 0 oder negativ deaktivieren den shot-type-spezifischen Pfad und
+# fallen auf FACE_MIN_BLUR_VARIANCE zurueck.
+FACE_MIN_BLUR_VARIANCE_HEADSHOT  = 25.0
+FACE_MIN_BLUR_VARIANCE_MEDIUM    = 35.0
+FACE_MIN_BLUR_VARIANCE_FULL_BODY = 45.0
 FACE_BLUR_PADDING_FACTOR   = 0.15      # Face-Bbox um diesen Faktor erweitern vor Blur-Messung
 
 # Belichtungs-Check per Histogramm-Median (PIL, kein OpenCV nötig).
@@ -237,6 +248,13 @@ MIN_FACE_RATIO = {
 # rein über den Status (keep/review/reject).
 ENABLE_MULTIPLE_PEOPLE_DOMINANCE_OVERRIDE = True
 MULTIPLE_PEOPLE_ALWAYS_DOWNGRADE_TO_REVIEW = True   # Empfohlen: True
+# Wenn ALWAYS_DOWNGRADE aktiv ist, gibt es trotzdem einen Hard-Reject-Pfad
+# fuer eindeutig echte Mehrpersonen-Bilder: ein zweites lokal erkanntes
+# Gesicht, das nicht klein gegenueber dem Hauptgesicht ist (Halluzinations-
+# Verdachts-Schwelle), bedeutet, dass tatsaechlich zwei Personen prominent
+# im Frame sind. Solche Bilder sind objektiv unbrauchbar fuers Training -
+# direkt rejecten statt unnoetig im Review-Bucket landen lassen.
+MULTIPLE_PEOPLE_HARD_REJECT_SECONDARY_FACE_RATIO = 0.30  # 0.0 = hard reject deaktiviert
 CO_FACE_AREA_RATIO_THRESHOLD = 0.25                 # nur relevant wenn ALWAYS_DOWNGRADE=False
 MULTIPLE_PEOPLE_SOFT_SCORE_MIN = 75                 # nur relevant wenn ALWAYS_DOWNGRADE=False
 
@@ -2091,7 +2109,14 @@ def cache_path_for_file(file_hash: str) -> str:
 #       Trigger-Logik fuer caption_remove parallel angepasst:
 #       prominent_readable_text alleine triggert nicht mehr, nur
 #       watermark_or_overlay oder mirror_selfie. Caches inkompatibel.
-AUDIT_CACHE_SCHEMA_VERSION = "v8"
+#   v9: Schema um image_medium erweitert (photograph/illustration/
+#       painting/3d_render/screenshot/mixed). Filtert AI-generierte
+#       Bilder, Anime/Manga-Fanart, Cartoons, gemalte Portraits und
+#       Screenshots heraus, die bisher nur per Freitext-Glueck im
+#       short_reason erkannt wurden. Alles ausser 'photograph' fuehrt
+#       zu hard reject mit Reason 'non_photographic_medium'. Caches
+#       inkompatibel.
+AUDIT_CACHE_SCHEMA_VERSION = "v9"
 
 
 def audit_cache_key(base_hash: str, model: str, variant: str = "audit") -> str:
@@ -2658,6 +2683,11 @@ def build_api_schema() -> Dict[str, Any]:
             },
             "face_occlusion": {"type": "string", "enum": ["none", "minor", "major"]},
             "watermark_or_overlay": {"type": "boolean"},
+            "image_medium": {
+                "type": "string",
+                "enum": ["photograph", "illustration", "painting", "3d_render", "screenshot", "mixed"],
+                "description": "Medium of the image. Use 'photograph' only for real camera photos of real people. Anything else (drawings, anime, paintings, AI-generated illustrations, video game screenshots, app screenshots, mixed photo+overlay) is non-photographic and unsuitable for identity training."
+            },
             "prominent_readable_text": {"type": "boolean"},
             "mirror_selfie": {"type": "boolean"},
             "hair_description": {"type": "string"},
@@ -2821,6 +2851,7 @@ def build_api_schema() -> Dict[str, Any]:
             "face_bbox_ai",
             "face_occlusion",
             "watermark_or_overlay",
+            "image_medium",
             "prominent_readable_text",
             "mirror_selfie",
             "hair_description",
@@ -2938,6 +2969,42 @@ Important:
   Both fields independent: a date stamp is watermark_or_overlay=True even
   if it is small. A huge shirt slogan is prominent_readable_text=True even
   if it is not an overlay. They can both be True simultaneously.
+
+- IMAGE MEDIUM CLASSIFICATION (critical, hard filter):
+  Determine what TYPE of image this is. The training pipeline can only use
+  real photographs of real people - anything else teaches the model wrong
+  visual statistics. Use exactly one value:
+    * "photograph": a real camera photo of a real human being. This is the
+      ONLY value that allows the image into the training set. Includes
+      selfies, portraits, candid shots, professional photography, photos
+      with light filters/grading, scanned analog photos.
+    * "illustration": drawings, line art, anime/manga style, cartoon,
+      stylized digital art, fanart, comic-book style. Even highly detailed
+      digital illustrations belong here, NOT in 'photograph'.
+    * "painting": traditional or digital paintings (oil, watercolor,
+      acrylic style, painterly digital art that imitates traditional media).
+    * "3d_render": CGI, 3D-rendered characters, video game screenshots,
+      Pixar-style renders, Daz3D, Blender renders, virtual avatars.
+    * "screenshot": app interface screenshots, social media UI screenshots
+      (TikTok Live, Instagram, Discord), video calls, anything that shows
+      a software interface or chrome around the actual content. A photo
+      that just happens to have a small UI element (timestamp, chat bubble)
+      should be 'photograph' with watermark_or_overlay=True instead.
+    * "mixed": composite images that combine a photograph with significant
+      illustrative or graphic-design elements (Instagram Story art layered
+      over a selfie, photo + drawn-on stickers/text covering large parts,
+      heavily photoshopped fanart of a real person).
+  When in doubt between 'photograph' and 'mixed': if removing the graphic
+  layer would still leave a recognizable, usable photograph, use
+  'photograph' + watermark_or_overlay. If the graphic layer is integral to
+  the image and dominates significantly, use 'mixed'.
+  When in doubt between 'photograph' and 'illustration': look for skin
+  pore detail, realistic hair strands, natural lighting falloff. If those
+  are absent and replaced by stylized smooth shading or line art, it is
+  'illustration' regardless of how realistic the proportions are.
+  Be strict. False classification of an illustration as 'photograph'
+  poisons the training set. False classification of a photograph as
+  'illustration' is a low-cost false positive (the image goes to review).
 
 - Flag multiple prominent people.
 - Ignore brand names and exact text content. Just flag the presence.
@@ -4380,6 +4447,7 @@ def write_caption_stage_reports(
         "quality_lighting", "quality_composition", "quality_identity_usefulness", "shot_type",
         "gender_class", "face_visible", "face_occlusion", "multiple_people",
         "main_subject_clear", "watermark_or_overlay", "prominent_readable_text",
+        "image_medium",
         "mirror_selfie", "hair_description", "beard_description", "glasses_description",
         "piercings_description", "makeup_description", "skin_tone", "eye_color", "body_build",
         "body_skin_visibility",
@@ -4594,12 +4662,41 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     main_subject_clear = bool(item.get("main_subject_clear", True))
     issues = set(item.get("issues", []))
 
+    # ── Image-Medium-Check (hard reject, hoechste Prioritaet) ──
+    # Nicht-photographische Bilder (Anime, Illustrationen, 3D-Renders,
+    # Screenshots, AI-Generiert) vergiften das LoRA-Training. Selbst wenn
+    # die Person erkannt wird, bringt das Modell falsche Visualstatistiken
+    # bei (anatomische Vereinfachungen, Anime-Augen-Proportionen, etc.).
+    # Strenger Filter, hoechste Prioritaet vor allen anderen Checks.
+    image_medium = str(item.get("image_medium", "")).strip().lower()
+    if image_medium and image_medium != "photograph":
+        reasons.append(f"non_photographic_medium({image_medium})")
+        item.setdefault("status_notes", []).append(
+            f"image_medium_{image_medium}_hard_reject"
+        )
+        return "reject", reasons
+
     if multiple_people:
-        # Strategie 1 (Default, empfohlen): immer auf review degradieren.
-        # Begruendung: lokaler MediaPipe-Cross-Check ist nicht zuverlaessig
-        # genug, um echte vs. halluzinierte Co-Faces zu trennen. Lieber
-        # einmal manuell sichten als systematische Falsch-Rejects.
+        sec_ratio = float(item.get("secondary_face_area_ratio", 0.0))
+
+        # Strategie 1 (Default, empfohlen): immer auf review degradieren -
+        # ABER mit Hard-Reject-Pfad fuer eindeutige Mehrpersonen-Bilder.
+        # Wenn lokal ein zweites Gesicht erkannt wurde, das gross genug ist
+        # (>= MULTIPLE_PEOPLE_HARD_REJECT_SECONDARY_FACE_RATIO), ist die
+        # API-Aussage durch lokale Detection bestaetigt und das Bild ist
+        # objektiv unbrauchbar (kein Review-Aufwand noetig).
         if MULTIPLE_PEOPLE_ALWAYS_DOWNGRADE_TO_REVIEW:
+            hard_threshold = float(MULTIPLE_PEOPLE_HARD_REJECT_SECONDARY_FACE_RATIO)
+            if (hard_threshold > 0.0
+                    and face_count_local >= 2
+                    and sec_ratio >= hard_threshold):
+                reasons.append(
+                    f"multiple_people_confirmed_local(sec_ratio={sec_ratio:.2f})"
+                )
+                item.setdefault("status_notes", []).append(
+                    f"multiple_people_hard_reject_sec_ratio_{sec_ratio:.2f}"
+                )
+                return "reject", reasons
             reasons.append("multiple_people_downgraded_to_review")
             item.setdefault("status_notes", []).append(
                 "multiple_people_always_downgrade_to_review"
@@ -4610,7 +4707,6 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
         # dominiert, ist die API-Meldung wahrscheinlich ein Mismatch (Reflexion
         # in Brille, Hintergrund-Statist, Spiegelbild). Dann statt hard reject
         # -> review. Sonst -> reject.
-        sec_ratio = float(item.get("secondary_face_area_ratio", 0.0))
         if (ENABLE_MULTIPLE_PEOPLE_DOMINANCE_OVERRIDE
                 and face_count_local >= 2
                 and 0.0 < sec_ratio < CO_FACE_AREA_RATIO_THRESHOLD
@@ -4680,9 +4776,22 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
                 # analysiert und der Threshold empirisch kalibriert werden kann.
                 if face_var >= 0:
                     item["face_blur_variance"] = round(face_var, 1)
-                if face_var >= 0 and face_var < FACE_MIN_BLUR_VARIANCE:
+                # Shot-type-spezifische Schwelle: bei Headshots ist die
+                # Face-Bbox so gross, dass glatte Hautflaechen die Variance
+                # statistisch druecken, selbst wenn das Bild scharf ist.
+                # Daher hat headshot eine niedrigere Schwelle als full_body.
+                shot = str(item.get("shot_type", "")).strip().lower()
+                if shot == "headshot" and FACE_MIN_BLUR_VARIANCE_HEADSHOT > 0:
+                    threshold = float(FACE_MIN_BLUR_VARIANCE_HEADSHOT)
+                elif shot == "medium" and FACE_MIN_BLUR_VARIANCE_MEDIUM > 0:
+                    threshold = float(FACE_MIN_BLUR_VARIANCE_MEDIUM)
+                elif shot == "full_body" and FACE_MIN_BLUR_VARIANCE_FULL_BODY > 0:
+                    threshold = float(FACE_MIN_BLUR_VARIANCE_FULL_BODY)
+                else:
+                    threshold = float(FACE_MIN_BLUR_VARIANCE)
+                if face_var >= 0 and face_var < threshold:
                     item.setdefault("status_notes", []).append(
-                        f"face_blur_variance_{face_var:.1f}_below_{FACE_MIN_BLUR_VARIANCE}"
+                        f"face_blur_variance_{face_var:.1f}_below_{threshold}_shot_{shot or 'unknown'}"
                     )
                     reasons.append("face_blur_too_high")
                     return "reject", reasons
@@ -6783,6 +6892,7 @@ def main() -> None:
         "main_subject_clear",
         "watermark_or_overlay",
         "prominent_readable_text",
+        "image_medium",
         "mirror_selfie",
         "hair_description",
         "beard_description",

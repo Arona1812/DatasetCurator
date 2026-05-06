@@ -136,6 +136,9 @@ DEFAULTS: Dict[str, Any] = {
     "c_use_blur": True,
     "c_min_blur": 25,
     "c_face_min_blur": 45,
+    "c_face_min_blur_headshot": 25,
+    "c_face_min_blur_medium": 35,
+    "c_face_min_blur_full_body": 45,
     "c_blur_norm_edge": 512,
     # Frühe pHash-Vorfilterung (zwei Schleifen)
     "c_use_early_phash": True,
@@ -364,6 +367,7 @@ def save_settings_fn(
     c_keep_min, c_reject, c_min_side,
     c_use_filesize, c_min_filesize,
     c_use_blur, c_min_blur, c_face_min_blur, c_blur_norm_edge,
+    c_face_min_blur_headshot, c_face_min_blur_medium, c_face_min_blur_full_body,
     c_use_early_phash,
     c_use_early_phash_loop1, c_early_phash_thresh_1, c_early_phash_keep_1,
     c_use_early_phash_loop2, c_early_phash_thresh_2, c_early_phash_keep_2,
@@ -404,6 +408,9 @@ def save_settings_fn(
         "c_use_filesize": c_use_filesize, "c_min_filesize": c_min_filesize,
         "c_use_blur": c_use_blur, "c_min_blur": c_min_blur,
         "c_face_min_blur": c_face_min_blur, "c_blur_norm_edge": c_blur_norm_edge,
+        "c_face_min_blur_headshot": c_face_min_blur_headshot,
+        "c_face_min_blur_medium": c_face_min_blur_medium,
+        "c_face_min_blur_full_body": c_face_min_blur_full_body,
         "c_use_early_phash": c_use_early_phash,
         "c_use_early_phash_loop1": c_use_early_phash_loop1,
         "c_early_phash_thresh_1": c_early_phash_thresh_1,
@@ -1186,6 +1193,7 @@ def start_curator(
     keep_score_min, hard_reject_score, hard_min_side,
     use_filesize_filter, min_filesize_kb,
     use_blur_filter, min_blur_variance, face_min_blur_variance, blur_norm_edge,
+    face_min_blur_variance_headshot, face_min_blur_variance_medium, face_min_blur_variance_full_body,
     use_early_phash,
     use_early_phash_loop1, early_phash_threshold_1, early_phash_keep_per_group_1,
     use_early_phash_loop2, early_phash_threshold_2, early_phash_keep_per_group_2,
@@ -1246,6 +1254,9 @@ def start_curator(
         "USE_BLUR_FILTER": use_blur_filter,
         "HARD_MIN_BLUR_VARIANCE": float(min_blur_variance),
         "FACE_MIN_BLUR_VARIANCE": float(face_min_blur_variance),
+        "FACE_MIN_BLUR_VARIANCE_HEADSHOT": float(face_min_blur_variance_headshot),
+        "FACE_MIN_BLUR_VARIANCE_MEDIUM": float(face_min_blur_variance_medium),
+        "FACE_MIN_BLUR_VARIANCE_FULL_BODY": float(face_min_blur_variance_full_body),
         "BLUR_NORMALIZE_LONG_EDGE": int(blur_norm_edge),
         "ENABLE_SUBJECT_SANITY_CHECK": subject_sanity,
         "SUBJECT_MIN_TORSO_LANDMARKS": int(subject_min_torso),
@@ -1308,6 +1319,7 @@ def start_caption_from_profile(
     keep_score_min, hard_reject_score, hard_min_side,
     use_filesize_filter, min_filesize_kb,
     use_blur_filter, min_blur_variance, face_min_blur_variance, blur_norm_edge,
+    face_min_blur_variance_headshot, face_min_blur_variance_medium, face_min_blur_variance_full_body,
     use_early_phash,
     use_early_phash_loop1, early_phash_threshold_1, early_phash_keep_per_group_1,
     use_early_phash_loop2, early_phash_threshold_2, early_phash_keep_per_group_2,
@@ -1994,16 +2006,69 @@ def build_ui() -> gr.Blocks:
                         )
                     with gr.Row():
                         c_face_min_blur = gr.Slider(
-                            label=tr("Stufe 2: Min. Schärfe (Gesicht)", "Stage 2: min sharpness (face)"),
+                            label=tr("Stufe 2: Min. Schärfe (Gesicht, Fallback)", "Stage 2: min sharpness (face, fallback)"),
                             minimum=10,
                             maximum=200,
                             step=5,
                             value=S["c_face_min_blur"],
                             info=tr(
-                                "Schärfe-Schwelle in der Gesichts-Region. Empfohlen: 45 (konservativ, lässt Beauty-Filter-Selfies durch). 70+ = streng (filtert auch leicht weichgezeichnete Gesichter raus).",
-                                "Sharpness threshold inside the face region. Recommended: 45 (conservative, keeps beauty-filter selfies). 70+ = strict (also filters slightly soft-focused faces).",
+                                "Globaler Fallback-Wert. Wird nur verwendet, wenn die shot-type-spezifischen Werte unten alle 0 sind. Empfohlen: 45.",
+                                "Global fallback value. Only used when all shot-type-specific values below are 0. Recommended: 45.",
                             ),
                         )
+                    with gr.Accordion(
+                        tr(
+                            "Schärfe-Schwellen pro Shot-Typ (empfohlen)",
+                            "Sharpness thresholds per shot type (recommended)",
+                        ),
+                        open=True,
+                    ):
+                        gr.Markdown(tr(
+                            "Bei Closeups (Headshots) ist die Gesichts-Bbox sehr groß. "
+                            "Glatte Wangen-/Stirnflächen drücken die Schärfemessung statistisch nach unten, "
+                            "selbst wenn das Bild scharf ist. Daher braucht headshot eine niedrigere Schwelle "
+                            "als full_body (kleines Gesicht, hohe Detail-Dichte). "
+                            "Werte 0 deaktivieren den shot-type-spezifischen Pfad und nutzen den globalen Fallback oben.",
+                            "Closeups (headshots) have a very large face bbox. Smooth cheek/forehead areas "
+                            "statistically drag the sharpness measurement down even when the image is sharp. "
+                            "So headshot needs a lower threshold than full_body (small face, high detail density). "
+                            "Values of 0 disable the shot-type-specific path and fall back to the global value above.",
+                        ))
+                        with gr.Row():
+                            c_face_min_blur_headshot = gr.Slider(
+                                label=tr("Headshot", "Headshot"),
+                                minimum=0,
+                                maximum=200,
+                                step=5,
+                                value=S["c_face_min_blur_headshot"],
+                                info=tr(
+                                    "Empfohlen: 25. Closeups vertragen weniger Variance.",
+                                    "Recommended: 25. Closeups tolerate less variance.",
+                                ),
+                            )
+                            c_face_min_blur_medium = gr.Slider(
+                                label=tr("Medium", "Medium"),
+                                minimum=0,
+                                maximum=200,
+                                step=5,
+                                value=S["c_face_min_blur_medium"],
+                                info=tr(
+                                    "Empfohlen: 35. Mittlere Schwelle für Halbfiguren.",
+                                    "Recommended: 35. Middle threshold for medium shots.",
+                                ),
+                            )
+                            c_face_min_blur_full_body = gr.Slider(
+                                label=tr("Full-Body", "Full-body"),
+                                minimum=0,
+                                maximum=200,
+                                step=5,
+                                value=S["c_face_min_blur_full_body"],
+                                info=tr(
+                                    "Empfohlen: 45. Kleines Gesicht im Frame braucht höhere Schwelle.",
+                                    "Recommended: 45. Small face in frame needs higher threshold.",
+                                ),
+                            )
+                    with gr.Row():
                         c_blur_norm_edge = gr.Slider(
                             label=tr("Normierungs-Kantenlänge (px)", "Normalization edge size (px)"),
                             minimum=256,
@@ -3032,6 +3097,7 @@ def build_ui() -> gr.Blocks:
                     c_keep_min, c_reject, c_min_side,
                     c_use_filesize, c_min_filesize,
                     c_use_blur, c_min_blur, c_face_min_blur, c_blur_norm_edge,
+                    c_face_min_blur_headshot, c_face_min_blur_medium, c_face_min_blur_full_body,
                     c_use_early_phash,
                     c_use_early_phash_loop1, c_early_phash_thresh_1, c_early_phash_keep_1,
                     c_use_early_phash_loop2, c_early_phash_thresh_2, c_early_phash_keep_2,
