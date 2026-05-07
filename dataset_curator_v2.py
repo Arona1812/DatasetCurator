@@ -3353,6 +3353,9 @@ def _ensure_article(phrase: str) -> str:
     'orange jumpsuit' -> 'an orange jumpsuit'
     'a black blazer' -> 'a black blazer' (unveraendert)
     'jeans' -> 'jeans' (uncountable / plural, kein Artikel)
+    'brown cardigan over a white top and blue jeans' ->
+        'a brown cardigan over a white top and blue jeans'
+        (erste Phrase bekommt Artikel, weitere bleiben wie sie sind)
     """
     p = phrase.strip()
     if not p:
@@ -3362,13 +3365,24 @@ def _ensure_article(phrase: str) -> str:
     # Bereits Artikel oder Possessiv vorhanden?
     if first_word in {"a", "an", "the", "her", "his", "their", "my"}:
         return p
-    # Plural-Endungen oder uncountable -> kein Artikel noetig
+
+    # Plural-Endungen oder uncountable -> kein Artikel noetig.
+    # WICHTIG: Wir schauen das ERSTE Substantiv an (vor dem ersten 'over',
+    # 'with', 'and', Komma), nicht das letzte Wort der gesamten Phrase.
+    # Sonst greifen wir nicht bei 'cardigan over a top and jeans' weil das
+    # letzte Wort 'jeans' (plural) ist.
     plural_or_uncount = {"jeans", "trousers", "pants", "shorts", "leggings",
                          "tights", "stockings", "pajamas", "scrubs", "sweats",
                          "underwear", "lingerie"}
-    last_word = p.rsplit(maxsplit=1)[-1].lower().rstrip(",.")
-    if last_word in plural_or_uncount:
+    # Splitte nur die erste Phrase (bis zum ersten Konnektor)
+    first_segment = re.split(r"\s+(?:over|with|and|under|above|on|in|,)\s+", p, maxsplit=1)[0]
+    first_segment_words = first_segment.split()
+    if not first_segment_words:
         return p
+    first_segment_last_word = first_segment_words[-1].lower().rstrip(",.")
+    if first_segment_last_word in plural_or_uncount:
+        return p
+
     # Listen-Aufzaehlung wie "blue dress and white sneakers" -> Artikel vor erster Phrase
     # Wir checken ob ein Kleidungs-Substantiv im Phrase vorkommt, sonst sicherer Skip
     has_clothing_noun = any(
@@ -3515,54 +3529,52 @@ def _normalize_glasses_token(text: str) -> str:
 
 def _simplify_or_phrase(text: str) -> str:
     """
-    Reduziert Phrasen mit KI-Unentschiedenheit ('X or Y Z') auf das
-    eindeutige Substantiv ('Z'). Wenn die KI sich nicht zwischen zwei
+    Reduziert Phrasen mit KI-Unentschiedenheit ('X or Y Z' oder 'X/Y Z') auf
+    das eindeutige Substantiv ('Z'). Wenn die KI sich nicht zwischen zwei
     Beschreibungs-Optionen entscheiden kann ('small hoop or stud nose
-    piercing'), wird die uneindeutige Adjektiv-Auswahl entfernt.
+    piercing', 'small floral/script tattoo'), wird die uneindeutige
+    Adjektiv-Auswahl entfernt.
 
     Beispiele:
     - 'small hoop or stud earring' -> 'small earring'
     - 'small hoop or stud nose piercing' -> 'small nose piercing'
-    - 'small earring or stud' -> 'small earring'
-    - 'long or medium-length hair' -> 'long hair'  (erstes gewinnt)
+    - 'small floral/script tattoo' -> 'small tattoo'
+    - 'two or more' -> 'two or more' (kein Substantiv-Trigger)
 
-    Behaelt feste Phrasen die genuin 'or' enthalten ('jewelry or accessories',
-    'two or more') unangetastet, weil dort kein Adjektiv-Auswahl-Pattern vorliegt.
+    Behaelt feste Phrasen die genuin 'or' enthalten ('two or more') unangetastet,
+    weil dort kein Adjektiv-Auswahl-Pattern vorliegt.
     """
     if not text:
         return text
 
-    # Pattern: '<adj1> or <adj2> <noun>'
-    # Wir matchen nur 1-Wort-Adjektive auf beiden Seiten des 'or', um
-    # Phrasen wie 'two or more' nicht zu treffen (die haben Mehrwort-Pattern
-    # nach 'more').
-    # Weiterhin: das Substantiv nach 'or Y' muss vorhanden sein.
     def replace(m: re.Match) -> str:
-        prefix = m.group(1) or ""  # optionales fuehrendes Adjektiv (z.B. 'small')
+        prefix = m.group(1) or ""
         adj1 = m.group(2)
         adj2 = m.group(3)
         noun_part = m.group(4)
-        # Falls adj1==adj2 (sollte nicht vorkommen, aber safe), behalten
         if adj1.lower() == adj2.lower():
             return f"{prefix}{adj1} {noun_part}"
-        # Standardfall: 'X or Y Z' -> 'Z' (oder 'prefix Z' wenn prefix vorhanden)
         return f"{prefix}{noun_part}".strip()
 
-    # Eines fuehrendes Adjektiv (optional, z.B. 'small'),
-    # gefolgt von 'A or B', gefolgt von Substantiv-Phrase (1-3 Worte)
-    pattern = re.compile(
+    # Pattern 1: 'X or Y Z' (Whitespace-Trennung um 'or')
+    pattern_or = re.compile(
         r"\b((?:small |large |big |tiny |medium |short |long )?)"
         r"([a-z]+) or ([a-z]+) "
         r"((?:[a-z]+(?:\s+[a-z]+){0,2}))",
         re.IGNORECASE,
     )
+    text = pattern_or.sub(replace, text)
 
-    # Falle: Phrase soll nicht greifen wenn der Match gar nicht im
-    # Beschreibungs-Kontext steht. Wir wenden das Pattern aber nur in
-    # Caption-Stellen an, die Beschreibungen sind (Piercing, Earring).
-    # Globaler Caption-Apply ist trotzdem safe, weil das Pattern sehr
-    # restriktiv ist.
-    return pattern.sub(replace, text)
+    # Pattern 2: 'X/Y Z' (Slash-Trennung ohne Whitespace)
+    pattern_slash = re.compile(
+        r"\b((?:small |large |big |tiny |medium |short |long )?)"
+        r"([a-z]+)/([a-z]+) "
+        r"((?:[a-z]+(?:\s+[a-z]+){0,2}))",
+        re.IGNORECASE,
+    )
+    text = pattern_slash.sub(replace, text)
+
+    return text
 
 
 def _dedupe_phrase_list(phrases: List[str]) -> List[str]:
@@ -5936,13 +5948,23 @@ def build_caption(
     # Earring-Doubletten dedupen: 'small hoop earring' und 'small hoop' sind
     # die gleiche Information - die KI liefert manchmal beide, weil sie sich
     # nicht entscheiden kann. Wir behalten den spezifischeren Eintrag.
+    # Gleiche Logik fuer Tattoos: 'small floral/script tattoo' und
+    # 'small script tattoo' sind dieselbe Beobachtung mit anderem Detail.
     piercing_bits = _dedupe_phrase_list(piercing_bits)
+    tattoo_bits = _dedupe_phrase_list(tattoo_bits)
 
     # KI-Unentschiedenheit aufloesen: 'small hoop or stud nose piercing'
     # -> 'small nose piercing'. Zwei konkurrierende Adjektive werden zugunsten
     # des klaren Substantivs entfernt. Wirkt auf Piercings und Tattoos.
+    # Auch Slash-Form: 'small floral/script tattoo' -> 'small tattoo'.
     piercing_bits = [_simplify_or_phrase(p) for p in piercing_bits]
     tattoo_bits = [_simplify_or_phrase(t) for t in tattoo_bits]
+
+    # Nach Simplify nochmal dedupen, weil 'small floral/script tattoo'
+    # und 'small script tattoo' nach Simplify beide zu 'small tattoo'
+    # werden und dann substring-Doubletten sind.
+    piercing_bits = _dedupe_phrase_list(piercing_bits)
+    tattoo_bits = _dedupe_phrase_list(tattoo_bits)
 
     clothing = normalize_feature_value(item.get("clothing_description"))
     pose = normalize_feature_value(item.get("pose_description"))
