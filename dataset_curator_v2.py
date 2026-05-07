@@ -3374,8 +3374,13 @@ def _ensure_article(phrase: str) -> str:
     plural_or_uncount = {"jeans", "trousers", "pants", "shorts", "leggings",
                          "tights", "stockings", "pajamas", "scrubs", "sweats",
                          "underwear", "lingerie"}
-    # Splitte nur die erste Phrase (bis zum ersten Konnektor)
-    first_segment = re.split(r"\s+(?:over|with|and|under|above|on|in|,)\s+", p, maxsplit=1)[0]
+    # Splitte nur die erste Phrase (bis zum ersten Konnektor).
+    # Komma ist Sonderfall: braucht keinen Whitespace davor (typisch "top,").
+    # Andere Konnektoren (over, with, and, ...) brauchen Whitespace beidseits.
+    first_segment = re.split(
+        r"(?:\s+(?:over|with|and|under|above|on|in)\s+|,\s*)",
+        p, maxsplit=1
+    )[0]
     first_segment_words = first_segment.split()
     if not first_segment_words:
         return p
@@ -3574,7 +3579,67 @@ def _simplify_or_phrase(text: str) -> str:
     )
     text = pattern_slash.sub(replace, text)
 
+    # Pattern 3: 'X or Y' am Phrasen-Ende (kein nachfolgendes Substantiv).
+    # Hier ist X selbst das Substantiv, Y die Alternative dazu.
+    # Beispiel: 'left ear lobe earring or stud' -> 'left ear lobe earring'
+    # Wir behalten das erste Substantiv (X) als das spezifischere/uebliche.
+    #
+    # WICHTIG: Wir matchen NUR bei einer Whitelist von Schmuck-/Piercing-
+    # Substantiven, weil ein freies 'X or Y'-Pattern legitime 'or'-Phrasen
+    # in Background/Lighting-Saetzen kaputtmacht ('curtain or wall',
+    # 'daylight or flash', 'standing or sitting').
+    JEWELRY_NOUNS = (
+        "earring|earrings|stud|studs|hoop|hoops|piercing|piercings|"
+        "ring|rings|necklace|necklaces|bracelet|bracelets|pendant|pendants"
+    )
+    pattern_or_terminal = re.compile(
+        rf"\b({JEWELRY_NOUNS}) or ({JEWELRY_NOUNS})(?=\s*(?:[,.;]|$))",
+        re.IGNORECASE,
+    )
+
+    def replace_terminal(m: re.Match) -> str:
+        return m.group(1)
+
+    text = pattern_or_terminal.sub(replace_terminal, text)
+
     return text
+
+
+def _ensure_gaze_verb(gaze: str) -> str:
+    """
+    Setzt 'looking' vor reine Direction-Adverbien, damit der Caption-Satz
+    grammatikalisch sauber ist:
+    - 'downward' -> 'looking downward'
+    - 'toward camera' -> 'toward camera' (hat schon eine Praeposition,
+       in der naechsten Pose-Bit-Aufzaehlung lesbar)
+    - 'looking at the camera' -> unveraendert (Verb schon vorhanden)
+
+    Behebt den Bug 'holding cards, downward.' der entsteht wenn die KI
+    nur das Adverb liefert ohne Verb.
+    """
+    g = gaze.strip()
+    if not g:
+        return g
+    # Verb schon vorhanden? Pruefe nach gaengigen Blick-Verben am Anfang
+    GAZE_VERBS = {"looking", "gazing", "staring", "glancing", "facing",
+                  "watching", "peering", "looks", "gazes", "stares"}
+    first_word = g.split()[0].lower().rstrip(",.")
+    if first_word in GAZE_VERBS:
+        return g
+    # Praeposition vorhanden? ('toward', 'at', 'into', etc.) - dann ist es
+    # eine vollstaendige Phrase die in der Caption-Aufzaehlung sauber liest
+    GAZE_PREPS = {"toward", "towards", "at", "into", "upon", "across", "past",
+                  "through", "above", "below", "behind", "ahead"}
+    if first_word in GAZE_PREPS:
+        return g
+    # Reine Direction-Adverbien -> 'looking' davorsetzen
+    DIRECTION_ADVERBS = {"downward", "upward", "sideways", "leftward",
+                         "rightward", "forward", "backward", "away", "down",
+                         "up", "left", "right", "outward", "inward"}
+    if first_word in DIRECTION_ADVERBS:
+        return f"looking {g}"
+    # Fallback: ungewoehnliche gaze-Phrase, unveraendert lassen
+    return g
 
 
 def _dedupe_phrase_list(phrases: List[str]) -> List[str]:
@@ -6091,7 +6156,11 @@ def build_caption(
             # Nur gaze ist eyes closed -> normal anhaengen
             pose_bits.append("with eyes closed")
         else:
-            pose_bits.append(gaze)
+            # Bug G: KI liefert manchmal gaze als reines Direction-Adverb
+            # ('downward', 'upward', 'sideways'), was zu losgeloesten Saetzen
+            # fuehrt: 'holding cards, downward.'. Wir setzen 'looking' davor
+            # wenn gaze eine kurze Direction-Phrase ohne eigenes Verb ist.
+            pose_bits.append(_ensure_gaze_verb(gaze))
     elif eyes_closed_in_expr:
         # Nur Expression hatte eyes closed (und wurde dort verworfen) -> hier anhaengen
         pose_bits.append("with eyes closed")
