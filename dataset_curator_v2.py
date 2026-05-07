@@ -3323,6 +3323,283 @@ def normalize_feature_value(val: Optional[str]) -> str:
     return v
 
 
+# ============================================================
+# Caption-Cleanup-Helpers
+# ============================================================
+
+# Bekannte Kleidungs-Substantive die in der Phrase "wearing X" als Hauptnomen
+# auftauchen koennen. Liste ist defensiv gewaehlt - es schadet nicht, wenn
+# ein Substantiv auf der Liste ist auch wenn die Caption in seltenen Faellen
+# legitim ohne Artikel auskommen koennte (z.B. uncountable nouns).
+_CLOTHING_NOUNS = {
+    "top", "shirt", "blouse", "tee", "t-shirt", "tshirt", "sweater", "hoodie",
+    "pullover", "cardigan", "jacket", "coat", "blazer", "vest", "tank",
+    "dress", "skirt", "pants", "trousers", "jeans", "shorts", "leggings",
+    "robe", "kimono", "scarf", "shawl", "poncho", "cape", "outfit",
+    "uniform", "suit", "jumpsuit", "romper", "bodysuit", "swimsuit",
+    "bikini", "lingerie", "bra", "underwear", "pajamas", "nightgown",
+    "tunic", "kaftan", "saree", "sari",
+}
+
+# Kleine Adjektiv-Liste fuer Vokal-Erkennung beim Artikel ("a" vs "an").
+# Wir entscheiden basierend auf dem ersten Wort der Phrase.
+_VOWEL_SOUNDS = ("a", "e", "i", "o", "u")
+
+
+def _ensure_article(phrase: str) -> str:
+    """
+    Fuegt vor einer Kleidungs-Phrase einen Artikel ein, falls einer fehlt.
+    'dark sleeveless top' -> 'a dark sleeveless top'
+    'orange jumpsuit' -> 'an orange jumpsuit'
+    'a black blazer' -> 'a black blazer' (unveraendert)
+    'jeans' -> 'jeans' (uncountable / plural, kein Artikel)
+    """
+    p = phrase.strip()
+    if not p:
+        return p
+
+    first_word = p.split()[0].lower().rstrip(",.")
+    # Bereits Artikel oder Possessiv vorhanden?
+    if first_word in {"a", "an", "the", "her", "his", "their", "my"}:
+        return p
+    # Plural-Endungen oder uncountable -> kein Artikel noetig
+    plural_or_uncount = {"jeans", "trousers", "pants", "shorts", "leggings",
+                         "tights", "stockings", "pajamas", "scrubs", "sweats",
+                         "underwear", "lingerie"}
+    last_word = p.rsplit(maxsplit=1)[-1].lower().rstrip(",.")
+    if last_word in plural_or_uncount:
+        return p
+    # Listen-Aufzaehlung wie "blue dress and white sneakers" -> Artikel vor erster Phrase
+    # Wir checken ob ein Kleidungs-Substantiv im Phrase vorkommt, sonst sicherer Skip
+    has_clothing_noun = any(
+        w.lower().rstrip(",.;") in _CLOTHING_NOUNS
+        for w in p.split()
+    )
+    if not has_clothing_noun:
+        return p
+    article = "an" if first_word.startswith(_VOWEL_SOUNDS) else "a"
+    return f"{article} {p}"
+
+
+def _clean_expression(expr: str) -> str:
+    """
+    Stellt sicher, dass der Expression-Wert eine grammatikalisch sinnvolle
+    Phrase ist. Bringt drei Faelle in saubere Form:
+
+    1. Single-Adjektiv: 'neutral' -> 'neutral expression'
+    2. Mehrfach-Adjektive: 'neutral, confident' -> 'neutral and confident expression'
+    3. Augen-Beschreibung als Expression: 'eyes closed' -> '' (leer, weil
+       'eyes closed' kein Gesichtsausdruck ist sondern Augen-Eigenschaft;
+       wird in build_caption getrennt als 'with eyes closed' angehaengt)
+
+    Phrasen mit Substantiv ('slight smile', 'wide-eyed playful expression')
+    bleiben unveraendert.
+
+    Behebt Bugs:
+    - 'with a neutral, looking at camera' (Bug 1, Adjektiv ohne Substantiv)
+    - 'with a neutral, confident, toward camera' (Bug B, Doppel-Adjektiv)
+    - 'with a eyes closed with relaxed lips' (Bug A, eyes-closed in Expression)
+    """
+    e = expr.strip().rstrip(",.;").strip()
+    if not e:
+        return ""
+
+    # Sonderfall: 'eyes closed' ist kein Expression-Adjektiv. Verwerfen,
+    # damit der Caption-Builder das ueber den eigenen Pfad anhaengt.
+    if re.search(r"\beyes closed\b", e, re.IGNORECASE):
+        # Falls die Phrase NUR 'eyes closed' enthaelt, leer zurueckgeben.
+        # Falls die Phrase 'eyes closed with relaxed lips' o.ae. enthaelt,
+        # extrahiere den Teil nach dem 'with' (das ist der echte Ausdruck).
+        m = re.search(r"eyes closed\s+with\s+(.+)$", e, re.IGNORECASE)
+        if m:
+            # Rekursiver Cleanup auf den Rest. Falls Rest mit 'a ' / 'an '
+            # beginnt (z.B. 'a calm, posed expression'), den Artikel
+            # strippen damit der Caption-Builder nicht 'with a a calm...'
+            # produziert.
+            cleaned = _clean_expression(m.group(1))
+            cleaned = re.sub(r"^(an?|the)\s+", "", cleaned, flags=re.IGNORECASE)
+            return cleaned
+        # Reines 'eyes closed' oder 'eyes closed, relaxed lips' etc.
+        return ""
+
+    # Bekannte Substantive die signalisieren: Phrase ist schon vollstaendig
+    EXPRESSION_NOUNS = {
+        "expression", "look", "smile", "smirk", "frown", "grin", "pout",
+        "stare", "gaze", "glance", "face", "demeanor", "mood",
+    }
+    words = [w.lower().rstrip(",.;") for w in e.split()]
+    if any(w in EXPRESSION_NOUNS for w in words):
+        return e
+
+    # Komma-getrennte Mehrfach-Adjektive zusammenfuehren
+    if "," in e:
+        parts = [p.strip() for p in e.split(",") if p.strip()]
+        # Filter: nur Adjektiv-aehnliche Teile (1-3 Worte ohne Substantive)
+        adj_parts = []
+        for p in parts:
+            p_words = [w.lower() for w in p.split()]
+            if any(w in EXPRESSION_NOUNS for w in p_words):
+                # Wenn ein Teil schon ein Substantiv enthaelt, nimm diesen Teil
+                # alleine - er ist die saubere Phrase
+                return p
+            if len(p_words) <= 3:
+                adj_parts.append(p)
+        if len(adj_parts) >= 2:
+            return f"{' and '.join(adj_parts)} expression"
+        elif len(adj_parts) == 1:
+            return f"{adj_parts[0]} expression"
+        return ""
+
+    # Single-Adjektiv-Phrase -> 'expression' anhaengen
+    return f"{e} expression"
+
+
+def _clean_pose_phrase(pose: str) -> str:
+    """
+    Saeubert die pose_description-Phrase von haeufigen KI-Output-Bugs:
+    - 'front-facing selfie seated in a car' -> 'seated in a car' (entfernt
+       redundanten Compound-Modifier am Anfang wenn er mit einem inkompatiblen
+       Hauptverb kollidiert)
+    - 'close-up selfie with one hand' -> 'with one hand' (entfernt
+       Shot-Type-Doublung)
+
+    Heuristik: Wenn die Phrase mit einem Adjektiv-Compound startet
+    ('front-facing', 'side-profile', 'close-up', 'head-tilted') und
+    danach ein neuer Subjekt-Verb-Block kommt ('seated', 'sitting', 'standing',
+    'lying', 'with'), dann verwirft sie den Adjektiv-Compound.
+    """
+    p = pose.strip()
+    if not p:
+        return ""
+
+    # Compound-Modifier die typisch falsch verschmolzen werden
+    redundant_starters = {
+        "front-facing", "side-profile", "side-facing", "close-up", "head-tilted",
+        "back-facing", "three-quarter", "frontal",
+    }
+    incompatible_continuations = {
+        "selfie", "shot", "portrait", "view",
+    }
+    follow_verbs = {
+        "seated", "sitting", "standing", "lying", "laying", "leaning",
+        "kneeling", "crouching", "with",
+    }
+
+    words = p.split()
+    if len(words) < 4:
+        return p
+
+    first = words[0].lower().rstrip(",")
+    # Pattern: "<modifier> <noun> <verb>" -> nimm "<verb>..." wenn modifier+noun zur Falle wird
+    if first in redundant_starters and words[1].lower().rstrip(",") in incompatible_continuations:
+        # Suche nach erstem follow-verb ab Position 2
+        for i in range(2, len(words)):
+            if words[i].lower().rstrip(",") in follow_verbs:
+                return " ".join(words[i:])
+    return p
+
+
+def _normalize_glasses_token(text: str) -> str:
+    """
+    Ersetzt 'eyeglasses' durch 'glasses' in der gesamten Caption.
+    Behaelt 'sunglasses' bei (sind ein eigenes Wort).
+    """
+    if not text:
+        return text
+    # Erst sunglasses schuetzen, dann ersetzen, dann zurueckmappen
+    text = text.replace("sunglasses", "\x00SUNGLASSES\x00")
+    text = re.sub(r"\beyeglasses\b", "glasses", text, flags=re.IGNORECASE)
+    text = text.replace("\x00SUNGLASSES\x00", "sunglasses")
+    return text
+
+
+def _simplify_or_phrase(text: str) -> str:
+    """
+    Reduziert Phrasen mit KI-Unentschiedenheit ('X or Y Z') auf das
+    eindeutige Substantiv ('Z'). Wenn die KI sich nicht zwischen zwei
+    Beschreibungs-Optionen entscheiden kann ('small hoop or stud nose
+    piercing'), wird die uneindeutige Adjektiv-Auswahl entfernt.
+
+    Beispiele:
+    - 'small hoop or stud earring' -> 'small earring'
+    - 'small hoop or stud nose piercing' -> 'small nose piercing'
+    - 'small earring or stud' -> 'small earring'
+    - 'long or medium-length hair' -> 'long hair'  (erstes gewinnt)
+
+    Behaelt feste Phrasen die genuin 'or' enthalten ('jewelry or accessories',
+    'two or more') unangetastet, weil dort kein Adjektiv-Auswahl-Pattern vorliegt.
+    """
+    if not text:
+        return text
+
+    # Pattern: '<adj1> or <adj2> <noun>'
+    # Wir matchen nur 1-Wort-Adjektive auf beiden Seiten des 'or', um
+    # Phrasen wie 'two or more' nicht zu treffen (die haben Mehrwort-Pattern
+    # nach 'more').
+    # Weiterhin: das Substantiv nach 'or Y' muss vorhanden sein.
+    def replace(m: re.Match) -> str:
+        prefix = m.group(1) or ""  # optionales fuehrendes Adjektiv (z.B. 'small')
+        adj1 = m.group(2)
+        adj2 = m.group(3)
+        noun_part = m.group(4)
+        # Falls adj1==adj2 (sollte nicht vorkommen, aber safe), behalten
+        if adj1.lower() == adj2.lower():
+            return f"{prefix}{adj1} {noun_part}"
+        # Standardfall: 'X or Y Z' -> 'Z' (oder 'prefix Z' wenn prefix vorhanden)
+        return f"{prefix}{noun_part}".strip()
+
+    # Eines fuehrendes Adjektiv (optional, z.B. 'small'),
+    # gefolgt von 'A or B', gefolgt von Substantiv-Phrase (1-3 Worte)
+    pattern = re.compile(
+        r"\b((?:small |large |big |tiny |medium |short |long )?)"
+        r"([a-z]+) or ([a-z]+) "
+        r"((?:[a-z]+(?:\s+[a-z]+){0,2}))",
+        re.IGNORECASE,
+    )
+
+    # Falle: Phrase soll nicht greifen wenn der Match gar nicht im
+    # Beschreibungs-Kontext steht. Wir wenden das Pattern aber nur in
+    # Caption-Stellen an, die Beschreibungen sind (Piercing, Earring).
+    # Globaler Caption-Apply ist trotzdem safe, weil das Pattern sehr
+    # restriktiv ist.
+    return pattern.sub(replace, text)
+
+
+def _dedupe_phrase_list(phrases: List[str]) -> List[str]:
+    """
+    Entfernt Doppleinträge in einer Liste von kurzen Beschreibungs-Phrasen.
+    Behandelt 'small hoop earring' und 'small hoop' als gleichwertig
+    (Substring-Match), behaelt aber den laengeren/spezifischeren Eintrag.
+
+    Behebt den Earring-Doublette-Bug: 'small hoop earring, small hoop'.
+    """
+    if not phrases:
+        return phrases
+    cleaned: List[str] = []
+    seen_normalized: List[str] = []
+    for p in phrases:
+        p_clean = p.strip().lower().rstrip(",.;")
+        if not p_clean:
+            continue
+        # Ist dieser Eintrag in einem bereits aufgenommenen enthalten?
+        if any(p_clean in s or s in p_clean for s in seen_normalized):
+            # Wenn der neue Eintrag laenger ist als ein bereits aufgenommener,
+            # ersetze ihn statt zu skippen
+            replaced = False
+            for i, s in enumerate(seen_normalized):
+                if s in p_clean and len(p_clean) > len(s):
+                    cleaned[i] = p
+                    seen_normalized[i] = p_clean
+                    replaced = True
+                    break
+            if not replaced:
+                continue
+        else:
+            cleaned.append(p)
+            seen_normalized.append(p_clean)
+    return cleaned
+
+
 def compute_global_rules(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     rules: Dict[str, Any] = {}
 
@@ -5656,6 +5933,17 @@ def build_caption(
         if fallback_piercing:
             piercing_bits.append(fallback_piercing)
 
+    # Earring-Doubletten dedupen: 'small hoop earring' und 'small hoop' sind
+    # die gleiche Information - die KI liefert manchmal beide, weil sie sich
+    # nicht entscheiden kann. Wir behalten den spezifischeren Eintrag.
+    piercing_bits = _dedupe_phrase_list(piercing_bits)
+
+    # KI-Unentschiedenheit aufloesen: 'small hoop or stud nose piercing'
+    # -> 'small nose piercing'. Zwei konkurrierende Adjektive werden zugunsten
+    # des klaren Substantivs entfernt. Wirkt auf Piercings und Tattoos.
+    piercing_bits = [_simplify_or_phrase(p) for p in piercing_bits]
+    tattoo_bits = [_simplify_or_phrase(t) for t in tattoo_bits]
+
     clothing = normalize_feature_value(item.get("clothing_description"))
     pose = normalize_feature_value(item.get("pose_description"))
     expression = normalize_feature_value(item.get("expression"))
@@ -5740,15 +6028,51 @@ def build_caption(
         pronoun = "He"
 
     if clothing:
-        sentences.append(f"{pronoun} {'is' if pronoun in ['He', 'She'] else 'are'} wearing {clothing}.")
+        # Bug-Fix: KI laesst manchmal den Artikel weg ('wearing dark
+        # sleeveless top'). Wir fuegen 'a' bzw 'an' ein wenn fehlt.
+        clothing_with_article = _ensure_article(clothing)
+        sentences.append(f"{pronoun} {'is' if pronoun in ['He', 'She'] else 'are'} wearing {clothing_with_article}.")
 
     pose_bits = []
     if pose and pose not in {"none", "unknown"}:
-        pose_bits.append(pose)
+        # Bug-Fix: gelegentlich liefert die KI doppelt verschmolzene
+        # Compound-Phrasen wie 'front-facing selfie seated in a car'.
+        # Wir saeubern den Compound-Modifier-Praefix wenn er mit dem
+        # nachfolgenden Verb kollidiert.
+        pose_bits.append(_clean_pose_phrase(pose))
+
+    # Eyes-closed-Sonderfall (Bug A + E):
+    # Die KI markiert manchmal 'eyes closed' als Expression UND/ODER als Gaze.
+    # 'eyes closed expression' ist grammatikalischer Unsinn (Expression
+    # beschreibt Mund/Lippen/Augenbrauen, nicht die Augen). Wir behandeln
+    # 'eyes closed' als eigenstaendigen Pose-Bit und vermeiden dabei
+    # Mehrfach-Erwaehnung wenn beide Felder es liefern.
+    eyes_closed_in_expr = bool(expression and re.search(r"\beyes closed\b", expression, re.IGNORECASE))
+    eyes_closed_in_gaze = bool(gaze and re.search(r"\beyes closed\b", gaze, re.IGNORECASE))
+
     if CAPTION_POLICY["include_expression"] and expression and expression not in {"none", "unknown"}:
-        pose_bits.append(f"with a {expression}")
+        # Bug-Fix: gelegentlich liefert die KI nur ein Adjektiv ohne
+        # Substantiv ('neutral', 'pensive'), was zu kaputten Saetzen wie
+        # 'with a neutral, looking at camera' fuehrt. Bei Mehrfach-Adjektiven
+        # ('neutral, confident') wird mit 'and' verknuepft. 'eyes closed'
+        # in Expression wird verworfen (s.o.).
+        cleaned_expr = _clean_expression(expression)
+        if cleaned_expr:
+            pose_bits.append(f"with a {cleaned_expr}")
     if CAPTION_POLICY["include_gaze"] and gaze and gaze not in {"none", "unknown"}:
-        pose_bits.append(gaze)
+        # Wenn gaze=='eyes closed' und Expression auch eyes closed enthielt,
+        # haengen wir 'with eyes closed' nur einmal an.
+        if eyes_closed_in_gaze and eyes_closed_in_expr:
+            # Beide Felder reden ueber geschlossene Augen -> einmal sauber anhaengen
+            pose_bits.append("with eyes closed")
+        elif eyes_closed_in_gaze:
+            # Nur gaze ist eyes closed -> normal anhaengen
+            pose_bits.append("with eyes closed")
+        else:
+            pose_bits.append(gaze)
+    elif eyes_closed_in_expr:
+        # Nur Expression hatte eyes closed (und wurde dort verworfen) -> hier anhaengen
+        pose_bits.append("with eyes closed")
 
     if pose_bits:
         sentences.append(f"{pronoun} {'is' if pronoun in ['He', 'She'] else 'are'} " + ", ".join(pose_bits) + ".")
@@ -5761,6 +6085,9 @@ def build_caption(
 
     caption = " ".join(sentences)
     caption = re.sub(r"\s+", " ", caption).strip()
+    # Bug-Fix: 'eyeglasses' konsistent zu 'glasses' normalisieren. 'sunglasses'
+    # bleibt unveraendert. Greift auch auf eingebaute Trait-Phrases der KI.
+    caption = _normalize_glasses_token(caption)
     return caption
 
 
