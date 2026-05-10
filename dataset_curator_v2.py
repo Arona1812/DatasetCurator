@@ -179,6 +179,38 @@ USE_EXPOSURE_FILTER       = False
 HARD_MAX_DARK_MEDIAN      = 20        # Unter 30/255 -> zu dunkel
 HARD_MIN_BRIGHT_MEDIAN    = 255       # Über 225/255 -> überbelichtet
 
+# Kleiner Soft-Penalty für Bilder, die praktisch farblos sind
+# (echte Schwarz-Weiß-/Graustufenfotos oder starke Monochrom-Filter).
+# Kein Hard-Reject: der Abzug soll nur knappe Fälle etwas nach unten ziehen.
+USE_GRAYSCALE_PENALTY = True
+GRAYSCALE_SCORE_PENALTY = 5.0
+# Konservative Schwellen: beide Bedingungen müssen erfüllt sein, damit normale
+# entsättigte/stimmungsvolle Farbfotos nicht versehentlich bestraft werden.
+GRAYSCALE_SATURATION_THRESHOLD = 0.08
+GRAYSCALE_CHANNEL_DELTA_THRESHOLD = 3.5
+# Color-Tint-Detection: erkennt Bilder mit dominantem Farbstich (Blau-/Sepia-/
+# Grün-Filter etc.). Dient ausschliesslich der Caption-Markierung, kein
+# Quality-Penalty - getoente Bilder sind grundsaetzlich brauchbar, der LoRA
+# muss nur wissen dass der Tint ein Bild-Attribut ist und nicht zur Person
+# gehoert.
+USE_COLOR_TINT_CAPTION = True
+# Channel-Asymmetrie ab der ein Tint ueberhaupt in Betracht kommt. Werte unter
+# 0.15 sind im Bereich von natuerlich warmer/kalter Beleuchtung, die wir nicht
+# als Filter behandeln wollen.
+TINT_MIN_ASYMMETRY = 0.15
+# Asymmetrie ab der Strength = 1.0. Bilder mit asym >= 0.45 sind eindeutige
+# Filter (Sepia, Heavy-Blue-Filter, etc.).
+TINT_STRONG_ASYMMETRY = 0.45
+# Strength-Schwelle ab der das Tint-Label tatsaechlich in die Caption geht.
+# Werte zwischen MIN_ASYMMETRY und dieser Schwelle gelten als "leichter
+# Farbstich" und werden NICHT captionen, um false positives bei Sonnenuntergang
+# / kaltem Tageslicht zu vermeiden.
+TINT_MIN_STRENGTH_FOR_CAPTION = 0.30
+# Sepia-Spezialfall: braeunlicher Vintage-Look (R > G > B mit deutlicher
+# R-B-Differenz im 0..255 Mittel). Wird nur dann als sepia getaggt, wenn die
+# RGB-Reihenfolge stimmt UND mean_r - mean_b ueber dieser Schwelle liegt.
+TINT_SEPIA_MIN_R_B_DELTA = 25.0
+
 # pHash-Vorfilter VOR der API: berechnet alle Hashes lokal und wirft
 # nur nahezu identische Bilder raus, bevor ein einziger API-Call gemacht wird.
 # Wichtig: Early-Dedup ist absichtlich strenger als der spaetere Pass-2-Filter,
@@ -324,13 +356,30 @@ USE_AI_TRIGGERWORD_CHECK = False  # Prüft das Triggerwort per KI auf Kollisione
 # --------------------------------
 # Near-Duplicate Optionen
 # --------------------------------
-USE_CLIP_DUPLICATE_SCORING = True  # Erkennt semantisch sehr ähnliche Bilder per CLIP
-USE_PHASH_DUPLICATE_SCORING = True  # Erkennt visuell nahezu identische Bilder per pHash
+USE_CLIP_DUPLICATE_SCORING = True
+USE_PHASH_DUPLICATE_SCORING = True
 
 PHASH_HAMMING_THRESHOLD = 8
 
-# Für semantische Dubletten konservativ halten
-CLIP_COSINE_THRESHOLD = 0.985
+# Soft-Threshold: CLIP-Aehnlichkeit ab der ein Bild als near-duplicate gilt,
+# WENN zusaetzlich Metadaten-Match (gleicher Shot + gleiche Clothing/BG/Session)
+# zustimmt. Frueher 0.985 - praktisch nie ausgeloest. 0.96 fängt semantische
+# Naehe ohne dass unterschiedliche Outfits faelschlich verschmolzen werden.
+CLIP_COSINE_THRESHOLD = 0.96
+
+# Hard-Threshold: Bei sehr hoher CLIP-Aehnlichkeit (>= 0.92) wird ohne
+# Metadaten-Bedingung als Duplicate gewertet. Schuetzt vor Style-Cluster-
+# Dominanz (z.B. 5 B/W-Closeups derselben Person mit minimal anderer Pose und
+# nominell unterschiedlicher Sweater-Beschreibung). Hard-Threshold MUSS unter
+# Soft-Threshold liegen.
+CLIP_HARD_DUPLICATE_THRESHOLD = 0.92
+
+# Visual-Style-Diversity: Erkennt Konzentration von Bildern mit gleichem
+# Bild-Stil (B/W oder dominanter Farbstich) im Final-Set. Soft-Penalty,
+# kein Hard-Reject.
+ENABLE_VISUAL_STYLE_DIVERSITY = True
+VISUAL_STYLE_SOFT_LIMIT = 2          # ab dem 3. Bild gleichen Stils -> Penalty
+VISUAL_STYLE_PENALTY_WEIGHT = 8.0    # pro ueberzaehligem Bild gleichen Stils
 
 # CLIP Setup – ViT-L-14 ist deutlich besser für Person-Similarity als ViT-B-32
 CLIP_MODEL_NAME = "ViT-L-14"
@@ -432,6 +481,7 @@ CAPTION_POLICY = {
     "include_gender_class": True,
     "include_skin_tone": True, 
     "include_body_build": True,
+    "include_freckles": True,
     "include_tattoos": True,
     "include_glasses": True,
     "include_piercings": True,
@@ -446,6 +496,7 @@ CAPTION_POLICY = {
     "include_beard_when_variable": True,
     "include_mirror_selfie_marker": True,
     "include_eye_color": True,        # ← NEU: Augenfarbe (siehe unten)
+    "include_visual_style": True,    # B/W- und Tint-Marker als Caption-Praefix
 }
 
 # Bilder mit Text / Wasserzeichen bei Bedarf separat ausgeben
@@ -1324,6 +1375,144 @@ def local_exposure_median(image_path: str) -> float:
     except Exception:
         return 128.0
 
+def _classify_color_tint(
+    arr: np.ndarray,
+    saturation_mean: float,
+) -> Tuple[str, float]:
+    """Erkennt einen dominanten Farbstich im Bild.
+
+    Args:
+        arr: HxWx3 RGB-Array (float, 0..255).
+        saturation_mean: Bereits berechnete mittlere HSV-Saettigung.
+
+    Returns:
+        (label, strength) - label ist eines von:
+            "" (kein Tint), "blue", "warm", "green", "purple", "sepia"
+        strength ist 0..1 (geclamped).
+
+    Hinweise:
+        - Naturwarme/-kalte Beleuchtung (asym < TINT_MIN_ASYMMETRY) gibt "".
+        - Sehr niedrige Saettigung (< 0.05) gibt "" - das ist Grayscale-Territorium
+          und wird separat ueber is_grayscale_filter geflagged.
+        - "warm" ist der Sammelbegriff fuer R-dominante Tints, die NICHT die
+          Sepia-Kriterien erfuellen (z.B. Instagram-Warm-Filter).
+    """
+    if arr.size == 0:
+        return ("", 0.0)
+    if saturation_mean < 0.05:
+        # Grayscale-Territorium - separater Pfad
+        return ("", 0.0)
+
+    mean_r = float(np.mean(arr[:, :, 0]))
+    mean_g = float(np.mean(arr[:, :, 1]))
+    mean_b = float(np.mean(arr[:, :, 2]))
+    avg = (mean_r + mean_g + mean_b) / 3.0
+    if avg < 1e-6:
+        return ("", 0.0)
+
+    rel_r = mean_r / avg
+    rel_g = mean_g / avg
+    rel_b = mean_b / avg
+    asymmetry = max(rel_r, rel_g, rel_b) - min(rel_r, rel_g, rel_b)
+
+    if asymmetry < float(TINT_MIN_ASYMMETRY):
+        return ("", 0.0)
+
+    # Strength normalisieren
+    span = max(1e-6, float(TINT_STRONG_ASYMMETRY) - float(TINT_MIN_ASYMMETRY))
+    strength = min(1.0, max(0.0, (asymmetry - float(TINT_MIN_ASYMMETRY)) / span))
+
+    # Sepia: R > G > B mit deutlicher R-B-Differenz im absoluten Mittel.
+    # Reihenfolge der Pruefungen wichtig: Sepia VOR Warm, weil Sepia ein
+    # Spezialfall von "R-dominant" ist.
+    sepia_r_b_delta = mean_r - mean_b
+    if (
+        rel_r > rel_g
+        and rel_g > rel_b
+        and sepia_r_b_delta >= float(TINT_SEPIA_MIN_R_B_DELTA)
+    ):
+        return ("sepia", strength)
+
+    # Reine Channel-Dominanz
+    if rel_b > rel_r and rel_b > rel_g:
+        return ("blue", strength)
+    if rel_g > rel_r and rel_g > rel_b:
+        return ("green", strength)
+    if rel_r > rel_g and rel_r > rel_b:
+        # R-dominant ohne Sepia-Kriterium = warmer Filter
+        return ("warm", strength)
+    # R+B hoch, G niedrig = magenta/purple (z.B. Disco/Konzert-Lighting)
+    if rel_r > rel_g and rel_b > rel_g:
+        return ("purple", strength)
+
+    return ("", 0.0)
+
+def local_colorfulness_metrics(image_path: str) -> Dict[str, Any]:
+    """Erkennt nahezu farblose Bilder UND Bilder mit dominantem Farbstich
+    lokal und guenstig.
+
+    Drei Output-Signale:
+    - is_grayscale_filter (bool): praktisch farblos (B/W oder reines Greyscale)
+    - color_tint_label (str): "" | "blue" | "warm" | "green" | "purple" | "sepia"
+    - color_tint_strength (float, 0..1): wie stark der Tint ausgeprägt ist
+
+    is_grayscale_filter ist konservativ - es muessen sowohl die mittlere
+    HSV-Saettigung als auch die mittlere RGB-Kanalabweichung sehr niedrig sein.
+
+    color_tint_label wird nur gesetzt, wenn der Tint stark genug ist
+    (strength >= TINT_MIN_STRENGTH_FOR_CAPTION). Naturwarme/-kalte Beleuchtung
+    bleibt unmarkiert.
+    """
+    result: Dict[str, Any] = {
+        "color_saturation_mean": 0.0,
+        "color_channel_delta_mean": 0.0,
+        "is_grayscale_filter": False,
+        "color_tint_label": "",
+        "color_tint_strength": 0.0,
+    }
+    try:
+        img = Image.open(image_path)
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        # Fuer die Statistik klein rechnen: schneller, aber stabil genug.
+        thumb = img.copy()
+        thumb.thumbnail((256, 256), Image.Resampling.BILINEAR)
+        arr = np.asarray(thumb).astype(np.float32)
+        if arr.size == 0:
+            return result
+
+        rgb = arr / 255.0
+        maxc = rgb.max(axis=2)
+        minc = rgb.min(axis=2)
+        sat = np.where(maxc > 1e-6, (maxc - minc) / np.maximum(maxc, 1e-6), 0.0)
+
+        r = arr[:, :, 0]
+        g = arr[:, :, 1]
+        b = arr[:, :, 2]
+        channel_delta = (np.abs(r - g) + np.abs(r - b) + np.abs(g - b)) / 3.0
+
+        saturation_mean = float(np.mean(sat))
+        channel_delta_mean = float(np.mean(channel_delta))
+        is_grayscale = (
+            saturation_mean <= float(GRAYSCALE_SATURATION_THRESHOLD)
+            and channel_delta_mean <= float(GRAYSCALE_CHANNEL_DELTA_THRESHOLD)
+        )
+
+        result["color_saturation_mean"] = round(saturation_mean, 4)
+        result["color_channel_delta_mean"] = round(channel_delta_mean, 3)
+        result["is_grayscale_filter"] = bool(is_grayscale)
+
+        # Tint nur wenn nicht schon Grayscale
+        if not is_grayscale:
+            tint_label, tint_strength = _classify_color_tint(arr, saturation_mean)
+            # Erst ab MIN_STRENGTH_FOR_CAPTION wirklich als Tint flaggen,
+            # darunter bleibt das Bild als "neutral" gewertet.
+            if tint_label and tint_strength >= float(TINT_MIN_STRENGTH_FOR_CAPTION):
+                result["color_tint_label"] = tint_label
+                result["color_tint_strength"] = round(tint_strength, 3)
+        return result
+    except Exception:
+        return result
+
 def early_duplicate_pick_score(image_path: str) -> Tuple[float, Dict[str, float]]:
     """
     Schneller, deterministischer Lokalscore für Early-pHash-Gruppen.
@@ -1946,7 +2135,13 @@ def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]]
         "torso_landmark_count": -1,  # -1 = MediaPipe nicht gelaufen / nicht verfuegbar
         "phash": None,
         "mtime_bucket": get_file_mtime_bucket(image_path),
+        "color_saturation_mean": 0.0,
+        "color_channel_delta_mean": 0.0,
+        "is_grayscale_filter": False,
+        "color_tint_label": "",
+        "color_tint_strength": 0.0,
     }
+    metrics.update(local_colorfulness_metrics(image_path))
 
     if USE_PHASH_DUPLICATE_SCORING:
         # Aus Early-Dedup-Cache wiederverwenden wenn vorhanden
@@ -2116,7 +2311,10 @@ def cache_path_for_file(file_hash: str) -> str:
 #       short_reason erkannt wurden. Alles ausser 'photograph' fuehrt
 #       zu hard reject mit Reason 'non_photographic_medium'. Caches
 #       inkompatibel.
-AUDIT_CACHE_SCHEMA_VERSION = "v9"
+#   v10: Audit/Profile/Caption-Pipeline um freckles_description erweitert.
+#        Freckles werden als flexibler, sichtbarkeitsabhaengiger Marker
+#        behandelt und muessen in alten Caches neu erhoben werden.
+AUDIT_CACHE_SCHEMA_VERSION = "v10"
 
 
 def audit_cache_key(base_hash: str, model: str, variant: str = "audit") -> str:
@@ -2695,6 +2893,10 @@ def build_api_schema() -> Dict[str, Any]:
             "glasses_description": {"type": "string"},
             "piercings_description": {"type": "string"},
             "makeup_description": {"type": "string"},
+            "freckles_description": {
+                "type": "string",
+                "description": "Visible freckles of the main subject, if present and discernible. Use short factual phrases like 'light freckles across the nose and cheeks'. Empty string if no freckles are visible or they cannot be determined reliably."
+            },
             "skin_tone": {"type": "string"},
             "eye_color": {
                 "type": "string",
@@ -2859,6 +3061,7 @@ def build_api_schema() -> Dict[str, Any]:
             "glasses_description",
             "piercings_description",
             "makeup_description",
+            "freckles_description",
             "skin_tone",
             "eye_color",
             "body_build",
@@ -3013,6 +3216,10 @@ Important:
 - Describe eye color PRECISELY if visible (e.g. "blue", "green", "gray-green", "hazel"). Return empty string only if eyes are not visible.
 - Describe skin_tone as a neutral factual value (e.g. "fair", "light", "medium", "olive", "dark"). Never return empty.
 - Describe beard/glasses/piercings/makeup only as visible raw facts.
+- Describe freckles only when actually visible. Use short factual phrases like
+  'light freckles across the nose and cheeks' or 'prominent facial freckles'.
+  If freckles are not visible or cannot be determined reliably because of
+  distance, makeup, filter smoothing or lighting, return an empty string.
 - body_build: ONLY judge body build when the body is actually visible.
     * On HEADSHOTS (only head and shoulders visible): body_build MUST be empty string "". Do not guess.
     * On medium shots: only fill body_build if torso shape is clearly readable.
@@ -3290,6 +3497,36 @@ def normalize_audit_scores(audit: Dict[str, Any]) -> Dict[str, Any]:
     audit["quality_total"] = round(min(100.0, max(0.0, weighted)), 1)
 
     return audit
+
+
+def apply_local_score_adjustments(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Wendet deterministische lokale Soft-Penalties auf den finalen Score an."""
+    try:
+        current_score = float(row.get("quality_total", 0) or 0)
+    except Exception:
+        current_score = 0.0
+
+    row["quality_total_before_local_penalties"] = round(current_score, 1)
+    penalties_applied: List[str] = []
+    total_penalty = 0.0
+
+    if USE_GRAYSCALE_PENALTY and bool(row.get("is_grayscale_filter")):
+        total_penalty += float(GRAYSCALE_SCORE_PENALTY)
+        penalties_applied.append(f"grayscale_filter_penalty_{GRAYSCALE_SCORE_PENALTY:.1f}")
+
+    final_score = max(0.0, min(100.0, current_score - total_penalty))
+    row["grayscale_penalty"] = round(float(GRAYSCALE_SCORE_PENALTY), 1) if bool(row.get("is_grayscale_filter")) else 0.0
+    row["local_score_penalty_total"] = round(total_penalty, 1)
+    row["quality_total"] = round(final_score, 1)
+
+    if penalties_applied:
+        notes = row.setdefault("status_notes", [])
+        if isinstance(notes, list):
+            for note in penalties_applied:
+                if note not in notes:
+                    notes.append(note)
+
+    return row
 
 
 def should_use_review_escalation() -> bool:
@@ -3784,6 +4021,7 @@ def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
             "eye_color": row.get("eye_color", ""),
             "body_build": row.get("body_build", ""),
             "hair_description": row.get("hair_description", ""),
+            "freckles_description": row.get("freckles_description", ""),
             "hair_texture": row.get("hair_texture", ""),
             "beard_description": row.get("beard_description", ""),
             "glasses_description": row.get("glasses_description", ""),
@@ -3970,8 +4208,18 @@ def subject_profile_schema() -> Dict[str, Any]:
                             "additionalProperties": False,
                         },
                     },
+                    "freckles": {
+                        "type": "object",
+                        "properties": {
+                            "has_freckles": {"type": "boolean"},
+                            "canonical_description": {"type": "string"},
+                            "frequency": {"type": "string"},
+                        },
+                        "required": ["has_freckles", "canonical_description", "frequency"],
+                        "additionalProperties": False,
+                    },
                 },
-                "required": ["glasses", "tattoo_inventory", "piercing_baseline"],
+                "required": ["glasses", "tattoo_inventory", "piercing_baseline", "freckles"],
                 "additionalProperties": False,
             },
             "normalizer_notes": {
@@ -4007,6 +4255,7 @@ def _profile_sample_payload(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "glasses_frame_shape": row.get("glasses_frame_shape", ""),
                 "makeup_description": row.get("makeup_description", ""),
                 "makeup_intensity": row.get("makeup_intensity", ""),
+                "freckles_description": row.get("freckles_description", ""),
                 "tattoo_inventory_now": row.get("tattoo_inventory_now", []),
                 "piercing_inventory_now": row.get("piercing_inventory_now", []),
                 "lighting_description": row.get("lighting_description", ""),
@@ -4031,6 +4280,7 @@ Important:
   "few full-body observations". Vision models tend to over-label women as 'slim' on headshots
   due to RLHF politeness bias - resist this tendency.
 - Glasses are regular only if visible in at least about 60% of sampled usable images.
+- Freckles are a flexible visibility-dependent identity marker: if they recur across the face in a substantial subset of images, preserve them as a canonical marker, but they must still only be captioned when visible in the current image.
 - Piercing baseline includes locations visible in at least about 40% of sampled usable images.
 - Tattoo inventory is the union of visible tattoos, grouped by location. Mention only visible markers later.
 - Force-only-when-visible policy: markers like glasses, tattoos and piercings must not be captioned in images where they are not visible.
@@ -4114,6 +4364,10 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
     glasses_descs = [compact_trait(r.get("glasses_description")) for r in glasses_rows]
     glasses_descs = [d for d in glasses_descs if d]
     glasses_mode = Counter(glasses_descs).most_common(1)[0][0] if glasses_descs else ""
+    freckles_rows = [r for r in rows if compact_trait(r.get("freckles_description"))]
+    freckles_descs = [compact_trait(r.get("freckles_description")) for r in freckles_rows]
+    freckles_descs = [d for d in freckles_descs if d]
+    freckles_mode = Counter(freckles_descs).most_common(1)[0][0] if freckles_descs else ""
 
     tattoos_by_loc: Dict[str, List[str]] = defaultdict(list)
     piercings_by_loc: Dict[str, List[str]] = defaultdict(list)
@@ -4185,6 +4439,11 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
                 "wears_regularly": (len(glasses_rows) / n) >= 0.60,
                 "canonical_description": glasses_mode,
                 "frequency": f"{len(glasses_rows)}/{n}",
+            },
+            "freckles": {
+                "has_freckles": (len(freckles_rows) / n) >= 0.25,
+                "canonical_description": freckles_mode,
+                "frequency": f"{len(freckles_rows)}/{n}",
             },
             "tattoo_inventory": inv_items(tattoos_by_loc, min_fraction=0.0),
             "piercing_baseline": inv_items(piercings_by_loc, min_fraction=0.40),
@@ -4382,6 +4641,8 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
         "hair_color_base": canonical_hair_color(row),
         "hair_form": canonical_hair_form(row),
         "makeup_intensity": canonical_makeup_intensity(row),
+        "freckles_visible": bool(compact_trait(row.get("freckles_description"))),
+        "freckles_description": compact_trait(row.get("freckles_description")),
         "glasses_visible": _profile_bool(row.get("has_glasses_now")) or bool(compact_trait(row.get("glasses_description"))),
         "tattoo_locations_visible": sorted(set(tattoos_visible)),
         "piercing_locations_visible": sorted(set(piercings_visible)),
@@ -4433,6 +4694,10 @@ def save_subject_profile(profile: Dict[str, Any]) -> None:
             "identity_markers": {
                 "glasses": {
                     "wears_regularly": False,
+                    "canonical_description": "",
+                },
+                "freckles": {
+                    "has_freckles": False,
                     "canonical_description": "",
                 }
             },
@@ -4699,6 +4964,38 @@ def _write_captioned_image(row: Dict[str, Any], out_dir: str, new_basename: str,
         f.write(row["final_caption"])
 
 
+def build_reject_export_text(
+    row: Dict[str, Any],
+    global_rules: Optional[Dict[str, Any]] = None,
+    subject_profile: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Baut den Textinhalt fuer exportierte Reject-.txt-Dateien.
+
+    Behaelt immer den diagnostischen Reject-Header und haengt darunter eine
+    normale Caption an, falls fuer die Row genug AI-Daten vorhanden sind und
+    der Caption-Build erfolgreich ist.
+    """
+    reasons_str = build_reject_reason_string(row)
+    header = (
+        f"REJECTED REASON: {reasons_str}\n"
+        f"score={row.get('quality_total', 0)} | "
+        f"type={row.get('shot_type', '')} | "
+        f"file={row.get('original_filename', '')}\n"
+    )
+
+    caption_text = ""
+    try:
+        caption_text = build_caption(row, global_rules or {}, subject_profile or {})
+    except Exception:
+        caption_text = ""
+
+    if caption_text:
+        row["final_caption"] = caption_text
+        return f"{header}\nCaption:\n{caption_text}"
+    return header
+
+
 def build_reject_reason_string(row: Dict[str, Any]) -> str:
     """
     Baut den vollstaendigen REJECTED REASON-String aus allen verfuegbaren
@@ -4797,13 +5094,17 @@ def write_caption_stage_reports(
 ) -> None:
     csv_fields = [
         "original_filename", "base_status", "selected", "output_bucket", "new_basename",
-        "quality_total", "grundscore", "score_nach_eskalation", "quality_sharpness",
+        "quality_total", "quality_total_before_local_penalties", "grundscore", "score_nach_eskalation", "quality_sharpness",
         "quality_lighting", "quality_composition", "quality_identity_usefulness", "shot_type",
+        "is_grayscale_filter", "grayscale_penalty", "local_score_penalty_total",
+        "color_saturation_mean", "color_channel_delta_mean",
+        "color_tint_label", "color_tint_strength",
         "gender_class", "face_visible", "face_occlusion", "multiple_people",
         "main_subject_clear", "watermark_or_overlay", "prominent_readable_text",
         "image_medium",
         "mirror_selfie", "hair_description", "beard_description", "glasses_description",
         "piercings_description", "makeup_description", "skin_tone", "eye_color", "body_build",
+        "freckles_description",
         "body_skin_visibility",
         "face_orientation_in_frame",
         "tattoos_visible", "tattoos_description", "clothing_description", "pose_description",
@@ -4983,10 +5284,9 @@ def continue_caption_from_profile() -> None:
             txt_out = os.path.join(REJECT_DIR, f"{new_basename}.txt")
             try:
                 shutil.copy2(row["original_path"], img_out)
-                reasons_str = build_reject_reason_string(row)
                 with open(txt_out, "w", encoding="utf-8") as ft:
-                    ft.write(f"REJECTED REASON: {reasons_str}\n")
-                    ft.write(f"score={row.get('quality_total', 0)} | type={row.get('shot_type', '')} | file={row.get('original_filename', '')}\n")
+                    ft.write(build_reject_export_text(row, global_rules, subject_profile))
+                _sync_row_update(row_index, row)
             except Exception as e:
                 safe_print(f"   ⚠️ Reject export failed for {row.get('original_filename','')}: {e}")
 
@@ -5345,6 +5645,23 @@ def mark_duplicates(items: List[Dict[str, Any]]) -> None:
 
             if USE_CLIP_DUPLICATE_SCORING and item_clip is not None and rep.get("clip_embedding") is not None:
                 sim = clip_cosine(item_clip, rep["clip_embedding"])
+
+                # Hard-Threshold: sehr hohe semantische Aehnlichkeit -> Duplicate
+                # OHNE Metadaten-Bedingung. Faengt z.B. mehrere Closeups derselben
+                # Person mit minimal anderer Pose / Beschreibung im selben Stil.
+                if sim >= CLIP_HARD_DUPLICATE_THRESHOLD:
+                    item["duplicate_of"] = rep["original_filename"]
+                    item["duplicate_method"] = "clip_hard"
+                    item["duplicate_distance"] = round(sim, 6)
+                    item["base_status"] = "reject"
+                    item.setdefault("status_notes", []).append("near_duplicate_clip_hard")
+                    is_dup = True
+                    break
+
+                # Soft-Threshold: mittlere semantische Aehnlichkeit -> Duplicate
+                # nur wenn Metadaten zustimmen (gleicher Shot + gleiche
+                # Clothing/BG/Session). Schuetzt vor false positives bei
+                # unterschiedlichen Outfits.
                 same_shot = item_shot == rep.get("shot_type", "")
                 same_clothing = item_clothing == coarse_key(rep.get("clothing_description"), 4)
                 same_bg = item_bg == coarse_key(rep.get("background_description"), 3)
@@ -5419,6 +5736,22 @@ def quotas_for_target(target_size: int, available_counts: Dict[str, int]) -> Dic
     quotas = {k: min(raw[k], available_counts.get(k, 0)) for k in raw}
     return quotas
 
+def visual_style_cluster_key(item: Dict[str, Any]) -> str:
+    """Cluster-Key fuer visuellen Bildstil.
+
+    - 'bw'    : Schwarz-Weiss-Bilder (is_grayscale_filter)
+    - 'sepia' / 'blue' / 'warm' / 'green' / 'purple' : starker Farbstich
+    - 'color' : neutral (kein dominanter Stich)
+
+    Wird im diversity_penalty genutzt, um Konzentration eines Stil-Clusters
+    im Final-Set zu bestrafen.
+    """
+    if bool(item.get("is_grayscale_filter")):
+        return "bw"
+    label = (item.get("color_tint_label") or "").strip().lower()
+    if label:
+        return label
+    return "color"
 
 def diversity_penalty(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> float:
     if not ENABLE_DIVERSITY_PENALTIES or not selected:
@@ -5465,6 +5798,21 @@ def diversity_penalty(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> f
                 if (normalize_text(s.get("head_pose_bucket")) or "unknown") == pose_key
             )
             penalty += max(0, pose_count - POSE_DIVERSITY_SOFT_LIMIT) * POSE_DIVERSITY_PENALTY_WEIGHT
+
+    # ── Visual-Style-Diversity ──
+    # Bestraft Konzentration eines Bildstils (B/W oder Tint) im Final-Set.
+    # Wirkt zusaetzlich zur CLIP-Duplicate-Detection - dort werden visuell
+    # nahezu identische Bilder hart rejected, hier wird verhindert dass die
+    # Auswahl insgesamt von einem Stil-Cluster dominiert wird.
+    if ENABLE_VISUAL_STYLE_DIVERSITY:
+        style_key = visual_style_cluster_key(item)
+        # 'color' (neutral) wird nicht bestraft - das ist der Default-Bucket.
+        if style_key != "color":
+            style_count = sum(
+                1 for s in selected
+                if visual_style_cluster_key(s) == style_key
+            )
+            penalty += max(0, style_count - VISUAL_STYLE_SOFT_LIMIT) * VISUAL_STYLE_PENALTY_WEIGHT
 
     return penalty
 
@@ -5917,6 +6265,40 @@ def build_hair_caption_tag(item: Dict[str, Any], global_rules: Dict[str, Any]) -
         return None
     return " ".join(parts) + " hair"
 
+def build_visual_style_phrase(item: Dict[str, Any]) -> str:
+    """Liefert einen optionalen Style-Praefix fuer die Caption.
+
+    Wird vor das photo_type gesetzt. Beispiele:
+        "black and white"
+        "sepia-toned"
+        "blue-tinted"
+        "warm-tinted"
+        "green-tinted"
+        "purple-tinted"
+
+    Leerstring bei Bildern ohne erkennbaren Filter / Stil.
+    """
+    if not CAPTION_POLICY.get("include_visual_style", True):
+        return ""
+
+    if bool(item.get("is_grayscale_filter")):
+        return "black and white"
+
+    if not USE_COLOR_TINT_CAPTION:
+        return ""
+
+    label = normalize_compact_text(item.get("color_tint_label", ""))
+    if not label:
+        return ""
+
+    # Mapping label -> Caption-Phrase. Zentrale Stelle, leicht zu pflegen.
+    return {
+        "sepia": "sepia-toned",
+        "blue": "blue-tinted",
+        "warm": "warm-tinted",
+        "green": "green-tinted",
+        "purple": "purple-tinted",
+    }.get(label, "")
 
 def build_caption(
     item: Dict[str, Any],
@@ -5970,10 +6352,15 @@ def build_caption(
 
     markers = profile.get("identity_markers", {}) if isinstance(profile, dict) else {}
     glasses_profile = markers.get("glasses", {}) if isinstance(markers, dict) else {}
+    freckles_profile = markers.get("freckles", {}) if isinstance(markers, dict) else {}
     glasses_visible = bool(image_traits.get("glasses_visible")) or _profile_bool(item.get("has_glasses_now"))
     glasses_desc = ""
     if glasses_visible:
         glasses_desc = compact_trait(glasses_profile.get("canonical_description")) or compact_trait(item.get("glasses_description"))
+    freckles_visible = bool(image_traits.get("freckles_visible")) or bool(compact_trait(item.get("freckles_description")))
+    freckles_desc = ""
+    if freckles_visible:
+        freckles_desc = compact_trait(image_traits.get("freckles_description")) or compact_trait(freckles_profile.get("canonical_description")) or compact_trait(item.get("freckles_description"))
 
     tattoo_map = _inventory_map(profile, "tattoos")
     piercing_map = _inventory_map(profile, "piercings")
@@ -6047,7 +6434,11 @@ def build_caption(
         if CAPTION_POLICY["include_skin_tone"] and skin_tone:
             anchor_parts.append(f"{skin_tone} skin")
 
-    first = f"A {photo_type} of {TRIGGER_WORD}"
+    visual_style = build_visual_style_phrase(item)
+    if visual_style:
+        first = f"A {visual_style} {photo_type} of {TRIGGER_WORD}"
+    else:
+        first = f"A {photo_type} of {TRIGGER_WORD}"
     if CAPTION_POLICY["include_gender_class"] and gender_class:
         first += f", a {gender_class}"
 
@@ -6093,6 +6484,9 @@ def build_caption(
 
     if CAPTION_POLICY["include_glasses"] and glasses_desc:
         trait_bits.append(glasses_desc)
+
+    if CAPTION_POLICY.get("include_freckles") and freckles_desc:
+        trait_bits.append(freckles_desc)
 
     if CAPTION_POLICY["include_piercings"]:
         trait_bits.extend(piercing_bits)
@@ -6810,6 +7204,7 @@ def main() -> None:
             row["grundscore"] = row.get("quality_total", "")
             row["score_nach_eskalation"] = ""
 
+            row = apply_local_score_adjustments(row)
             local_status, local_reasons = local_status_override(row)
             api_status = row.get("suggested_status", "review")
 
@@ -6840,6 +7235,7 @@ def main() -> None:
                     row["score_nach_eskalation"] = row.get("quality_total", "")
                     row.setdefault("status_notes", []).append("review_escalation_applied")
                     row["audit_model_used"] = REVIEW_ESCALATION_MODEL
+                    row = apply_local_score_adjustments(row)
                     local_status, local_reasons = local_status_override(row)
                     api_status = row.get("suggested_status", "review")
                 else:
@@ -6927,8 +7323,8 @@ def main() -> None:
                                         audit_cache_payload(crop_audit, AI_MODEL, "primary_crop_audit"),
                                     )
 
-                                crop_score = float(crop_audit.get("quality_total", 0))
-                                crop_grundscore = crop_score
+                                crop_grundscore = float(crop_audit.get("quality_total", 0))
+                                crop_score = crop_grundscore
                                 crop_score_nach_eskalation: Any = ""
                                 orig_score = float(row.get("quality_total", 0))
 
@@ -6957,8 +7353,8 @@ def main() -> None:
                                                 crop_escalation_cache_key,
                                                 audit_cache_payload(crop_audit, REVIEW_ESCALATION_MODEL, "escalation_crop_audit"),
                                             )
-                                    crop_score = float(crop_audit.get("quality_total", 0))
-                                    crop_score_nach_eskalation = crop_score
+                                    crop_score_nach_eskalation = float(crop_audit.get("quality_total", 0))
+                                    crop_score = crop_score_nach_eskalation
 
                                 safe_print(
                                         f"   ↳ Crop {crop_score:.1f} vs. original {orig_score:.1f} "
@@ -7004,6 +7400,9 @@ def main() -> None:
                                     crop_row["shot_type"] = "headshot"
                                     crop_row["main_face_bbox"] = ai_bbox
                                     crop_row["main_face_ratio"] = row.get("main_face_ratio", 0.0)
+
+                                    crop_row = apply_local_score_adjustments(crop_row)
+                                    crop_score = float(crop_row.get("quality_total", 0))
 
                                     c_local_status, c_local_reasons = local_status_override(crop_row)
                                     c_api_status = crop_row.get("suggested_status", "review")
@@ -7329,12 +7728,8 @@ def main() -> None:
 
             # Reason-Datei: gemeinsamer Helper baut den vollstaendigen String
             try:
-                reasons_str = build_reject_reason_string(row)
                 with open(txt_out, "w", encoding="utf-8") as ft:
-                    ft.write(f"REJECTED REASON: {reasons_str}\n")
-                    ft.write(f"score={row.get('quality_total', 0)} | "
-                             f"type={row.get('shot_type', '')} | "
-                             f"file={row.get('original_filename', '')}\n")
+                    ft.write(build_reject_export_text(row, global_rules, subject_profile))
             except Exception as txt_err:
                 safe_print(f"   ⚠️ Failed to write reject text file: {row.get('original_filename','')} – {txt_err}")
 
@@ -7481,12 +7876,20 @@ def main() -> None:
         "selected",
         "output_bucket",
         "new_basename",
+        "quality_total_before_local_penalties",
         "quality_total",
         "grundscore",
         "score_nach_eskalation",
         "quality_sharpness",
         "quality_lighting",
         "quality_composition",
+        "is_grayscale_filter",
+        "grayscale_penalty",
+        "local_score_penalty_total",
+        "color_saturation_mean",
+        "color_tint_label",
+        "color_tint_strength",
+        "color_channel_delta_mean",
         "quality_identity_usefulness",
         "shot_type",
         "gender_class",

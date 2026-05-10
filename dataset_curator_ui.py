@@ -88,6 +88,7 @@ SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
     "include_gender_class",
     "include_skin_tone",
     "include_body_build",
+    "include_freckles",
     "include_tattoos",
     "include_glasses",
     "include_piercings",
@@ -102,6 +103,37 @@ SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
     "include_beard_when_variable",
     "include_mirror_selfie_marker",
     "include_eye_color",
+    "include_visual_style",
+]
+
+# Z-Image_Base-Profil: bewusst reduziert. Stabile Identitaetsmerkmale
+# (Hautfarbe, Augenfarbe, Koerperbau, konstante Frisur, Geschlechts-Klasse)
+# werden NICHT captioniert, damit der LoRA-Trigger sie als Person-Identitaet
+# absorbiert statt sie als austauschbare Caption-Tokens zu lernen.
+# Variable Attribute (Hair-when-variable, Brille, Sommersprossen, Tattoos,
+# Piercings, Make-up, Kleidung, Pose, Gaze, Ausdruck, Hintergrund,
+# Beleuchtung, Bildstil) bleiben drin, weil sie zwischen Bildern wechseln
+# und das LoRA sie als situative Marker lernen soll.
+# Begruendung: Z-Image_Base ist ein 6B-Parameter Single-Stream DiT, dessen
+# T5-basierter Text-Encoder Standard-Konzepte wie 'blonde hair', 'blue eyes',
+# 'fair skin' bereits sehr gut kennt. Diese in jeder Caption zu wiederholen
+# konkurriert mit der Trigger-Identitaet bei Inferenz und reduziert die
+# Steuerbarkeit (z.B. 'Kathi mit roten Haaren' wird unsauber, weil der
+# Trigger 'blonde' mitschleppt).
+Z_IMAGE_BASE_CAPTION_FIELDS: List[str] = [
+    "include_freckles",
+    "include_tattoos",
+    "include_glasses",
+    "include_piercings",
+    "include_makeup",
+    "include_background",
+    "include_lighting",
+    "include_gaze",
+    "include_expression",
+    "include_hair_when_variable",
+    "include_beard_when_variable",
+    "include_mirror_selfie_marker",
+    "include_visual_style",
 ]
 
 DEFAULTS: Dict[str, Any] = {
@@ -206,10 +238,18 @@ DEFAULTS: Dict[str, Any] = {
     "v_sharp": 50,
 }
 
+OPENAI_MODEL_PRESET_CHOICES: List[str] = [
+    "gpt-5.4-mini",
+    "gpt-5.4-nano",
+    "gpt-5.4",
+    "gpt-5.5",
+]
+
 CAPTION_FIELD_CHOICES: List[str] = [
     "include_gender_class",
     "include_skin_tone",
     "include_body_build",
+    "include_freckles",
     "include_tattoos",
     "include_glasses",
     "include_piercings",
@@ -224,17 +264,34 @@ CAPTION_FIELD_CHOICES: List[str] = [
     "include_beard_when_variable",
     "include_mirror_selfie_marker",
     "include_eye_color",
+    "include_visual_style",
 ]
 
 CAPTION_PROFILE_PRESETS: Dict[str, List[str]] = {
+    # ERNIE: volle Beschreibung inkl. stabiler Identitaetsmerkmale.
+    # Begruendung: ERNIE-Image hat im Default-Output einen asiatischen Bias,
+    # explizite Anker (blonde hair, blue eyes, fair skin) sind noetig damit
+    # nicht-asiatische Personen sauber generiert werden.
+    "ernie": list(SHARED_COMPACT_CAPTION_FIELDS),
+    # Z-Image_Base: nur variable Attribute. Trigger-Wort uebernimmt die
+    # stabile Person-Identitaet, Captions beschreiben nur was zwischen
+    # Bildern wechselt.
+    "z_image_base": list(Z_IMAGE_BASE_CAPTION_FIELDS),
+    # Legacy-Alias: bestehende Configs mit "shared_compact" werden
+    # automatisch wie ERNIE behandelt (das war urspruenglich das einzige
+    # Profil, faktisch ERNIE-Style).
     "shared_compact": list(SHARED_COMPACT_CAPTION_FIELDS),
 }
 
 
 def normalize_caption_profile(value: Optional[str]) -> str:
     v = (value or "").strip().lower()
-    if v in {"shared_compact", "z_image_base", "ernie"}:
-        return "shared_compact"
+    # Legacy-Alias "shared_compact" wird zu "ernie" - das war historisch
+    # das einzige Profil und entspricht der ERNIE-Strategie.
+    if v == "shared_compact":
+        return "ernie"
+    if v in {"ernie", "z_image_base"}:
+        return v
     if v in CAPTION_PROFILE_PRESETS:
         return v
     return "custom"
@@ -242,7 +299,20 @@ def normalize_caption_profile(value: Optional[str]) -> str:
 
 def caption_profile_choices() -> List[Tuple[str, str]]:
     return [
-        (tr("Shared Compact (Z-Image + ERNIE)", "Shared Compact (Z-Image + ERNIE)"), "shared_compact"),
+        (
+            tr(
+                "ERNIE (alle Felder, robust für asiatisch geprägtes Basismodell)",
+                "ERNIE (all fields, robust for Asia-leaning base model)",
+            ),
+            "ernie",
+        ),
+        (
+            tr(
+                "Z-Image Base (nur veränderliche Felder, Trigger-Wort trägt die Identität)",
+                "Z-Image Base (only variable fields, trigger word carries identity)",
+            ),
+            "z_image_base",
+        ),
         (tr("Custom", "Custom"), "custom"),
     ]
 
@@ -539,6 +609,7 @@ def _profile_summary_markdown(profile: Dict[str, Any]) -> str:
     stable = profile.get("stable_identity", {}) or {}
     markers = profile.get("identity_markers", {}) or {}
     glasses = markers.get("glasses", {}) or {}
+    freckles = markers.get("freckles", {}) or {}
     tattoos = markers.get("tattoo_inventory", []) or []
     piercings = markers.get("piercing_baseline", []) or []
     per_image = profile.get("per_image_traits", {}) or {}
@@ -552,6 +623,7 @@ def _profile_summary_markdown(profile: Dict[str, Any]) -> str:
         f"**Body build:** {stable.get('body_build', '-')}",
         "",
         f"**Glasses:** {glasses.get('canonical_description', '-') if glasses.get('wears_regularly') else 'not regular'}",
+        f"**Freckles:** {freckles.get('canonical_description', '-') if freckles.get('has_freckles') else 'not regular'}",
         f"**Tattoos in inventory:** {len(tattoos)}",
         f"**Baseline piercings:** {len(piercings)}",
         f"**Per-image trait rows:** {len(per_image)}",
@@ -712,6 +784,7 @@ def _empty_editor_payload(status_msg: str) -> Tuple:
         empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown,
         empty_info, empty_info, empty_info, empty_info, empty_info,
         False, "",  # glasses
+        False, "",  # freckles
         "_kein Profil_", "_kein Profil_", "_kein Profil_",
         "_kein Profil_", "_kein Profil_", "_kein Profil_",
         # Bucket-edit dropdowns (3x from + 3x to)
@@ -742,6 +815,7 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     stable = profile.get("stable_identity", {}) or {}
     markers = profile.get("identity_markers", {}) or {}
     glasses = markers.get("glasses", {}) or {}
+    freckles = markers.get("freckles", {}) or {}
 
     def info(field: str) -> str:
         level = _conf_level(profile, field)
@@ -832,6 +906,8 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
         info("gender"), info("skin_tone"), info("eye_color"), info("hair_texture"), info("body_build"),
         bool(glasses.get("wears_regularly", False)),
         str(glasses.get("canonical_description", "") or ""),
+        bool(freckles.get("has_freckles", False)),
+        str(freckles.get("canonical_description", "") or ""),
         hair_color_md, hair_form_md, makeup_md,
         tattoo_md, piercing_md, notes_md,
         color_from_dd, form_from_dd, makeup_from_dd,
@@ -851,6 +927,8 @@ def save_profile_from_editor(
     body_build: str,
     glasses_regular: bool,
     glasses_desc: str,
+    freckles_present: bool,
+    freckles_desc: str,
 ) -> str:
     """Speichert die Editor-Werte zurueck ins _subject_profile.json.
 
@@ -892,6 +970,9 @@ def save_profile_from_editor(
     glasses = markers.setdefault("glasses", {"wears_regularly": False, "canonical_description": "", "frequency": ""})
     glasses["wears_regularly"] = bool(glasses_regular)
     glasses["canonical_description"] = (glasses_desc or "").strip()
+    freckles = markers.setdefault("freckles", {"has_freckles": False, "canonical_description": "", "frequency": ""})
+    freckles["has_freckles"] = bool(freckles_present)
+    freckles["canonical_description"] = (freckles_desc or "").strip()
 
     profile["force_only_when_visible"] = True
 
@@ -1491,6 +1572,17 @@ def build_ui() -> gr.Blocks:
     global UI_LANG
     UI_LANG = _normalize_lang(S.get("ui_language"))
 
+    def openai_model_dropdown_kwargs() -> Dict[str, Any]:
+        """Use custom values when supported so presets stay future-proof."""
+        kwargs: Dict[str, Any] = {}
+        try:
+            dropdown_signature = inspect.signature(gr.Dropdown.__init__)
+            if "allow_custom_value" in dropdown_signature.parameters:
+                kwargs["allow_custom_value"] = True
+        except Exception:
+            pass
+        return kwargs
+
     blocks_kwargs = {
         "title": tr("LoRA Dataset Curator", "LoRA Dataset Curator"),
     }
@@ -1590,14 +1682,15 @@ def build_ui() -> gr.Blocks:
                             ),
                             max_lines=1,
                         )
-                        c_model = gr.Textbox(
+                        c_model = gr.Dropdown(
                             label=tr("Primäres AI-Modell", "Primary AI model"),
+                            choices=OPENAI_MODEL_PRESET_CHOICES,
                             value=S["c_model"],
                             info=tr(
-                                "Hauptmodell für den ersten Audit-Durchlauf. Günstigere Modelle sind schneller, bewerten aber oft ungenauer.",
-                                "Main model for the first audit pass. Cheaper models are faster, but often less accurate.",
+                                "Hauptmodell für den ersten Audit-Durchlauf. Empfohlen: `gpt-5.4-mini`. `gpt-5.4-nano` ist günstiger, aber ungenauer. `gpt-5.5` ist bewusst mit in der Liste, aber wegen Kosten/Nutzen nicht als Standard empfohlen. Eigene Modellnamen können bei unterstützter Gradio-Version trotzdem eingetragen werden.",
+                                "Main model for the first audit pass. Recommended: `gpt-5.4-mini`. `gpt-5.4-nano` is cheaper but less accurate. `gpt-5.5` is intentionally included, but not recommended as the default due to cost/benefit. On supported Gradio versions, you can still enter custom model names.",
                             ),
-                            max_lines=1,
+                            **openai_model_dropdown_kwargs(),
                         )
                         c_use_trigger_check = gr.Checkbox(
                             label=tr("Trigger-Check aktivieren", "Enable trigger check"),
@@ -1607,14 +1700,15 @@ def build_ui() -> gr.Blocks:
                                 "Checks the trigger word via AI for collisions or problematic similarities. If disabled, the check is skipped entirely.",
                             ),
                         )
-                        c_trigger_model = gr.Textbox(
+                        c_trigger_model = gr.Dropdown(
                             label=tr("Trigger-Check-Modell", "Trigger-check model"),
+                            choices=OPENAI_MODEL_PRESET_CHOICES,
                             value=S["c_trigger_model"],
                             info=tr(
                                 "Optional separates Modell für die Triggerwort-Prüfung. Leer = primäres Modell verwenden. Wird nur genutzt, wenn der Trigger-Check aktiviert ist.",
                                 "Optional separate model for trigger-word checks. Empty = use primary model. Only used when trigger check is enabled.",
                             ),
-                            max_lines=1,
+                            **openai_model_dropdown_kwargs(),
                         )
 
                 with gr.Accordion(tr("🧠 Modellstrategie & Eskalation", "🧠 Model strategy & escalation"), open=False):
@@ -1684,14 +1778,15 @@ def build_ui() -> gr.Blocks:
                         ),
                     )
                     with gr.Row():
-                        c_review_escalation_model = gr.Textbox(
+                        c_review_escalation_model = gr.Dropdown(
                             label=tr("Eskalationsmodell", "Escalation model"),
+                            choices=[""] + OPENAI_MODEL_PRESET_CHOICES,
                             value=S["c_review_escalation_model"],
                             info=tr(
                                 "Stärkeres Modell für die Eskalation. Leer = Eskalation effektiv aus, auch wenn der Schalter oben an ist. Empfohlen: ein Modell der nächsthöheren Klasse (z. B. `gpt-5.4` wenn das Hauptmodell `gpt-5.4-mini` ist).",
                                 "Stronger model for escalation. Empty = escalation effectively off, even if the switch above is on. Recommended: a model from the next-higher tier (e.g. `gpt-5.4` if the main model is `gpt-5.4-mini`).",
                             ),
-                            max_lines=1,
+                            **openai_model_dropdown_kwargs(),
                         )
                     with gr.Row():
                         c_review_escalation_score_min = gr.Slider(
@@ -2850,14 +2945,15 @@ def build_ui() -> gr.Blocks:
                             "Single pass uses the profile automatically. Profile then Caption pauses after the profile build; switch to the Profile tab to edit and start captioning separately.",
                         ),
                     )
-                    c_profile_normalizer_model = gr.Textbox(
+                    c_profile_normalizer_model = gr.Dropdown(
                         label=tr("Profile-Normalizer-Modell", "Profile normalizer model"),
+                        choices=OPENAI_MODEL_PRESET_CHOICES,
                         value=S["c_profile_normalizer_model"],
-                        max_lines=1,
                         info=tr(
                             "Modell für den einen zusätzlichen Profil-Call pro Lauf. Empfehlung: gpt-5.4-mini.",
                             "Model for the single additional profile call per run. Recommended: gpt-5.4-mini.",
                         ),
+                        **openai_model_dropdown_kwargs(),
                     )
                     with gr.Row():
                         c_profile_sample_threshold = gr.Slider(
@@ -2908,26 +3004,36 @@ def build_ui() -> gr.Blocks:
                         "aufgenommen werden – das beeinflusst, wie das LoRA später auf "
                         "Prompts reagiert.\n\n"
                         "**Caption-Preset:**\n\n"
-                        "Ein Voreinstellungs-Bündel, das passende Felder für ein bestimmtes "
-                        "Basis-Modell vorbelegt. Du kannst danach die einzelnen Felder "
-                        "trotzdem nachjustieren.\n\n"
+                        "Bündel passender Felder für ein bestimmtes Basismodell. "
+                        "Du kannst die Einzelfelder nach Auswahl trotzdem manuell "
+                        "anpassen.\n\n"
                         "**Aktive Caption-Felder:**\n\n"
-                        "Welche Eigenschaften sollen in die Beschreibung? Hier gibt es zwei "
-                        "Denkschulen, je nach Basismodell:\n\n"
-                        "**Alles inkludieren** (empfohlen für ERNIE und allgemein gut für "
-                        "Anfänger): Auch permanente Eigenschaften wie Hautfarbe, konstante "
-                        "Frisur, Augenfarbe werden in jede Caption geschrieben. Vorteil: "
-                        "Das LoRA hat redundante Anker und ist robust. Nachteil: Wenn du "
-                        "im späteren Prompt nicht alle Anker erwähnst, kann das Modell "
-                        "verwirrt sein.\n\n"
-                        "**Nur Veränderliches** (für Z-Image fortgeschritten): Permanente "
-                        "Eigenschaften werden weggelassen, weil das LoRA von selbst lernen "
-                        "soll, dass sie zur Person gehören. Nur situative Dinge wie "
-                        "Kleidung, Brille, Hintergrund kommen rein. Vorteil: Sauberere "
-                        "Trennung von 'Person' und 'Situation' in den späteren "
-                        "Generierungen. Nachteil: Sensibler gegen Caption-Fehler.\n\n"
-                        "**Wenn du unsicher bist:** Lass das Preset entscheiden – es ist "
-                        "auf typische Anwendungsfälle voreingestellt."
+                        "Welche Eigenschaften gehen in die Beschreibung? Die "
+                        "Antwort hängt am Basismodell:\n\n"
+                        "**ERNIE** – alle Felder einschließen. ERNIE-Image hat im "
+                        "Default einen asiatischen Bias, der durch redundante Anker "
+                        "(blonde hair, blue eyes, fair skin) ausgeglichen wird. "
+                        "Auch permanente Eigenschaften gehören in jede Caption.\n\n"
+                        "**Z-Image Base** – nur veränderliche Felder. Z-Image hat "
+                        "ein starkes Sprachverständnis und kennt Standardkonzepte "
+                        "schon. Permanente Identitätsmerkmale (Hautton, Augenfarbe, "
+                        "Körperbau, konstante Frisur) werden weggelassen, damit das "
+                        "Trigger-Wort die Person-Identität sauber absorbiert. Nur "
+                        "variable Sachen (Kleidung, Pose, Hintergrund, Brille wenn "
+                        "wechselnd, Hair-when-variable, Make-up, Tattoos, Bildstil) "
+                        "kommen rein. Vorteil: bessere Steuerbarkeit bei Inferenz "
+                        "('Kathi mit roten Haaren' funktioniert sauber, weil der "
+                        "Trigger 'blonde' nicht in der Caption mitfährt).\n\n"
+                        "**Wichtig zur Hair-when-variable-Logik:** Wenn jemand in "
+                        "den Trainingsbildern *meistens* blond ist und auf wenigen "
+                        "Bildern rot, captioniert der Curator nur den variablen "
+                        "Fall ('red hair'). Der blonde Mehrheitsfall wird vom "
+                        "Trigger absorbiert. Das gilt analog für andere variable "
+                        "Attribute (Brille, Sommersprossen, Tattoos).\n\n"
+                        "**Wenn du unsicher bist:** ERNIE ist der robustere Default, "
+                        "Z-Image Base ist die saubere Wahl wenn du gezielt auf "
+                        "Z-Image_Base trainierst und maximale Inferenz-Flexibilität "
+                        "willst."
                         "</details>",
                         "<details>"
                         "<summary><b>ℹ️ How do captions work?</b></summary>"
@@ -2940,32 +3046,51 @@ def build_ui() -> gr.Blocks:
                         "analysis. You pick which attributes go into the captions – this "
                         "affects how the LoRA later reacts to prompts.\n\n"
                         "**Caption preset:**\n\n"
-                        "A bundle preselecting fields suitable for a particular base model. "
+                        "Bundle of fields suitable for a particular base model. "
                         "You can fine-tune individual fields afterwards.\n\n"
                         "**Active caption fields:**\n\n"
-                        "Which attributes go into the description? Two schools of thought, "
-                        "depending on the base model:\n\n"
-                        "**Include everything** (recommended for ERNIE and generally safer "
-                        "for beginners): Persistent attributes like skin tone, consistent "
-                        "hair, eye color are written into every caption. Pro: The LoRA has "
-                        "redundant anchors and is robust. Con: If your later prompts don't "
-                        "mention all anchors, the model may get confused.\n\n"
-                        "**Only changeable** (advanced, for Z-Image): Persistent attributes "
-                        "are omitted so the LoRA learns by itself that they belong to the "
-                        "person. Only situational things like clothing, glasses, background "
-                        "go in. Pro: Cleaner separation of 'person' vs 'situation' in "
-                        "later generations. Con: More sensitive to caption errors.\n\n"
-                        "**If unsure:** Let the preset decide – it's preset for typical "
-                        "use cases."
+                        "Which attributes go into the description? The answer "
+                        "depends on the base model:\n\n"
+                        "**ERNIE** – include all fields. ERNIE-Image has an "
+                        "Asia-leaning default bias that's compensated by redundant "
+                        "anchors (blonde hair, blue eyes, fair skin). Even "
+                        "persistent attributes belong in every caption.\n\n"
+                        "**Z-Image Base** – only variable fields. Z-Image has "
+                        "strong language understanding and already knows standard "
+                        "concepts. Persistent identity features (skin tone, eye "
+                        "color, body build, consistent hair) are omitted so the "
+                        "trigger word cleanly absorbs the person identity. Only "
+                        "variable things (clothing, pose, background, glasses if "
+                        "they vary, hair-when-variable, makeup, tattoos, visual "
+                        "style) go in. Benefit: better inference steerability "
+                        "('Kathi with red hair' works cleanly because the trigger "
+                        "doesn't drag 'blonde' along in every caption).\n\n"
+                        "**Important on hair-when-variable logic:** If a subject "
+                        "is *mostly* blonde across training images and red in only "
+                        "a few, the curator only captions the variable case "
+                        "('red hair'). The blonde majority is absorbed by the "
+                        "trigger. The same logic applies to other variable "
+                        "attributes (glasses, freckles, tattoos).\n\n"
+                        "**If unsure:** ERNIE is the safer default, Z-Image Base "
+                        "is the clean choice when you specifically train on "
+                        "Z-Image_Base and want maximum inference flexibility."
                         "</details>",
                     ))
                     c_caption_profile = gr.Dropdown(
                         label=tr("Caption-Voreinstellung", "Caption preset"),
                         choices=caption_profile_choices(),
-                        value=normalize_caption_profile(S.get("c_caption_profile")) or "shared_compact",
+                        value=normalize_caption_profile(S.get("c_caption_profile")) or "ernie",
                         info=tr(
-                            "Voreingestelltes Schema für ein Basis-Modell. Empfohlen: 'Shared Compact' für Z-Image und ERNIE. Die einzelnen Felder unten kannst du nach Auswahl trotzdem manuell anpassen.",
-                            "Preset schema for a base model. Recommended: 'Shared Compact' for Z-Image and ERNIE. You can still manually tweak the individual fields below after selection.",
+                            "Voreingestelltes Schema je Basismodell. ERNIE = alle "
+                            "Felder (asiatisch geprägtes Basismodell, redundante "
+                            "Anker helfen). Z-Image Base = nur variable Felder "
+                            "(stabiles Sprachverständnis, Trigger trägt die "
+                            "Identität). Im Zweifel ERNIE wählen.",
+                            "Preset schema per base model. ERNIE = all fields "
+                            "(Asia-leaning base model, redundant anchors help). "
+                            "Z-Image Base = only variable fields (strong language "
+                            "understanding, trigger carries identity). When in "
+                            "doubt pick ERNIE.",
                         ),
                     )
                     c_captions = gr.CheckboxGroup(
@@ -2973,8 +3098,25 @@ def build_ui() -> gr.Blocks:
                         choices=CAPTION_FIELD_CHOICES,
                         value=S["c_captions"],
                         info=tr(
-                            "Welche Merkmale in die Trainings-Captions aufgenommen werden. Empfehlung hängt vom Basis-Modell ab: Bei ERNIE meistens alle Felder einschließen (das Basis-Dataset ist asiatisch geprägt, redundante Anker helfen). Bei Z-Image Base sind die Meinungen geteilt – manche empfehlen ebenfalls alles, andere nur veränderliche Merkmale (Kleidung, Brille) und permanente Eigenschaften (Hautfarbe, konstante Frisur, Tattoos) weglassen, damit das LoRA selbst lernt was zur Person gehört. Im Zweifel auf das Preset oben verlassen.",
-                            "Which attributes go into the training captions. The recommendation depends on the base model: for ERNIE, usually include all fields (its base dataset is Asia-leaning, redundant anchors help). For Z-Image Base, opinions vary – some recommend including everything too, others only changeable attributes (clothing, glasses) and dropping persistent ones (skin tone, consistent hairstyle, tattoos) so the LoRA learns by itself what belongs to the person. When in doubt, trust the preset above.",
+                            "Welche Merkmale in die Trainings-Captions aufgenommen "
+                            "werden. Empfehlung pro Basismodell: bei ERNIE "
+                            "alle Felder einschließen, bei Z-Image Base nur "
+                            "variable Felder (Kleidung, Pose, Hintergrund, "
+                            "Brille-wenn-variabel, Hair-when-variable, Sommersprossen, "
+                            "Tattoos, Make-up, Visual-Style). Permanente Merkmale "
+                            "(Hautton, Augenfarbe, Körperbau, konstante Haare) "
+                            "lässt man bei Z-Image Base weg, damit das Trigger-Wort "
+                            "die Identität sauber absorbiert. Im Zweifel auf das "
+                            "Preset oben verlassen.",
+                            "Which attributes go into the training captions. "
+                            "Recommendation per base model: for ERNIE include "
+                            "all fields; for Z-Image Base only variable fields "
+                            "(clothing, pose, background, glasses-when-variable, "
+                            "hair-when-variable, freckles, tattoos, makeup, "
+                            "visual style). Persistent features (skin tone, eye "
+                            "color, body build, constant hair) are omitted with "
+                            "Z-Image Base so the trigger word cleanly absorbs "
+                            "identity. When in doubt trust the preset above.",
                         ),
                     )
                     c_caption_profile.change(
@@ -3247,12 +3389,32 @@ def build_ui() -> gr.Blocks:
                     # ----- Subtab: Variable Traits -----
                     with gr.TabItem(tr("🎨 Variable Traits", "🎨 Variable traits")):
                         gr.Markdown(tr(
-                            "Per-Image-Tokens für Haarfarbe, Frisur und Makeup. Bei Ausreißern (z.B. "
-                            "Lichtartefakte als 'red' klassifiziert) kannst du Bilder eines Buckets "
-                            "bequem auf einen anderen Wert umbuchen.",
-                            "Per-image tokens for hair color, hair form and makeup. For outliers (e.g. "
-                            "lighting artifacts classified as 'red'), use Re-bucket to move all images "
+                            "Per-Image-Tokens und sichtbarkeitsabhängige Merkmale wie Sommersprossen. "
+                            "Bei Ausreißern (z.B. Lichtartefakte als 'red' klassifiziert) kannst du Bilder "
+                            "eines Buckets bequem auf einen anderen Wert umbuchen.",
+                            "Per-image tokens and visibility-dependent traits like freckles. For outliers "
+                            "(e.g. lighting artifacts classified as 'red'), use Re-bucket to move all images "
                             "of a bucket to another value.",
+                        ))
+
+                        gr.Markdown(tr("**Sommersprossen (flexibler Marker)**", "**Freckles (flexible marker)**"))
+                        with gr.Row():
+                            p_freckles_present = gr.Checkbox(
+                                label=tr("Hat regelmäßig sichtbare Sommersprossen", "Has regularly visible freckles"),
+                                value=False,
+                                interactive=True,
+                                scale=1,
+                            )
+                            p_freckles_desc = gr.Textbox(
+                                label=tr("Kanonische Beschreibung", "Canonical description"),
+                                value="",
+                                max_lines=1,
+                                interactive=True,
+                                scale=3,
+                            )
+                        gr.Markdown(tr(
+                            "_Flexibler Sichtbarkeits-Marker: Sommersprossen werden nur in Captions gesetzt, wenn sie im Bild sichtbar sind._",
+                            "_Flexible visibility marker: freckles are only captioned when they are visible in the image._",
                         ))
 
                         with gr.Row():
@@ -3367,6 +3529,7 @@ def build_ui() -> gr.Blocks:
                     p_gender, p_skin, p_eyes, p_hair_texture, p_body,
                     p_gender_info, p_skin_info, p_eyes_info, p_hair_texture_info, p_body_info,
                     p_glasses_regular, p_glasses_desc,
+                    p_freckles_present, p_freckles_desc,
                     p_hair_color_md, p_hair_form_md, p_makeup_md,
                     p_tattoo_md, p_piercing_md, p_notes_md,
                     p_color_from, p_form_from, p_makeup_from,
@@ -3392,6 +3555,7 @@ def build_ui() -> gr.Blocks:
                         p_trigger, p_input, p_raw_json,
                         p_gender, p_skin, p_eyes, p_hair_texture, p_body,
                         p_glasses_regular, p_glasses_desc,
+                        p_freckles_present, p_freckles_desc,
                     ],
                     outputs=[p_status],
                 )
