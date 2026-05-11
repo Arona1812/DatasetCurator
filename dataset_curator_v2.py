@@ -188,6 +188,16 @@ GRAYSCALE_SCORE_PENALTY = 5.0
 # entsättigte/stimmungsvolle Farbfotos nicht versehentlich bestraft werden.
 GRAYSCALE_SATURATION_THRESHOLD = 0.08
 GRAYSCALE_CHANNEL_DELTA_THRESHOLD = 3.5
+
+# Relaxed fallback for JPEG/social-media B/W images:
+# Some visually black-and-white images have tiny RGB channel differences
+# from compression, filters, tiles/walls, or app processing.
+# The strict path stays unchanged; this fallback only catches near-monochrome
+# images with low saturation and mostly channel-even pixels.
+GRAYSCALE_RELAXED_SATURATION_THRESHOLD = 0.06
+GRAYSCALE_RELAXED_CHANNEL_DELTA_THRESHOLD = 6.0
+GRAYSCALE_PIXEL_DELTA_THRESHOLD = 8.0
+GRAYSCALE_PIXEL_SHARE_THRESHOLD = 0.92
 # Color-Tint-Detection: erkennt Bilder mit dominantem Farbstich (Blau-/Sepia-/
 # Grün-Filter etc.). Dient ausschliesslich der Caption-Markierung, kein
 # Quality-Penalty - getoente Bilder sind grundsaetzlich brauchbar, der LoRA
@@ -1492,10 +1502,27 @@ def local_colorfulness_metrics(image_path: str) -> Dict[str, Any]:
 
         saturation_mean = float(np.mean(sat))
         channel_delta_mean = float(np.mean(channel_delta))
-        is_grayscale = (
+
+        strict_grayscale = (
             saturation_mean <= float(GRAYSCALE_SATURATION_THRESHOLD)
             and channel_delta_mean <= float(GRAYSCALE_CHANNEL_DELTA_THRESHOLD)
         )
+
+        # Pixel-share fallback:
+        # A visually B/W image can fail the mean channel-delta threshold by a tiny margin
+        # because of JPEG compression, social-media processing, or slightly tinted wall/tile areas.
+        # We only accept the relaxed path if most pixels are still near channel-equal.
+        near_mono_pixel_share = float(
+            np.mean(channel_delta <= float(GRAYSCALE_PIXEL_DELTA_THRESHOLD))
+        )
+
+        relaxed_grayscale = (
+            saturation_mean <= float(GRAYSCALE_RELAXED_SATURATION_THRESHOLD)
+            and channel_delta_mean <= float(GRAYSCALE_RELAXED_CHANNEL_DELTA_THRESHOLD)
+            and near_mono_pixel_share >= float(GRAYSCALE_PIXEL_SHARE_THRESHOLD)
+        )
+
+        is_grayscale = strict_grayscale or relaxed_grayscale
 
         result["color_saturation_mean"] = round(saturation_mean, 4)
         result["color_channel_delta_mean"] = round(channel_delta_mean, 3)
@@ -6540,15 +6567,18 @@ def build_caption(
         cleaned_expr = _clean_expression(expression)
         if cleaned_expr:
             pose_bits.append(f"with a {cleaned_expr}")
+    def _pose_bits_have_eyes_closed() -> bool:
+        return any(
+            re.search(r"\beyes closed\b", str(bit), re.IGNORECASE)
+            for bit in pose_bits
+        )
+
     if CAPTION_POLICY["include_gaze"] and gaze and gaze not in {"none", "unknown"}:
-        # Wenn gaze=='eyes closed' und Expression auch eyes closed enthielt,
-        # haengen wir 'with eyes closed' nur einmal an.
-        if eyes_closed_in_gaze and eyes_closed_in_expr:
-            # Beide Felder reden ueber geschlossene Augen -> einmal sauber anhaengen
-            pose_bits.append("with eyes closed")
-        elif eyes_closed_in_gaze:
-            # Nur gaze ist eyes closed -> normal anhaengen
-            pose_bits.append("with eyes closed")
+        # Wenn gaze == "eyes closed", nur ergänzen, wenn es nicht bereits
+        # in pose_description / pose_bits vorkommt.
+        if eyes_closed_in_gaze:
+            if not _pose_bits_have_eyes_closed():
+                pose_bits.append("with eyes closed")
         else:
             # Bug G: KI liefert manchmal gaze als reines Direction-Adverb
             # ('downward', 'upward', 'sideways'), was zu losgeloesten Saetzen
@@ -6556,8 +6586,10 @@ def build_caption(
             # wenn gaze eine kurze Direction-Phrase ohne eigenes Verb ist.
             pose_bits.append(_ensure_gaze_verb(gaze))
     elif eyes_closed_in_expr:
-        # Nur Expression hatte eyes closed (und wurde dort verworfen) -> hier anhaengen
-        pose_bits.append("with eyes closed")
+        # Nur Expression hatte eyes closed und wurde dort verworfen.
+        # Auch hier nicht doppeln, falls pose_description es bereits enthält.
+        if not _pose_bits_have_eyes_closed():
+            pose_bits.append("with eyes closed")
 
     if pose_bits:
         sentences.append(f"{pronoun} {'is' if pronoun in ['He', 'She'] else 'are'} " + ", ".join(pose_bits) + ".")
