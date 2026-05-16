@@ -145,6 +145,7 @@ DEFAULTS: Dict[str, Any] = {
     "c_target": 30,
     "c_api_key": "",
     "c_model": "gpt-5.4-mini",
+    "c_openai_token_limit": 0,
     "c_use_trigger_check": False,
     "c_trigger_model": "gpt-5.4-mini",
     "c_use_review_escalation": False,
@@ -430,7 +431,7 @@ def save_language_and_restart(lang_code: str) -> str:
 def save_settings_fn(
     ui_language,
     # Curator
-    c_trigger, c_input, c_target, c_api_key, c_model, c_use_trigger_check, c_trigger_model,
+    c_trigger, c_input, c_target, c_api_key, c_model, c_openai_token_limit, c_use_trigger_check, c_trigger_model,
     c_use_review_escalation, c_review_escalation_model,
     c_review_escalation_score_min, c_review_escalation_score_max,
     c_escalate_on_review, c_escalate_on_conflict, c_escalate_smart_crop, c_smart_crop_escalation_delta,
@@ -464,6 +465,7 @@ def save_settings_fn(
         "ui_language": "en",
         "c_trigger": c_trigger, "c_input": c_input, "c_target": c_target,
         "c_api_key": c_api_key, "c_model": c_model,
+        "c_openai_token_limit": int(c_openai_token_limit or 0),
         "c_use_trigger_check": c_use_trigger_check,
         "c_trigger_model": c_trigger_model,
         "c_use_review_escalation": c_use_review_escalation,
@@ -1099,6 +1101,32 @@ def format_duration(seconds: float) -> str:
     return f"{hours}h {mins}m"
 
 
+def parse_openai_usage_delta(line: str) -> Optional[Tuple[int, int, int, int]]:
+    m = re.search(
+        r"OpenAI usage:\s*req\+=([\d,]+)\s*\|\s*in\+=([\d,]+)\s*\|\s*out\+=([\d,]+)\s*\|\s*total\+=([\d,]+)",
+        line,
+    )
+    if not m:
+        return None
+    try:
+        req = int(m.group(1).replace(",", ""))
+        inp = int(m.group(2).replace(",", ""))
+        out = int(m.group(3).replace(",", ""))
+        total = int(m.group(4).replace(",", ""))
+        return req, inp, out, total
+    except Exception:
+        return None
+
+
+def format_openai_usage_text(requests_count: int, input_tokens: int, output_tokens: int, total_tokens: int) -> str:
+    if requests_count <= 0 and total_tokens <= 0:
+        return tr("💰 0 Requests | 0 Tokens", "💰 0 requests | 0 tokens")
+    return tr(
+        f"💰 {requests_count:,} Requests | {total_tokens:,} Tokens | In {input_tokens:,} | Out {output_tokens:,}",
+        f"💰 {requests_count:,} requests | {total_tokens:,} tokens | in {input_tokens:,} | out {output_tokens:,}",
+    )
+
+
 def kill_process():
     global _active_process
     if _active_process and _active_process.poll() is None:
@@ -1166,11 +1194,30 @@ def run_script(
     last_progress_total = 0
     seconds_per_item: Optional[float] = None
     eta_seconds: Optional[float] = None
+    openai_requests = 0
+    openai_input_tokens = 0
+    openai_output_tokens = 0
+    openai_total_tokens = 0
+    openai_usage_text = format_openai_usage_text(0, 0, 0, 0)
 
     try:
         for line in _active_process.stdout:
             line = line.rstrip("\n\r")
             log_lines.append(line)
+
+            usage_delta = parse_openai_usage_delta(line)
+            if usage_delta:
+                delta_req, delta_in, delta_out, delta_total = usage_delta
+                openai_requests += delta_req
+                openai_input_tokens += delta_in
+                openai_output_tokens += delta_out
+                openai_total_tokens += delta_total
+                openai_usage_text = format_openai_usage_text(
+                    openai_requests,
+                    openai_input_tokens,
+                    openai_output_tokens,
+                    openai_total_tokens,
+                )
 
             p = parse_progress(line)
             if p:
@@ -1213,7 +1260,7 @@ def run_script(
             yield log_text, images, progress, tr(
                 status_de,
                 status_en,
-            )
+            ), openai_usage_text
 
     except Exception as e:
         log_lines.append(tr(f"\n⚠️ Fehler: {e}", f"\n⚠️ Error: {e}"))
@@ -1259,7 +1306,7 @@ def run_script(
         if rc == 0
         else tr(f"❌ Fehlercode {rc}", f"❌ Exit code {rc}")
     )
-    yield log_text, images, 1.0, status
+    yield log_text, images, 1.0, status, openai_usage_text
 
 
 # ============================================================
@@ -1267,7 +1314,7 @@ def run_script(
 # ============================================================
 
 def start_curator(
-    trigger_word, input_folder, target_size, api_key, ai_model, use_trigger_check, trigger_check_model,
+    trigger_word, input_folder, target_size, api_key, ai_model, openai_token_limit, use_trigger_check, trigger_check_model,
     use_review_escalation, review_escalation_model,
     review_escalation_score_min, review_escalation_score_max,
     escalate_on_review, escalate_on_conflict, escalate_smart_crop, smart_crop_escalation_delta,
@@ -1294,16 +1341,16 @@ def start_curator(
     export_review, export_reject, export_crop_compare,
 ):
     if not trigger_word.strip():
-        yield tr("Bitte ein Triggerwort eingeben.", "Please enter a trigger word."), [], 0, tr("❌ Fehler", "❌ Error")
+        yield tr("Bitte ein Triggerwort eingeben.", "Please enter a trigger word."), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0)
         return
     if not os.path.isdir(input_folder):
         yield tr(
             f"Input-Ordner existiert nicht: {input_folder}",
             f"Input folder does not exist: {input_folder}",
-        ), [], 0, tr("❌ Fehler", "❌ Error")
+        ), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0)
         return
     if not api_key.strip():
-        yield tr("Bitte einen OpenAI API Key eingeben.", "Please enter an OpenAI API key."), [], 0, tr("❌ Fehler", "❌ Error")
+        yield tr("Bitte einen OpenAI API Key eingeben.", "Please enter an OpenAI API key."), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0)
         return
 
     all_caption_keys = list(CAPTION_FIELD_CHOICES)
@@ -1315,6 +1362,7 @@ def start_curator(
         "TARGET_DATASET_SIZE": int(target_size),
         "API_KEY": api_key.strip(),
         "AI_MODEL": ai_model.strip(),
+        "OPENAI_TOKEN_LIMIT_TOTAL": int(openai_token_limit or 0),
         "USE_AI_TRIGGERWORD_CHECK": use_trigger_check,
         "TRIGGER_CHECK_MODEL": trigger_check_model.strip() or ai_model.strip(),
         "USE_REVIEW_ESCALATION": use_review_escalation,
@@ -1393,7 +1441,7 @@ def start_curator(
 
 
 def start_caption_from_profile(
-    trigger_word, input_folder, target_size, api_key, ai_model, use_trigger_check, trigger_check_model,
+    trigger_word, input_folder, target_size, api_key, ai_model, openai_token_limit, use_trigger_check, trigger_check_model,
     use_review_escalation, review_escalation_model,
     review_escalation_score_min, review_escalation_score_max,
     escalate_on_review, escalate_on_conflict, escalate_smart_crop, smart_crop_escalation_delta,
@@ -1421,13 +1469,16 @@ def start_caption_from_profile(
 ):
     """Phase 3: nur Caption-/Bildexport aus bereits gebautem Profil starten."""
     if not trigger_word.strip():
-        yield tr("Bitte ein Triggerwort eingeben.", "Please enter a trigger word."), [], 0, tr("❌ Fehler", "❌ Error")
+        yield tr("Bitte ein Triggerwort eingeben.", "Please enter a trigger word."), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0)
         return
     if not os.path.isdir(input_folder):
         yield tr(
             f"Input-Ordner existiert nicht: {input_folder}",
             f"Input folder does not exist: {input_folder}",
-        ), [], 0, tr("❌ Fehler", "❌ Error")
+        ), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0)
+        return
+    if not api_key.strip():
+        yield tr("Bitte einen OpenAI API Key eingeben.", "Please enter an OpenAI API key."), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0)
         return
 
     stage_path = caption_stage_path_for(input_folder, trigger_word)
@@ -1436,13 +1487,13 @@ def start_caption_from_profile(
         yield tr(
             f"_caption_stage.json fehlt. Starte zuerst den Curator im Modus 'Profile then Caption'. Erwartet: {stage_path}",
             f"_caption_stage.json is missing. First run the curator in 'Profile then Caption' mode. Expected: {stage_path}",
-        ), [], 0, tr("❌ Fehler", "❌ Error")
+        ), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0)
         return
     if not os.path.exists(profile_path):
         yield tr(
             f"_subject_profile.json fehlt. Erwartet: {profile_path}",
             f"_subject_profile.json is missing. Expected: {profile_path}",
-        ), [], 0, tr("❌ Fehler", "❌ Error")
+        ), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0)
         return
 
     all_caption_keys = list(CAPTION_FIELD_CHOICES)
@@ -1454,6 +1505,7 @@ def start_caption_from_profile(
         "TARGET_DATASET_SIZE": int(target_size),
         "API_KEY": api_key.strip(),
         "AI_MODEL": ai_model.strip(),
+        "OPENAI_TOKEN_LIMIT_TOTAL": int(openai_token_limit or 0),
         "CAPTION_PROFILE": normalize_caption_profile(caption_profile),
         "CAPTION_POLICY": caption_policy,
         "PIPELINE_MODE": "profile_then_caption",
@@ -1491,13 +1543,13 @@ def start_video(
         yield tr(
             f"Video-Ordner existiert nicht: {source_folder}",
             f"Video folder does not exist: {source_folder}",
-        ), [], 0, tr("❌ Fehler", "❌ Error")
+        ), [], 0, tr("❌ Fehler", "❌ Error"), ""
         return
     if not os.path.isfile(reference_image):
         yield tr(
             f"Referenzbild nicht gefunden: {reference_image}",
             f"Reference image not found: {reference_image}",
-        ), [], 0, tr("❌ Fehler", "❌ Error")
+        ), [], 0, tr("❌ Fehler", "❌ Error"), ""
         return
 
     config = {
@@ -1691,6 +1743,15 @@ def build_ui() -> gr.Blocks:
                                 "Main model for the first audit pass. Recommended: `gpt-5.4-mini`. `gpt-5.4-nano` is cheaper but less accurate. `gpt-5.5` is intentionally included, but not recommended as the default due to cost/benefit. On supported Gradio versions, you can still enter custom model names.",
                             ),
                             **openai_model_dropdown_kwargs(),
+                        )
+                        c_openai_token_limit = gr.Number(
+                            label=tr("OpenAI Token-Limit pro Lauf", "OpenAI token limit per run"),
+                            value=S["c_openai_token_limit"],
+                            precision=0,
+                            info=tr(
+                                "0 = kein Limit. Wenn das Limit erreicht ist, stoppt der Curator vor weiteren OpenAI-API-Calls. Tipp: bei 2.500.000 Tageslimit lieber etwas Reserve lassen, z. B. 2.400.000.",
+                                "0 = no limit. Once the limit is reached, the curator stops before any further OpenAI API calls. Tip: if your daily cap is 2,500,000, leave some headroom, e.g. 2,400,000."
+                            ),
                         )
                         c_use_trigger_check = gr.Checkbox(
                             label=tr("Trigger-Check aktivieren", "Enable trigger check"),
@@ -3221,7 +3282,9 @@ def build_ui() -> gr.Blocks:
                     c_stop_btn = gr.Button(tr("⏹ Abbrechen", "⏹ Cancel"), variant="stop", scale=1)
                     c_save_btn = gr.Button(tr("💾 Einstellungen speichern", "💾 Save settings"), variant="secondary", scale=2)
 
-                c_status = gr.Textbox(label=tr("Status", "Status"), interactive=False, max_lines=1)
+                with gr.Row():
+                    c_status = gr.Textbox(label=tr("Status", "Status"), interactive=False, max_lines=1, scale=2)
+                    c_openai_usage = gr.Textbox(label=tr("OpenAI Tokens", "OpenAI tokens"), interactive=False, max_lines=1, value=tr("💰 0 Requests | 0 Tokens", "💰 0 requests | 0 tokens"), scale=2)
                 c_progress = gr.Slider(label=tr("Fortschritt", "Progress"), minimum=0, maximum=1, step=0.01, value=0, interactive=False)
 
                 with gr.Row():
@@ -3232,7 +3295,7 @@ def build_ui() -> gr.Blocks:
 
                 # Alle Curator-Inputs als Liste (fuer Save und Start)
                 curator_inputs = [
-                    c_trigger, c_input, c_target, c_api_key, c_model, c_use_trigger_check, c_trigger_model,
+                    c_trigger, c_input, c_target, c_api_key, c_model, c_openai_token_limit, c_use_trigger_check, c_trigger_model,
                     c_use_review_escalation, c_review_escalation_model,
                     c_review_escalation_score_min, c_review_escalation_score_max,
                     c_escalate_on_review, c_escalate_on_conflict, c_escalate_smart_crop, c_smart_crop_escalation_delta,
@@ -3259,7 +3322,7 @@ def build_ui() -> gr.Blocks:
                     c_exp_review, c_exp_reject, c_exp_compare,
                 ]
 
-                c_start_btn.click(fn=start_curator, inputs=curator_inputs, outputs=[c_log, c_gallery, c_progress, c_status])
+                c_start_btn.click(fn=start_curator, inputs=curator_inputs, outputs=[c_log, c_gallery, c_progress, c_status, c_openai_usage])
                 c_stop_btn.click(fn=kill_process, outputs=[c_status])
 
             # ==============================================================
@@ -3515,7 +3578,9 @@ def build_ui() -> gr.Blocks:
                     )
 
                 # Live log + gallery für Phase 3 Continue-Run
-                p_status_run = gr.Textbox(label=tr("Run-Status", "Run status"), interactive=False, max_lines=1)
+                with gr.Row():
+                    p_status_run = gr.Textbox(label=tr("Run-Status", "Run status"), interactive=False, max_lines=1, scale=2)
+                    p_openai_usage = gr.Textbox(label=tr("OpenAI Tokens", "OpenAI tokens"), interactive=False, max_lines=1, value=tr("💰 0 Requests | 0 Tokens", "💰 0 requests | 0 tokens"), scale=2)
                 p_progress = gr.Slider(label=tr("Fortschritt", "Progress"), minimum=0, maximum=1, step=0.01, value=0, interactive=False)
                 with gr.Row():
                     with gr.Column(scale=3):
@@ -3613,7 +3678,7 @@ def build_ui() -> gr.Blocks:
                 ).then(
                     fn=start_caption_from_profile,
                     inputs=curator_inputs,  # dieselbe Liste wie der ehemalige Continue-Button im Curator-Tab
-                    outputs=[p_log, p_gallery, p_progress, p_status_run],
+                    outputs=[p_log, p_gallery, p_progress, p_status_run, p_openai_usage],
                 )
 
             # ==============================================================
@@ -3706,7 +3771,9 @@ def build_ui() -> gr.Blocks:
                     v_start_btn = gr.Button(tr("▶ Video-Extraktion starten", "▶ Start video extraction"), variant="primary", scale=3)
                     v_stop_btn = gr.Button(tr("⏹ Abbrechen", "⏹ Cancel"), variant="stop", scale=1)
 
-                v_status = gr.Textbox(label=tr("Status", "Status"), interactive=False, max_lines=1)
+                with gr.Row():
+                    v_status = gr.Textbox(label=tr("Status", "Status"), interactive=False, max_lines=1, scale=2)
+                    v_openai_usage = gr.Textbox(label=tr("OpenAI Tokens", "OpenAI tokens"), interactive=False, max_lines=1, value="", scale=2)
                 v_progress = gr.Slider(label=tr("Fortschritt", "Progress"), minimum=0, maximum=1, step=0.01, value=0, interactive=False)
 
                 with gr.Row():
@@ -3716,7 +3783,7 @@ def build_ui() -> gr.Blocks:
                         v_gallery = gr.Gallery(label=tr("Extrahierte Frames", "Extracted frames"), columns=3, rows=3, height=340, object_fit="cover")
 
                 video_inputs = [v_source, v_target, v_ref, v_fpm, v_fps, v_sim, v_sharp]
-                v_start_btn.click(fn=start_video, inputs=video_inputs, outputs=[v_log, v_gallery, v_progress, v_status])
+                v_start_btn.click(fn=start_video, inputs=video_inputs, outputs=[v_log, v_gallery, v_progress, v_status, v_openai_usage])
                 v_stop_btn.click(fn=kill_process, outputs=[v_status])
 
             # ==============================================================

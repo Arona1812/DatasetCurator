@@ -35,7 +35,7 @@ logging.getLogger("huggingface_hub.utils._http").addFilter(_SuppressHfHubUnauthW
 
 import requests
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 try:
     import cv2
@@ -95,6 +95,7 @@ API_KEY = os.environ.get("OPENAI_API_KEY", "")
 # Datasetgroessen (<200 Bildern) ist das vernachlaessigbar.
 AI_MODEL = "gpt-5.4-mini"
 TRIGGER_CHECK_MODEL = "gpt-5.4-mini"
+OPENAI_TOKEN_LIMIT_TOTAL = 0  # 0 = disabled
 
 # Optionale Eskalation für schwierige Fälle:
 # Erstes Audit läuft mit AI_MODEL. Falls ein Bild im Grenzbereich liegt,
@@ -560,7 +561,9 @@ PROFILE_NORMALIZER_MODEL = "gpt-5.4-mini"
 #   v1: initial (Phase 2)
 #   v2: confidence ist jetzt ein Objekt {level, reasoning, outliers}
 #       statt nur ein String. Alte Cache-Eintraege werden invalidiert.
-PROFILE_CACHE_SCHEMA_VERSION = "v2"
+#   v3: robustere Brillenlogik. Sonnenbrillen duerfen nicht mehr durch die
+#       kanonische Profil-Brille ueberschrieben werden.
+PROFILE_CACHE_SCHEMA_VERSION = "v3"
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
@@ -1190,6 +1193,161 @@ def bbox_area_ratio(bbox: Optional[List[int]], w: int, h: int) -> float:
 
 def clamp_int(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
+
+
+OPENAI_PRICING_PER_1M_TOKENS: Dict[str, Dict[str, float]] = {
+    # Optional local price table for estimated cost display.
+    # Intentionally empty by default to avoid showing stale or guessed prices.
+    # Example:
+    # "gpt-5.4-mini": {"input": 0.0, "output": 0.0},
+}
+
+_OPENAI_USAGE_LOCK = threading.Lock()
+OPENAI_USAGE_STATS: Dict[str, Any] = {
+    "requests": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+    "by_model": {},
+    "by_phase": {},
+}
+
+
+class OpenAITokenBudgetExceeded(RuntimeError):
+    """Raised when the configured OpenAI token budget for this run is exhausted."""
+
+
+def openai_token_limit_enabled() -> bool:
+    try:
+        return int(OPENAI_TOKEN_LIMIT_TOTAL or 0) > 0
+    except Exception:
+        return False
+
+
+def current_openai_total_tokens() -> int:
+    with _OPENAI_USAGE_LOCK:
+        return int(OPENAI_USAGE_STATS.get("total_tokens", 0))
+
+
+def remaining_openai_token_budget() -> Optional[int]:
+    if not openai_token_limit_enabled():
+        return None
+    limit = int(OPENAI_TOKEN_LIMIT_TOTAL or 0)
+    return max(0, limit - current_openai_total_tokens())
+
+
+def assert_openai_token_budget_available(context: str = "") -> None:
+    if not openai_token_limit_enabled():
+        return
+    limit = int(OPENAI_TOKEN_LIMIT_TOTAL or 0)
+    used = current_openai_total_tokens()
+    if used >= limit:
+        detail = f" during {context}" if context else ""
+        raise OpenAITokenBudgetExceeded(
+            f"OpenAI token limit reached{detail}: {used:,} / {limit:,} tokens used."
+        )
+
+
+def _usage_bucket_key(value: Optional[str], fallback: str) -> str:
+    text = normalize_text(value)
+    return text or fallback
+
+
+def _extract_usage_int(usage: Dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = usage.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except Exception:
+            continue
+    return 0
+
+
+def record_openai_usage(model: str, phase_label: str, data: Dict[str, Any]) -> Dict[str, int]:
+    usage = data.get("usage", {}) if isinstance(data, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+
+    input_tokens = _extract_usage_int(usage, "input_tokens", "prompt_tokens")
+    output_tokens = _extract_usage_int(usage, "output_tokens", "completion_tokens")
+    total_tokens = _extract_usage_int(usage, "total_tokens")
+    if total_tokens <= 0:
+        total_tokens = input_tokens + output_tokens
+
+    request_usage = {
+        "requests": 1,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+    model_key = _usage_bucket_key(model, "unknown_model")
+    phase_key = _usage_bucket_key(phase_label, "responses_api")
+
+    with _OPENAI_USAGE_LOCK:
+        OPENAI_USAGE_STATS["requests"] += 1
+        OPENAI_USAGE_STATS["input_tokens"] += input_tokens
+        OPENAI_USAGE_STATS["output_tokens"] += output_tokens
+        OPENAI_USAGE_STATS["total_tokens"] += total_tokens
+
+        model_bucket = OPENAI_USAGE_STATS["by_model"].setdefault(
+            model_key,
+            {"requests": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+        phase_bucket = OPENAI_USAGE_STATS["by_phase"].setdefault(
+            phase_key,
+            {"requests": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+
+        for key, value in request_usage.items():
+            model_bucket[key] += value
+            phase_bucket[key] += value
+
+    return request_usage
+
+
+def estimate_openai_cost_usd() -> Optional[float]:
+    total_cost = 0.0
+    with _OPENAI_USAGE_LOCK:
+        by_model = dict(OPENAI_USAGE_STATS.get("by_model", {}))
+
+    for model_name, usage in by_model.items():
+        pricing = OPENAI_PRICING_PER_1M_TOKENS.get(model_name)
+        if not pricing:
+            return None
+        input_price = float(pricing.get("input", 0.0))
+        output_price = float(pricing.get("output", 0.0))
+        total_cost += (float(usage.get("input_tokens", 0)) / 1_000_000.0) * input_price
+        total_cost += (float(usage.get("output_tokens", 0)) / 1_000_000.0) * output_price
+
+    return round(total_cost, 6)
+
+
+def build_openai_usage_summary() -> Dict[str, Any]:
+    with _OPENAI_USAGE_LOCK:
+        summary = {
+            "requests": int(OPENAI_USAGE_STATS.get("requests", 0)),
+            "input_tokens": int(OPENAI_USAGE_STATS.get("input_tokens", 0)),
+            "output_tokens": int(OPENAI_USAGE_STATS.get("output_tokens", 0)),
+            "total_tokens": int(OPENAI_USAGE_STATS.get("total_tokens", 0)),
+            "by_model": json.loads(json.dumps(OPENAI_USAGE_STATS.get("by_model", {}))),
+            "by_phase": json.loads(json.dumps(OPENAI_USAGE_STATS.get("by_phase", {}))),
+        }
+
+    estimated_cost = estimate_openai_cost_usd()
+    summary["estimated_cost_usd"] = estimated_cost
+    token_limit_total = int(OPENAI_TOKEN_LIMIT_TOTAL or 0) if openai_token_limit_enabled() else 0
+    summary["token_limit_total"] = token_limit_total
+    summary["token_limit_enabled"] = token_limit_total > 0
+    summary["token_limit_reached"] = token_limit_total > 0 and summary["total_tokens"] >= token_limit_total
+    summary["token_limit_remaining"] = (
+        max(0, token_limit_total - summary["total_tokens"])
+        if token_limit_total > 0
+        else None
+    )
+    return summary
 
 
 def get_file_mtime_bucket(path: str, seconds_bucket: int = 6 * 3600) -> str:
@@ -2342,11 +2500,157 @@ def cache_path_for_file(file_hash: str) -> str:
 #        Freckles werden als flexibler, sichtbarkeitsabhaengiger Marker
 #        behandelt und muessen in alten Caches neu erhoben werden.
 AUDIT_CACHE_SCHEMA_VERSION = "v10"
+EARLY_RESULT_CACHE_SCHEMA_VERSION = "v1"
 
 
 def audit_cache_key(base_hash: str, model: str, variant: str = "audit") -> str:
     raw = f"{AUDIT_CACHE_SCHEMA_VERSION}|{variant}|{base_hash}|{(model or '').strip().lower()}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def early_result_cache_path() -> str:
+    return os.path.join(CACHE_DIR, "early_results.json")
+
+
+def early_result_cache_settings() -> Dict[str, Any]:
+    return {
+        "HARD_MIN_SIDE_PX": int(HARD_MIN_SIDE_PX),
+        "USE_MIN_FILESIZE_FILTER": bool(USE_MIN_FILESIZE_FILTER),
+        "HARD_MIN_FILESIZE_KB": float(HARD_MIN_FILESIZE_KB),
+        "USE_EARLY_PHASH_DEDUP": bool(USE_EARLY_PHASH_DEDUP),
+        "USE_PHASH_DUPLICATE_SCORING": bool(USE_PHASH_DUPLICATE_SCORING),
+        "USE_EARLY_PHASH_LOOP1": bool(globals().get("USE_EARLY_PHASH_LOOP1", True)),
+        "EARLY_PHASH_HAMMING_THRESHOLD_1": int(globals().get("EARLY_PHASH_HAMMING_THRESHOLD_1", 1)),
+        "EARLY_PHASH_KEEP_PER_GROUP_1": int(globals().get("EARLY_PHASH_KEEP_PER_GROUP_1", 1)),
+        "EARLY_PHASH_LOOP1_PREFER_RESOLUTION": bool(globals().get("EARLY_PHASH_LOOP1_PREFER_RESOLUTION", True)),
+        "USE_EARLY_PHASH_LOOP2": bool(globals().get("USE_EARLY_PHASH_LOOP2", True)),
+        "EARLY_PHASH_HAMMING_THRESHOLD_2": int(globals().get("EARLY_PHASH_HAMMING_THRESHOLD_2", EARLY_PHASH_HAMMING_THRESHOLD)),
+        "EARLY_PHASH_KEEP_PER_GROUP_2": int(globals().get("EARLY_PHASH_KEEP_PER_GROUP_2", EARLY_PHASH_KEEP_PER_GROUP)),
+        "EARLY_PHASH_HAMMING_THRESHOLD": int(EARLY_PHASH_HAMMING_THRESHOLD),
+        "EARLY_PHASH_KEEP_PER_GROUP": int(EARLY_PHASH_KEEP_PER_GROUP),
+    }
+
+
+def early_result_settings_fingerprint() -> str:
+    payload = early_result_cache_settings()
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def dataset_fingerprint(image_paths: List[str]) -> str:
+    rows: List[List[Any]] = []
+    for path in sorted(image_paths, key=lambda p: p.lower()):
+        try:
+            rel_path = os.path.relpath(path, INPUT_FOLDER)
+        except Exception:
+            rel_path = path
+        try:
+            st = os.stat(path)
+            size = int(st.st_size)
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+        except Exception:
+            size = -1
+            mtime_ns = -1
+        rows.append([rel_path.replace("\\", "/"), size, mtime_ns])
+    raw = json.dumps(rows, ensure_ascii=False, sort_keys=False)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def load_cached_early_results(dataset_fp: str, settings_fp: str) -> Optional[Dict[str, Any]]:
+    path = early_result_cache_path()
+    if not ENABLE_CACHE or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        if data.get("schema_version") != EARLY_RESULT_CACHE_SCHEMA_VERSION:
+            return None
+        if data.get("dataset_fingerprint") != dataset_fp:
+            return None
+        if data.get("settings_fingerprint") != settings_fp:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def save_cached_early_results(payload: Dict[str, Any]) -> None:
+    if not ENABLE_CACHE:
+        return
+    path = early_result_cache_path()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def apply_early_static_rejects(image_paths: List[str]) -> Tuple[List[str], List[Dict[str, Any]]]:
+    survivors: List[str] = []
+    reject_rows: List[Dict[str, Any]] = []
+    for image_path in image_paths:
+        original_filename = os.path.basename(image_path)
+        try:
+            width, height = image_dimensions(image_path)
+        except (OSError, UnidentifiedImageError, ValueError) as e:
+            reason = "unreadable_or_corrupt_image"
+            reject_rows.append({
+                "original_filename": original_filename,
+                "original_path": image_path,
+                "width": 0,
+                "height": 0,
+                "quality_total": 0,
+                "base_status": "reject",
+                "final_status": "reject",
+                "short_reason": reason,
+                "local_override_reasons": [reason],
+                "status_notes": [f"image_open_error: {type(e).__name__}: {e}"],
+                "selected": False,
+                "output_bucket": "",
+                "new_basename": "",
+            })
+            continue
+
+        if min(width, height) < HARD_MIN_SIDE_PX:
+            reject_rows.append({
+                "original_filename": original_filename,
+                "original_path": image_path,
+                "width": width,
+                "height": height,
+                "quality_total": 0,
+                "base_status": "reject",
+                "final_status": "reject",
+                "short_reason": f"hard_pass_too_small_{width}x{height}",
+                "status_notes": [],
+                "selected": False,
+                "output_bucket": "",
+                "new_basename": "",
+            })
+            continue
+
+        if USE_MIN_FILESIZE_FILTER:
+            kb = local_filesize_kb(image_path)
+            if kb < HARD_MIN_FILESIZE_KB:
+                reason = f"filesize_too_small_{kb:.0f}kb"
+                reject_rows.append({
+                    "original_filename": original_filename,
+                    "original_path": image_path,
+                    "width": width,
+                    "height": height,
+                    "quality_total": 0,
+                    "base_status": "reject",
+                    "final_status": "reject",
+                    "short_reason": reason,
+                    "local_override_reasons": [reason],
+                    "status_notes": [],
+                    "selected": False,
+                    "output_bucket": "",
+                    "new_basename": "",
+                })
+                continue
+
+        survivors.append(image_path)
+
+    return survivors, reject_rows
 
 
 def load_cached_audit(file_hash: str) -> Optional[Dict[str, Any]]:
@@ -2807,6 +3111,7 @@ def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "
         attempt_label = f"{phase_label} | model={model} | attempt={attempt}/{MAX_RETRIES}"
         started_at, stop_event, thread = start_phase_heartbeat(attempt_label)
         try:
+            assert_openai_token_budget_available(phase_label)
             response = requests.post(
                 "https://api.openai.com/v1/responses",
                 headers=headers,
@@ -2820,9 +3125,34 @@ def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "
                     err = {"error": {"message": response.text}}
                 message = err.get("error", {}).get("message", f"HTTP {response.status_code}")
                 raise RuntimeError(message)
+            data = response.json()
+            request_usage = record_openai_usage(model, phase_label, data)
             stop_phase_heartbeat(attempt_label, started_at, stop_event, thread, success=True)
-            safe_print(f"   ↳ API response ok: status={response.status_code} | phase={phase_label}")
-            return response.json()
+            safe_print(
+                f"   ↳ API response ok: status={response.status_code} | phase={phase_label}"
+            )
+            safe_print(
+                "   💰 OpenAI usage: "
+                f"req+={request_usage['requests']} | "
+                f"in+={request_usage['input_tokens']:,} | "
+                f"out+={request_usage['output_tokens']:,} | "
+                f"total+={request_usage['total_tokens']:,}"
+            )
+            if openai_token_limit_enabled():
+                limit = int(OPENAI_TOKEN_LIMIT_TOTAL or 0)
+                used = current_openai_total_tokens()
+                remaining = max(0, limit - used)
+                safe_print(
+                    f"   🧮 OpenAI token budget: used={used:,} / {limit:,} | remaining={remaining:,}"
+                )
+                if used >= limit:
+                    raise OpenAITokenBudgetExceeded(
+                        f"OpenAI token limit reached after {phase_label}: {used:,} / {limit:,} tokens used."
+                    )
+            return data
+        except OpenAITokenBudgetExceeded:
+            stop_phase_heartbeat(attempt_label, started_at, stop_event, thread, success=False)
+            raise
         except Exception as e:
             stop_phase_heartbeat(attempt_label, started_at, stop_event, thread, success=False)
             last_error = e
@@ -3796,6 +4126,70 @@ def _normalize_glasses_token(text: str) -> str:
     return text
 
 
+def _is_sunglasses_description(text: Optional[str]) -> bool:
+    """Erkennt Beschreibungen, die explizit Sonnenbrillen/Shades meinen.
+
+    Wichtig: Diese Bilder duerfen NICHT durch die kanonische Profil-Brille
+    (z.B. "thin rectangular glasses") ueberschrieben werden.
+    """
+    t = normalize_compact_text(text)
+    if not t:
+        return False
+    keywords = [
+        "sunglasses", "sun glasses", "shades",
+        "dark sunglasses", "aviator sunglasses",
+        "tinted lenses", "dark lenses", "black lenses",
+        "mirrored lenses", "mirror lenses", "reflective lenses",
+        "tinted shades", "dark shades",
+    ]
+    return any(k in t for k in keywords)
+
+
+def _is_regular_glasses_description(text: Optional[str]) -> bool:
+    """Erkennt normale optische Brillenbeschreibungen grob heuristisch."""
+    t = normalize_compact_text(text)
+    if not t or _is_sunglasses_description(t):
+        return False
+    keywords = [
+        "glasses", "eyeglasses", "spectacles", "frames", "rimless",
+        "browline", "rectangular", "round", "square", "oval", "cat eye",
+        "cat-eye", "geometric", "clear lenses", "clear lens",
+    ]
+    return any(k in t for k in keywords)
+
+
+def resolve_visible_glasses_description(item: Dict[str, Any], profile: Dict[str, Any], image_traits: Dict[str, Any]) -> str:
+    """Waehlt eine sichere Brillenbeschreibung fuer die Caption.
+
+    Regeln:
+    - Wenn im Einzelbild Sonnenbrille sichtbar ist, IMMER die Einzelbild-
+      Beschreibung behalten.
+    - Wenn das Profil Sonnenbrille sagt, das Einzelbild aber normale Brille,
+      ebenfalls die Einzelbild-Beschreibung bevorzugen.
+    - Nur kompatible normale Brillen duerfen durch die kanonische Profil-
+      Beschreibung vereinheitlicht werden.
+    """
+    glasses_visible = bool(image_traits.get("glasses_visible")) or _profile_bool(item.get("has_glasses_now"))
+    if not glasses_visible:
+        return ""
+
+    markers = profile.get("identity_markers", {}) if isinstance(profile, dict) else {}
+    glasses_profile = markers.get("glasses", {}) if isinstance(markers, dict) else {}
+
+    item_desc = compact_trait(item.get("glasses_description"))
+    profile_desc = compact_trait(glasses_profile.get("canonical_description"))
+
+    if _is_sunglasses_description(item_desc):
+        return item_desc
+    if _is_sunglasses_description(profile_desc) and item_desc:
+        return item_desc
+    if item_desc and _is_regular_glasses_description(item_desc) and _is_regular_glasses_description(profile_desc):
+        return profile_desc or item_desc
+    if item_desc:
+        return item_desc
+    return profile_desc
+
+
 def _simplify_or_phrase(text: str) -> str:
     """
     Reduziert Phrasen mit KI-Unentschiedenheit ('X or Y Z' oder 'X/Y Z') auf
@@ -4307,6 +4701,10 @@ Important:
   "few full-body observations". Vision models tend to over-label women as 'slim' on headshots
   due to RLHF politeness bias - resist this tendency.
 - Glasses are regular only if visible in at least about 60% of sampled usable images.
+- Do not let occasional sunglasses overwrite a regular prescription-glasses baseline.
+- If a subject regularly wears normal eyeglasses, per-image sunglasses must remain
+  sunglasses in downstream captions and must not be normalized to the profile glasses description.
+- Prefer a non-sunglasses canonical_description unless sunglasses are genuinely the regular baseline.
 - Freckles are a flexible visibility-dependent identity marker: if they recur across the face in a substantial subset of images, preserve them as a canonical marker, but they must still only be captioned when visible in the current image.
 - Piercing baseline includes locations visible in at least about 40% of sampled usable images.
 - Tattoo inventory is the union of visible tattoos, grouped by location. Mention only visible markers later.
@@ -4390,7 +4788,11 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
     glasses_rows = [r for r in rows if _profile_bool(r.get("has_glasses_now")) or compact_trait(r.get("glasses_description"))]
     glasses_descs = [compact_trait(r.get("glasses_description")) for r in glasses_rows]
     glasses_descs = [d for d in glasses_descs if d]
-    glasses_mode = Counter(glasses_descs).most_common(1)[0][0] if glasses_descs else ""
+    regular_glasses_descs = [d for d in glasses_descs if not _is_sunglasses_description(d)]
+    if regular_glasses_descs:
+        glasses_mode = Counter(regular_glasses_descs).most_common(1)[0][0]
+    else:
+        glasses_mode = Counter(glasses_descs).most_common(1)[0][0] if glasses_descs else ""
     freckles_rows = [r for r in rows if compact_trait(r.get("freckles_description"))]
     freckles_descs = [compact_trait(r.get("freckles_description")) for r in freckles_rows]
     freckles_descs = [d for d in freckles_descs if d]
@@ -5310,7 +5712,11 @@ def continue_caption_from_profile() -> None:
             img_out = os.path.join(REJECT_DIR, f"{new_basename}.jpg")
             txt_out = os.path.join(REJECT_DIR, f"{new_basename}.txt")
             try:
-                shutil.copy2(row["original_path"], img_out)
+                if should_copy_reject_original(row):
+                    shutil.copy2(row["original_path"], img_out)
+                else:
+                    cropped = body_aware_crop(row["original_path"], row)
+                    cropped.save(img_out, "JPEG", quality=100)
                 with open(txt_out, "w", encoding="utf-8") as ft:
                     ft.write(build_reject_export_text(row, global_rules, subject_profile))
                 _sync_row_update(row_index, row)
@@ -6381,9 +6787,7 @@ def build_caption(
     glasses_profile = markers.get("glasses", {}) if isinstance(markers, dict) else {}
     freckles_profile = markers.get("freckles", {}) if isinstance(markers, dict) else {}
     glasses_visible = bool(image_traits.get("glasses_visible")) or _profile_bool(item.get("has_glasses_now"))
-    glasses_desc = ""
-    if glasses_visible:
-        glasses_desc = compact_trait(glasses_profile.get("canonical_description")) or compact_trait(item.get("glasses_description"))
+    glasses_desc = resolve_visible_glasses_description(item, profile, image_traits) if glasses_visible else ""
     freckles_visible = bool(image_traits.get("freckles_visible")) or bool(compact_trait(item.get("freckles_description")))
     freckles_desc = ""
     if freckles_visible:
@@ -6802,6 +7206,21 @@ def body_aware_crop(image_path: str, item: Dict[str, Any]) -> Image.Image:
     return crop
 
 
+def should_copy_reject_original(row: Dict[str, Any]) -> bool:
+    """Bestimmt, ob ein Reject unverändert statt gecroppt exportiert werden soll.
+
+    Early-Hard-Rejects sollen als Diagnosematerial im Originalzustand erhalten
+    bleiben, damit kleine/duplizierte/problematische Inputs nicht künstlich
+    auf Trainingsgrößen hochskaliert oder neu beschnitten werden.
+    """
+    reason = str(row.get("short_reason", "") or "")
+    return (
+        reason.startswith("hard_pass_too_small")
+        or reason.startswith("filesize_too_small")
+        or reason == "early_phash_duplicate"
+    )
+
+
 # ============================================================
 # 11) REPORTS
 # ============================================================
@@ -6825,6 +7244,47 @@ def save_report_md(path: str, report: Dict[str, Any]) -> None:
     for k, v in report["summary"].items():
         lines.append(f"- {k}: {v}")
     lines.append("")
+    openai_usage = report.get("openai_usage", {}) or {}
+    if openai_usage:
+        lines.append("## OpenAI usage")
+        lines.append("")
+        lines.append(f"- requests: {openai_usage.get('requests', 0)}")
+        lines.append(f"- input_tokens: {openai_usage.get('input_tokens', 0)}")
+        lines.append(f"- output_tokens: {openai_usage.get('output_tokens', 0)}")
+        lines.append(f"- total_tokens: {openai_usage.get('total_tokens', 0)}")
+        if openai_usage.get("token_limit_enabled"):
+            lines.append(f"- token_limit_total: {openai_usage.get('token_limit_total', 0)}")
+            lines.append(f"- token_limit_remaining: {openai_usage.get('token_limit_remaining', 0)}")
+            lines.append(f"- token_limit_reached: {openai_usage.get('token_limit_reached', False)}")
+        estimated_cost = openai_usage.get("estimated_cost_usd")
+        lines.append(
+            f"- estimated_cost_usd: {estimated_cost}"
+            if estimated_cost is not None
+            else "- estimated_cost_usd: n/a (no local pricing table configured)"
+        )
+        if openai_usage.get("by_model"):
+            lines.append("")
+            lines.append("### By model")
+            lines.append("")
+            for model_name, usage in openai_usage["by_model"].items():
+                lines.append(
+                    f"- `{model_name}`: requests={usage.get('requests', 0)}, "
+                    f"input_tokens={usage.get('input_tokens', 0)}, "
+                    f"output_tokens={usage.get('output_tokens', 0)}, "
+                    f"total_tokens={usage.get('total_tokens', 0)}"
+                )
+        if openai_usage.get("by_phase"):
+            lines.append("")
+            lines.append("### By phase")
+            lines.append("")
+            for phase_name, usage in openai_usage["by_phase"].items():
+                lines.append(
+                    f"- `{phase_name}`: requests={usage.get('requests', 0)}, "
+                    f"input_tokens={usage.get('input_tokens', 0)}, "
+                    f"output_tokens={usage.get('output_tokens', 0)}, "
+                    f"total_tokens={usage.get('total_tokens', 0)}"
+                )
+        lines.append("")
     if report.get("warnings"):
         lines.append("## Warnings")
         lines.append("")
@@ -6947,6 +7407,7 @@ def generate_dashboard(all_rows: List[Dict[str, Any]], selected: List[Dict[str, 
 
 def main() -> None:
     warnings: List[str] = []
+    budget_limit_reached = False
 
     # Konfig-Banner: zeigt aktiv geladenes Modell + Cache-Schema-Version.
     # Dient zum schnellen Debug-Check, ob UI-Config-Overrides oder
@@ -6956,6 +7417,9 @@ def main() -> None:
     safe_print(f"  Audit model:        {AI_MODEL}")
     safe_print(f"  Trigger model:      {TRIGGER_CHECK_MODEL}")
     safe_print(f"  Escalation:         {'ON (' + REVIEW_ESCALATION_MODEL + ')' if USE_REVIEW_ESCALATION and REVIEW_ESCALATION_MODEL else 'OFF'}")
+    safe_print(
+        f"  Token limit:        {f'{int(OPENAI_TOKEN_LIMIT_TOTAL):,}' if openai_token_limit_enabled() else 'OFF'}"
+    )
     safe_print(f"  Audit cache schema: {AUDIT_CACHE_SCHEMA_VERSION}")
     safe_print(f"  Pipeline mode:      {PIPELINE_MODE}")
     safe_print("=" * 60)
@@ -6975,6 +7439,10 @@ def main() -> None:
                 suggestion = trigger_check.get("suggested_trigger", "").strip()
                 if suggestion and suggestion.lower() != TRIGGER_WORD.lower():
                     warnings.append(f"Suggested more robust trigger word: {suggestion}")
+        except OpenAITokenBudgetExceeded as e:
+            budget_limit_reached = True
+            warnings.append(str(e))
+            safe_print(f"🛑 {e}")
         except Exception as e:
             warnings.append(f"Trigger-word check failed: {e}")
 
@@ -6988,16 +7456,60 @@ def main() -> None:
 
     safe_print(f"Images found: {len(image_paths)}")
 
-    # ── Early pHash-Dedup VOR der API ──────────────────────────────────────
+    dataset_fp = dataset_fingerprint(image_paths)
+    settings_fp = early_result_settings_fingerprint()
+    cached_early = load_cached_early_results(dataset_fp, settings_fp)
+
+    early_reject_rows: List[Dict[str, Any]] = []
     early_dup_paths: List[str] = []
     phash_cache: Dict[str, int] = {}
-    if USE_EARLY_PHASH_DEDUP and USE_PHASH_DUPLICATE_SCORING:
-        image_paths, early_dup_paths, phash_cache = early_phash_dedup(image_paths)
+
+    if cached_early:
+        image_paths = [
+            p for p in cached_early.get("survivor_paths", [])
+            if isinstance(p, str) and os.path.exists(p)
+        ]
+        early_dup_paths = [
+            p for p in cached_early.get("early_duplicate_paths", [])
+            if isinstance(p, str) and os.path.exists(p)
+        ]
+        raw_phash_cache = cached_early.get("phash_cache", {}) or {}
+        if isinstance(raw_phash_cache, dict):
+            phash_cache = {
+                str(p): int(v)
+                for p, v in raw_phash_cache.items()
+                if isinstance(p, str) and os.path.exists(p)
+            }
+        raw_reject_rows = cached_early.get("early_reject_rows", []) or []
+        early_reject_rows = [r for r in raw_reject_rows if isinstance(r, dict)]
+        safe_print(
+            f"   ↳ Early result cache used: {len(image_paths)} survivors, "
+            f"{len(early_reject_rows)} early rejects, {len(early_dup_paths)} early duplicates"
+        )
+    else:
+        image_paths, early_reject_rows = apply_early_static_rejects(image_paths)
+        if USE_EARLY_PHASH_DEDUP and USE_PHASH_DUPLICATE_SCORING:
+            image_paths, early_dup_paths, phash_cache = early_phash_dedup(image_paths)
+        save_cached_early_results({
+            "schema_version": EARLY_RESULT_CACHE_SCHEMA_VERSION,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "dataset_fingerprint": dataset_fp,
+            "settings_fingerprint": settings_fp,
+            "settings": early_result_cache_settings(),
+            "survivor_paths": list(image_paths),
+            "early_duplicate_paths": list(early_dup_paths),
+            "phash_cache": phash_cache,
+            "early_reject_rows": early_reject_rows,
+        })
+        safe_print(
+            f"   ↳ Early result cache saved: {len(image_paths)} survivors, "
+            f"{len(early_reject_rows)} early rejects, {len(early_dup_paths)} early duplicates"
+        )
 
     safe_print(f"Starting audit for trigger word: {TRIGGER_WORD}")
     safe_print("")
 
-    all_rows: List[Dict[str, Any]] = []
+    all_rows: List[Dict[str, Any]] = list(early_reject_rows)
     # Sammelt alle Smart-Crop-Paare fuer den Vergleichs-Export
     crop_pairs: List[Dict[str, Any]] = []
 
@@ -7031,40 +7543,6 @@ def main() -> None:
                 "output_bucket": "",
                 "new_basename": "",
             }
-
-            if min(width, height) < HARD_MIN_SIDE_PX:
-                row.update({
-                    "width": width,
-                    "height": height,
-                    "quality_total": 0,
-                    "base_status": "reject",
-                    "final_status": "reject",
-                    "short_reason": f"hard_pass_too_small_{width}x{height}",
-                })
-                all_rows.append(row)
-                safe_print(f"   ❌ Reject: hard pass {width}x{height}")
-                continue
-
-            # ── Vorfilter STUFE 1: Dateigroesse (gratis, vor IG-Crop) ──────
-            # Diese Pruefung kommt vor dem IG-Crop, weil sie quasi kostenlos
-            # ist und das Laden kleiner Daten filtern kann, bevor wir
-            # potenziell teure Frame-Detection starten.
-            if USE_MIN_FILESIZE_FILTER:
-                kb = local_filesize_kb(image_path)
-                if kb < HARD_MIN_FILESIZE_KB:
-                    reason = f"filesize_too_small_{kb:.0f}kb"
-                    row.update({
-                        "width": width,
-                        "height": height,
-                        "quality_total": 0,
-                        "base_status": "reject",
-                        "final_status": "reject",
-                        "short_reason": reason,
-                        "local_override_reasons": [reason],
-                    })
-                    all_rows.append(row)
-                    safe_print(f"   ❌ Reject: {reason}")
-                    continue
 
             file_hash = file_sha1(image_path)
 
@@ -7502,6 +7980,14 @@ def main() -> None:
                 "short_reason": f"script_error: {e}",
                 "traceback": tb,
             })
+            if isinstance(e, OpenAITokenBudgetExceeded):
+                budget_limit_reached = True
+                warnings.append(str(e))
+                safe_print(f"🛑 {e}")
+                break
+
+        if budget_limit_reached:
+            break
 
     # PASS 2: Duplicate-Filter
     mark_duplicates(all_rows)
@@ -7752,11 +8238,16 @@ def main() -> None:
             img_out = os.path.join(REJECT_DIR, f"{new_basename}.jpg")
             txt_out = os.path.join(REJECT_DIR, f"{new_basename}.txt")
 
-            # Bild kopieren
+            # Early-Hard-Rejects im Originalzustand behalten; alle anderen wie
+            # Keep/Review auf Exportgröße crop/resize.
             try:
-                shutil.copy2(row["original_path"], img_out)
-            except Exception as copy_err:
-                safe_print(f"   ⚠️ Failed to copy reject image: {row.get('original_filename','')} – {copy_err}")
+                if should_copy_reject_original(row):
+                    shutil.copy2(row["original_path"], img_out)
+                else:
+                    cropped = body_aware_crop(row["original_path"], row)
+                    cropped.save(img_out, "JPEG", quality=100)
+            except Exception as export_err:
+                safe_print(f"   ⚠️ Failed to export reject image: {row.get('original_filename','')} – {export_err}")
 
             # Reason-Datei: gemeinsamer Helper baut den vollstaendigen String
             try:
@@ -8016,6 +8507,20 @@ def main() -> None:
         "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
         "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
     }
+    openai_usage_summary = build_openai_usage_summary()
+    summary.update({
+        "openai_api_requests": openai_usage_summary.get("requests", 0),
+        "openai_input_tokens": openai_usage_summary.get("input_tokens", 0),
+        "openai_output_tokens": openai_usage_summary.get("output_tokens", 0),
+        "openai_total_tokens": openai_usage_summary.get("total_tokens", 0),
+        "openai_token_limit_total": openai_usage_summary.get("token_limit_total", 0),
+        "openai_token_limit_reached": openai_usage_summary.get("token_limit_reached", False),
+        "openai_estimated_cost_usd": (
+            openai_usage_summary.get("estimated_cost_usd")
+            if openai_usage_summary.get("estimated_cost_usd") is not None
+            else "n/a"
+        ),
+    })
 
     if len(selected_sorted) < TARGET_DATASET_SIZE:
         warnings.append(
@@ -8049,6 +8554,7 @@ def main() -> None:
 
     report = {
         "summary": summary,
+        "openai_usage": openai_usage_summary,
         "warnings": warnings,
         "global_rules": global_rules,
         "identity_check": identity_summary,
