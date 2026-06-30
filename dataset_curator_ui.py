@@ -99,6 +99,8 @@ SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
     "include_expression",
     "include_hair_always",
     "include_hair_when_variable",
+    "include_eye_color_when_variable",
+    "include_costume_accessories",
     "include_beard_always",
     "include_beard_when_variable",
     "include_mirror_selfie_marker",
@@ -131,6 +133,8 @@ Z_IMAGE_BASE_CAPTION_FIELDS: List[str] = [
     "include_gaze",
     "include_expression",
     "include_hair_when_variable",
+    "include_eye_color_when_variable",
+    "include_costume_accessories",
     "include_beard_when_variable",
     "include_mirror_selfie_marker",
     "include_visual_style",
@@ -261,6 +265,8 @@ CAPTION_FIELD_CHOICES: List[str] = [
     "include_expression",
     "include_hair_always",
     "include_hair_when_variable",
+    "include_eye_color_when_variable",
+    "include_costume_accessories",
     "include_beard_always",
     "include_beard_when_variable",
     "include_mirror_selfie_marker",
@@ -623,6 +629,8 @@ def _profile_summary_markdown(profile: Dict[str, Any]) -> str:
         f"**Eye color:** {stable.get('eye_color', '-')}",
         f"**Hair texture:** {stable.get('hair_texture', '-')}",
         f"**Body build:** {stable.get('body_build', '-')}",
+        f"**Body height impression:** {stable.get('body_height_impression', '-')}",
+        f"**Appearance mode:** {profile.get('profile_appearance_mode', '-')}",
         "",
         f"**Glasses:** {glasses.get('canonical_description', '-') if glasses.get('wears_regularly') else 'not regular'}",
         f"**Freckles:** {freckles.get('canonical_description', '-') if freckles.get('has_freckles') else 'not regular'}",
@@ -686,21 +694,41 @@ def save_subject_profile_ui(trigger_word: str, input_folder: str, profile_json_t
 # Bei Aenderungen dort auch hier anpassen.
 
 PROFILE_VOCAB_GENDER: List[str] = ["woman", "man", "girl", "boy", "person"]
-PROFILE_VOCAB_SKIN: List[str] = ["fair", "light", "medium", "tan", "olive", "dark", "deep"]
-PROFILE_VOCAB_EYES: List[str] = ["blue", "green", "hazel", "brown", "dark_brown", "gray", "amber"]
+PROFILE_VOCAB_SKIN: List[str] = ["very_fair", "fair", "light", "medium", "tan", "olive", "brown", "dark", "deep", "unclear"]
+PROFILE_VOCAB_EYES: List[str] = ["blue", "blue_green", "green", "hazel", "brown", "dark_brown", "gray", "gray_blue", "amber", "not_visible", "unclear"]
 PROFILE_VOCAB_HAIR_TEXTURE: List[str] = ["straight", "wavy", "curly", "coily", "afro_textured"]
-PROFILE_VOCAB_BODY: List[str] = ["", "slim", "average", "athletic", "curvy", "plus_size", "muscular"]
+PROFILE_VOCAB_BODY: List[str] = ["petite", "slim", "average", "athletic", "curvy", "plus_size", "muscular", "broad_build", "unclear"]
+PROFILE_VOCAB_BODY_HEIGHT: List[str] = ["short", "average_height", "tall", "unclear"]
 PROFILE_VOCAB_HAIR_COLOR: List[str] = [
-    "black", "dark_brown", "brown", "light_brown", "blonde", "platinum",
-    "red", "auburn", "burgundy", "gray", "white", "dyed_other",
+    "black", "dark_brown", "brown", "light_brown", "dark_blonde", "blonde",
+    "platinum", "strawberry_blonde", "red", "copper", "auburn", "burgundy",
+    "gray", "silver", "white", "blue", "pink", "purple", "green",
+    "dyed_other", "multicolor", "ombre", "highlights", "not_visible", "unclear",
 ]
 PROFILE_VOCAB_HAIR_FORM: List[str] = [
     "loose_straight", "loose_wavy", "loose_curly", "loose_coily",
-    "afro_natural", "ponytail", "pigtails", "two_braids", "single_braid",
-    "box_braids", "knotless_braids", "cornrows", "bun", "updo",
-    "half_up", "pulled_back", "short_cut",
+    "afro_natural", "ponytail", "low_ponytail", "high_ponytail",
+    "pigtails", "two_braids", "single_braid", "box_braids",
+    "knotless_braids", "cornrows", "dreadlocks", "bun", "low_bun",
+    "high_bun", "messy_bun", "updo", "half_up", "pulled_back",
+    "pixie_cut", "bob_cut", "lob_cut", "short_cut", "buzz_cut",
+    "shaved_head", "undercut", "side_shaved", "bangs", "curtain_bangs",
+    "covered_hair", "other",
 ]
-PROFILE_VOCAB_MAKEUP: List[str] = ["none", "minimal", "natural", "defined", "full", "dramatic"]
+PROFILE_VOCAB_MAKEUP: List[str] = ["none", "minimal", "natural", "defined", "full", "dramatic", "stage_makeup", "costume_makeup", "face_paint", "unclear"]
+PROFILE_VOCAB_MAKEUP_STYLE: List[str] = [
+    "natural_makeup", "gyaru_makeup", "cosplay_makeup",
+    "anime_inspired_makeup", "dramatic_eyeliner", "smoky_eye_makeup",
+    "false_eyelashes", "glossy_lips", "face_paint", "fantasy_makeup", "unclear",
+]
+PROFILE_VOCAB_LOOK_CONTEXT: List[str] = [
+    "regular_photo", "fashion", "glamour", "gyaru_style", "cosplay",
+    "character_costume", "fantasy_costume", "stage_costume",
+    "swimwear_costume", "lingerie_costume", "unclear",
+]
+PROFILE_VOCAB_APPEARANCE_MODE: List[str] = [
+    "natural_identity", "fashion_identity", "cosplay_identity", "high_variation_model_identity",
+]
 
 
 def _conf_level(profile: Dict[str, Any], field: str) -> str:
@@ -751,7 +779,7 @@ def _normalize_dropdown_choices(vocab: List[str], current: str) -> List[str]:
 def aggregate_per_image_traits(profile: Dict[str, Any]) -> Dict[str, List[Tuple[str, int]]]:
     """Bucket-Counts ueber per_image_traits, sortiert nach Haeufigkeit absteigend."""
     per_image = (profile or {}).get("per_image_traits", {}) or {}
-    fields = ["hair_color_base", "hair_form", "makeup_intensity"]
+    fields = ["hair_color_base", "hair_form", "eye_color_base", "eye_appearance", "makeup_intensity", "makeup_style", "look_context"]
     result: Dict[str, List[Tuple[str, int]]] = {}
     for field in fields:
         counts: Dict[str, int] = {}
@@ -783,8 +811,8 @@ def _empty_editor_payload(status_msg: str) -> Tuple:
     empty_info = "—"
     return (
         {}, "",  # state, raw_json
-        empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown,
-        empty_info, empty_info, empty_info, empty_info, empty_info,
+        empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown,
+        empty_info, empty_info, empty_info, empty_info, empty_info, empty_info,
         False, "",  # glasses
         False, "",  # freckles
         "_kein Profil_", "_kein Profil_", "_kein Profil_",
@@ -792,6 +820,9 @@ def _empty_editor_payload(status_msg: str) -> Tuple:
         # Bucket-edit dropdowns (3x from + 3x to)
         empty_dropdown, empty_dropdown, empty_dropdown,
         empty_dropdown, empty_dropdown, empty_dropdown,
+        tr("_Keine Identity-Cluster geladen._", "_No identity clusters loaded._"), [],
+        tr("_Kein Cluster ausgewählt._", "_No cluster selected._"), [],
+        "", gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value="variation"),
         status_msg,
     )
 
@@ -832,12 +863,14 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     eyes_val = (stable.get("eye_color") or "").strip()
     hair_tex_val = (stable.get("hair_texture") or "").strip()
     body_val = (stable.get("body_build") or "").strip()
+    body_height_val = (stable.get("body_height_impression") or "").strip()
 
     gender_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_GENDER, gender_val), value=gender_val)
     skin_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_SKIN, skin_val), value=skin_val)
     eyes_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_EYES, eyes_val), value=eyes_val)
     hair_tex_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_HAIR_TEXTURE, hair_tex_val), value=hair_tex_val)
     body_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_BODY, body_val), value=body_val)
+    body_height_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_BODY_HEIGHT, body_height_val), value=body_height_val)
 
     counts = aggregate_per_image_traits(profile)
     hair_color_md = _bucket_summary_markdown(
@@ -854,6 +887,26 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
         tr("Makeup-Intensität (per Bild)", "Makeup intensity (per image)"),
         counts.get("makeup_intensity", []),
         PROFILE_VOCAB_MAKEUP,
+    )
+    eye_color_md = _bucket_summary_markdown(
+        tr("Augenfarbe (per Bild)", "Eye color (per image)"),
+        counts.get("eye_color_base", []),
+        PROFILE_VOCAB_EYES,
+    )
+    eye_appearance_md = _bucket_summary_markdown(
+        tr("Augen-/Linsenlook (per Bild)", "Eye/lens appearance (per image)"),
+        counts.get("eye_appearance", []),
+        ["natural_eyes", "colored_contact_lenses", "circle_lenses", "cosmetic_lenses", "unnatural_eye_color", "unclear"],
+    )
+    makeup_style_md = _bucket_summary_markdown(
+        tr("Makeup-Stil (per Bild)", "Makeup style (per image)"),
+        counts.get("makeup_style", []),
+        PROFILE_VOCAB_MAKEUP_STYLE,
+    )
+    look_context_md = _bucket_summary_markdown(
+        tr("Look-Kontext (per Bild)", "Look context (per image)"),
+        counts.get("look_context", []),
+        PROFILE_VOCAB_LOOK_CONTEXT,
     )
 
     # Re-bucket dropdowns: from-Werte sind die im Profil vorkommenden Tokens
@@ -904,8 +957,8 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
 
     return (
         profile, raw_json,
-        gender_dd, skin_dd, eyes_dd, hair_tex_dd, body_dd,
-        info("gender"), info("skin_tone"), info("eye_color"), info("hair_texture"), info("body_build"),
+        gender_dd, skin_dd, eyes_dd, hair_tex_dd, body_dd, body_height_dd,
+        info("gender"), info("skin_tone"), info("eye_color"), info("hair_texture"), info("body_build"), info("body_height_impression"),
         bool(glasses.get("wears_regularly", False)),
         str(glasses.get("canonical_description", "") or ""),
         bool(freckles.get("has_freckles", False)),
@@ -914,6 +967,13 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
         tattoo_md, piercing_md, notes_md,
         color_from_dd, form_from_dd, makeup_from_dd,
         color_to_dd, form_to_dd, makeup_to_dd,
+        _identity_clusters_markdown(profile), _identity_clusters_table(profile),
+        _identity_cluster_preview_markdown(profile), _identity_cluster_preview_gallery(profile, trigger_word, input_folder),
+        str((_identity_cluster_by_id(profile) or {}).get("cluster_id", "") or ""),
+        gr.update(
+            choices=IDENTITY_CLUSTER_ROLE_CHOICES,
+            value=_identity_cluster_role_for_id(profile, str((_identity_cluster_by_id(profile) or {}).get("cluster_id", "") or "")),
+        ),
         status,
     )
 
@@ -927,6 +987,7 @@ def save_profile_from_editor(
     eye_color: str,
     hair_texture: str,
     body_build: str,
+    body_height_impression: str,
     glasses_regular: bool,
     glasses_desc: str,
     freckles_present: bool,
@@ -967,6 +1028,7 @@ def save_profile_from_editor(
     stable["eye_color"] = (eye_color or "").strip()
     stable["hair_texture"] = (hair_texture or "").strip()
     stable["body_build"] = (body_build or "").strip()  # explicit "" erlaubt
+    stable["body_height_impression"] = (body_height_impression or "").strip()
 
     markers = profile.setdefault("identity_markers", {})
     glasses = markers.setdefault("glasses", {"wears_regularly": False, "canonical_description": "", "frequency": ""})
@@ -1071,6 +1133,659 @@ def reset_profile_from_backup(trigger_word: str, input_folder: str, raw_profile_
         return tr(f"↩️ Reset abgeschlossen: {path}", f"↩️ Reset complete: {path}")
     except Exception as e:
         return tr(f"❌ Schreibfehler: {e}", f"❌ Write error: {e}")
+
+
+
+def _candidate_image_paths_for_cluster_preview(trigger_word: str, input_folder: str, filename_or_path: str) -> List[str]:
+    """Return likely filesystem locations for a cluster preview image.
+
+    Profiles may contain either original filenames, absolute original paths, or
+    cached/exported paths depending on which Curator version created them. The
+    UI should be forgiving and show previews whenever the image still exists in
+    the input folder or one of the curated output buckets.
+    """
+    value = str(filename_or_path or "").strip()
+    if not value:
+        return []
+
+    candidates: List[str] = []
+    seen: set = set()
+
+    def add(path: str) -> None:
+        if not path:
+            return
+        p = os.path.normpath(path)
+        if p not in seen:
+            seen.add(p)
+            candidates.append(p)
+
+    # Absolute / explicit path first.
+    add(value)
+
+    basename = os.path.basename(value)
+    if input_folder:
+        add(os.path.join(input_folder, value))
+        add(os.path.join(input_folder, basename))
+
+    root = output_root_for(input_folder, trigger_word)
+    for sub in (
+        "01_train_ready",
+        "02_keep_unused",
+        "03_caption_remove",
+        "04_review",
+        "05_reject",
+        "06_needs_manual_review",
+        os.path.join("_cache", "ig_frame_crops"),
+    ):
+        add(os.path.join(root, sub, value))
+        add(os.path.join(root, sub, basename))
+
+    return candidates
+
+
+def _find_cluster_preview_image(trigger_word: str, input_folder: str, filename_or_path: str) -> Optional[str]:
+    for path in _candidate_image_paths_for_cluster_preview(trigger_word, input_folder, filename_or_path):
+        if os.path.isfile(path):
+            return path
+
+    # Last-resort bounded recursive search by basename in the input folder and
+    # curated output root. This keeps older profiles useful without forcing a
+    # full re-run. The search is intentionally filename-only and stops early.
+    basename = os.path.basename(str(filename_or_path or "").strip())
+    if not basename:
+        return None
+    roots = []
+    if input_folder and os.path.isdir(input_folder):
+        roots.append(input_folder)
+    out_root = output_root_for(input_folder, trigger_word)
+    if os.path.isdir(out_root) and out_root not in roots:
+        roots.append(out_root)
+
+    scanned = 0
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            scanned += 1
+            if scanned > 500:
+                return None
+            if basename in filenames:
+                return os.path.join(dirpath, basename)
+    return None
+
+
+def _identity_clusters_gallery(
+    profile: Dict[str, Any],
+    trigger_word: str,
+    input_folder: str,
+    max_per_cluster: int = 4,
+    max_total: int = 80,
+) -> List[Tuple[Image.Image, str]]:
+    """Build preview thumbnails for identity clusters.
+
+    Shows a small representative sample per cluster. These are previews only;
+    the editable table remains the source of truth for cluster roles.
+    """
+    gallery: List[Tuple[Image.Image, str]] = []
+    clusters = profile.get("identity_clusters", []) or []
+    if not isinstance(clusters, list):
+        return gallery
+
+    for c in clusters:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("cluster_id", "") or "")
+        role = str(c.get("role", "variation") or "variation")
+        summary = str(c.get("summary", "") or "")
+        filenames = c.get("filenames", []) or []
+        image_paths = c.get("image_paths", []) or []
+        preview_sources: List[str] = []
+        for src in list(image_paths) + list(filenames):
+            s = str(src or "").strip()
+            if s and s not in preview_sources:
+                preview_sources.append(s)
+
+        shown = 0
+        for src in preview_sources:
+            if shown >= max_per_cluster or len(gallery) >= max_total:
+                break
+            path = _find_cluster_preview_image(trigger_word, input_folder, src)
+            if not path:
+                continue
+            img = load_gallery_image(path, max_size=(512, 512))
+            if img is None:
+                continue
+            caption = f"{cid} | {role} | {summary}\n{os.path.basename(path)}"
+            gallery.append((img, caption))
+            shown += 1
+        if len(gallery) >= max_total:
+            break
+    return gallery
+
+
+def _identity_cluster_selector_choices(profile: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Choices for selecting exactly one identity cluster in the UI preview."""
+    choices: List[Tuple[str, str]] = []
+    clusters = profile.get("identity_clusters", []) or []
+    if not isinstance(clusters, list):
+        return choices
+    for idx, c in enumerate(clusters, start=1):
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("cluster_id", "") or "").strip()
+        if not cid:
+            continue
+        role = str(c.get("role", "variation") or "variation")
+        n = int(c.get("n", 0) or 0)
+        summary = str(c.get("summary", "") or cid)
+        label = f"{idx:02d}. {role} | n={n} | {summary}"
+        choices.append((label, cid))
+    return choices
+
+
+def _identity_cluster_by_id(profile: Dict[str, Any], cluster_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    clusters = profile.get("identity_clusters", []) or []
+    if not isinstance(clusters, list) or not clusters:
+        return None
+    wanted = str(cluster_id or "").strip()
+    if wanted:
+        for c in clusters:
+            if isinstance(c, dict) and str(c.get("cluster_id", "") or "") == wanted:
+                return c
+    for c in clusters:
+        if isinstance(c, dict):
+            return c
+    return None
+
+
+def _identity_cluster_preview_markdown(profile: Dict[str, Any], cluster_id: Optional[str] = None) -> str:
+    c = _identity_cluster_by_id(profile, cluster_id)
+    if not c:
+        return tr("_Kein Cluster ausgewählt._", "_No cluster selected._")
+    cid = str(c.get("cluster_id", "") or "")
+    role = str(c.get("role", "variation") or "variation")
+    summary = str(c.get("summary", "") or "")
+    n = int(c.get("n", 0) or 0)
+    quality = str(c.get("avg_quality_total", "") or "")
+    identity = str(c.get("avg_identity_usefulness", "") or "")
+    style_counts = c.get("style_counts", {}) or {}
+    shot_counts = c.get("shot_counts", {}) or {}
+    filenames = c.get("filenames", []) or []
+    lines = [
+        f"### {tr('Vorschau', 'Preview')}: `{cid}`",
+        f"**Role:** `{role}`  ",
+        f"**N:** {n}  ",
+        f"**Summary:** {summary}  ",
+    ]
+    if quality or identity:
+        lines.append(f"**Quality / Identity:** {quality or '-'} / {identity or '-'}  ")
+    if shot_counts:
+        lines.append("**Shots:** " + ", ".join(f"`{k}`={v}" for k, v in sorted(shot_counts.items())))
+    if style_counts:
+        lines.append("**Style:** " + ", ".join(f"`{k}`={v}" for k, v in sorted(style_counts.items())))
+    if filenames:
+        lines.append("")
+        lines.append("**" + tr("Dateien", "Files") + ":** " + ", ".join(str(x) for x in filenames[:10]) + (" …" if len(filenames) > 10 else ""))
+    return "\n".join(lines)
+
+
+def _identity_cluster_preview_gallery(
+    profile: Dict[str, Any],
+    trigger_word: str,
+    input_folder: str,
+    cluster_id: Optional[str] = None,
+    max_images: int = 18,
+) -> List[Tuple[Image.Image, str]]:
+    """Build thumbnails only for the currently selected identity cluster."""
+    gallery: List[Tuple[Image.Image, str]] = []
+    c = _identity_cluster_by_id(profile, cluster_id)
+    if not c:
+        return gallery
+    cid = str(c.get("cluster_id", "") or "")
+    role = str(c.get("role", "variation") or "variation")
+    summary = str(c.get("summary", "") or "")
+    filenames = c.get("filenames", []) or []
+    image_paths = c.get("image_paths", []) or []
+    preview_sources: List[str] = []
+    for src in list(image_paths) + list(filenames):
+        s = str(src or "").strip()
+        if s and s not in preview_sources:
+            preview_sources.append(s)
+    for src in preview_sources:
+        if len(gallery) >= max_images:
+            break
+        path = _find_cluster_preview_image(trigger_word, input_folder, src)
+        if not path:
+            continue
+        img = load_gallery_image(path, max_size=(768, 768))
+        if img is None:
+            continue
+        caption = f"{role} | {summary}\n{os.path.basename(path)}"
+        gallery.append((img, caption))
+    return gallery
+
+
+def _table_records_from_gradio(table_data: Any) -> List[Dict[str, Any]]:
+    """Normalize gr.Dataframe payloads across Gradio versions."""
+    if table_data is None:
+        return []
+    try:
+        if hasattr(table_data, "to_dict"):
+            return list(table_data.to_dict("records"))
+    except Exception:
+        pass
+    if isinstance(table_data, dict) and "data" in table_data:
+        headers = table_data.get("headers") or ["cluster_id", "role", "n", "summary", "avg_quality_total", "avg_identity_usefulness"]
+        records: List[Dict[str, Any]] = []
+        for row in table_data.get("data") or []:
+            if isinstance(row, dict):
+                records.append(row)
+            else:
+                records.append({headers[i]: row[i] if i < len(row) else None for i in range(len(headers))})
+        return records
+    if isinstance(table_data, list):
+        # Some Gradio versions return a raw list of rows.
+        records = []
+        headers = ["cluster_id", "role", "n", "summary", "avg_quality_total", "avg_identity_usefulness"]
+        for row in table_data:
+            if isinstance(row, dict):
+                records.append(row)
+            elif isinstance(row, (list, tuple)):
+                records.append({headers[i]: row[i] if i < len(row) else None for i in range(len(headers))})
+        return records
+    return []
+
+
+def preview_identity_cluster_from_dropdown_ui(
+    profile: Dict[str, Any],
+    trigger_word: str,
+    input_folder: str,
+    cluster_id: str,
+) -> Tuple[str, List[Tuple[Image.Image, str]]]:
+    profile = profile or {}
+    return (
+        _identity_cluster_preview_markdown(profile, cluster_id),
+        _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cluster_id),
+    )
+
+
+def _identity_cluster_id_from_table_select(
+    profile: Dict[str, Any],
+    table_data: Any,
+    evt: Optional[gr.SelectData],
+) -> str:
+    """Resolve the selected identity-cluster id from a Gradio Dataframe click.
+
+    Different Gradio versions expose Dataframe selection data differently:
+    - evt.index may be (row, col), row, or sometimes a string-like row key.
+    - evt.value may be the selected cell, a row dict, or a row list.
+    - table_data may be a pandas DataFrame, a dict payload, or a list of rows.
+
+    The previous implementation depended too strongly on table_data. When that
+    payload was not populated in the expected shape, the preview silently fell
+    back to the first cluster, so every click showed the same images.
+    """
+    profile = profile or {}
+    clusters = profile.get("identity_clusters", []) or []
+    cluster_ids = [
+        str(c.get("cluster_id", "") or "")
+        for c in clusters
+        if isinstance(c, dict) and str(c.get("cluster_id", "") or "")
+    ]
+
+    def _valid(value: Any) -> str:
+        s = str(value or "").strip()
+        return s if s in cluster_ids else ""
+
+    # 1) Some Gradio versions pass the selected row or cell value.
+    value = getattr(evt, "value", None) if evt is not None else None
+    if isinstance(value, dict):
+        cid = _valid(value.get("cluster_id"))
+        if cid:
+            return cid
+    elif isinstance(value, (list, tuple)) and value:
+        cid = _valid(value[0])
+        if cid:
+            return cid
+    else:
+        cid = _valid(value)
+        if cid:
+            return cid
+
+    # 2) Resolve row index from evt.index.
+    row_idx: Optional[int] = None
+    idx = getattr(evt, "index", None) if evt is not None else None
+    try:
+        first = idx[0] if isinstance(idx, (tuple, list)) and idx else idx
+        # If a future/alternate Gradio build returns the cluster id as row key,
+        # accept it directly.
+        cid = _valid(first)
+        if cid:
+            return cid
+        if first is not None:
+            row_idx = int(first)
+    except Exception:
+        row_idx = None
+
+    # 3) Prefer the live table payload if available, because the user may have
+    # edited role values. The cluster_id column itself should still match.
+    records = _table_records_from_gradio(table_data)
+    if row_idx is not None and 0 <= row_idx < len(records):
+        cid = _valid(records[row_idx].get("cluster_id", ""))
+        if cid:
+            return cid
+
+    # 4) Robust fallback: use the same row index against the profile cluster
+    # order. This keeps selection working even when Gradio does not pass the
+    # Dataframe value back in a parseable shape.
+    if row_idx is not None and 0 <= row_idx < len(clusters):
+        c = clusters[row_idx]
+        if isinstance(c, dict):
+            cid = _valid(c.get("cluster_id"))
+            if cid:
+                return cid
+
+    # 5) Final fallback: first cluster, preserving previous startup behavior.
+    first = _identity_cluster_by_id(profile)
+    return str(first.get("cluster_id", "") or "") if first else ""
+
+
+IDENTITY_CLUSTER_ROLE_CHOICES = ["core", "variation", "body_reference", "review", "exclude"]
+
+
+def _identity_cluster_role_for_id(profile: Dict[str, Any], cluster_id: str) -> str:
+    c = _identity_cluster_by_id(profile or {}, cluster_id)
+    role = str((c or {}).get("role", "variation") or "variation").strip().lower()
+    return role if role in IDENTITY_CLUSTER_ROLE_CHOICES else "variation"
+
+
+def preview_identity_cluster_from_table_ui(
+    profile: Dict[str, Any],
+    trigger_word: str,
+    input_folder: str,
+    table_data: Any,
+    evt: gr.SelectData,
+) -> Tuple[str, List[Tuple[Image.Image, str]], str, Any]:
+    """Update the right-side preview and selected-row role editor from a table click."""
+    profile = profile or {}
+    cluster_id = _identity_cluster_id_from_table_select(profile, table_data, evt)
+    role = _identity_cluster_role_for_id(profile, cluster_id)
+    return (
+        _identity_cluster_preview_markdown(profile, cluster_id),
+        _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cluster_id),
+        cluster_id,
+        gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value=role),
+    )
+
+
+def _cluster_table_rows_from_records(records: List[Dict[str, Any]]) -> List[List[Any]]:
+    headers = ["cluster_id", "role", "n", "summary", "avg_quality_total", "avg_identity_usefulness"]
+    rows: List[List[Any]] = []
+    for rec in records:
+        rows.append([rec.get(h, "") for h in headers])
+    return rows
+
+
+def apply_identity_cluster_role_to_table_ui(
+    table_data: Any,
+    selected_cluster_id: str,
+    selected_role: str,
+) -> List[List[Any]]:
+    """Apply the role dropdown value to the currently selected cluster row."""
+    records = _table_records_from_gradio(table_data)
+    cid = str(selected_cluster_id or "").strip()
+    role = str(selected_role or "").strip().lower()
+    if not records or not cid or role not in IDENTITY_CLUSTER_ROLE_CHOICES:
+        return _cluster_table_rows_from_records(records)
+    for rec in records:
+        if str(rec.get("cluster_id", "") or "").strip() == cid:
+            rec["role"] = role
+            break
+    return _cluster_table_rows_from_records(records)
+
+
+def _apply_identity_cluster_role_to_profile(
+    profile: Dict[str, Any],
+    selected_cluster_id: str,
+    selected_role: str,
+) -> Tuple[Dict[str, Any], bool]:
+    """Update identity cluster roles inside the in-memory profile state.
+
+    This avoids relying on gr.Dataframe cell editing, which is inconsistent
+    across Gradio versions. The dropdown becomes the source of truth for the
+    selected row and is also merged again during Save.
+    """
+    profile = profile if isinstance(profile, dict) else {}
+    cid = str(selected_cluster_id or "").strip()
+    role = str(selected_role or "").strip().lower()
+    if not cid or role not in IDENTITY_CLUSTER_ROLE_CHOICES:
+        return profile, False
+
+    clusters = profile.get("identity_clusters", []) or []
+    if not isinstance(clusters, list):
+        return profile, False
+
+    changed = False
+    for c in clusters:
+        if not isinstance(c, dict):
+            continue
+        if str(c.get("cluster_id", "") or "").strip() == cid:
+            if str(c.get("role", "") or "").strip().lower() != role:
+                changed = True
+            c["role"] = role
+            member_roles = profile.setdefault("identity_cluster_member_roles", {})
+            if isinstance(member_roles, dict):
+                for mid in c.get("members", []) or []:
+                    member_roles[str(mid)] = role
+            overrides = profile.setdefault("identity_cluster_role_overrides", {})
+            if isinstance(overrides, dict):
+                overrides[cid] = role
+            break
+
+    profile["identity_clusters"] = clusters
+    return profile, changed
+
+
+def apply_identity_cluster_role_selection_ui(
+    profile: Dict[str, Any],
+    table_data: Any,
+    selected_cluster_id: str,
+    selected_role: str,
+) -> Tuple[Dict[str, Any], List[List[Any]], str, str]:
+    """Apply the role dropdown to the selected cluster and refresh the table.
+
+    The UI previously relied on Dropdown.change updating only the visible
+    Dataframe. On some Gradio builds the visual table did not persist the
+    changed value. This function updates both the hidden profile state and the
+    table rows, and the Save function also receives the selected dropdown value
+    as a final override.
+    """
+    cid = str(selected_cluster_id or "").strip()
+    role = str(selected_role or "").strip().lower()
+    if not cid:
+        return (
+            profile if isinstance(profile, dict) else {},
+            _cluster_table_rows_from_records(_table_records_from_gradio(table_data)),
+            tr("_Kein Cluster ausgewählt._", "_No cluster selected._"),
+            tr("⚠️ Erst links eine Cluster-Zeile anklicken.", "⚠️ Click a cluster row on the left first."),
+        )
+    if role not in IDENTITY_CLUSTER_ROLE_CHOICES:
+        return (
+            profile if isinstance(profile, dict) else {},
+            _cluster_table_rows_from_records(_table_records_from_gradio(table_data)),
+            _identity_cluster_preview_markdown(profile if isinstance(profile, dict) else {}, cid),
+            tr("⚠️ Ungültige Rolle.", "⚠️ Invalid role."),
+        )
+
+    profile, changed = _apply_identity_cluster_role_to_profile(profile if isinstance(profile, dict) else {}, cid, role)
+
+    # Build rows from profile state if available, otherwise fall back to the visible table.
+    if isinstance(profile, dict) and profile.get("identity_clusters"):
+        rows = _identity_clusters_table(profile)
+    else:
+        rows = apply_identity_cluster_role_to_table_ui(table_data, cid, role)
+
+    status = tr(
+        f"✅ Rolle übernommen: {cid} → {role}. Danach Cluster-Rollen speichern klicken.",
+        f"✅ Role applied: {cid} → {role}. Click Save cluster roles afterwards.",
+    )
+    if not changed:
+        status = tr(
+            f"ℹ️ Rolle ist bereits gesetzt: {cid} → {role}. Danach Cluster-Rollen speichern klicken.",
+            f"ℹ️ Role already set: {cid} → {role}. Click Save cluster roles afterwards.",
+        )
+    return profile, rows, _identity_cluster_preview_markdown(profile, cid), status
+
+
+def _identity_clusters_table(profile: Dict[str, Any]) -> List[List[Any]]:
+    rows: List[List[Any]] = []
+    for c in profile.get("identity_clusters", []) or []:
+        if not isinstance(c, dict):
+            continue
+        rows.append([
+            str(c.get("cluster_id", "")),
+            str(c.get("role", "variation") or "variation"),
+            int(c.get("n", 0) or 0),
+            str(c.get("summary", "")),
+            str(c.get("avg_quality_total", "")),
+            str(c.get("avg_identity_usefulness", "")),
+        ])
+    return rows
+
+
+def _identity_clusters_markdown(profile: Dict[str, Any]) -> str:
+    clusters = profile.get("identity_clusters", []) or []
+    if not clusters:
+        return tr(
+            "_Keine Identity-Cluster im Profil. Starte den Curator mit aktualisierter Version neu oder baue das Profil neu._",
+            "_No identity clusters in profile. Restart the curator with the updated version or rebuild the profile._",
+        )
+    role_counts: Dict[str, int] = {}
+    for c in clusters:
+        role = str(c.get("role", "variation") or "variation")
+        role_counts[role] = role_counts.get(role, 0) + int(c.get("n", 0) or 0)
+    warnings = [n for n in profile.get("normalizer_notes", []) or [] if "Identity clustering:" in str(n)]
+    lines = [
+        tr("### Identity-/Appearance-Cluster", "### Identity / appearance clusters"),
+        "",
+        tr(
+            "Die Rollen sind **keine Caption-Tokens**. Sie steuern nur Phase 3 Export und Ranking: `core`, `variation`, `body_reference` gehen ins Training; `review` und `exclude` nicht.",
+            "Roles are **not caption tokens**. They only control phase-3 export and ranking: `core`, `variation`, `body_reference` go into training; `review` and `exclude` do not.",
+        ),
+        "",
+        "**" + tr("Bildrollen", "Image roles") + ":** " + ", ".join(f"`{k}`={v}" for k, v in sorted(role_counts.items())),
+    ]
+    if warnings:
+        lines.append("")
+        lines.append("**" + tr("Hinweise", "Notes") + ":**")
+        for w in warnings[-8:]:
+            lines.append(f"- {str(w).replace('Identity clustering: ', '')}")
+    lines.extend([
+        "",
+        tr(
+            "Klicke einen Cluster an und setze die Rolle über das Dropdown unter der Tabelle. Erlaubt sind: `core`, `variation`, `body_reference`, `review`, `exclude`.",
+            "Click a cluster and set the role with the dropdown below the table. Allowed values: `core`, `variation`, `body_reference`, `review`, `exclude`.",
+        ),
+    ])
+    return "\n".join(lines)
+
+
+def save_identity_cluster_roles_ui(trigger_word: str, input_folder: str, table_data: Any, profile_state: Dict[str, Any], selected_cluster_id: str, selected_role: str) -> str:
+    path = subject_profile_path_for(input_folder, trigger_word)
+    if not os.path.exists(path):
+        return tr(f"❌ Kein Profil unter {path}", f"❌ No profile at {path}")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            profile = json.load(f)
+    except Exception as e:
+        return tr(f"❌ Profil konnte nicht gelesen werden: {e}", f"❌ Could not read profile: {e}")
+
+    # Gradio Dataframe kann je nach Version pandas.DataFrame, dict oder list liefern.
+    records: List[Dict[str, Any]] = []
+    try:
+        if hasattr(table_data, "to_dict"):
+            records = table_data.to_dict("records")
+        elif isinstance(table_data, dict) and "data" in table_data:
+            headers = table_data.get("headers") or ["cluster_id", "role", "n", "summary", "avg_quality_total", "avg_identity_usefulness"]
+            for row in table_data.get("data") or []:
+                records.append({str(headers[i]): row[i] if i < len(row) else "" for i in range(len(headers))})
+        elif isinstance(table_data, list):
+            for row in table_data:
+                if isinstance(row, dict):
+                    records.append(row)
+                elif isinstance(row, (list, tuple)):
+                    headers = ["cluster_id", "role", "n", "summary", "avg_quality_total", "avg_identity_usefulness"]
+                    records.append({headers[i]: row[i] if i < len(row) else "" for i in range(min(len(headers), len(row)))})
+    except Exception as e:
+        return tr(f"❌ Tabellenformat nicht lesbar: {e}", f"❌ Could not parse table data: {e}")
+
+    role_by_cluster: Dict[str, str] = {}
+    invalid: List[str] = []
+    for rec in records:
+        cid = str(rec.get("cluster_id", "") or "").strip()
+        role = str(rec.get("role", "") or "").strip().lower()
+        if not cid:
+            continue
+        if role not in IDENTITY_CLUSTER_ROLE_CHOICES:
+            invalid.append(f"{cid}: {role or '<empty>'}")
+            continue
+        role_by_cluster[cid] = role
+
+    # Merge roles from hidden profile state. This is more reliable than relying
+    # only on the visible Dataframe value on all Gradio versions.
+    if isinstance(profile_state, dict):
+        for c in profile_state.get("identity_clusters", []) or []:
+            if not isinstance(c, dict):
+                continue
+            cid = str(c.get("cluster_id", "") or "").strip()
+            role = str(c.get("role", "") or "").strip().lower()
+            if cid and role in IDENTITY_CLUSTER_ROLE_CHOICES:
+                role_by_cluster[cid] = role
+
+    # Final explicit override from the currently selected dropdown. This makes
+    # Save work even if the user changed the dropdown and did not press Apply.
+    selected_cid = str(selected_cluster_id or "").strip()
+    selected_role_value = str(selected_role or "").strip().lower()
+    if selected_cid and selected_role_value in IDENTITY_CLUSTER_ROLE_CHOICES:
+        role_by_cluster[selected_cid] = selected_role_value
+
+    if invalid:
+        return tr(
+            "❌ Ungültige Rollen: " + ", ".join(invalid[:8]) + ". Erlaubt: " + ", ".join(IDENTITY_CLUSTER_ROLE_CHOICES),
+            "❌ Invalid roles: " + ", ".join(invalid[:8]) + ". Allowed: " + ", ".join(IDENTITY_CLUSTER_ROLE_CHOICES),
+        )
+
+    clusters = profile.get("identity_clusters", []) or []
+    member_roles: Dict[str, str] = profile.get("identity_cluster_member_roles", {}) or {}
+    changed = 0
+    for c in clusters:
+        if not isinstance(c, dict):
+            continue
+        cid = str(c.get("cluster_id", "") or "")
+        if cid in role_by_cluster:
+            new_role = role_by_cluster[cid]
+            if c.get("role") != new_role:
+                changed += 1
+            c["role"] = new_role
+            for mid in c.get("members", []) or []:
+                member_roles[str(mid)] = new_role
+
+    profile["identity_clusters"] = clusters
+    profile["identity_cluster_member_roles"] = member_roles
+    profile["identity_cluster_role_overrides"] = role_by_cluster
+    notes = profile.setdefault("normalizer_notes", [])
+    if isinstance(notes, list):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        notes.append(f"User-edited identity cluster roles via UI at {stamp}; changed_clusters={changed}.")
+        profile["normalizer_notes"] = notes[-30:]
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
+        return tr(
+            f"✅ Cluster-Rollen gespeichert ({changed} geändert). Phase-3-Export nutzt diese Rollen fürs Ranking und für rein/raus.",
+            f"✅ Cluster roles saved ({changed} changed). Phase-3 export uses these roles for ranking and in/out selection.",
+        )
+    except Exception as e:
+        return tr(f"❌ Speichern fehlgeschlagen: {e}", f"❌ Save failed: {e}")
 
 
 def parse_progress(line: str) -> Optional[Tuple[int, int]]:
@@ -1763,7 +2478,7 @@ def build_ui() -> gr.Blocks:
                         )
                         c_trigger_model = gr.Dropdown(
                             label=tr("Trigger-Check-Modell", "Trigger-check model"),
-                            choices=OPENAI_MODEL_PRESET_CHOICES,
+                            choices=[""] + OPENAI_MODEL_PRESET_CHOICES,
                             value=S["c_trigger_model"],
                             info=tr(
                                 "Optional separates Modell für die Triggerwort-Prüfung. Leer = primäres Modell verwenden. Wird nur genutzt, wenn der Trigger-Check aktiviert ist.",
@@ -3385,7 +4100,7 @@ def build_ui() -> gr.Blocks:
                         with gr.Row():
                             p_gender = gr.Dropdown(
                                 label=tr("Gender", "Gender"),
-                                choices=PROFILE_VOCAB_GENDER,
+                                choices=[""] + PROFILE_VOCAB_GENDER,
                                 value="",
                                 interactive=True,
                                 allow_custom_value=True,
@@ -3394,7 +4109,7 @@ def build_ui() -> gr.Blocks:
                         with gr.Row():
                             p_skin = gr.Dropdown(
                                 label=tr("Skin Tone", "Skin tone"),
-                                choices=PROFILE_VOCAB_SKIN,
+                                choices=[""] + PROFILE_VOCAB_SKIN,
                                 value="",
                                 interactive=True,
                                 allow_custom_value=True,
@@ -3403,7 +4118,7 @@ def build_ui() -> gr.Blocks:
                         with gr.Row():
                             p_eyes = gr.Dropdown(
                                 label=tr("Eye Color", "Eye color"),
-                                choices=PROFILE_VOCAB_EYES,
+                                choices=[""] + PROFILE_VOCAB_EYES,
                                 value="",
                                 interactive=True,
                                 allow_custom_value=True,
@@ -3412,7 +4127,7 @@ def build_ui() -> gr.Blocks:
                         with gr.Row():
                             p_hair_texture = gr.Dropdown(
                                 label=tr("Hair Texture", "Hair texture"),
-                                choices=PROFILE_VOCAB_HAIR_TEXTURE,
+                                choices=[""] + PROFILE_VOCAB_HAIR_TEXTURE,
                                 value="",
                                 interactive=True,
                                 allow_custom_value=True,
@@ -3420,13 +4135,22 @@ def build_ui() -> gr.Blocks:
                             p_hair_texture_info = gr.Markdown("—")
                         with gr.Row():
                             p_body = gr.Dropdown(
-                                label=tr("Body Build", "Body build"),
-                                choices=PROFILE_VOCAB_BODY,
+                                label=tr("Körperbau", "Body build"),
+                                choices=[""] + PROFILE_VOCAB_BODY,
                                 value="",
                                 interactive=True,
                                 allow_custom_value=True,
                             )
                             p_body_info = gr.Markdown("—")
+                        with gr.Row():
+                            p_body_height = gr.Dropdown(
+                                label=tr("Größeneindruck", "Body height impression"),
+                                choices=[""] + PROFILE_VOCAB_BODY_HEIGHT,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            p_body_height_info = gr.Markdown("—")
 
                         gr.Markdown(tr("**Brille (Identity Marker)**", "**Glasses (identity marker)**"))
                         with gr.Row():
@@ -3486,7 +4210,7 @@ def build_ui() -> gr.Blocks:
                                 with gr.Row():
                                     p_color_from = gr.Dropdown(
                                         label=tr("Quelle", "From"),
-                                        choices=[],
+                                        choices=[""],
                                         value="",
                                         allow_custom_value=True,
                                         scale=2,
@@ -3504,7 +4228,7 @@ def build_ui() -> gr.Blocks:
                                 with gr.Row():
                                     p_form_from = gr.Dropdown(
                                         label=tr("Quelle", "From"),
-                                        choices=[],
+                                        choices=[""],
                                         value="",
                                         allow_custom_value=True,
                                         scale=2,
@@ -3522,7 +4246,7 @@ def build_ui() -> gr.Blocks:
                                 with gr.Row():
                                     p_makeup_from = gr.Dropdown(
                                         label=tr("Quelle", "From"),
-                                        choices=[],
+                                        choices=[""],
                                         value="",
                                         allow_custom_value=True,
                                         scale=2,
@@ -3549,6 +4273,49 @@ def build_ui() -> gr.Blocks:
                                 p_tattoo_md = gr.Markdown("_kein Profil geladen_")
                             with gr.Column():
                                 p_piercing_md = gr.Markdown("_kein Profil geladen_")
+
+                    # ----- Subtab: Identity Clustering -----
+                    with gr.TabItem(tr("🧩 Identity Clustering", "🧩 Identity clustering")):
+                        p_cluster_md = gr.Markdown("_kein Profil geladen_")
+                        gr.Markdown(tr(
+                            "`core` gibt einen kleinen Ranking-Boost. `variation` und `body_reference` bleiben Trainingskandidaten. `review` und `exclude` gehen nicht in `01_train_ready`. Klicke links eine Cluster-Zeile an, um rechts die passenden Beispielbilder zu sehen.",
+                            "`core` gives a small ranking boost. `variation` and `body_reference` remain training candidates. `review` and `exclude` do not go to `01_train_ready`. Click a cluster row on the left to show the matching sample images on the right.",
+                        ))
+                        with gr.Row():
+                            with gr.Column(scale=3):
+                                p_cluster_table = gr.Dataframe(
+                                    headers=["cluster_id", "role", "n", "summary", "avg_quality_total", "avg_identity_usefulness"],
+                                    column_count=(6, "fixed"),
+                                    datatype=["str", "str", "number", "str", "str", "str"],
+                                    value=[],
+                                    interactive=True,
+                                    row_count=(0, "dynamic"),
+                                    label=tr("Cluster-Kategorien / Rollen", "Cluster categories / roles"),
+                                )
+                                p_selected_cluster_id = gr.State("")
+                                p_cluster_role_editor = gr.Dropdown(
+                                    label=tr("Rolle für ausgewählten Cluster", "Role for selected cluster"),
+                                    choices=IDENTITY_CLUSTER_ROLE_CHOICES,
+                                    value="variation",
+                                    interactive=True,
+                                    allow_custom_value=False,
+                                    info=tr(
+                                        "Cluster links anklicken, dann hier die Rolle per Dropdown ändern. Speichern übernimmt immer auch die aktuell gewählte Rolle.",
+                                        "Click a cluster on the left, then change its role here. Save always applies the currently selected role too.",
+                                    ),
+                                )
+                                with gr.Row():
+                                    p_apply_cluster_role_btn = gr.Button(tr("↪ Rolle übernehmen", "↪ Apply role"), variant="secondary", scale=1)
+                                    p_save_clusters_btn = gr.Button(tr("💾 Cluster-Rollen speichern", "💾 Save cluster roles"), variant="secondary", scale=1)
+                            with gr.Column(scale=2):
+                                p_cluster_preview_md = gr.Markdown(tr("_Kein Cluster ausgewählt._", "_No cluster selected._"))
+                                p_cluster_gallery = gr.Gallery(
+                                    label=tr("Cluster-Vorschau", "Cluster preview"),
+                                    columns=3,
+                                    rows=3,
+                                    height=520,
+                                    object_fit="cover",
+                                )
 
                     # ----- Subtab: Diagnostics -----
                     with gr.TabItem(tr("🔬 Diagnostik & Raw JSON", "🔬 Diagnostics & raw JSON")):
@@ -3591,14 +4358,16 @@ def build_ui() -> gr.Blocks:
                 # ---- Wiring ----
                 p_load_outputs = [
                     p_state, p_raw_json,
-                    p_gender, p_skin, p_eyes, p_hair_texture, p_body,
-                    p_gender_info, p_skin_info, p_eyes_info, p_hair_texture_info, p_body_info,
+                    p_gender, p_skin, p_eyes, p_hair_texture, p_body, p_body_height,
+                    p_gender_info, p_skin_info, p_eyes_info, p_hair_texture_info, p_body_info, p_body_height_info,
                     p_glasses_regular, p_glasses_desc,
                     p_freckles_present, p_freckles_desc,
                     p_hair_color_md, p_hair_form_md, p_makeup_md,
                     p_tattoo_md, p_piercing_md, p_notes_md,
                     p_color_from, p_form_from, p_makeup_from,
                     p_color_to, p_form_to, p_makeup_to,
+                    p_cluster_md, p_cluster_table, p_cluster_preview_md, p_cluster_gallery,
+                    p_selected_cluster_id, p_cluster_role_editor,
                     p_status,
                 ]
                 p_load_btn.click(
@@ -3614,15 +4383,42 @@ def build_ui() -> gr.Blocks:
                     outputs=[p_raw_view],
                 )
 
+                p_cluster_table.select(
+                    fn=preview_identity_cluster_from_table_ui,
+                    inputs=[p_state, p_trigger, p_input, p_cluster_table],
+                    outputs=[p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_id, p_cluster_role_editor],
+                )
+
+                p_cluster_role_editor.change(
+                    fn=apply_identity_cluster_role_selection_ui,
+                    inputs=[p_state, p_cluster_table, p_selected_cluster_id, p_cluster_role_editor],
+                    outputs=[p_state, p_cluster_table, p_cluster_preview_md, p_status],
+                )
+                p_apply_cluster_role_btn.click(
+                    fn=apply_identity_cluster_role_selection_ui,
+                    inputs=[p_state, p_cluster_table, p_selected_cluster_id, p_cluster_role_editor],
+                    outputs=[p_state, p_cluster_table, p_cluster_preview_md, p_status],
+                )
+
                 p_save_btn.click(
                     fn=save_profile_from_editor,
                     inputs=[
                         p_trigger, p_input, p_raw_json,
-                        p_gender, p_skin, p_eyes, p_hair_texture, p_body,
+                        p_gender, p_skin, p_eyes, p_hair_texture, p_body, p_body_height,
                         p_glasses_regular, p_glasses_desc,
                         p_freckles_present, p_freckles_desc,
                     ],
                     outputs=[p_status],
+                )
+
+                p_save_clusters_btn.click(
+                    fn=save_identity_cluster_roles_ui,
+                    inputs=[p_trigger, p_input, p_cluster_table, p_state, p_selected_cluster_id, p_cluster_role_editor],
+                    outputs=[p_status],
+                ).then(
+                    fn=load_profile_for_editor,
+                    inputs=[p_trigger, p_input],
+                    outputs=p_load_outputs,
                 )
 
                 p_reset_btn.click(

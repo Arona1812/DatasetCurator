@@ -503,6 +503,8 @@ CAPTION_POLICY = {
     "include_expression": True,
     "include_hair_always": True,   
     "include_hair_when_variable": True,
+    "include_eye_color_when_variable": True,
+    "include_costume_accessories": True,
     "include_beard_always": False,
     "include_beard_when_variable": True,
     "include_mirror_selfie_marker": True,
@@ -553,6 +555,26 @@ PROFILE_UI_PER_IMAGE_THRESHOLD = 30   # ueberschreibbar via UI
 # Profile-Builder verwendet welche Buckets als Input:
 PROFILE_INPUT_BUCKETS = ["train_ready", "keep_unused"]   # rejects/reviews aus
 
+# Identity-/Appearance-Clusterung fuer den Subject-Profile-UI-Bereich.
+# Wichtig: diese Rollen sind keine Caption-Tokens. Sie steuern nur, welche
+# Bilder bei Phase-3-Export in 01_train_ready kommen und wie stark sie im
+# Ranking bevorzugt werden.
+ENABLE_IDENTITY_APPEARANCE_CLUSTERING = True
+IDENTITY_CLUSTER_SCHEMA_VERSION = "v2"
+IDENTITY_CLUSTER_CORE_SCORE_BOOST = 6.0
+IDENTITY_CLUSTER_VARIATION_SCORE_BOOST = 1.5
+IDENTITY_CLUSTER_BODY_SCORE_BOOST = 2.5
+IDENTITY_CLUSTER_MAX_CORE_SHARE = 0.60
+IDENTITY_CLUSTER_CORE_OVERFLOW_PENALTY = 18.0
+IDENTITY_CLUSTER_TRAIN_ROLES = {"core", "variation", "body_reference"}
+IDENTITY_CLUSTER_NONTRAIN_ROLES = {"review", "exclude"}
+
+# Body build soll nicht verworfen werden, nur weil das Dataset headshot-lastig
+# ist, wenn wenigstens einige brauchbare Medium-/Fullbody-Bilder vorhanden sind.
+PROFILE_BODY_BUILD_MIN_ABSOLUTE = 3
+PROFILE_BODY_BUILD_MIN_FRACTION = 0.30
+PROFILE_BODY_PRIORITY_SAMPLE_MAX = 24
+
 # Normalizer-Modell (gpt-5.4-mini empfohlen wegen Context-Window)
 PROFILE_NORMALIZER_MODEL = "gpt-5.4-mini"
 
@@ -563,7 +585,9 @@ PROFILE_NORMALIZER_MODEL = "gpt-5.4-mini"
 #       statt nur ein String. Alte Cache-Eintraege werden invalidiert.
 #   v3: robustere Brillenlogik. Sonnenbrillen duerfen nicht mehr durch die
 #       kanonische Profil-Brille ueberschrieben werden.
-PROFILE_CACHE_SCHEMA_VERSION = "v3"
+#   v7: Erweiterte Profile-Vokabulare inkl. hair_length und
+#       body_height_impression; Body-Build ersetzt stocky durch broad_build.
+PROFILE_CACHE_SCHEMA_VERSION = "v8"
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
@@ -907,49 +931,165 @@ OR_PRIORITY_MAP: Dict[str, int] = {
 # --- Kanonische Vokabular-Buckets fuer LLM-Normalizer (Phase 2) ----------
 # Diese Listen werden im Audit-Prompt als Hinweise mitgegeben (nicht als
 # strikte ENUMs - der User wollte Freitext mit nachgelagerter LLM-Norm).
+# Wichtig: shot_type bleibt fuer Auswahl/Quoten unveraendert bei
+# headshot | medium | full_body. frame_subtype ist nur ein Zusatzfeld fuer
+# Caption/Analyse und beeinflusst die Zielverteilung nicht.
 HAIR_FORM_VOCAB: List[str] = [
     "loose_straight", "loose_wavy", "loose_curly", "loose_coily",
-    "afro_natural", "ponytail", "pigtails", "two_braids", "single_braid",
-    "box_braids", "knotless_braids", "cornrows", "bun", "updo",
-    "half_up", "pulled_back", "short_cut",
+    "afro_natural",
+    "ponytail", "low_ponytail", "high_ponytail",
+    "pigtails", "two_braids", "single_braid",
+    "box_braids", "knotless_braids", "cornrows", "dreadlocks",
+    "bun", "low_bun", "high_bun", "messy_bun",
+    "updo", "half_up", "pulled_back",
+    "pixie_cut", "bob_cut", "lob_cut", "short_cut",
+    "buzz_cut", "shaved_head", "undercut", "side_shaved",
+    "bangs", "curtain_bangs", "covered_hair", "other",
+]
+
+HAIR_LENGTH_VOCAB: List[str] = [
+    "shaved", "very_short", "short", "chin_length", "shoulder_length",
+    "medium_length", "long", "very_long", "not_visible", "unclear",
 ]
 
 HAIR_COLOR_VOCAB: List[str] = [
-    "black", "dark_brown", "brown", "light_brown", "blonde", "platinum",
-    "red", "auburn", "burgundy", "gray", "white", "dyed_other",
+    "black", "dark_brown", "brown", "light_brown",
+    "dark_blonde", "blonde", "platinum", "strawberry_blonde",
+    "red", "copper", "auburn", "burgundy",
+    "gray", "silver", "white",
+    "blue", "pink", "purple", "green",
+    "dyed_other", "multicolor", "ombre", "highlights",
+    "not_visible", "unclear",
 ]
 
 EYE_COLOR_VOCAB: List[str] = [
-    "blue", "green", "hazel", "brown", "dark_brown", "gray", "amber",
+    "blue", "blue_green", "green", "hazel", "brown", "dark_brown",
+    "gray", "gray_blue", "amber", "not_visible", "unclear",
 ]
 
 SKIN_TONE_VOCAB: List[str] = [
-    "fair", "light", "medium", "tan", "olive", "dark", "deep",
+    "very_fair", "fair", "light", "medium", "tan", "olive",
+    "brown", "dark", "deep", "unclear",
 ]
 
 BODY_BUILD_VOCAB: List[str] = [
-    "slim", "average", "athletic", "curvy", "plus_size", "muscular",
+    "petite", "slim", "average", "athletic", "curvy",
+    "plus_size", "muscular", "broad_build", "unclear",
+]
+
+BODY_HEIGHT_IMPRESSION_VOCAB: List[str] = [
+    "short", "average_height", "tall", "unclear",
 ]
 
 MAKEUP_INTENSITY_VOCAB: List[str] = [
     "none", "minimal", "natural", "defined", "full", "dramatic",
+    "stage_makeup", "costume_makeup", "face_paint", "unclear",
 ]
 
 LIGHTING_TYPE_VOCAB: List[str] = [
     "studio_softbox", "studio_ringlight", "studio_other",
-    "natural_outdoor_sun", "natural_outdoor_overcast",
-    "natural_indoor_window", "indoor_artificial", "mixed", "low_light",
+    "natural_outdoor_sun", "natural_outdoor_overcast", "harsh_direct_sun",
+    "golden_hour", "natural_indoor_window",
+    "indoor_artificial", "camera_flash", "mixed", "low_light",
+    "backlit", "neon_colored", "colored_stage_light", "other",
 ]
 
 BACKGROUND_TYPE_VOCAB: List[str] = [
-    "studio_plain", "studio_textured", "indoor_room", "indoor_bathroom",
-    "outdoor_urban", "outdoor_nature", "outdoor_beach", "outdoor_other",
-    "vehicle_interior", "transparent_or_isolated", "other",
+    "studio_plain", "studio_textured",
+    "indoor_room", "indoor_bathroom", "indoor_kitchen",
+    "indoor_bedroom", "indoor_office", "indoor_gym",
+    "outdoor_urban", "outdoor_nature", "outdoor_forest",
+    "outdoor_beach", "outdoor_snow", "outdoor_mountain",
+    "outdoor_event", "outdoor_other",
+    "vehicle_interior", "public_transport",
+    "mirror_selfie", "transparent_or_isolated", "other",
 ]
 
 GLASSES_FRAME_SHAPE_VOCAB: List[str] = [
     "round", "square", "rectangular", "oval", "aviator", "cat_eye",
-    "oversized", "rimless", "browline", "geometric", "other",
+    "oversized", "rimless", "semi_rimless", "browline",
+    "geometric", "wayfarer", "shield", "other",
+]
+
+GLASSES_FRAME_MATERIAL_VOCAB: List[str] = [
+    "wire_frame", "metal_frame", "plastic_frame", "acetate_frame",
+    "rimless", "semi_rimless", "mixed_material", "unclear",
+]
+
+GLASSES_LENS_TYPE_VOCAB: List[str] = [
+    "clear_lenses", "tinted_lenses", "sunglasses",
+    "reflective_lenses", "blue_light_lenses", "unclear",
+]
+
+FRAME_SUBTYPE_VOCAB: List[str] = [
+    "close_up", "portrait", "selfie", "mirror_selfie",
+    "three_quarter_body", "full_body", "faceless_body",
+    "detail_only", "unclear",
+]
+
+GAZE_VOCAB: List[str] = [
+    "looking_at_camera", "looking_left", "looking_right",
+    "looking_up", "looking_down", "looking_away",
+    "eyes_closed", "partly_closed", "unclear",
+]
+
+EXPRESSION_VOCAB: List[str] = [
+    "neutral", "slight_smile", "smile", "wide_smile",
+    "serious", "pensive", "playful", "laughing",
+    "surprised", "sad", "angry", "duckface",
+    "winking", "eyes_closed", "other",
+]
+
+OCCLUSION_TYPE_VOCAB: List[str] = [
+    "none", "hair_covering_face", "hand_covering_face",
+    "object_covering_face", "sunglasses_occluding_eyes",
+    "mask", "hat_shadow", "motion_blur", "crop_cutoff",
+    "face_partly_out_of_frame", "other",
+]
+
+VISUAL_STYLE_VOCAB: List[str] = [
+    "normal_color", "black_and_white", "sepia",
+    "warm_tinted", "cool_tinted", "green_tinted", "blue_tinted",
+    "high_contrast", "low_contrast", "beauty_filter",
+    "heavy_smoothing", "vintage_filter", "screenshot", "other",
+]
+
+EYE_APPEARANCE_VOCAB: List[str] = [
+    "natural_eyes", "colored_contact_lenses", "circle_lenses",
+    "cosmetic_lenses", "unnatural_eye_color", "unclear",
+]
+
+LOOK_CONTEXT_VOCAB: List[str] = [
+    "regular_photo", "fashion", "glamour", "gyaru_style",
+    "cosplay", "character_costume", "fantasy_costume",
+    "stage_costume", "swimwear_costume", "lingerie_costume",
+    "unclear",
+]
+
+MAKEUP_STYLE_VOCAB: List[str] = [
+    "natural_makeup", "gyaru_makeup", "cosplay_makeup",
+    "anime_inspired_makeup", "dramatic_eyeliner",
+    "smoky_eye_makeup", "false_eyelashes", "glossy_lips",
+    "face_paint", "fantasy_makeup", "unclear",
+]
+
+COSTUME_ACCESSORY_VOCAB: List[str] = [
+    "animal_ears", "cat_ears", "fox_ears", "bunny_ears",
+    "elf_ears", "pointed_ears", "horns", "antlers",
+    "wings", "feather_headpiece", "headband", "hair_bow",
+    "hair_ribbon", "forehead_jewel", "tiara", "crown",
+    "halo", "veil", "hood", "hat", "cap", "helmet",
+    "mask", "choker", "collar", "necklace",
+    "gloves", "arm_guards", "wrist_cuffs",
+    "fantasy_armor", "shoulder_armor",
+    "prop_weapon", "prop_sword", "prop_gun", "prop_staff",
+    "prop_bottle", "prop_book", "other_prop",
+    "none_visible", "unclear",
+]
+
+PROFILE_APPEARANCE_MODE_VOCAB: List[str] = [
+    "natural_identity", "fashion_identity",
+    "cosplay_identity", "high_variation_model_identity",
 ]
 
 # --- Tattoo-Locations als kontrolliertes ENUM ----------------------------
@@ -958,16 +1098,25 @@ GLASSES_FRAME_SHAPE_VOCAB: List[str] = [
 # benannt sein muessen.
 TATTOO_LOCATION_ENUM: List[str] = [
     "forearm_left", "forearm_right",
+    "inner_forearm_left", "inner_forearm_right",
     "upper_arm_left", "upper_arm_right",
+    "inner_upper_arm_left", "inner_upper_arm_right",
+    "elbow_left", "elbow_right",
     "hand_left", "hand_right",
     "wrist_left", "wrist_right",
     "shoulder_left", "shoulder_right",
     "neck_left", "neck_right", "neck_back",
-    "chest_upper", "chest_sternum",
+    "chest_upper", "chest_left", "chest_right",
+    "chest_sternum", "sternum_underboob",
     "collarbone_left", "collarbone_right",
     "ribcage_left", "ribcage_right",
-    "abdomen", "back_upper", "back_lower",
+    "abdomen", "hip_left", "hip_right",
+    "back_upper", "upper_back_left", "upper_back_right",
+    "back_lower", "lower_back_left", "lower_back_right",
+    "buttock_left", "buttock_right",
     "thigh_left", "thigh_right",
+    "knee_left", "knee_right",
+    "shin_left", "shin_right",
     "calf_left", "calf_right",
     "ankle_left", "ankle_right",
     "foot_left", "foot_right",
@@ -981,11 +1130,19 @@ PIERCING_LOCATION_ENUM: List[str] = [
     "ear_lobe_left", "ear_lobe_right",
     "ear_helix_left", "ear_helix_right",
     "ear_tragus_left", "ear_tragus_right",
+    "ear_conch_left", "ear_conch_right",
+    "ear_daith_left", "ear_daith_right",
+    "ear_rook_left", "ear_rook_right",
+    "ear_industrial_left", "ear_industrial_right",
+    "ear_snug_left", "ear_snug_right",
     "ear_gauge_left", "ear_gauge_right",
     "nose_left", "nose_right", "nose_septum",
+    "nose_high_nostril_left", "nose_high_nostril_right",
     "nose_bridge", "eyebrow_left", "eyebrow_right",
     "lip_upper", "lip_lower", "lip_corner_left", "lip_corner_right",
-    "tongue", "navel", "other",
+    "lip_labret", "lip_medusa", "lip_monroe_left", "lip_monroe_right",
+    "cheek_left", "cheek_right",
+    "tongue", "navel", "nipple_left", "nipple_right", "other",
 ]
 
 
@@ -2499,7 +2656,13 @@ def cache_path_for_file(file_hash: str) -> str:
 #   v10: Audit/Profile/Caption-Pipeline um freckles_description erweitert.
 #        Freckles werden als flexibler, sichtbarkeitsabhaengiger Marker
 #        behandelt und muessen in alten Caches neu erhoben werden.
-AUDIT_CACHE_SCHEMA_VERSION = "v10"
+#   v11: Erweiterte Profil-Vokabulare und Aux-Felder: hair_length,
+#        body_height_impression, frame_subtype, gaze/expression categories,
+#        occlusion_type, visual_style_type sowie Brillenmaterial/-linsentyp.
+#   v12: Cosplay-/High-Variation-Felder ohne Herkunftserkennung:
+#        eye_appearance, look_context, makeup_style, costume_accessories
+#        plus datasetweite Hair-/Eye-Variability-Policies fuer Stable Profile.
+AUDIT_CACHE_SCHEMA_VERSION = "v12"
 EARLY_RESULT_CACHE_SCHEMA_VERSION = "v1"
 
 
@@ -3257,9 +3420,44 @@ def build_api_schema() -> Dict[str, Any]:
             "skin_tone": {"type": "string"},
             "eye_color": {
                 "type": "string",
-                "description": "Eye color of the main subject, e.g. 'blue', 'green', 'gray-green', 'brown', 'dark brown'. Empty string if not visible."
+                "description": "Eye color of the main subject. Use one of the controlled values where possible: blue, blue_green, green, hazel, brown, dark_brown, gray, gray_blue, amber. Empty string only if eyes are not visible."
             },
-            "body_build": {"type": "string"},
+            "eye_appearance": {
+                "type": "string",
+                "description": "Visible eye appearance marker. Use: natural_eyes, colored_contact_lenses, circle_lenses, cosmetic_lenses, unnatural_eye_color, unclear. Do not speculate; use unclear if not confident."
+            },
+            "body_build": {
+                "type": "string",
+                "description": "Body build if the body is actually readable. Use one of: petite, slim, average, athletic, curvy, plus_size, muscular, broad_build. Empty string for headshots or unclear views. Do not use 'stocky'."
+            },
+            "body_height_impression": {
+                "type": "string",
+                "description": "Only if enough body context is visible. Use one of: short, average_height, tall. Empty string if not readable."
+            },
+            "hair_length": {
+                "type": "string",
+                "description": "Hair length using controlled values: shaved, very_short, short, chin_length, shoulder_length, medium_length, long, very_long, not_visible, unclear."
+            },
+            "frame_subtype": {
+                "type": "string",
+                "description": "Fine frame subtype for caption/report only. Does NOT replace shot_type. Use: close_up, portrait, selfie, mirror_selfie, three_quarter_body, full_body, faceless_body, detail_only, unclear."
+            },
+            "gaze_category": {
+                "type": "string",
+                "description": "Controlled gaze category: looking_at_camera, looking_left, looking_right, looking_up, looking_down, looking_away, eyes_closed, partly_closed, unclear."
+            },
+            "expression_category": {
+                "type": "string",
+                "description": "Controlled expression category: neutral, slight_smile, smile, wide_smile, serious, pensive, playful, laughing, surprised, sad, angry, duckface, winking, eyes_closed, other."
+            },
+            "occlusion_type": {
+                "type": "string",
+                "description": "Main face/body occlusion category: none, hair_covering_face, hand_covering_face, object_covering_face, sunglasses_occluding_eyes, mask, hat_shadow, motion_blur, crop_cutoff, face_partly_out_of_frame, other."
+            },
+            "visual_style_type": {
+                "type": "string",
+                "description": "Image style marker, not image origin. Use: normal_color, black_and_white, sepia, warm_tinted, cool_tinted, green_tinted, blue_tinted, high_contrast, low_contrast, beauty_filter, heavy_smoothing, vintage_filter, screenshot, other."
+            },
             "body_skin_visibility": {
                 "type": "string",
                 "enum": ["low", "medium", "high", "n_a"],
@@ -3300,8 +3498,9 @@ def build_api_schema() -> Dict[str, Any]:
                 "description": (
                     "Categorical lighting label. Allowed values: studio_softbox, "
                     "studio_ringlight, studio_other, natural_outdoor_sun, "
-                    "natural_outdoor_overcast, natural_indoor_window, "
-                    "indoor_artificial, mixed, low_light. "
+                    "natural_outdoor_overcast, harsh_direct_sun, golden_hour, "
+                    "natural_indoor_window, indoor_artificial, camera_flash, mixed, "
+                    "low_light, backlit, neon_colored, colored_stage_light, other. "
                     "Use empty string only if truly indeterminable. "
                     "This is critical for studio-bias correction in skin-tone profiling."
                 )
@@ -3310,9 +3509,12 @@ def build_api_schema() -> Dict[str, Any]:
                 "type": "string",
                 "description": (
                     "Categorical background label. Allowed values: studio_plain, "
-                    "studio_textured, indoor_room, indoor_bathroom, outdoor_urban, "
-                    "outdoor_nature, outdoor_beach, outdoor_other, vehicle_interior, "
-                    "transparent_or_isolated, other. Empty string only if no background visible."
+                    "studio_textured, indoor_room, indoor_bathroom, indoor_kitchen, "
+                    "indoor_bedroom, indoor_office, indoor_gym, outdoor_urban, "
+                    "outdoor_nature, outdoor_forest, outdoor_beach, outdoor_snow, "
+                    "outdoor_mountain, outdoor_event, outdoor_other, vehicle_interior, "
+                    "public_transport, mirror_selfie, transparent_or_isolated, other. "
+                    "Empty string only if no background visible."
                 )
             },
             "hair_texture": {
@@ -3328,10 +3530,24 @@ def build_api_schema() -> Dict[str, Any]:
                 "type": "string",
                 "description": (
                     "Makeup intensity classification. Use exactly one of: none, "
-                    "minimal, natural, defined, full, dramatic. "
+                    "minimal, natural, defined, full, dramatic, stage_makeup, "
+                    "costume_makeup, face_paint, unclear. "
                     "NEVER use 'or'-phrases like 'minimal or no'. If unclear, pick the "
                     "closest single value."
                 )
+            },
+            "makeup_style": {
+                "type": "string",
+                "description": "Makeup style if visually clear. Use: natural_makeup, gyaru_makeup, cosplay_makeup, anime_inspired_makeup, dramatic_eyeliner, smoky_eye_makeup, false_eyelashes, glossy_lips, face_paint, fantasy_makeup, unclear."
+            },
+            "look_context": {
+                "type": "string",
+                "description": "Overall visible styling/context of this image. Use: regular_photo, fashion, glamour, gyaru_style, cosplay, character_costume, fantasy_costume, stage_costume, swimwear_costume, lingerie_costume, unclear."
+            },
+            "costume_accessories": {
+                "type": "array",
+                "description": "Visible costume/headpiece/prop accessories. Use controlled tokens only. Use [] if none are visible or if uncertain.",
+                "items": {"type": "string", "enum": COSTUME_ACCESSORY_VOCAB}
             },
             "has_glasses_now": {
                 "type": "boolean",
@@ -3342,8 +3558,17 @@ def build_api_schema() -> Dict[str, Any]:
                 "description": (
                     "If has_glasses_now is true: shape of the frame. One of: round, "
                     "square, rectangular, oval, aviator, cat_eye, oversized, rimless, "
-                    "browline, geometric, other. Empty string if no glasses."
+                    "semi_rimless, browline, geometric, wayfarer, shield, other. "
+                    "Empty string if no glasses."
                 )
+            },
+            "glasses_frame_material": {
+                "type": "string",
+                "description": "If has_glasses_now is true: material/type. One of: wire_frame, metal_frame, plastic_frame, acetate_frame, rimless, semi_rimless, mixed_material, unclear. Empty string if no glasses."
+            },
+            "glasses_lens_type": {
+                "type": "string",
+                "description": "If glasses/sunglasses are visible: clear_lenses, tinted_lenses, sunglasses, reflective_lenses, blue_light_lenses, unclear. Empty string if no glasses."
             },
             "tattoo_inventory_now": {
                 "type": "array",
@@ -3421,7 +3646,15 @@ def build_api_schema() -> Dict[str, Any]:
             "freckles_description",
             "skin_tone",
             "eye_color",
+            "eye_appearance",
             "body_build",
+            "body_height_impression",
+            "hair_length",
+            "frame_subtype",
+            "gaze_category",
+            "expression_category",
+            "occlusion_type",
+            "visual_style_type",
             "body_skin_visibility",
             "face_orientation_in_frame",
             "tattoos_visible",
@@ -3437,8 +3670,13 @@ def build_api_schema() -> Dict[str, Any]:
             "background_type",
             "hair_texture",
             "makeup_intensity",
+            "makeup_style",
+            "look_context",
+            "costume_accessories",
             "has_glasses_now",
             "glasses_frame_shape",
+            "glasses_frame_material",
+            "glasses_lens_type",
             "tattoo_inventory_now",
             "piercing_inventory_now",
             "quality_sharpness",
@@ -3570,8 +3808,8 @@ Important:
 - Ignore brand names and exact text content. Just flag the presence.
 - Describe visible tattoos only as a raw fact.
 - Describe hair color, length, and texture PRECISELY (e.g. "long wavy blonde hair", "short dark brown curly hair"). Never return empty or vague values like "brown".
-- Describe eye color PRECISELY if visible (e.g. "blue", "green", "gray-green", "hazel"). Return empty string only if eyes are not visible.
-- Describe skin_tone as a neutral factual value (e.g. "fair", "light", "medium", "olive", "dark"). Never return empty.
+- Describe eye color PRECISELY if visible. Prefer controlled values such as blue, blue_green, green, gray_blue, hazel, brown, dark_brown. Return empty string only if eyes are not visible.
+- Describe skin_tone as a neutral factual value (e.g. very_fair, fair, light, medium, tan, olive, brown, dark, deep). Never return empty.
 - Describe beard/glasses/piercings/makeup only as visible raw facts.
 - Describe freckles only when actually visible. Use short factual phrases like
   'light freckles across the nose and cheeks' or 'prominent facial freckles'.
@@ -3582,8 +3820,10 @@ Important:
     * On medium shots: only fill body_build if torso shape is clearly readable.
     * On full_body shots: judge accurately.
     * Resist the tendency to default to "slim" or "average". Use "curvy", "plus_size",
-      "athletic", "muscular" when the body actually shows those traits. Do not soften.
-    * Allowed values: slim | average | athletic | curvy | plus_size | muscular | "" (empty for headshots).
+      "athletic", "muscular", "petite" or "broad_build" when the body actually shows those traits. Do not soften.
+    * Allowed values: petite | slim | average | athletic | curvy | plus_size | muscular | broad_build | "" (empty for headshots/unclear).
+    * Do NOT use the term "stocky". Use broad_build if that is the intended neutral meaning.
+- body_height_impression: only fill when enough full/three-quarter body context is visible. Use short | average_height | tall | "". Do not infer height from headshots.
 - body_skin_visibility: how much bare skin (body only, EXCLUDING face and neck)
   is visible. Use exactly one of these values:
     * "low": long sleeves, long pants/skirt below the knee, body almost fully
@@ -3667,28 +3907,92 @@ Important:
 ============================================================
 CONTROLLED VOCABULARY (Phase 1)
 ============================================================
-For the categorical aux fields (lighting_type, background_type, hair_texture,
-makeup_intensity, glasses_frame_shape), use ONLY these values:
+For the categorical aux fields, use ONLY these values. Do not invent new tokens.
+shot_type remains ONLY headshot | medium | full_body and is used for dataset quotas;
+frame_subtype is an extra descriptive field for captions/reports only.
 
 lighting_type:
-  studio_softbox | studio_ringlight | studio_other |
-  natural_outdoor_sun | natural_outdoor_overcast |
-  natural_indoor_window | indoor_artificial | mixed | low_light
+  studio_softbox | studio_ringlight | studio_other | natural_outdoor_sun |
+  natural_outdoor_overcast | harsh_direct_sun | golden_hour |
+  natural_indoor_window | indoor_artificial | camera_flash | mixed |
+  low_light | backlit | neon_colored | colored_stage_light | other
 
 background_type:
   studio_plain | studio_textured | indoor_room | indoor_bathroom |
-  outdoor_urban | outdoor_nature | outdoor_beach | outdoor_other |
-  vehicle_interior | transparent_or_isolated | other
+  indoor_kitchen | indoor_bedroom | indoor_office | indoor_gym |
+  outdoor_urban | outdoor_nature | outdoor_forest | outdoor_beach |
+  outdoor_snow | outdoor_mountain | outdoor_event | outdoor_other |
+  vehicle_interior | public_transport | mirror_selfie |
+  transparent_or_isolated | other
 
-hair_texture (the natural texture of the hair, separate from style):
+hair_texture (natural texture, separate from style):
   straight | wavy | curly | coily | afro_textured
 
+hair_length:
+  shaved | very_short | short | chin_length | shoulder_length |
+  medium_length | long | very_long | not_visible | unclear
+
+eye_appearance:
+  natural_eyes | colored_contact_lenses | circle_lenses | cosmetic_lenses |
+  unnatural_eye_color | unclear
+
 makeup_intensity (pick exactly ONE):
-  none | minimal | natural | defined | full | dramatic
+  none | minimal | natural | defined | full | dramatic |
+  stage_makeup | costume_makeup | face_paint | unclear
+
+makeup_style:
+  natural_makeup | gyaru_makeup | cosplay_makeup | anime_inspired_makeup |
+  dramatic_eyeliner | smoky_eye_makeup | false_eyelashes | glossy_lips |
+  face_paint | fantasy_makeup | unclear
+
+look_context:
+  regular_photo | fashion | glamour | gyaru_style | cosplay |
+  character_costume | fantasy_costume | stage_costume | swimwear_costume |
+  lingerie_costume | unclear
+
+costume_accessories (array, use [] if none visible):
+  animal_ears | cat_ears | fox_ears | bunny_ears | elf_ears | pointed_ears |
+  horns | antlers | wings | feather_headpiece | headband | hair_bow |
+  hair_ribbon | forehead_jewel | tiara | crown | halo | veil | hood |
+  hat | cap | helmet | mask | choker | collar | necklace | gloves |
+  arm_guards | wrist_cuffs | fantasy_armor | shoulder_armor |
+  prop_weapon | prop_sword | prop_gun | prop_staff | prop_bottle |
+  prop_book | other_prop | none_visible | unclear
 
 glasses_frame_shape (only if has_glasses_now is true):
-  round | square | rectangular | oval | aviator | cat_eye |
-  oversized | rimless | browline | geometric | other
+  round | square | rectangular | oval | aviator | cat_eye | oversized |
+  rimless | semi_rimless | browline | geometric | wayfarer | shield | other
+
+glasses_frame_material:
+  wire_frame | metal_frame | plastic_frame | acetate_frame | rimless |
+  semi_rimless | mixed_material | unclear
+
+glasses_lens_type:
+  clear_lenses | tinted_lenses | sunglasses | reflective_lenses |
+  blue_light_lenses | unclear
+
+frame_subtype:
+  close_up | portrait | selfie | mirror_selfie | three_quarter_body |
+  full_body | faceless_body | detail_only | unclear
+
+gaze_category:
+  looking_at_camera | looking_left | looking_right | looking_up |
+  looking_down | looking_away | eyes_closed | partly_closed | unclear
+
+expression_category:
+  neutral | slight_smile | smile | wide_smile | serious | pensive |
+  playful | laughing | surprised | sad | angry | duckface | winking |
+  eyes_closed | other
+
+occlusion_type:
+  none | hair_covering_face | hand_covering_face | object_covering_face |
+  sunglasses_occluding_eyes | mask | hat_shadow | motion_blur |
+  crop_cutoff | face_partly_out_of_frame | other
+
+visual_style_type:
+  normal_color | black_and_white | sepia | warm_tinted | cool_tinted |
+  green_tinted | blue_tinted | high_contrast | low_contrast |
+  beauty_filter | heavy_smoothing | vintage_filter | screenshot | other
 
 If a value truly does not fit any of the above, use empty string "" for the
 auxiliary field, but still fill the freetext field (e.g. lighting_description).
@@ -3775,7 +4079,7 @@ If no piercings are visible: piercing_inventory_now = [].
                 "strict": True,
             }
         },
-        "max_output_tokens": 1800,  # leicht erhoeht wegen neuer Felder
+        "max_output_tokens": 2300,  # erhoeht wegen erweiterter Aux-Felder
         "store": False,
         "temperature": 0.1,
     }
@@ -4114,16 +4418,18 @@ def _clean_pose_phrase(pose: str) -> str:
 
 def _normalize_glasses_token(text: str) -> str:
     """
-    Ersetzt 'eyeglasses' durch 'glasses' in der gesamten Caption.
-    Behaelt 'sunglasses' bei (sind ein eigenes Wort).
+    Legacy-Hook fuer Brillen-Wording.
+
+    Wichtig: Profil-Canonical-Wording muss in Captions erhalten bleiben.
+    Wenn das Subject Profile z.B. "round wire-frame eyeglasses" als
+    canonical_description setzt, darf dieser Begriff nicht am Ende wieder
+    zu "round wire-frame glasses" normalisiert werden.
+
+    Die eigentliche Sicherheitslogik (Sonnenbrillen nicht durch Profilbrillen
+    ueberschreiben, normale Brillen mit dem Profil vereinheitlichen) passiert
+    in resolve_visible_glasses_description(...).
     """
-    if not text:
-        return text
-    # Erst sunglasses schuetzen, dann ersetzen, dann zurueckmappen
-    text = text.replace("sunglasses", "\x00SUNGLASSES\x00")
-    text = re.sub(r"\beyeglasses\b", "glasses", text, flags=re.IGNORECASE)
-    text = text.replace("\x00SUNGLASSES\x00", "sunglasses")
-    return text
+    return text or ""
 
 
 def _is_sunglasses_description(text: Optional[str]) -> bool:
@@ -4484,14 +4790,42 @@ def _quality_tier(row: Dict[str, Any]) -> str:
 
 def stratified_sample_for_profile(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Deterministisches Sample fuer grosse Datasets.
-    Strata: lighting_type × shot_type × quality-tier.
+
+    Profilbildung braucht mehr Koerperinformation als die finale Train-Auswahl:
+    Keep- und Keep-Unused-Bilder gehen upstream ohnehin in `rows`. Wenn das
+    Dataset > PROFILE_SAMPLE_THRESHOLD ist, werden Medium-/Fullbody-Bilder
+    bevorzugt in das Sample gehoben, damit body_build nicht von Headshots
+    ueberstimmt wird. Danach wird der Rest wie bisher stratifiziert nach
+    lighting × shot_type × quality-tier aufgefuellt.
     """
     if len(rows) <= int(PROFILE_SAMPLE_THRESHOLD):
         return list(rows)
 
     target = max(1, int(PROFILE_SAMPLE_SIZE))
+    selected: List[Dict[str, Any]] = []
+    selected_ids: set = set()
+
+    def _sid(row: Dict[str, Any]) -> str:
+        return profile_image_id(row)
+
+    # 1) Body-relevante Bilder zuerst, aber begrenzt, damit Face-Identity nicht
+    #    ueberrollt wird. Score-Sortierung sorgt fuer gute Body-Referenzen.
+    body_rows = [
+        r for r in rows
+        if normalize_text(r.get("shot_type")) in {"medium", "full_body"}
+    ]
+    body_rows.sort(key=lambda r: (normalize_text(r.get("shot_type")) != "full_body", -float(r.get("quality_total", 0)), _sid(r)))
+    for row in body_rows[: min(len(body_rows), int(PROFILE_BODY_PRIORITY_SAMPLE_MAX), target)]:
+        sid = _sid(row)
+        if sid not in selected_ids:
+            selected.append(row)
+            selected_ids.add(sid)
+
     groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in rows:
+        sid = _sid(row)
+        if sid in selected_ids:
+            continue
         key = (
             normalize_text(row.get("lighting_type")) or "unknown_lighting",
             normalize_text(row.get("shot_type")) or "unknown_shot",
@@ -4500,22 +4834,27 @@ def stratified_sample_for_profile(rows: List[Dict[str, Any]]) -> List[Dict[str, 
         groups[key].append(row)
 
     for key in groups:
-        groups[key].sort(key=lambda r: profile_image_id(r))
+        groups[key].sort(key=lambda r: _sid(r))
 
-    selected: List[Dict[str, Any]] = []
+    # 2) Mindestens einen Vertreter je Stratum.
     for key in sorted(groups.keys()):
         if len(selected) >= target:
             break
         if groups[key]:
-            selected.append(groups[key].pop(0))
+            row = groups[key].pop(0)
+            selected.append(row)
+            selected_ids.add(_sid(row))
 
+    # 3) Round-robin auffuellen.
     while len(selected) < target:
         progressed = False
         for key in sorted(groups.keys()):
             if len(selected) >= target:
                 break
             if groups[key]:
-                selected.append(groups[key].pop(0))
+                row = groups[key].pop(0)
+                selected.append(row)
+                selected_ids.add(_sid(row))
                 progressed = True
         if not progressed:
             break
@@ -4567,8 +4906,9 @@ def subject_profile_schema() -> Dict[str, Any]:
                     "eye_color": {"type": "string"},
                     "hair_texture": {"type": "string"},
                     "body_build": {"type": "string"},
+                    "body_height_impression": {"type": "string"},
                 },
-                "required": ["gender", "skin_tone", "eye_color", "hair_texture", "body_build"],
+                "required": ["gender", "skin_tone", "eye_color", "hair_texture", "body_build", "body_height_impression"],
                 "additionalProperties": False,
             },
             "confidence": {
@@ -4586,8 +4926,9 @@ def subject_profile_schema() -> Dict[str, Any]:
                     "eye_color":    _confidence_field_schema(),
                     "hair_texture": _confidence_field_schema(),
                     "body_build":   _confidence_field_schema(),
+                    "body_height_impression": _confidence_field_schema(),
                 },
-                "required": ["gender", "skin_tone", "eye_color", "hair_texture", "body_build"],
+                "required": ["gender", "skin_tone", "eye_color", "hair_texture", "body_build", "body_height_impression"],
                 "additionalProperties": False,
             },
             "identity_markers": {
@@ -4668,19 +5009,32 @@ def _profile_sample_payload(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "gender_class": row.get("gender_class", ""),
                 "skin_tone": row.get("skin_tone", ""),
                 "eye_color": row.get("eye_color", ""),
+                "eye_appearance": row.get("eye_appearance", ""),
                 "body_build": row.get("body_build", ""),
+                "body_height_impression": row.get("body_height_impression", ""),
                 "hair_description": row.get("hair_description", ""),
+                "hair_length": row.get("hair_length", ""),
                 "hair_texture": row.get("hair_texture", ""),
                 "glasses_description": row.get("glasses_description", ""),
                 "has_glasses_now": row.get("has_glasses_now", False),
                 "glasses_frame_shape": row.get("glasses_frame_shape", ""),
+                "glasses_frame_material": row.get("glasses_frame_material", ""),
+                "glasses_lens_type": row.get("glasses_lens_type", ""),
                 "makeup_description": row.get("makeup_description", ""),
                 "makeup_intensity": row.get("makeup_intensity", ""),
+                "makeup_style": row.get("makeup_style", ""),
+                "look_context": row.get("look_context", ""),
+                "costume_accessories": row.get("costume_accessories", []),
                 "freckles_description": row.get("freckles_description", ""),
                 "tattoo_inventory_now": row.get("tattoo_inventory_now", []),
                 "piercing_inventory_now": row.get("piercing_inventory_now", []),
                 "lighting_description": row.get("lighting_description", ""),
                 "background_description": row.get("background_description", ""),
+                "frame_subtype": row.get("frame_subtype", ""),
+                "gaze_category": row.get("gaze_category", ""),
+                "expression_category": row.get("expression_category", ""),
+                "occlusion_type": row.get("occlusion_type", ""),
+                "visual_style_type": row.get("visual_style_type", ""),
             },
         })
     return payload_rows
@@ -4696,10 +5050,15 @@ Important:
 - Use single, clean tokens or short phrases. No hedge words, no 'or'-phrases, no 'none visible'.
 - For skin tone, account for studio-lighting bias: studio or ring-light images can make darker skin read lighter.
 - For eye color, treat mirror selfies, filters, and extreme lighting as possible outliers.
-- Body build is unreliable on headshots. If less than ~30% of input images are medium/full_body,
-  set body_build to "" (empty string) and confidence.body_build.level = "low" with reasoning
-  "few full-body observations". Vision models tend to over-label women as 'slim' on headshots
+- Body build and body height impression are unreliable on headshots. If less than ~30% of input images
+  are medium/full_body and fewer than the configured minimum body-reference shots exist, set body_build
+  and body_height_impression to "" (empty string) and set their confidence levels to "low" with reasoning
+  "few full-body observations". Vision models tend to over-label women as 'slim'/'average' on headshots
   due to RLHF politeness bias - resist this tendency.
+- Do not use the word "stocky". If a compact/wide build is intended, use body_build="broad_build".
+- Do not try to decide whether hair is a wig. Instead, use dataset-wide variance: if hair color or hair form varies strongly across images, this will be handled later by profile policies and should not be treated as a stable identity cue.
+- If eye colors vary strongly or cosmetic/circle-lens looks recur, do not over-stabilize eye color. This will be handled later by profile policies and captioned as a variable attribute when needed.
+- Cosplay, character-costume, fantasy-costume, gyaru or high-variation styling should be preserved in per-image fields; do not merge those costume traits into stable identity.
 - Glasses are regular only if visible in at least about 60% of sampled usable images.
 - Do not let occasional sunglasses overwrite a regular prescription-glasses baseline.
 - If a subject regularly wears normal eyeglasses, per-image sunglasses must remain
@@ -4731,9 +5090,26 @@ Return JSON only.
             "eye_color": EYE_COLOR_VOCAB,
             "hair_texture": ["straight", "wavy", "curly", "coily", "afro_textured"],
             "body_build": BODY_BUILD_VOCAB,
+            "body_height_impression": BODY_HEIGHT_IMPRESSION_VOCAB,
             "makeup_intensity": MAKEUP_INTENSITY_VOCAB,
+            "makeup_style": MAKEUP_STYLE_VOCAB,
+            "look_context": LOOK_CONTEXT_VOCAB,
+            "costume_accessories": COSTUME_ACCESSORY_VOCAB,
+            "profile_appearance_mode": PROFILE_APPEARANCE_MODE_VOCAB,
             "hair_form": HAIR_FORM_VOCAB,
+            "hair_length": HAIR_LENGTH_VOCAB,
             "hair_color": HAIR_COLOR_VOCAB,
+            "lighting_type": LIGHTING_TYPE_VOCAB,
+            "background_type": BACKGROUND_TYPE_VOCAB,
+            "glasses_frame_shape": GLASSES_FRAME_SHAPE_VOCAB,
+            "glasses_frame_material": GLASSES_FRAME_MATERIAL_VOCAB,
+            "glasses_lens_type": GLASSES_LENS_TYPE_VOCAB,
+            "frame_subtype": FRAME_SUBTYPE_VOCAB,
+            "gaze_category": GAZE_VOCAB,
+            "expression_category": EXPRESSION_VOCAB,
+            "occlusion_type": OCCLUSION_TYPE_VOCAB,
+            "visual_style_type": VISUAL_STYLE_VOCAB,
+            "eye_appearance": EYE_APPEARANCE_VOCAB,
             "tattoo_locations": TATTOO_LOCATION_ENUM,
             "piercing_locations": PIERCING_LOCATION_ENUM,
         },
@@ -4757,7 +5133,7 @@ Return JSON only.
                 "strict": True,
             }
         },
-        "max_output_tokens": 2400,
+        "max_output_tokens": 2600,
         "store": False,
         "temperature": 0.1,
     }
@@ -4851,6 +5227,7 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
             "eye_color": _mode_clean(rows, "eye_color"),
             "hair_texture": _mode_clean(rows, "hair_texture"),
             "body_build": body_build_value,
+            "body_height_impression": _mode_clean(rows, "body_height_impression"),
         },
         "confidence": {
             "gender":       {"level": "fallback", "reasoning": "", "outliers": []},
@@ -4858,6 +5235,11 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
             "eye_color":    {"level": "fallback", "reasoning": "", "outliers": []},
             "hair_texture": {"level": "fallback", "reasoning": "", "outliers": []},
             "body_build":   {
+                "level": "low" if body_eligible_fraction < 0.30 else "fallback",
+                "reasoning": body_build_reason,
+                "outliers": [],
+            },
+            "body_height_impression": {
                 "level": "low" if body_eligible_fraction < 0.30 else "fallback",
                 "reasoning": body_build_reason,
                 "outliers": [],
@@ -4894,20 +5276,42 @@ def canonical_hair_color(row: Dict[str, Any]) -> str:
     ]))
     if not text:
         return ""
+    if _contains_any(text, ["highlight", "highlights", "streaks"]):
+        return "highlights"
+    if _contains_any(text, ["ombre", "balayage"]):
+        return "ombre"
+    if _contains_any(text, ["multi-colored", "multicolored", "multi color", "multicolor", "rainbow"]):
+        return "multicolor"
     if _contains_any(text, ["platinum", "white-blonde", "white blonde", "very light blonde", "very light ash", "silver blonde"]):
         return "platinum"
+    if _contains_any(text, ["silver hair", "silvery", "silver-gray", "silver grey"]):
+        return "silver"
     if _contains_any(text, ["burgundy", "wine-red", "wine red", "deep red", "dark red"]):
         return "burgundy"
-    if _contains_any(text, ["auburn", "copper"]):
+    if _contains_any(text, ["strawberry blonde", "strawberry-blonde"]):
+        return "strawberry_blonde"
+    if _contains_any(text, ["copper"]):
+        return "copper"
+    if _contains_any(text, ["auburn"]):
         return "auburn"
     if _contains_any(text, ["red hair", "red-haired", "reddish"]):
         return "red"
+    if _contains_any(text, ["blue hair", "blue-dyed"]):
+        return "blue"
+    if _contains_any(text, ["pink hair", "pink-dyed"]):
+        return "pink"
+    if _contains_any(text, ["purple hair", "violet hair"]):
+        return "purple"
+    if _contains_any(text, ["green hair", "green-dyed"]):
+        return "green"
     if _contains_any(text, ["black hair", "jet black", "raven", "black braided", "black braids", "dark black"]):
         return "black"
     if _contains_any(text, ["dark brown", "deep brown", "brunette"]):
         return "dark_brown"
     if _contains_any(text, ["light brown", "dirty blonde"]):
         return "light_brown"
+    if _contains_any(text, ["dark blonde", "dark-blonde"]):
+        return "dark_blonde"
     if _contains_any(text, ["blonde", "blond", "ash-blonde", "ash blonde"]):
         return "blonde"
     if _contains_any(text, ["brown hair", "brown wavy", "brown straight"]):
@@ -4919,6 +5323,163 @@ def canonical_hair_color(row: Dict[str, Any]) -> str:
     return ""
 
 
+
+def canonical_eye_color(row: Dict[str, Any]) -> str:
+    text = normalize_text(str(row.get("eye_color", "")))
+    if not text:
+        return ""
+    text = text.replace("grey", "gray")
+    if "blue_green" in text or "blue green" in text or "green blue" in text:
+        return "blue_green"
+    if "gray_blue" in text or "gray blue" in text or "blue gray" in text:
+        return "gray_blue"
+    for token in ["dark_brown", "blue", "green", "hazel", "brown", "gray", "amber"]:
+        if token in text:
+            return token
+    return ""
+
+
+def canonical_eye_appearance(row: Dict[str, Any]) -> str:
+    text = normalize_text(" ".join([
+        str(row.get("eye_appearance", "")),
+        str(row.get("eye_color", "")),
+        str(row.get("makeup_description", "")),
+        str(row.get("makeup_style", "")),
+    ]))
+    if not text:
+        return ""
+    if any(k in text for k in ["circle_lens", "circle lenses", "enlarging lens", "doll-like eyes"]):
+        return "circle_lenses"
+    if any(k in text for k in ["colored contact", "coloured contact", "contact lenses", "colored lenses", "colour contact"]):
+        return "colored_contact_lenses"
+    if any(k in text for k in ["cosmetic lens", "cosmetic lenses"]):
+        return "cosmetic_lenses"
+    if any(k in text for k in ["unnatural eye", "bright blue", "vivid blue", "vivid green", "anime-like eyes"]):
+        return "unnatural_eye_color"
+    if "natural_eyes" in text or "natural eyes" in text:
+        return "natural_eyes"
+    return normalize_text(row.get("eye_appearance")) if normalize_text(row.get("eye_appearance")) in EYE_APPEARANCE_VOCAB else ""
+
+
+def canonical_makeup_style(row: Dict[str, Any]) -> str:
+    text = normalize_text(" ".join([
+        str(row.get("makeup_style", "")),
+        str(row.get("makeup_description", "")),
+    ]))
+    if not text:
+        return ""
+    if any(k in text for k in ["gyaru", "gal makeup"]):
+        return "gyaru_makeup"
+    if any(k in text for k in ["cosplay makeup", "character makeup"]):
+        return "cosplay_makeup"
+    if any(k in text for k in ["anime inspired", "anime-style", "anime style"]):
+        return "anime_inspired_makeup"
+    if any(k in text for k in ["dramatic eyeliner", "winged eyeliner", "heavy eyeliner", "cat eye liner", "cat-eye liner"]):
+        return "dramatic_eyeliner"
+    if any(k in text for k in ["smoky eye", "smokey eye"]):
+        return "smoky_eye_makeup"
+    if any(k in text for k in ["false eyelashes", "fake eyelashes", "long false lashes", "heavy lashes"]):
+        return "false_eyelashes"
+    if any(k in text for k in ["glossy lips", "lip gloss"]):
+        return "glossy_lips"
+    if "face_paint" in text or "face paint" in text:
+        return "face_paint"
+    if any(k in text for k in ["fantasy makeup", "elf makeup", "demon makeup"]):
+        return "fantasy_makeup"
+    if "natural_makeup" in text or "natural makeup" in text:
+        return "natural_makeup"
+    token = normalize_text(row.get("makeup_style"))
+    return token if token in MAKEUP_STYLE_VOCAB else ""
+
+
+def canonical_look_context(row: Dict[str, Any]) -> str:
+    text = normalize_text(" ".join([
+        str(row.get("look_context", "")),
+        str(row.get("clothing_description", "")),
+        str(row.get("background_description", "")),
+        str(row.get("makeup_description", "")),
+    ]))
+    if not text:
+        return ""
+    if any(k in text for k in ["gyaru", "gal style"]):
+        return "gyaru_style"
+    if any(k in text for k in ["cosplay", "cosplayer"]):
+        return "cosplay"
+    if any(k in text for k in ["character costume", "anime costume", "game character", "character outfit"]):
+        return "character_costume"
+    if any(k in text for k in ["fantasy costume", "elf", "demon", "armor", "armour", "horns"]):
+        return "fantasy_costume"
+    if any(k in text for k in ["stage costume", "performance costume", "theatrical"]):
+        return "stage_costume"
+    if any(k in text for k in ["swimwear", "bikini", "swimsuit"]):
+        return "swimwear_costume"
+    if any(k in text for k in ["lingerie", "underwear", "bra and", "lace bra"]):
+        return "lingerie_costume"
+    if "glamour" in text:
+        return "glamour"
+    if "fashion" in text:
+        return "fashion"
+    token = normalize_text(row.get("look_context"))
+    return token if token in LOOK_CONTEXT_VOCAB else "regular_photo"
+
+
+def canonical_costume_accessories(row: Dict[str, Any]) -> List[str]:
+    raw = row.get("costume_accessories", [])
+    tokens: List[str] = []
+    if isinstance(raw, list):
+        tokens.extend(normalize_text(x) for x in raw if normalize_text(str(x)))
+    elif isinstance(raw, str) and raw.strip():
+        tokens.extend(normalize_text(x) for x in re.split(r"[,;/|]+", raw) if normalize_text(x))
+
+    text = normalize_text(" ".join([
+        str(row.get("clothing_description", "")),
+        str(row.get("pose_description", "")),
+        str(row.get("background_description", "")),
+    ]))
+    patterns = [
+        ("cat_ears", ["cat ears"]),
+        ("fox_ears", ["fox ears"]),
+        ("bunny_ears", ["bunny ears", "rabbit ears"]),
+        ("animal_ears", ["animal ears"]),
+        ("elf_ears", ["elf ears", "elven ears"]),
+        ("pointed_ears", ["pointed ears"]),
+        ("horns", ["horns", "demon horns"]),
+        ("antlers", ["antlers"]),
+        ("wings", ["wings"]),
+        ("feather_headpiece", ["feather headpiece", "feathered headpiece", "black feathers"]),
+        ("headband", ["headband"]),
+        ("hair_bow", ["hair bow", "bow in her hair"]),
+        ("hair_ribbon", ["hair ribbon", "ribbon in her hair"]),
+        ("forehead_jewel", ["forehead jewel", "forehead gem", "jewel on forehead"]),
+        ("tiara", ["tiara"]),
+        ("crown", ["crown"]),
+        ("halo", ["halo"]),
+        ("veil", ["veil"]),
+        ("hood", ["hood"]),
+        ("hat", ["hat"]),
+        ("cap", ["cap"]),
+        ("helmet", ["helmet"]),
+        ("mask", ["mask"]),
+        ("choker", ["choker"]),
+        ("collar", ["collar"]),
+        ("necklace", ["necklace"]),
+        ("gloves", ["gloves"]),
+        ("arm_guards", ["arm guards", "bracers"]),
+        ("wrist_cuffs", ["wrist cuffs", "cuffs"]),
+        ("fantasy_armor", ["fantasy armor", "fantasy armour", "armor", "armour"]),
+        ("shoulder_armor", ["shoulder armor", "shoulder armour", "pauldron"]),
+        ("prop_sword", ["sword"]),
+        ("prop_gun", ["gun", "pistol"]),
+        ("prop_staff", ["staff", "wand"]),
+        ("prop_bottle", ["bottle"]),
+        ("prop_book", ["book"]),
+    ]
+    for token, needles in patterns:
+        if any(n in text for n in needles):
+            tokens.append(token)
+    valid = [t for t in tokens if t in COSTUME_ACCESSORY_VOCAB and t not in {"none_visible", "unclear"}]
+    return sorted(dict.fromkeys(valid))
+
 def canonical_hair_form(row: Dict[str, Any]) -> str:
     text = normalize_text(" ".join([
         str(row.get("hair_description", "")),
@@ -4926,6 +5487,18 @@ def canonical_hair_form(row: Dict[str, Any]) -> str:
     ]))
     if not text:
         return ""
+    if _contains_any(text, ["covered hair", "hair covered", "headscarf", "hijab", "hood covers hair", "beanie covers hair"]):
+        return "covered_hair"
+    if _contains_any(text, ["side shaved", "shaved side"]):
+        return "side_shaved"
+    if "undercut" in text:
+        return "undercut"
+    if _contains_any(text, ["curtain bangs"]):
+        return "curtain_bangs"
+    if "bangs" in text or "fringe" in text:
+        return "bangs"
+    if _contains_any(text, ["dreadlock", "locs", "dreads"]):
+        return "dreadlocks"
     if _contains_any(text, ["knotless braid", "knotless braids"]):
         return "knotless_braids"
     if _contains_any(text, ["box braid", "box braids", "individual braid", "individual braids", "small braids", "rope-like braid"]):
@@ -4938,9 +5511,19 @@ def canonical_hair_form(row: Dict[str, Any]) -> str:
         return "single_braid"
     if "pigtail" in text:
         return "pigtails"
+    if "high ponytail" in text:
+        return "high_ponytail"
+    if "low ponytail" in text:
+        return "low_ponytail"
     if "ponytail" in text:
         return "ponytail"
-    if _contains_any(text, ["bun", "top knot", "chignon"]):
+    if _contains_any(text, ["messy bun"]):
+        return "messy_bun"
+    if _contains_any(text, ["high bun", "top knot"]):
+        return "high_bun"
+    if "low bun" in text:
+        return "low_bun"
+    if _contains_any(text, ["bun", "chignon"]):
         return "bun"
     if _contains_any(text, ["updo", "up-do"]):
         return "updo"
@@ -4948,7 +5531,17 @@ def canonical_hair_form(row: Dict[str, Any]) -> str:
         return "half_up"
     if _contains_any(text, ["pulled back", "tied back", "slicked back"]):
         return "pulled_back"
-    if _contains_any(text, ["short hair", "pixie", "short cut"]):
+    if _contains_any(text, ["shaved head", "completely shaved"]):
+        return "shaved_head"
+    if _contains_any(text, ["buzz cut", "buzzcut"]):
+        return "buzz_cut"
+    if _contains_any(text, ["pixie"]):
+        return "pixie_cut"
+    if _contains_any(text, ["long bob", "lob cut", "lob"]):
+        return "lob_cut"
+    if _contains_any(text, ["bob cut", "bob haircut", "bob"]):
+        return "bob_cut"
+    if _contains_any(text, ["short hair", "short cut"]):
         return "short_cut"
     if _contains_any(text, ["afro", "rounded shape", "voluminous rounded", "afro-textured"]):
         return "afro_natural"
@@ -4963,6 +5556,53 @@ def canonical_hair_form(row: Dict[str, Any]) -> str:
     return ""
 
 
+def canonical_hair_length(row: Dict[str, Any]) -> str:
+    explicit = normalize_text(row.get("hair_length"))
+    if explicit in HAIR_LENGTH_VOCAB:
+        return explicit
+    text = normalize_text(row.get("hair_description"))
+    if not text:
+        return ""
+    if _contains_any(text, ["not visible", "covered", "hidden"]):
+        return "not_visible"
+    if _contains_any(text, ["shaved head", "shaved"]):
+        return "shaved"
+    if _contains_any(text, ["very short", "buzz cut", "buzzcut", "pixie"]):
+        return "very_short"
+    if _contains_any(text, ["short hair", "short cut"]):
+        return "short"
+    if _contains_any(text, ["chin length", "chin-length", "bob"]):
+        return "chin_length"
+    if _contains_any(text, ["shoulder length", "shoulder-length", "to the shoulders"]):
+        return "shoulder_length"
+    if _contains_any(text, ["medium length", "medium-length"]):
+        return "medium_length"
+    if _contains_any(text, ["very long", "waist length", "waist-length"]):
+        return "very_long"
+    if _contains_any(text, ["long hair", "long "]):
+        return "long"
+    return ""
+
+
+def canonical_body_height_impression(row: Dict[str, Any]) -> str:
+    explicit = normalize_text(row.get("body_height_impression"))
+    if explicit in BODY_HEIGHT_IMPRESSION_VOCAB:
+        return explicit
+    text = normalize_text(" ".join([
+        str(row.get("body_build", "")),
+        str(row.get("pose_description", "")),
+        str(row.get("short_reason", "")),
+    ]))
+    if not text:
+        return ""
+    if _contains_any(text, ["short stature", "appears short", "shorter"]):
+        return "short"
+    if _contains_any(text, ["tall", "long-limbed", "long limbed"]):
+        return "tall"
+    if _contains_any(text, ["average height", "average-height"]):
+        return "average_height"
+    return ""
+
 def canonical_makeup_intensity(row: Dict[str, Any]) -> str:
     explicit = normalize_text(row.get("makeup_intensity"))
     if explicit in MAKEUP_INTENSITY_VOCAB:
@@ -4970,6 +5610,12 @@ def canonical_makeup_intensity(row: Dict[str, Any]) -> str:
     text = normalize_text(row.get("makeup_description"))
     if not text:
         return ""
+    if _contains_any(text, ["face paint", "face-paint", "painted face"]):
+        return "face_paint"
+    if _contains_any(text, ["costume makeup", "cosplay makeup", "special effects makeup", "sfx makeup"]):
+        return "costume_makeup"
+    if _contains_any(text, ["stage makeup", "theatrical makeup"]):
+        return "stage_makeup"
     if _contains_any(text, ["dramatic", "bold", "heavy glam"]):
         return "dramatic"
     if _contains_any(text, ["full makeup", "heavy makeup", "glam makeup"]):
@@ -5015,15 +5661,31 @@ def profile_hair_caption(hair_color: str, hair_form: str) -> str:
         "pulled_back": f"{color_prefix()}hair pulled back",
         "half_up": f"{color_prefix()}hair in a half-up style",
         "ponytail": f"{color_prefix()}hair in a ponytail",
+        "low_ponytail": f"{color_prefix()}hair in a low ponytail",
+        "high_ponytail": f"{color_prefix()}hair in a high ponytail",
         "pigtails": f"{color_prefix()}hair in pigtails",
         "bun": f"{color_prefix()}hair in a bun",
+        "low_bun": f"{color_prefix()}hair in a low bun",
+        "high_bun": f"{color_prefix()}hair in a high bun",
+        "messy_bun": f"{color_prefix()}hair in a messy bun",
         "updo": f"{color_prefix()}hair in an updo",
         "two_braids": f"{color_prefix()}hair in two braids",
         "single_braid": f"{color_prefix()}hair in a single braid",
         "box_braids": f"{color_prefix()}box braids",
         "knotless_braids": f"{color_prefix()}knotless braids",
         "cornrows": f"{color_prefix()}cornrows",
+        "dreadlocks": f"{color_prefix()}dreadlocks",
+        "pixie_cut": f"{color_prefix()}pixie cut",
+        "bob_cut": f"{color_prefix()}bob cut",
+        "lob_cut": f"{color_prefix()}long bob cut",
         "short_cut": f"short {color_prefix()}hair".strip(),
+        "buzz_cut": f"{color_prefix()}buzz cut",
+        "shaved_head": "shaved head",
+        "undercut": f"{color_prefix()}hair with an undercut",
+        "side_shaved": f"{color_prefix()}hair with one side shaved",
+        "bangs": f"{color_prefix()}hair with bangs",
+        "curtain_bangs": f"{color_prefix()}hair with curtain bangs",
+        "covered_hair": "covered hair",
         "afro_natural": f"{color_prefix()}natural afro-textured hair",
     }
     if form_token in phrase_map:
@@ -5069,13 +5731,329 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
     return {
         "hair_color_base": canonical_hair_color(row),
         "hair_form": canonical_hair_form(row),
+        "hair_length": canonical_hair_length(row),
+        "eye_color_base": canonical_eye_color(row),
+        "eye_appearance": canonical_eye_appearance(row),
+        "body_height_impression": canonical_body_height_impression(row),
         "makeup_intensity": canonical_makeup_intensity(row),
+        "makeup_style": canonical_makeup_style(row),
+        "look_context": canonical_look_context(row),
+        "costume_accessories": canonical_costume_accessories(row),
         "freckles_visible": bool(compact_trait(row.get("freckles_description"))),
         "freckles_description": compact_trait(row.get("freckles_description")),
         "glasses_visible": _profile_bool(row.get("has_glasses_now")) or bool(compact_trait(row.get("glasses_description"))),
         "tattoo_locations_visible": sorted(set(tattoos_visible)),
         "piercing_locations_visible": sorted(set(piercings_visible)),
+        "frame_subtype": normalize_text(row.get("frame_subtype")),
+        "gaze_category": normalize_text(row.get("gaze_category")),
+        "expression_category": normalize_text(row.get("expression_category")),
+        "occlusion_type": normalize_text(row.get("occlusion_type")),
+        "visual_style_type": normalize_text(row.get("visual_style_type")),
+        "glasses_frame_material": normalize_text(row.get("glasses_frame_material")),
+        "glasses_lens_type": normalize_text(row.get("glasses_lens_type")),
     }
+
+
+
+def _appearance_hair_family(token: str) -> str:
+    t = normalize_text(token)
+    if t in {"blonde", "platinum", "gray", "white"}:
+        return "blonde_light_family"
+    if t in {"light_brown", "brown", "dark_brown", "black"}:
+        return "brown_dark_family"
+    if t in {"auburn", "red", "copper"}:
+        return "red_auburn_family"
+    if not t:
+        return "unknown_hair"
+    return f"{t}_family"
+
+
+def _appearance_glasses_family(row: Dict[str, Any], traits: Dict[str, Any]) -> str:
+    desc = normalize_text(row.get("glasses_description"))
+    if any(k in desc for k in ["sunglass", "dark_lens", "tinted_lens", "shades"]):
+        return "sunglasses"
+    if _profile_bool(row.get("has_glasses_now")) or bool(traits.get("glasses_visible")):
+        return "regular_glasses"
+    if desc:
+        return "glasses_unclear"
+    return "no_glasses"
+
+
+def _appearance_visual_group(row: Dict[str, Any]) -> str:
+    if bool(row.get("is_grayscale_filter")):
+        return "filtered_bw"
+    label = normalize_text(row.get("color_tint_label"))
+    strength = float(row.get("color_tint_strength", 0.0) or 0.0)
+    if label and strength >= float(TINT_MIN_STRENGTH_FOR_CAPTION):
+        return "filtered_tinted"
+    return "clean"
+
+
+def _appearance_frame_group(row: Dict[str, Any]) -> str:
+    shot = normalize_text(row.get("shot_type"))
+    if shot == "full_body":
+        return "body"
+    if shot == "medium":
+        return "medium"
+    return "face"
+
+
+def _safe_cluster_id(label: str, existing: set) -> str:
+    base = re.sub(r"[^a-zA-Z0-9_\-]+", "_", label).strip("_").lower() or "look"
+    cid = base
+    i = 2
+    while cid in existing:
+        cid = f"{base}_{i}"
+        i += 1
+    existing.add(cid)
+    return cid
+
+
+def build_identity_appearance_clusters(rows: List[Dict[str, Any]], profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Baut grobe, UI-taugliche Appearance-Cluster fuer den Personality-/Profile-Bereich.
+
+    Ziel ist NICHT perfekte automatische Phasenerkennung. Ziel ist ein Entscheidungsboard:
+    wenige grobe Gruppen, die der User als core / variation / body_reference / review / exclude
+    markieren kann. Tints, B/W, Sonnenbrillen und Body-Shots werden bewusst nicht als Core
+    vorgeschlagen.
+    """
+    if not ENABLE_IDENTITY_APPEARANCE_CLUSTERING:
+        return {"clusters": [], "member_roles": {}, "member_clusters": {}, "warnings": []}
+
+    usable = [r for r in rows if r.get("base_status") in {"keep", "review"} and r.get("arcface_flag") != "hard"]
+    if not usable:
+        return {"clusters": [], "member_roles": {}, "member_clusters": {}, "warnings": []}
+
+    per_img = profile.get("per_image_traits", {}) or {}
+
+    # Haupt-Haarfamilie aus sauberen Face/Medium-Bildern bestimmen. Das ist nur
+    # ein Priorisierungssignal, kein harter Reject.
+    hair_counter = Counter()
+    for row in usable:
+        image_id = profile_image_id(row)
+        traits = per_img.get(image_id) or per_image_profile_traits(row, profile)
+        frame = _appearance_frame_group(row)
+        visual = _appearance_visual_group(row)
+        if frame in {"face", "medium"} and visual == "clean":
+            hair_counter[_appearance_hair_family(str(traits.get("hair_color_base", "")))] += 1
+    main_hair = hair_counter.most_common(1)[0][0] if hair_counter else "unknown_hair"
+
+    raw: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    row_meta: Dict[str, Dict[str, str]] = {}
+    for row in usable:
+        image_id = profile_image_id(row)
+        traits = per_img.get(image_id) or per_image_profile_traits(row, profile)
+        frame = _appearance_frame_group(row)
+        hair = _appearance_hair_family(str(traits.get("hair_color_base", "")))
+        glasses = _appearance_glasses_family(row, traits)
+        visual = _appearance_visual_group(row)
+        # Seltene Einzelfaelle nicht als 10 Einzel-Looks aufblasen.
+        key = (frame, hair, glasses, visual)
+        raw[key].append(row)
+        row_meta[image_id] = {"frame": frame, "hair": hair, "glasses": glasses, "visual": visual}
+
+    # Zweite Zusammenfassung: seltene Outlier und Filterbilder grob bündeln.
+    grouped: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    for key, members in raw.items():
+        frame, hair, glasses, visual = key
+        if frame == "body":
+            new_key = ("body", hair if hair == main_hair else "other_hair", glasses, "filtered" if visual != "clean" else "clean")
+        elif visual != "clean":
+            # Tinted/BW trennt Core nicht weiter in zig Mini-Looks.
+            new_key = (frame, hair if hair == main_hair else "other_hair", glasses, "filtered")
+        elif len(members) == 1 and hair != main_hair:
+            new_key = ("outlier", "other_hair", "mixed_glasses", "clean")
+        else:
+            new_key = key
+        grouped[new_key].extend(members)
+
+    clusters: List[Dict[str, Any]] = []
+    member_roles: Dict[str, str] = {}
+    member_clusters: Dict[str, str] = {}
+    used_ids: set = set()
+    warnings: List[str] = []
+
+    for key, members in sorted(grouped.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        frame, hair, glasses, visual = key
+        n = len(members)
+        role = "variation"
+        if frame == "body":
+            role = "body_reference"
+        elif visual != "clean" or visual == "filtered":
+            role = "variation" if n >= 2 else "review"
+        elif glasses == "sunglasses":
+            role = "variation" if n >= 2 else "review"
+        elif frame in {"face", "medium"} and hair == main_hair and n >= 2:
+            role = "core"
+        elif frame == "outlier":
+            role = "review"
+
+        label_parts = [frame, hair, glasses, visual]
+        cid = _safe_cluster_id("look_" + "_".join(label_parts), used_ids)
+
+        shot_counts = Counter(normalize_text(r.get("shot_type")) or "unknown" for r in members)
+        style_counts = Counter(_appearance_visual_group(r) for r in members)
+        quality_avg = sum(float(r.get("quality_total", 0) or 0) for r in members) / max(1, n)
+        identity_avg = sum(float(r.get("quality_identity_usefulness", 0) or 0) for r in members) / max(1, n)
+        member_ids = [profile_image_id(r) for r in members]
+        filenames = [r.get("original_filename", "") for r in members]
+        image_paths = [r.get("original_path", "") or r.get("source_path", "") or r.get("image_path", "") for r in members]
+        summary = f"{frame} | {hair} | {glasses} | {visual}"
+        cluster = {
+            "cluster_id": cid,
+            "role": role,
+            "n": n,
+            "summary": summary,
+            "frame_group": frame,
+            "hair_family": hair,
+            "glasses_family": glasses,
+            "visual_group": visual,
+            "avg_quality_total": round(quality_avg, 1),
+            "avg_identity_usefulness": round(identity_avg, 1),
+            "shot_counts": dict(shot_counts),
+            "style_counts": dict(style_counts),
+            "members": member_ids,
+            "filenames": filenames,
+            "image_paths": image_paths,
+        }
+        clusters.append(cluster)
+        for mid in member_ids:
+            member_roles[mid] = role
+            member_clusters[mid] = cid
+
+    if len(clusters) > 10:
+        warnings.append(
+            f"Detected {len(clusters)} appearance clusters. If this is hard to review, merge/re-bucket variable traits first."
+        )
+    if any(c.get("visual_group") != "clean" and c.get("role") == "core" for c in clusters):
+        warnings.append("Filtered / black-and-white / tinted clusters should not be core by default.")
+    if len(hair_counter) > 2:
+        warnings.append("High hair-family variance across clean portrait clusters: " + ", ".join(f"{k}={v}" for k, v in hair_counter.most_common()))
+
+    return {
+        "schema": IDENTITY_CLUSTER_SCHEMA_VERSION,
+        "main_hair_family": main_hair,
+        "clusters": clusters,
+        "member_roles": member_roles,
+        "member_clusters": member_clusters,
+        "warnings": warnings,
+    }
+
+
+def attach_identity_clusters_to_profile(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    data = build_identity_appearance_clusters(rows, profile)
+    profile["identity_cluster_schema_version"] = IDENTITY_CLUSTER_SCHEMA_VERSION
+    profile["identity_clusters"] = data.get("clusters", [])
+    profile["identity_cluster_member_roles"] = data.get("member_roles", {})
+    profile["identity_cluster_member_clusters"] = data.get("member_clusters", {})
+    notes = profile.setdefault("normalizer_notes", [])
+    if isinstance(notes, list):
+        for w in data.get("warnings", []) or []:
+            notes.append("Identity clustering: " + str(w))
+        profile["normalizer_notes"] = notes[-30:]
+    return profile
+
+
+def identity_cluster_role_for_row(row: Dict[str, Any], profile: Optional[Dict[str, Any]]) -> str:
+    if not profile:
+        return ""
+    roles = profile.get("identity_cluster_member_roles", {}) or {}
+    image_id = row.get("profile_image_id") or profile_image_id(row)
+    role = str(roles.get(image_id, "") or "").strip().lower()
+    if role not in IDENTITY_CLUSTER_TRAIN_ROLES and role not in IDENTITY_CLUSTER_NONTRAIN_ROLES:
+        return ""
+    return role
+
+
+def apply_identity_cluster_roles_to_rows(rows: List[Dict[str, Any]], profile: Optional[Dict[str, Any]]) -> None:
+    for row in rows:
+        role = identity_cluster_role_for_row(row, profile)
+        if role:
+            row["identity_cluster_role"] = role
+
+
+def identity_cluster_role_bonus(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> float:
+    role = str(item.get("identity_cluster_role", "") or "").strip().lower()
+    if not role:
+        return 0.0
+    if role == "core":
+        core_count = sum(1 for s in selected if str(s.get("identity_cluster_role", "") or "").strip().lower() == "core")
+        max_core = max(2, int(round(float(TARGET_DATASET_SIZE) * float(IDENTITY_CLUSTER_MAX_CORE_SHARE))))
+        bonus = float(IDENTITY_CLUSTER_CORE_SCORE_BOOST)
+        if core_count >= max_core:
+            bonus -= float(IDENTITY_CLUSTER_CORE_OVERFLOW_PENALTY) * (core_count - max_core + 1)
+        return bonus
+    if role == "variation":
+        return float(IDENTITY_CLUSTER_VARIATION_SCORE_BOOST)
+    if role == "body_reference":
+        return float(IDENTITY_CLUSTER_BODY_SCORE_BOOST)
+    if role in {"review", "exclude"}:
+        return -9999.0
+    return 0.0
+
+
+def rebuild_selection_from_identity_roles(
+    all_rows: List[Dict[str, Any]],
+    profile: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Phase-3 Re-Ranking nach UI-Clusterrollen.
+
+    Fuer AI Toolkit gibt es weiterhin nur 'rein' oder 'raus'. Die Rollen steuern hier:
+    - core / variation / body_reference -> Kandidaten fuer 01_train_ready
+    - review -> 04_review
+    - exclude -> 02_keep_unused
+    Core bekommt einen kleinen Score-Boost, wird aber durch MAX_CORE_SHARE begrenzt,
+    damit Variation nicht wegoptimiert wird.
+    """
+    apply_identity_cluster_roles_to_rows(all_rows, profile)
+    has_roles = any(r.get("identity_cluster_role") for r in all_rows)
+    if not has_roles:
+        return [], [], []
+
+    train_candidates: List[Dict[str, Any]] = []
+    review_items: List[Dict[str, Any]] = []
+    overflow_items: List[Dict[str, Any]] = []
+    for row in all_rows:
+        if row.get("arcface_flag") == "hard" or row.get("base_status") == "reject":
+            continue
+        role = str(row.get("identity_cluster_role", "") or "").strip().lower()
+        if role in IDENTITY_CLUSTER_TRAIN_ROLES:
+            train_candidates.append(row)
+        elif role == "review" or row.get("base_status") == "review":
+            review_items.append(row)
+        elif role == "exclude":
+            overflow_items.append(row)
+        elif row.get("base_status") == "keep":
+            # Falls kein Cluster-Mapping fuer ein Bild existiert: nicht verlieren,
+            # aber nur als Overflow bereitstellen.
+            overflow_items.append(row)
+
+    if not train_candidates:
+        return [], [], []
+
+    selected = choose_final_dataset(train_candidates)
+    selected = crop_dedup_selected(selected)
+    selected, final_duplicate_rows = dedup_final_selected_scene_variants(selected)
+    selected_names = {r.get("original_filename") for r in selected}
+
+    unselected = [
+        r for r in train_candidates
+        if r.get("original_filename") not in selected_names
+        and r.get("base_status") != "reject"
+    ] + overflow_items
+
+    shot_order = {"headshot": 0, "medium": 1, "full_body": 2}
+    selected_sorted = sorted(
+        selected,
+        key=lambda r: (
+            shot_order.get(r.get("shot_type"), 9),
+            {"core": 0, "variation": 1, "body_reference": 2}.get(str(r.get("identity_cluster_role", "")), 9),
+            -float(r.get("quality_total", 0) or 0),
+        ),
+    )
+    review_sorted = sorted(review_items, key=lambda r: -float(r.get("quality_total", 0) or 0))
+    unselected_sorted = sorted(unselected, key=lambda r: -float(r.get("quality_total", 0) or 0))
+    return selected_sorted, review_sorted, unselected_sorted
 
 
 def deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -5119,6 +6097,7 @@ def save_subject_profile(profile: Dict[str, Any]) -> None:
                 "eye_color": "",
                 "hair_texture": "",
                 "body_build": "",
+                "body_height_impression": "",
             },
             "identity_markers": {
                 "glasses": {
@@ -5152,6 +6131,108 @@ def load_subject_profile_cache(input_hash: str) -> Optional[Dict[str, Any]]:
         return None
     return None
 
+
+
+def _trait_variance(values: List[str], min_unique: int = 3, max_mode_fraction: float = 0.70) -> Tuple[bool, Dict[str, Any]]:
+    clean = [normalize_text(v) for v in values if normalize_text(v) and normalize_text(v) not in {"none", "unknown", "unclear", "not_visible", "n_a"}]
+    if not clean:
+        return False, {"total": 0, "unique": 0, "mode": "", "mode_fraction": 0.0, "counts": {}}
+    counts = Counter(clean)
+    mode, count = counts.most_common(1)[0]
+    total = len(clean)
+    unique = len(counts)
+    mode_fraction = count / max(1, total)
+    variable = unique >= min_unique and mode_fraction <= max_mode_fraction
+    return variable, {
+        "total": total,
+        "unique": unique,
+        "mode": mode,
+        "mode_fraction": round(mode_fraction, 3),
+        "counts": dict(counts.most_common(12)),
+    }
+
+
+def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Attach dataset-wide policies for high-variation/cosplay datasets.
+
+    The goal is deliberately NOT to detect wigs or contact lenses reliably.
+    Instead, we use measurable dataset variance: if hair or eye color changes
+    strongly across usable images, captions should treat those traits as
+    visible per-image attributes rather than stable identity traits.
+    """
+    per_image = profile.get("per_image_traits", {}) or {}
+    trait_rows = list(per_image.values()) if isinstance(per_image, dict) else []
+    hair_color_variable, hair_color_stats = _trait_variance([t.get("hair_color_base", "") for t in trait_rows], min_unique=4, max_mode_fraction=0.72)
+    hair_form_variable, hair_form_stats = _trait_variance([t.get("hair_form", "") for t in trait_rows], min_unique=5, max_mode_fraction=0.70)
+    eye_color_variable, eye_color_stats = _trait_variance([t.get("eye_color_base", "") for t in trait_rows], min_unique=3, max_mode_fraction=0.78)
+    eye_appearance_counts = Counter(
+        normalize_text(t.get("eye_appearance", "")) for t in trait_rows
+        if normalize_text(t.get("eye_appearance", "")) and normalize_text(t.get("eye_appearance", "")) not in {"natural_eyes", "unclear"}
+    )
+    look_counts = Counter(
+        normalize_text(t.get("look_context", "")) for t in trait_rows
+        if normalize_text(t.get("look_context", "")) and normalize_text(t.get("look_context", "")) != "unclear"
+    )
+    cosplay_tokens = {"cosplay", "character_costume", "fantasy_costume", "stage_costume", "gyaru_style"}
+    cosplay_count = sum(c for k, c in look_counts.items() if k in cosplay_tokens)
+    total = max(1, len(trait_rows))
+    cosplay_fraction = cosplay_count / total
+
+    if cosplay_fraction >= 0.25:
+        appearance_mode = "cosplay_identity"
+    elif hair_color_variable or hair_form_variable or eye_color_variable:
+        appearance_mode = "high_variation_model_identity"
+    elif look_counts.get("fashion", 0) + look_counts.get("glamour", 0) >= max(3, int(total * 0.25)):
+        appearance_mode = "fashion_identity"
+    else:
+        appearance_mode = "natural_identity"
+
+    eye_variable = eye_color_variable or bool(eye_appearance_counts)
+    policies = profile.setdefault("profile_policies", {})
+    policies.update({
+        "appearance_mode": appearance_mode,
+        "hair_color_policy": "always_caption_when_visible" if hair_color_variable or appearance_mode in {"cosplay_identity", "high_variation_model_identity"} else "stable_or_caption_deviation",
+        "hair_form_policy": "always_caption_when_visible" if hair_form_variable or appearance_mode in {"cosplay_identity", "high_variation_model_identity"} else "stable_or_caption_deviation",
+        "eye_color_policy": "caption_when_clear_or_variable" if eye_variable else "stable_identity",
+        "makeup_policy": "always_caption_when_visible" if appearance_mode in {"cosplay_identity", "high_variation_model_identity"} else "caption_when_visible",
+        "costume_policy": "always_caption_when_visible" if appearance_mode in {"cosplay_identity", "high_variation_model_identity"} else "caption_when_visible",
+    })
+    profile["profile_appearance_mode"] = appearance_mode
+    profile["profile_variability_stats"] = {
+        "hair_color": hair_color_stats,
+        "hair_form": hair_form_stats,
+        "eye_color": eye_color_stats,
+        "eye_appearance_counts": dict(eye_appearance_counts.most_common(10)),
+        "look_context_counts": dict(look_counts.most_common(10)),
+        "cosplay_fraction": round(cosplay_fraction, 3),
+    }
+
+    if eye_variable:
+        stable = profile.setdefault("stable_identity", {})
+        prev_eye = stable.get("eye_color", "")
+        if prev_eye:
+            stable["eye_color"] = ""
+            conf = profile.setdefault("confidence", {})
+            existing = conf.get("eye_color", {})
+            if not isinstance(existing, dict):
+                existing = {"level": str(existing or ""), "reasoning": "", "outliers": []}
+            existing["level"] = "low"
+            existing["reasoning"] = "Demoted because eye color/cosmetic-lens appearance varies across the selected images."
+            existing.setdefault("outliers", [])
+            conf["eye_color"] = existing
+            profile.setdefault("normalizer_notes", []).append(
+                f"Eye color demoted from stable identity (was '{prev_eye}') because it varies across images or cosmetic/circle lenses are detected."
+            )
+
+    if hair_color_variable or hair_form_variable or appearance_mode in {"cosplay_identity", "high_variation_model_identity"}:
+        profile.setdefault("normalizer_notes", []).append(
+            "High hair/look variation detected: hair color/form will be captioned per image when visible instead of treated as a stable identity cue."
+        )
+    if appearance_mode == "cosplay_identity":
+        profile.setdefault("normalizer_notes", []).append(
+            "Cosplay mode enabled from dataset-wide look_context distribution; costume/headpiece/makeup traits remain per-image attributes."
+        )
+    return profile
 
 def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Baut/lädt das zentrale Subject-Profile und erzeugt per-image Tokens.
@@ -5189,7 +6270,10 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     # bei Headshots wegen RLHF-Bias).
     body_eligible = sum(1 for r in rows if normalize_text(r.get("shot_type")) in {"medium", "full_body"})
     body_eligible_fraction = body_eligible / max(1, len(rows))
-    if body_eligible_fraction < 0.30:
+    # Vorher wurde body_build bereits bei <30% Medium/Fullbody geleert.
+    # Fuer Identity-LoRAs mit wenigen, aber wertvollen Body-Shots ist das zu hart:
+    # 3-5 gute Body-Referenzen sollen den Koerperbau ins Profil einbringen duerfen.
+    if body_eligible < int(PROFILE_BODY_BUILD_MIN_ABSOLUTE) and body_eligible_fraction < float(PROFILE_BODY_BUILD_MIN_FRACTION):
         stable = profile.setdefault("stable_identity", {})
         prev_body = stable.get("body_build", "")
         if prev_body:
@@ -5205,6 +6289,14 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             )
             existing.setdefault("outliers", [])
             conf["body_build"] = existing
+            stable["body_height_impression"] = ""
+            height_conf = conf.get("body_height_impression", {})
+            if not isinstance(height_conf, dict):
+                height_conf = {"level": str(height_conf or ""), "reasoning": "", "outliers": []}
+            height_conf["level"] = "low"
+            height_conf["reasoning"] = existing.get("reasoning", "few full-body observations")
+            height_conf.setdefault("outliers", [])
+            conf["body_height_impression"] = height_conf
             profile.setdefault("normalizer_notes", []).append(
                 f"Body build demoted to empty (was '{prev_body}'): only "
                 f"{body_eligible}/{len(rows)} medium/full-body images. Override in UI if known."
@@ -5217,10 +6309,16 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         per_image[image_id] = per_image_profile_traits(row, profile)
 
     profile["per_image_traits"] = per_image
+    profile = attach_profile_variability_policies(profile, rows)
     profile["input_hash"] = input_hash
     profile["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
     profile["subject_id"] = profile.get("subject_id") or SAFE_TRIGGER
     profile["force_only_when_visible"] = True
+
+    # Identity-/Appearance-Cluster fuer den UI-Personality-Bereich.
+    # Wird nach per_image_traits gebaut, damit die Cluster dieselben normalisierten
+    # Merkmale nutzen wie die Captions.
+    profile = attach_identity_clusters_to_profile(profile, rows)
 
     override = load_profile_override()
     if override:
@@ -5235,7 +6333,9 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         f"skin={stable.get('skin_tone','') or '-'} | "
         f"eyes={stable.get('eye_color','') or '-'} | "
         f"hair_texture={stable.get('hair_texture','') or '-'} | "
-        f"body={stable.get('body_build','') or '-'}"
+        f"body={stable.get('body_build','') or '-'} | "
+        f"height={stable.get('body_height_impression','') or '-'} | "
+        f"mode={profile.get('profile_appearance_mode','') or '-'}"
     )
     return profile
 
@@ -5251,6 +6351,9 @@ def subject_profile_report_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
         "total_usable_images": profile.get("total_usable_images", 0),
         "force_only_when_visible": profile.get("force_only_when_visible", True),
         "stable_identity": profile.get("stable_identity", {}),
+        "profile_appearance_mode": profile.get("profile_appearance_mode", ""),
+        "profile_policies": profile.get("profile_policies", {}),
+        "profile_variability_stats": profile.get("profile_variability_stats", {}),
         "confidence": profile.get("confidence", {}),
         "identity_markers": profile.get("identity_markers", {}),
         "normalizer_notes": profile.get("normalizer_notes", []),
@@ -5531,15 +6634,20 @@ def write_caption_stage_reports(
         "gender_class", "face_visible", "face_occlusion", "multiple_people",
         "main_subject_clear", "watermark_or_overlay", "prominent_readable_text",
         "image_medium",
-        "mirror_selfie", "hair_description", "beard_description", "glasses_description",
-        "piercings_description", "makeup_description", "skin_tone", "eye_color", "body_build",
-        "freckles_description",
+        "mirror_selfie", "frame_subtype", "visual_style_type",
+        "look_context",
+        "hair_description", "hair_length", "beard_description", "glasses_description",
+        "piercings_description", "makeup_description", "makeup_intensity", "makeup_style",
+        "skin_tone", "eye_color", "eye_appearance", "body_build",
+        "body_height_impression", "freckles_description", "costume_accessories",
         "body_skin_visibility",
         "face_orientation_in_frame",
         "tattoos_visible", "tattoos_description", "clothing_description", "pose_description",
-        "expression", "gaze_direction", "head_pose_bucket", "background_description",
+        "expression", "expression_category", "gaze_direction", "gaze_category",
+        "head_pose_bucket", "occlusion_type", "background_description",
         "lighting_description", "lighting_type", "background_type", "hair_texture",
-        "makeup_intensity", "has_glasses_now", "glasses_frame_shape", "issues",
+        "has_glasses_now", "glasses_frame_shape",
+        "glasses_frame_material", "glasses_lens_type", "issues",
         "short_reason", "local_override_reasons", "duplicate_of", "duplicate_method",
         "duplicate_distance", "main_face_ratio", "secondary_face_area_ratio",
         "face_count_local", "width", "height",
@@ -5553,6 +6661,7 @@ def write_caption_stage_reports(
         for row in all_rows:
             row_copy = dict(row)
             row_copy["issues"] = ", ".join(row_copy.get("issues", [])) if isinstance(row_copy.get("issues"), list) else row_copy.get("issues", "")
+            row_copy["costume_accessories"] = ", ".join(row_copy.get("costume_accessories", [])) if isinstance(row_copy.get("costume_accessories"), list) else row_copy.get("costume_accessories", "")
             row_copy["local_override_reasons"] = ", ".join(row_copy.get("local_override_reasons", [])) if isinstance(row_copy.get("local_override_reasons"), list) else row_copy.get("local_override_reasons", "")
             writer.writerow(row_copy)
 
@@ -5649,6 +6758,16 @@ def continue_caption_from_profile() -> None:
     identity_summary = stage.get("identity_summary", {}) or {}
     warnings = stage.get("warnings", []) or []
     valid_candidate_count = int(stage.get("valid_candidate_count", 0) or 0)
+
+    reranked_selected, reranked_review, reranked_unused = rebuild_selection_from_identity_roles(all_rows, subject_profile)
+    if reranked_selected:
+        safe_print(
+            f"   🧩 Identity roles applied: train_ready={len(reranked_selected)} | "
+            f"review={len(reranked_review)} | keep_unused={len(reranked_unused)}"
+        )
+        selected_sorted = reranked_selected
+        review_items = reranked_review
+        unselected_keep = reranked_unused
 
     clean_caption_output_dirs()
     row_index = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
@@ -5794,19 +6913,22 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
         # dominiert, ist die API-Meldung wahrscheinlich ein Mismatch (Reflexion
         # in Brille, Hintergrund-Statist, Spiegelbild). Dann statt hard reject
         # -> review. Sonst -> reject.
-        if (ENABLE_MULTIPLE_PEOPLE_DOMINANCE_OVERRIDE
-                and face_count_local >= 2
-                and 0.0 < sec_ratio < CO_FACE_AREA_RATIO_THRESHOLD
-                and score >= MULTIPLE_PEOPLE_SOFT_SCORE_MIN):
-            reasons.append(
-                f"multiple_people_dominant_main_face(sec_ratio={sec_ratio:.2f},score={score})"
-            )
-            item.setdefault("status_notes", []).append(
-                f"multiple_people_downgraded_to_review_sec_ratio_{sec_ratio:.2f}"
-            )
-            return "review", reasons
-        reasons.append("multiple_people")
-        return "reject", reasons
+  
+    # ── POSE-FILTER ────────────────────────────────────────────────────
+    # Filtere unvorteilhafte Posen (kniend nach vorn, liegend, auf allen Vieren)
+    # direkt auf "reject", da das LoRA-Modell diese Haltungen ueberlernt.
+    pose_desc = str(item.get("pose_description", "")).lower()
+    bad_pose_keywords = [
+        "crouched on hands and knees", "on hands and knees", "all fours",
+        "lying on a bed", "lying on", "reclining", 
+        "kneeling forward", "leaning forward", 
+        "crouching forward", "crouched forward"
+    ]
+    for bad_kw in bad_pose_keywords:
+        if bad_kw in pose_desc:
+            reasons.append(f"bad_lora_pose: {bad_kw}")
+            item.setdefault("status_notes", []).append(f"pose_override: {pose_desc}")
+            return "reject", reasons
 
     # ── SUBJECT-SANITY-CHECK (nach Gesichts-Erkennung) ─────────────────────
     # Bilder ohne sichtbares Gesicht UND ohne erkennbaren Torso sind
@@ -6156,6 +7278,218 @@ def crop_dedup_selected(selected: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [r for r in selected if r["original_filename"] not in to_remove]
 
 
+# --- Final selected-set duplicate guard ------------------------------------
+# Early pHash/CLIP dedup runs before the final dataset is assembled. In real
+# phone/Google/WhatsApp exports the same source moment can still survive as a
+# crop/resized variant with a different filename. This final guard is deliberately
+# later and stricter in scope: it only compares images that were already selected
+# for 01_train_ready and suppresses one when the scene, outfit and pose are close
+# enough that both would teach the same frame.
+_FINAL_DUP_STOPWORDS = {
+    "a", "an", "and", "are", "at", "both", "from", "he", "her", "his", "in",
+    "is", "of", "on", "she", "the", "they", "to", "with", "wearing",
+    "standing", "sitting", "looking", "photo", "portrait", "image",
+}
+
+
+def _duplicate_token_set(value: Any) -> set:
+    text = normalize_compact_text(value)
+    tokens = set()
+    for token in re.findall(r"[a-z0-9]+", text):
+        if len(token) < 3 or token in _FINAL_DUP_STOPWORDS:
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def _token_jaccard(a: Any, b: Any) -> float:
+    ta = _duplicate_token_set(a)
+    tb = _duplicate_token_set(b)
+    if not ta and not tb:
+        return 0.0
+    return len(ta & tb) / max(1, len(ta | tb))
+
+
+def _final_duplicate_text_blob(item: Dict[str, Any]) -> str:
+    fields = [
+        "clothing_description",
+        "pose_description",
+        "expression",
+        "gaze_direction",
+        "background_description",
+        "lighting_description",
+    ]
+    return " ".join(str(item.get(f, "") or "") for f in fields)
+
+
+def _safe_float_value(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def export_crop_retention_fraction(item: Dict[str, Any]) -> float:
+    """Approximate how much of the original frame survives the export crop.
+
+    This is mainly used as a tie-breaker for near-duplicate scene variants. For
+    full-body landscape shots a more conservative/wider source often preserves
+    arms/legs better after conversion to the AI-Toolkit training aspect ratio.
+    """
+    w = int(_safe_float_value(item.get("width"), 0))
+    h = int(_safe_float_value(item.get("height"), 0))
+    if w <= 0 or h <= 0:
+        return 0.0
+
+    shot_type = str(item.get("shot_type", "") or "").strip().lower()
+    if shot_type in {"medium", "full_body"}:
+        aspect = 832 / 1216
+    else:
+        aspect = 1.0
+
+    crop_h = h
+    crop_w = int(round(crop_h * aspect))
+    if crop_w > w:
+        crop_w = w
+        crop_h = int(round(crop_w / aspect))
+    return max(0.0, min(1.0, (crop_w * crop_h) / max(1.0, float(w * h))))
+
+
+def final_duplicate_keeper_score(item: Dict[str, Any]) -> float:
+    score = _safe_float_value(item.get("quality_total"), 0.0)
+    shot_type = str(item.get("shot_type", "") or "").strip().lower()
+    retention = export_crop_retention_fraction(item)
+    # Full-body duplicates should prefer the source that survives the export
+    # crop better, even when its API quality score is marginally lower.
+    if shot_type == "full_body":
+        score += retention * 20.0
+    elif shot_type == "medium":
+        score += retention * 8.0
+    else:
+        score += retention * 3.0
+
+    width = _safe_float_value(item.get("width"), 0.0)
+    height = _safe_float_value(item.get("height"), 0.0)
+    score += min((width * height) / 1_000_000.0, 16.0) * 0.15
+    return score
+
+
+def is_same_smart_crop_family(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    a_name = str(a.get("original_filename", "") or "")
+    b_name = str(b.get("original_filename", "") or "")
+    a_crop_of = str(a.get("crop_of", "") or "")
+    b_crop_of = str(b.get("crop_of", "") or "")
+    return bool(
+        (a_crop_of and a_crop_of == b_name) or
+        (b_crop_of and b_crop_of == a_name) or
+        (a_crop_of and b_crop_of and a_crop_of == b_crop_of)
+    )
+
+
+def is_final_scene_duplicate(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[bool, str, float]:
+    if is_same_smart_crop_family(a, b):
+        return True, "smart_crop_family", 1.0
+
+    if str(a.get("shot_type", "") or "") != str(b.get("shot_type", "") or ""):
+        return False, "", 0.0
+
+    # CLIP, if present, is the strongest signal. Keep the threshold lower than
+    # the global duplicate filter because this only runs inside the already
+    # selected final set.
+    if USE_CLIP_DUPLICATE_SCORING and a.get("clip_embedding") is not None and b.get("clip_embedding") is not None:
+        sim = clip_cosine(a.get("clip_embedding"), b.get("clip_embedding"))
+        if sim >= 0.90:
+            return True, "final_clip_scene", float(sim)
+
+    clothing_sim = _token_jaccard(a.get("clothing_description"), b.get("clothing_description"))
+    background_sim = _token_jaccard(a.get("background_description"), b.get("background_description"))
+    pose_sim = _token_jaccard(
+        " ".join(str(a.get(f, "") or "") for f in ["pose_description", "expression", "gaze_direction"]),
+        " ".join(str(b.get(f, "") or "") for f in ["pose_description", "expression", "gaze_direction"]),
+    )
+    combo_sim = _token_jaccard(_final_duplicate_text_blob(a), _final_duplicate_text_blob(b))
+
+    # Very conservative text fallback: outfit + background + pose/expression
+    # need to agree, or the combined caption-like scene text must be highly
+    # overlapping. This catches same-moment crop/original exports without
+    # removing ordinary same-outfit variation too aggressively.
+    if combo_sim >= 0.52:
+        return True, "final_scene_text", combo_sim
+    if clothing_sim >= 0.38 and background_sim >= 0.45 and pose_sim >= 0.25:
+        return True, "final_scene_text_parts", min(0.99, (clothing_sim + background_sim + pose_sim) / 3.0)
+
+    return False, "", max(combo_sim, clothing_sim, background_sim, pose_sim)
+
+
+def dedup_final_selected_scene_variants(selected: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Remove final-set crop/scene variants so they do not land in train_ready
+    *or* keep_unused.
+
+    Returns (kept_selected, suppressed_duplicates). Suppressed rows are marked as
+    rejects/duplicates so the later keep_unused export will not preserve both
+    versions.
+    """
+    if len(selected) < 2:
+        return selected, []
+
+    kept: List[Dict[str, Any]] = []
+    suppressed: List[Dict[str, Any]] = []
+
+    # Strongest candidate first, but still allow a later item to replace an
+    # earlier representative if it is clearly a better export source.
+    for item in sorted(selected, key=final_duplicate_keeper_score, reverse=True):
+        duplicate_rep = None
+        duplicate_method = ""
+        duplicate_distance = 0.0
+        for rep in kept:
+            is_dup, method, distance = is_final_scene_duplicate(item, rep)
+            if is_dup:
+                duplicate_rep = rep
+                duplicate_method = method
+                duplicate_distance = distance
+                break
+
+        if duplicate_rep is None:
+            kept.append(item)
+            continue
+
+        item_score = final_duplicate_keeper_score(item)
+        rep_score = final_duplicate_keeper_score(duplicate_rep)
+        if item_score > rep_score + 0.25:
+            # Replace previous representative with the better export source.
+            kept.remove(duplicate_rep)
+            suppressed.append(duplicate_rep)
+            kept.append(item)
+            loser = duplicate_rep
+            winner = item
+        else:
+            suppressed.append(item)
+            loser = item
+            winner = duplicate_rep
+
+        loser["base_status"] = "reject"
+        loser["final_status"] = "reject"
+        loser["selected"] = False
+        loser["duplicate_of"] = winner.get("original_filename", "")
+        loser["duplicate_method"] = duplicate_method or "final_scene_duplicate"
+        loser["duplicate_distance"] = round(float(duplicate_distance), 6)
+        loser.setdefault("status_notes", []).append("final_selected_scene_duplicate")
+        loser["short_reason"] = (
+            f"final_selected_scene_duplicate_of:{winner.get('original_filename','')} "
+            f"method:{duplicate_method or 'final_scene_duplicate'}"
+        )
+        safe_print(
+            f"   🔁 Final duplicate suppressed: {loser.get('original_filename','')} "
+            f"→ duplicate of {winner.get('original_filename','')} "
+            f"({duplicate_method}, score {final_duplicate_keeper_score(loser):.1f} vs "
+            f"{final_duplicate_keeper_score(winner):.1f})"
+        )
+
+    return kept, suppressed
+
+
 def quotas_for_target(target_size: int, available_counts: Dict[str, int]) -> Dict[str, int]:
     raw = {
         "headshot": int(round(target_size * RATIO_HEADSHOT)),
@@ -6331,6 +7665,10 @@ def adjusted_pick_score(item: Dict[str, Any], selected: List[Dict[str, Any]]) ->
     # bei gleicher Bildqualitaet. Nur fuer full_body und medium relevant.
     base += body_visibility_bonus(item)
 
+    # UI-Clusterrollen aus dem Subject-Profile: core darf im Ranking etwas
+    # nach oben, aber mit Core-Share-Bremse, damit Variation nicht stirbt.
+    base += identity_cluster_role_bonus(item, selected)
+
     # Face-Orientation-Penalty: bestraft Bilder mit gekippten/seitlichen/
     # umgekehrten Gesichtern im Frame (LoRA-Anti-Toxin).
     base -= face_orientation_penalty(item)
@@ -6406,13 +7744,28 @@ def choose_final_dataset(clean_keep_items: List[Dict[str, Any]]) -> List[Dict[st
 # 9) CAPTIONING
 # ============================================================
 
-def photo_type_phrase(shot_type: str, mirror_selfie: bool) -> str:
-    if mirror_selfie:
+def photo_type_phrase(shot_type: str, mirror_selfie: bool, frame_subtype: str = "") -> str:
+    # shot_type bleibt die harte Auswahl-/Quotengruppe. frame_subtype ist nur
+    # fuer eine etwas natuerlichere Caption relevant.
+    subtype = normalize_text(frame_subtype)
+    if mirror_selfie or subtype == "mirror_selfie":
         return {
             "headshot": "mirror selfie photo",
             "medium": "mirror selfie photo",
             "full_body": "full-body mirror selfie photo",
         }.get(shot_type, "mirror selfie photo")
+
+    subtype_map = {
+        "close_up": "close-up photo",
+        "portrait": "portrait photo",
+        "selfie": "selfie photo",
+        "three_quarter_body": "three-quarter body portrait photo",
+        "full_body": "full-body photo",
+        "faceless_body": "faceless body-reference photo",
+        "detail_only": "detail photo",
+    }
+    if subtype in subtype_map:
+        return subtype_map[subtype]
 
     return {
         "headshot": "close-up photo",
@@ -6454,17 +7807,37 @@ def normalize_hair_tag(raw: str) -> dict:
         return {"color": None, "style": None, "visible": False}
 
     # Haarfarbe
-    if any(x in d for x in ["red hair", "auburn", "reddish"]):
+    if any(x in d for x in ["strawberry blonde", "strawberry-blonde"]):
+        color = "strawberry blonde"
+    elif any(x in d for x in ["platinum", "white blonde", "white-blonde"]):
+        color = "platinum"
+    elif any(x in d for x in ["auburn"]):
+        color = "auburn"
+    elif any(x in d for x in ["red hair", "reddish"]):
         color = "red"
+    elif "copper" in d:
+        color = "copper"
     elif "blue" in d:
         color = "blue"
+    elif "pink" in d:
+        color = "pink"
+    elif any(x in d for x in ["purple", "violet"]):
+        color = "purple"
+    elif "green" in d or "mint" in d:
+        color = "green"
     elif any(x in d for x in ["dark brown", "dark hair", "brunette", "black"]):
         color = "dark"
-    elif any(x in d for x in ["brown", "light brown"]):
+    elif any(x in d for x in ["light brown", "dirty blonde"]):
+        color = "light brown"
+    elif "dark blonde" in d:
+        color = "dark blonde"
+    elif any(x in d for x in ["brown"]):
         color = "brown"
     elif any(x in d for x in ["blonde", "blond", "light blonde", "light-blonde",
                                "light colored", "light-colored"]):
         color = "blonde"
+    elif any(x in d for x in ["white hair", "white wig", "silver hair", "gray hair", "grey hair"]):
+        color = "white"
     else:
         color = "other"
 
@@ -6740,7 +8113,7 @@ def build_caption(
 ) -> str:
     shot_type = item.get("shot_type", "headshot")
     mirror_selfie = bool(item.get("mirror_selfie", False))
-    photo_type = photo_type_phrase(shot_type, mirror_selfie)
+    photo_type = photo_type_phrase(shot_type, mirror_selfie, item.get("frame_subtype", ""))
     caption_profile = normalize_caption_profile(globals().get("CAPTION_PROFILE", "ernie"))
 
     profile = subject_profile or {}
@@ -6752,8 +8125,13 @@ def build_caption(
     gender_class = normalize_feature_value(stable_identity.get("gender")) or normalize_feature_value(item.get("gender_class")) or "person"
     beard_desc = compact_trait(item.get("beard_description"))
 
+    profile_policies = profile.get("profile_policies", {}) if isinstance(profile, dict) else {}
     skin_tone = compact_trait(stable_identity.get("skin_tone")) or compact_trait(item.get("skin_tone"))
-    eye_color = compact_trait(stable_identity.get("eye_color")) or compact_trait(item.get("eye_color"))
+    eye_policy = normalize_text(profile_policies.get("eye_color_policy"))
+    if eye_policy == "caption_when_clear_or_variable":
+        eye_color = compact_trait(image_traits.get("eye_color_base")) or compact_trait(item.get("eye_color"))
+    else:
+        eye_color = compact_trait(stable_identity.get("eye_color")) or compact_trait(item.get("eye_color"))
     # Body-Build-Sticky-Empty: Wenn das Profile bewusst body_build = "" gesetzt hat
     # (z.B. wegen Headshot-Dominanz oder User-Override im UI), darf NICHT auf den
     # per-image Audit-Wert zurueckgefallen werden. Sonst wuerde die Demotion sinnlos.
@@ -6767,21 +8145,42 @@ def build_caption(
     profile_hair_tag = profile_hair_caption(hair_color, hair_form)
 
     hair_desc = compact_trait(item.get("hair_description"))
-    if profile_hair_tag:
-        hair_tag = profile_hair_tag
-    elif CAPTION_POLICY["include_hair_always"] and hair_desc:
-        hair_tag = hair_desc
-    elif CAPTION_POLICY["include_hair_when_variable"]:
+    hair_policy_variable = (
+        normalize_text(profile_policies.get("hair_color_policy")) == "always_caption_when_visible"
+        or normalize_text(profile_policies.get("hair_form_policy")) == "always_caption_when_visible"
+    )
+    hair_rule = global_rules.get("hair_description", {}) if isinstance(global_rules, dict) else {}
+    hair_global_variable = bool(isinstance(hair_rule, dict) and hair_rule.get("variable"))
+    if caption_profile in {"ernie", "shared_compact"}:
+        hair_tag = profile_hair_tag or (hair_desc if CAPTION_POLICY.get("include_hair_always") else None)
+        if not hair_tag and CAPTION_POLICY.get("include_hair_when_variable"):
+            hair_tag = build_hair_caption_tag(item, global_rules)
+    elif CAPTION_POLICY.get("include_hair_always"):
+        hair_tag = profile_hair_tag or hair_desc or build_hair_caption_tag(item, global_rules)
+    elif CAPTION_POLICY.get("include_hair_when_variable") and (hair_policy_variable or hair_global_variable):
+        hair_tag = profile_hair_tag or hair_desc or build_hair_caption_tag(item, global_rules)
+    elif CAPTION_POLICY.get("include_hair_when_variable"):
         hair_tag = build_hair_caption_tag(item, global_rules)
     else:
         hair_tag = None
 
     makeup_token = image_traits.get("makeup_intensity", "")
+    makeup_style_token = image_traits.get("makeup_style", "")
     makeup_desc = ""
-    if makeup_token and makeup_token not in {"none", "no"}:
+    if makeup_style_token and makeup_style_token not in {"none", "no", "unclear", "natural_makeup"}:
+        makeup_desc = _phrase_from_token(makeup_style_token)
+    elif makeup_token and makeup_token not in {"none", "no", "unclear"}:
         makeup_desc = f"{_phrase_from_token(makeup_token)} makeup"
     else:
         makeup_desc = compact_trait(item.get("makeup_description"))
+
+    costume_accessories = image_traits.get("costume_accessories", [])
+    if not isinstance(costume_accessories, list):
+        costume_accessories = []
+    costume_bits = [
+        _phrase_from_token(t) for t in costume_accessories
+        if normalize_text(t) not in {"", "none", "none_visible", "unclear"}
+    ]
 
     markers = profile.get("identity_markers", {}) if isinstance(profile, dict) else {}
     glasses_profile = markers.get("glasses", {}) if isinstance(markers, dict) else {}
@@ -6861,7 +8260,7 @@ def build_caption(
         if hair_tag:
             anchor_parts.append(hair_tag)
         if CAPTION_POLICY.get("include_eye_color") and eye_color:
-            anchor_parts.append(f"{eye_color} eyes")
+            anchor_parts.append(f"{_phrase_from_token(eye_color)} eyes")
         if CAPTION_POLICY["include_skin_tone"] and skin_tone:
             anchor_parts.append(f"{skin_tone} skin")
 
@@ -6880,10 +8279,19 @@ def build_caption(
 
     if shot_type in {"medium", "full_body"} and CAPTION_POLICY["include_body_build"] and body_build:
         # Grammatical compact tag: "slim build" instead of a dangling "slim".
-        trait_bits.append(body_build if "build" in body_build else f"{body_build} build")
+        body_build_phrase = _phrase_from_token(body_build)
+        trait_bits.append(body_build_phrase if "build" in body_build_phrase else f"{body_build_phrase} build")
 
     if caption_profile not in {"ernie", "shared_compact"} and hair_tag:
         trait_bits.append(hair_tag)
+
+    if (
+        caption_profile not in {"ernie", "shared_compact"}
+        and CAPTION_POLICY.get("include_eye_color_when_variable")
+        and eye_policy == "caption_when_clear_or_variable"
+        and eye_color
+    ):
+        trait_bits.append(f"{_phrase_from_token(eye_color)} eyes")
 
     beard_rule = global_rules.get("beard_description", {})
     beard_variable = beard_rule.get("variable", False)
@@ -6924,6 +8332,9 @@ def build_caption(
 
     if CAPTION_POLICY["include_makeup"] and makeup_desc:
         trait_bits.append(makeup_desc)
+
+    if CAPTION_POLICY.get("include_costume_accessories") and costume_bits:
+        trait_bits.extend(costume_bits)
 
     if CAPTION_POLICY["include_tattoos"]:
         trait_bits.extend(tattoo_bits)
@@ -7006,8 +8417,9 @@ def build_caption(
 
     caption = " ".join(sentences)
     caption = re.sub(r"\s+", " ", caption).strip()
-    # Bug-Fix: 'eyeglasses' konsistent zu 'glasses' normalisieren. 'sunglasses'
-    # bleibt unveraendert. Greift auch auf eingebaute Trait-Phrases der KI.
+    # Brillen-Wording absichtlich NICHT global vereinheitlichen:
+    # der Canonical-Begriff aus dem Subject Profile soll wortgleich in die
+    # Caption gehen (z.B. "eyeglasses" bleibt "eyeglasses").
     caption = _normalize_glasses_token(caption)
     return caption
 
@@ -8006,8 +9418,14 @@ def main() -> None:
 
     selected = choose_final_dataset(valid_candidates)
     # Wenn sowohl Original als auch sein Smart-Crop ausgewählt wurden,
-    # behalte nur den besseren von beiden.
+    # behalte nur den besseren von beiden. Anschließend finaler Schutz gegen
+    # Crop-/Resize-/Scene-Varianten, die mit anderem Dateinamen in derselben
+    # Endauswahl gelandet sind. Unterdrückte Varianten werden als Duplicate
+    # markiert und landen dadurch nicht zusätzlich in keep_unused.
     selected = crop_dedup_selected(selected)
+    selected, final_duplicate_rows = dedup_final_selected_scene_variants(selected)
+    if final_duplicate_rows:
+        reject_items.extend(final_duplicate_rows)
 
     # ── Identity-Konsistenz-Check (ArcFace) ──────────────────────────────
     # Berechnet pro Bild die Aehnlichkeit zur "Set-Identitaet" (outlier-
@@ -8424,13 +9842,22 @@ def main() -> None:
         "prominent_readable_text",
         "image_medium",
         "mirror_selfie",
+        "frame_subtype",
+        "visual_style_type",
+        "look_context",
         "hair_description",
+        "hair_length",
         "beard_description",
         "glasses_description",
         "piercings_description",
         "makeup_description",
+        "makeup_intensity",
+        "makeup_style",
         "skin_tone",
+        "eye_color",
+        "eye_appearance",
         "body_build",
+        "body_height_impression",
         "body_skin_visibility",
         "face_orientation_in_frame",
         "tattoos_visible",
@@ -8438,10 +9865,21 @@ def main() -> None:
         "clothing_description",
         "pose_description",
         "expression",
+        "expression_category",
         "gaze_direction",
+        "gaze_category",
         "head_pose_bucket",
+        "occlusion_type",
         "background_description",
         "lighting_description",
+        "lighting_type",
+        "background_type",
+        "hair_texture",
+        "has_glasses_now",
+        "glasses_frame_shape",
+        "glasses_frame_material",
+        "glasses_lens_type",
+        "costume_accessories",
         "issues",
         "short_reason",
         "local_override_reasons",
