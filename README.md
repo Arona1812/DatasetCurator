@@ -27,9 +27,12 @@ Many checks and review steps are optional or configurable in the UI. The main fe
 - Web UI with saved settings and English/German language switching
 - Local pre-filtering and duplicate detection before expensive API calls
 - OpenAI-assisted image review and automatic captioning
+- Dedicated `Krea 2 Character` workflow with dataset-aware natural-language captions
 - Centralized subject profile generation from audited images
 - Profile-guided caption normalization for more consistent dataset-wide captions
-- Optional smart crop, subject checks and diversity balancing
+- Separate IG-frame cleanup, headshot smart crop and medium-shot rescue crop
+- Optional controlled export buckets; natural image composition is preserved by default
+- Subject checks, identity consistency and diversity balancing
 - Structured outputs for train-ready, review and manual cleanup workflows
 - Export of captions, CSV, JSONL and a markdown dataset report
 
@@ -125,6 +128,34 @@ python dataset_curator_ui.py
 
 6. Use the `01_train_ready` files and selected pictures from `04_review` for your LoRA training. Also check `02_keep_unused`, `03_caption_remove` and `06_needs_manual_review` for shots that may only need minor manual cleanup, manual selection or recaptioning.
 
+### Krea 2 Character workflow
+
+Select the caption preset **`Krea 2 Character`** when preparing a person or character dataset for Krea 2. Selecting the preset applies the recommended starting configuration:
+
+- target size: **20 images**,
+- shot distribution: **40% headshot / 35% medium / 25% full body**,
+- primary audit: **`gpt-5.6-luna`**,
+- subject-profile normalization: **`gpt-5.6-terra`**,
+- final natural-language captions: **`gpt-5.6-luna`**.
+
+The profile stores stable identity and body information for consistency checks. Stable traits such as body build, tattoos, permanent piercings, scars and canonical facial features are not repeated in Krea captions; the trigger token carries that identity. Captions instead focus on visible, image-specific information such as framing, pose, action, expression, gaze, clothing, temporary accessories, background, lighting, camera angle and composition.
+
+For the most controllable result, use `Profile then Caption`, review the subject profile, and then start the final caption pass from the profile tab. Only selected training images receive the additional Krea natural-language caption call.
+
+### Crop and export mechanisms
+
+The curator treats three mechanisms separately:
+
+1. **IG-frame cleanup** removes detected social-media borders before audit and selection.
+2. **Rescue crops** create additional candidates without changing the original image classification:
+   - Smart Pre-Crop can recover a headshot from a large image with a small face.
+   - Medium Rescue Crop can recover a usable torso/hip composition from a weak full-body image.
+3. **Controlled buckets** affect only the final export and are **off by default**:
+   - off: preserve the selected image's natural composition and let the trainer bucket it,
+   - on: export headshots at `1024×1024` and medium/full-body images at `832×1216`.
+
+There is no legacy mode that forces every image into a square crop.
+
 ### 2. Video Processor
 
 1. In the **Video Processor** tab:
@@ -209,3 +240,15 @@ You are responsible for:
 - complying with the license and usage terms of the OpenAI API and any other external services.
 
 The author assumes no liability for the use of this tool in production or commercial environments.
+
+### Configurable reasoning effort
+
+The UI exposes separate `reasoning.effort` selectors for:
+
+- regular image audits
+- trigger-word checks
+- review escalation
+- subject-profile normalization
+- final Krea 2 captions
+
+Recommended Krea 2 defaults are `none` for routine audits, trigger checks and final captions, and `low` for Terra-based escalation and subject-profile reconciliation. GPT-5.6 also supports `medium`, `high`, `xhigh` and `max`; higher settings increase latency and token use. Selecting the Krea 2 preset restores these recommended stage-specific values.

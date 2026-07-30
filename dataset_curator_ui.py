@@ -140,6 +140,25 @@ Z_IMAGE_BASE_CAPTION_FIELDS: List[str] = [
     "include_visual_style",
 ]
 
+# Krea 2 character profile: stable physical identity is recorded in the
+# subject profile for QC but deliberately omitted from captions. Captions focus
+# on visible scene-specific attributes and are generated as natural language.
+KREA2_CHARACTER_CAPTION_FIELDS: List[str] = [
+    "include_glasses",
+    "include_makeup",
+    "include_background",
+    "include_lighting",
+    "include_gaze",
+    "include_expression",
+    "include_hair_when_variable",
+    "include_eye_color_when_variable",
+    "include_costume_accessories",
+    "include_beard_when_variable",
+    "include_mirror_selfie_marker",
+    "include_visual_style",
+]
+
+
 DEFAULTS: Dict[str, Any] = {
     # UI
     "ui_language": "en",
@@ -148,12 +167,15 @@ DEFAULTS: Dict[str, Any] = {
     "c_input": r"",
     "c_target": 30,
     "c_api_key": "",
-    "c_model": "gpt-5.4-mini",
+    "c_model": "gpt-5.6-luna",
+    "c_audit_reasoning_effort": "none",
     "c_openai_token_limit": 0,
     "c_use_trigger_check": False,
-    "c_trigger_model": "gpt-5.4-mini",
+    "c_trigger_model": "gpt-5.6-luna",
+    "c_trigger_reasoning_effort": "none",
     "c_use_review_escalation": False,
     "c_review_escalation_model": "",
+    "c_review_escalation_reasoning_effort": "low",
     "c_review_escalation_score_min": 50,
     "c_review_escalation_score_max": 58,
     "c_escalate_on_review": True,
@@ -203,6 +225,8 @@ DEFAULTS: Dict[str, Any] = {
     "c_smart_crop": True,
     "c_crop_gain": 8,
     "c_crop_pad": 1.5,
+    "c_medium_rescue_crop": True,
+    "c_medium_rescue_gain": 4,
     # Clustering
     "c_use_cluster": True,
     "c_max_outfit": 4,
@@ -223,9 +247,12 @@ DEFAULTS: Dict[str, Any] = {
     # Captions
     "c_caption_profile": "shared_compact",
     "c_captions": list(SHARED_COMPACT_CAPTION_FIELDS),
+    "c_krea_caption_model": "gpt-5.6-luna",
+    "c_krea_caption_reasoning_effort": "none",
     # Subject Profile / Phase 2
     "c_pipeline_mode": "single_pass",
-    "c_profile_normalizer_model": "gpt-5.4-mini",
+    "c_profile_normalizer_model": "gpt-5.6-terra",
+    "c_profile_reasoning_effort": "low",
     "c_profile_sample_threshold": 100,
     "c_profile_sample_size": 80,
     "c_profile_ui_per_image_threshold": 30,
@@ -233,6 +260,7 @@ DEFAULTS: Dict[str, Any] = {
     "c_exp_review": True,
     "c_exp_reject": True,
     "c_exp_compare": True,
+    "c_controlled_buckets": False,
     # Video Processor
     "v_source": r".\00_videos",
     "v_target": r".\00_input",
@@ -243,7 +271,20 @@ DEFAULTS: Dict[str, Any] = {
     "v_sharp": 50,
 }
 
+REASONING_EFFORT_CHOICES: List[str] = [
+    "none",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+]
+
 OPENAI_MODEL_PRESET_CHOICES: List[str] = [
+    "gpt-5.6-luna",
+    "gpt-5.6-terra",
+    "gpt-5.6-sol",
+    "gpt-5.6",
     "gpt-5.4-mini",
     "gpt-5.4-nano",
     "gpt-5.4",
@@ -284,6 +325,7 @@ CAPTION_PROFILE_PRESETS: Dict[str, List[str]] = {
     # stabile Person-Identitaet, Captions beschreiben nur was zwischen
     # Bildern wechselt.
     "z_image_base": list(Z_IMAGE_BASE_CAPTION_FIELDS),
+    "krea2_character": list(KREA2_CHARACTER_CAPTION_FIELDS),
     # Legacy-Alias: bestehende Configs mit "shared_compact" werden
     # automatisch wie ERNIE behandelt (das war urspruenglich das einzige
     # Profil, faktisch ERNIE-Style).
@@ -297,7 +339,7 @@ def normalize_caption_profile(value: Optional[str]) -> str:
     # das einzige Profil und entspricht der ERNIE-Strategie.
     if v == "shared_compact":
         return "ernie"
-    if v in {"ernie", "z_image_base"}:
+    if v in {"ernie", "z_image_base", "krea2_character"}:
         return v
     if v in CAPTION_PROFILE_PRESETS:
         return v
@@ -320,6 +362,13 @@ def caption_profile_choices() -> List[Tuple[str, str]]:
             ),
             "z_image_base",
         ),
+        (
+            tr(
+                "Krea 2 Character (natürliche GPT-Captions, stabile Körpermerkmale nur im Profil)",
+                "Krea 2 Character (natural GPT captions, stable physical traits only in profile)",
+            ),
+            "krea2_character",
+        ),
         (tr("Custom", "Custom"), "custom"),
     ]
 
@@ -339,6 +388,58 @@ def resolve_caption_fields_for_profile(
     if normalized == "custom":
         return list(current_fields) if current_fields is not None else list(DEFAULTS["c_captions"])
     return get_caption_preset_values(normalized)
+
+
+def apply_caption_profile_defaults(
+    profile: Optional[str],
+    current_fields: Optional[List[str]],
+    target_size: int,
+    ratio_h: float,
+    ratio_m: float,
+    ratio_f: float,
+    audit_model: str,
+    audit_reasoning_effort: str,
+    trigger_reasoning_effort: str,
+    escalation_reasoning_effort: str,
+    profile_model: str,
+    profile_reasoning_effort: str,
+    krea_caption_model: str,
+    krea_caption_reasoning_effort: str,
+):
+    """Apply Krea-specific recommendations without changing other profiles."""
+    normalized = normalize_caption_profile(profile)
+    fields = resolve_caption_fields_for_profile(normalized, current_fields)
+    if normalized == "krea2_character":
+        return (
+            fields,
+            20,
+            0.40,
+            0.35,
+            0.25,
+            "gpt-5.6-luna",
+            "none",
+            "none",
+            "low",
+            "gpt-5.6-terra",
+            "low",
+            "gpt-5.6-luna",
+            "none",
+        )
+    return (
+        fields,
+        target_size,
+        ratio_h,
+        ratio_m,
+        ratio_f,
+        audit_model,
+        audit_reasoning_effort,
+        trigger_reasoning_effort,
+        escalation_reasoning_effort,
+        profile_model,
+        profile_reasoning_effort,
+        krea_caption_model,
+        krea_caption_reasoning_effort,
+    )
 
 
 def detect_caption_profile(selected_fields: Optional[List[str]]) -> str:
@@ -437,8 +538,8 @@ def save_language_and_restart(lang_code: str) -> str:
 def save_settings_fn(
     ui_language,
     # Curator
-    c_trigger, c_input, c_target, c_api_key, c_model, c_openai_token_limit, c_use_trigger_check, c_trigger_model,
-    c_use_review_escalation, c_review_escalation_model,
+    c_trigger, c_input, c_target, c_api_key, c_model, c_audit_reasoning_effort, c_openai_token_limit, c_use_trigger_check, c_trigger_model, c_trigger_reasoning_effort,
+    c_use_review_escalation, c_review_escalation_model, c_review_escalation_reasoning_effort,
     c_review_escalation_score_min, c_review_escalation_score_max,
     c_escalate_on_review, c_escalate_on_conflict, c_escalate_smart_crop, c_smart_crop_escalation_delta,
     c_ratio_h, c_ratio_m, c_ratio_f,
@@ -453,15 +554,16 @@ def save_settings_fn(
     c_ig_frame_crop, c_ig_two_stage_bar,
     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
     c_smart_crop, c_crop_gain, c_crop_pad,
+    c_medium_rescue_crop, c_medium_rescue_gain,
     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,
     c_use_pose_diversity, c_pose_soft_limit, c_pose_penalty_weight,
     c_use_arcface, c_arcface_hard, c_arcface_soft, c_arcface_trim,
     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
     c_caption_profile,
-    c_captions,
-    c_pipeline_mode, c_profile_normalizer_model,
+    c_captions, c_krea_caption_model, c_krea_caption_reasoning_effort,
+    c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
-    c_exp_review, c_exp_reject, c_exp_compare,
+    c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
     # Video
     v_source, v_target, v_ref, v_fpm, v_fps, v_sim, v_sharp,
 ):
@@ -471,11 +573,14 @@ def save_settings_fn(
         "ui_language": "en",
         "c_trigger": c_trigger, "c_input": c_input, "c_target": c_target,
         "c_api_key": c_api_key, "c_model": c_model,
+        "c_audit_reasoning_effort": c_audit_reasoning_effort,
         "c_openai_token_limit": int(c_openai_token_limit or 0),
         "c_use_trigger_check": c_use_trigger_check,
         "c_trigger_model": c_trigger_model,
+        "c_trigger_reasoning_effort": c_trigger_reasoning_effort,
         "c_use_review_escalation": c_use_review_escalation,
         "c_review_escalation_model": c_review_escalation_model,
+        "c_review_escalation_reasoning_effort": c_review_escalation_reasoning_effort,
         "c_review_escalation_score_min": c_review_escalation_score_min,
         "c_review_escalation_score_max": c_review_escalation_score_max,
         "c_escalate_on_review": c_escalate_on_review,
@@ -504,6 +609,8 @@ def save_settings_fn(
         "c_use_clip": c_use_clip, "c_use_phash": c_use_phash,
         "c_phash_thresh": c_phash_thresh, "c_clip_thresh": c_clip_thresh,
         "c_smart_crop": c_smart_crop, "c_crop_gain": c_crop_gain, "c_crop_pad": c_crop_pad,
+        "c_medium_rescue_crop": c_medium_rescue_crop,
+        "c_medium_rescue_gain": c_medium_rescue_gain,
         "c_use_cluster": c_use_cluster, "c_max_outfit": c_max_outfit,
         "c_max_session": c_max_session, "c_use_diversity": c_use_diversity,
         "c_use_pose_diversity": c_use_pose_diversity,
@@ -518,13 +625,17 @@ def save_settings_fn(
         "c_arcface_det_size": c_arcface_det_size,
         "c_caption_profile": normalize_caption_profile(c_caption_profile),
         "c_captions": c_captions,
+        "c_krea_caption_model": c_krea_caption_model,
+        "c_krea_caption_reasoning_effort": c_krea_caption_reasoning_effort,
         "c_pipeline_mode": c_pipeline_mode,
         "c_profile_normalizer_model": c_profile_normalizer_model,
+        "c_profile_reasoning_effort": c_profile_reasoning_effort,
         "c_profile_sample_threshold": int(c_profile_sample_threshold),
         "c_profile_sample_size": int(c_profile_sample_size),
         "c_profile_ui_per_image_threshold": int(c_profile_ui_per_image_threshold),
         "c_exp_review": c_exp_review, "c_exp_reject": c_exp_reject,
         "c_exp_compare": c_exp_compare,
+        "c_controlled_buckets": c_controlled_buckets,
         "v_source": v_source, "v_target": v_target, "v_ref": v_ref,
         "v_fpm": v_fpm, "v_fps": v_fps, "v_sim": v_sim, "v_sharp": v_sharp,
     }
@@ -2029,8 +2140,8 @@ def run_script(
 # ============================================================
 
 def start_curator(
-    trigger_word, input_folder, target_size, api_key, ai_model, openai_token_limit, use_trigger_check, trigger_check_model,
-    use_review_escalation, review_escalation_model,
+    trigger_word, input_folder, target_size, api_key, ai_model, audit_reasoning_effort, openai_token_limit, use_trigger_check, trigger_check_model, trigger_reasoning_effort,
+    use_review_escalation, review_escalation_model, review_escalation_reasoning_effort,
     review_escalation_score_min, review_escalation_score_max,
     escalate_on_review, escalate_on_conflict, escalate_smart_crop, smart_crop_escalation_delta,
     ratio_h, ratio_m, ratio_f,
@@ -2045,15 +2156,16 @@ def start_curator(
     ig_frame_crop, ig_two_stage_bar,
     use_clip, use_phash, phash_threshold, clip_threshold,
     enable_smart_crop, crop_min_gain, crop_padding,
+    enable_medium_rescue_crop, medium_rescue_min_gain,
     use_clustering, max_outfit, max_session, use_diversity,
     use_pose_diversity, pose_soft_limit, pose_penalty_weight,
     use_arcface, arcface_hard, arcface_soft, arcface_trim,
     arcface_min_faces, arcface_model, arcface_det_size,
     caption_profile,
-    caption_options,
-    c_pipeline_mode, c_profile_normalizer_model,
+    caption_options, krea_caption_model, krea_caption_reasoning_effort,
+    c_pipeline_mode, c_profile_normalizer_model, profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
-    export_review, export_reject, export_crop_compare,
+    export_review, export_reject, export_crop_compare, controlled_buckets,
 ):
     if not trigger_word.strip():
         yield tr("Bitte ein Triggerwort eingeben.", "Please enter a trigger word."), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0)
@@ -2077,11 +2189,14 @@ def start_curator(
         "TARGET_DATASET_SIZE": int(target_size),
         "API_KEY": api_key.strip(),
         "AI_MODEL": ai_model.strip(),
+        "AUDIT_REASONING_EFFORT": str(audit_reasoning_effort or "none"),
         "OPENAI_TOKEN_LIMIT_TOTAL": int(openai_token_limit or 0),
         "USE_AI_TRIGGERWORD_CHECK": use_trigger_check,
         "TRIGGER_CHECK_MODEL": trigger_check_model.strip() or ai_model.strip(),
+        "TRIGGER_CHECK_REASONING_EFFORT": str(trigger_reasoning_effort or "none"),
         "USE_REVIEW_ESCALATION": use_review_escalation,
         "REVIEW_ESCALATION_MODEL": review_escalation_model.strip(),
+        "REVIEW_ESCALATION_REASONING_EFFORT": str(review_escalation_reasoning_effort or "low"),
         "REVIEW_ESCALATION_SCORE_MIN": int(review_escalation_score_min),
         "REVIEW_ESCALATION_SCORE_MAX": int(review_escalation_score_max),
         "ESCALATE_ON_REVIEW_STATUS": escalate_on_review,
@@ -2121,6 +2236,8 @@ def start_curator(
         "ENABLE_SMART_PRECROP": enable_smart_crop,
         "SMART_PRECROP_MIN_GAIN": float(crop_min_gain),
         "SMART_PRECROP_PADDING_FACTOR": float(crop_padding),
+        "ENABLE_MEDIUM_RESCUE_CROP": bool(enable_medium_rescue_crop),
+        "MEDIUM_RESCUE_MIN_GAIN": float(medium_rescue_min_gain),
         "USE_SESSION_OUTFIT_CLUSTERING": use_clustering,
         "MAX_PER_OUTFIT_CLUSTER": int(max_outfit),
         "MAX_PER_SESSION_CLUSTER": int(max_session),
@@ -2137,14 +2254,19 @@ def start_curator(
         "ARCFACE_DET_SIZE": int(arcface_det_size),
         "CAPTION_PROFILE": normalize_caption_profile(caption_profile),
         "CAPTION_POLICY": caption_policy,
+        "USE_KREA_AI_CAPTIONING": normalize_caption_profile(caption_profile) == "krea2_character",
+        "KREA_CAPTION_MODEL": krea_caption_model.strip() or "gpt-5.6-luna",
+        "KREA_CAPTION_REASONING_EFFORT": str(krea_caption_reasoning_effort or "none"),
         "PIPELINE_MODE": c_pipeline_mode,
-        "PROFILE_NORMALIZER_MODEL": c_profile_normalizer_model.strip() or "gpt-5.4-mini",
+        "PROFILE_NORMALIZER_MODEL": c_profile_normalizer_model.strip() or "gpt-5.6-terra",
+        "PROFILE_REASONING_EFFORT": str(profile_reasoning_effort or "low"),
         "PROFILE_SAMPLE_THRESHOLD": int(c_profile_sample_threshold),
         "PROFILE_SAMPLE_SIZE": int(c_profile_sample_size),
         "PROFILE_UI_PER_IMAGE_THRESHOLD": int(c_profile_ui_per_image_threshold),
         "EXPORT_REVIEW_IMAGES": export_review,
         "EXPORT_REJECT_IMAGES": export_reject,
         "EXPORT_SMART_CROP_COMPARISON": export_crop_compare,
+        "USE_CONTROLLED_BUCKETS": bool(controlled_buckets),
         "SEND_TEXT_IMAGES_TO_CAPTION_REMOVE": True,
         "INTERACTIVE_CAPTION_OVERRIDE": False,
     }
@@ -2156,8 +2278,8 @@ def start_curator(
 
 
 def start_caption_from_profile(
-    trigger_word, input_folder, target_size, api_key, ai_model, openai_token_limit, use_trigger_check, trigger_check_model,
-    use_review_escalation, review_escalation_model,
+    trigger_word, input_folder, target_size, api_key, ai_model, audit_reasoning_effort, openai_token_limit, use_trigger_check, trigger_check_model, trigger_reasoning_effort,
+    use_review_escalation, review_escalation_model, review_escalation_reasoning_effort,
     review_escalation_score_min, review_escalation_score_max,
     escalate_on_review, escalate_on_conflict, escalate_smart_crop, smart_crop_escalation_delta,
     ratio_h, ratio_m, ratio_f,
@@ -2172,15 +2294,16 @@ def start_caption_from_profile(
     ig_frame_crop, ig_two_stage_bar,
     use_clip, use_phash, phash_threshold, clip_threshold,
     enable_smart_crop, crop_min_gain, crop_padding,
+    enable_medium_rescue_crop, medium_rescue_min_gain,
     use_clustering, max_outfit, max_session, use_diversity,
     use_pose_diversity, pose_soft_limit, pose_penalty_weight,
     use_arcface, arcface_hard, arcface_soft, arcface_trim,
     arcface_min_faces, arcface_model, arcface_det_size,
     caption_profile,
-    caption_options,
-    c_pipeline_mode, c_profile_normalizer_model,
+    caption_options, krea_caption_model, krea_caption_reasoning_effort,
+    c_pipeline_mode, c_profile_normalizer_model, profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
-    export_review, export_reject, export_crop_compare,
+    export_review, export_reject, export_crop_compare, controlled_buckets,
 ):
     """Phase 3: nur Caption-/Bildexport aus bereits gebautem Profil starten."""
     if not trigger_word.strip():
@@ -2220,12 +2343,19 @@ def start_caption_from_profile(
         "TARGET_DATASET_SIZE": int(target_size),
         "API_KEY": api_key.strip(),
         "AI_MODEL": ai_model.strip(),
+        "AUDIT_REASONING_EFFORT": str(audit_reasoning_effort or "none"),
         "OPENAI_TOKEN_LIMIT_TOTAL": int(openai_token_limit or 0),
+        "TRIGGER_CHECK_REASONING_EFFORT": str(trigger_reasoning_effort or "none"),
+        "REVIEW_ESCALATION_REASONING_EFFORT": str(review_escalation_reasoning_effort or "low"),
         "CAPTION_PROFILE": normalize_caption_profile(caption_profile),
         "CAPTION_POLICY": caption_policy,
+        "USE_KREA_AI_CAPTIONING": normalize_caption_profile(caption_profile) == "krea2_character",
+        "KREA_CAPTION_MODEL": krea_caption_model.strip() or "gpt-5.6-luna",
+        "KREA_CAPTION_REASONING_EFFORT": str(krea_caption_reasoning_effort or "none"),
         "PIPELINE_MODE": "profile_then_caption",
         "CONTINUE_FROM_PROFILE": True,
-        "PROFILE_NORMALIZER_MODEL": c_profile_normalizer_model.strip() or "gpt-5.4-mini",
+        "PROFILE_NORMALIZER_MODEL": c_profile_normalizer_model.strip() or "gpt-5.6-terra",
+        "PROFILE_REASONING_EFFORT": str(profile_reasoning_effort or "low"),
         "PROFILE_SAMPLE_THRESHOLD": int(c_profile_sample_threshold),
         "PROFILE_SAMPLE_SIZE": int(c_profile_sample_size),
         "PROFILE_UI_PER_IMAGE_THRESHOLD": int(c_profile_ui_per_image_threshold),
@@ -2237,6 +2367,9 @@ def start_caption_from_profile(
         "ENABLE_SMART_PRECROP": enable_smart_crop,
         "SMART_PRECROP_MIN_GAIN": float(crop_min_gain),
         "SMART_PRECROP_PADDING_FACTOR": float(crop_padding),
+        "ENABLE_MEDIUM_RESCUE_CROP": bool(enable_medium_rescue_crop),
+        "MEDIUM_RESCUE_MIN_GAIN": float(medium_rescue_min_gain),
+        "USE_CONTROLLED_BUCKETS": bool(controlled_buckets),
         "HARD_MIN_SIDE_PX": int(hard_min_side),
         "RATIO_HEADSHOT": round(ratio_h, 2),
         "RATIO_MEDIUM": round(ratio_m, 2),
@@ -2435,8 +2568,8 @@ def build_ui() -> gr.Blocks:
                             step=1,
                             value=S["c_target"],
                             info=tr(
-                                "Wie viele Bilder das finale Training-Set haben soll. Qualität geht vor Füllmaterial.",
-                                "How many images the final training set should contain. Quality over filler images.",
+                                "Wie viele Bilder das finale Training-Set haben soll. Qualität geht vor Füllmaterial. Für Krea 2 Character setzt das Preset 20 als Ziel; 12 hochwertige Bilder gelten als kompaktes Minimum.",
+                                "How many images the final training set should contain. Quality over filler images. The Krea 2 Character preset sets a target of 20; 12 high-quality images are a compact minimum.",
                             ),
                         )
                         c_api_key = gr.Textbox(
@@ -2454,10 +2587,19 @@ def build_ui() -> gr.Blocks:
                             choices=OPENAI_MODEL_PRESET_CHOICES,
                             value=S["c_model"],
                             info=tr(
-                                "Hauptmodell für den ersten Audit-Durchlauf. Empfohlen: `gpt-5.4-mini`. `gpt-5.4-nano` ist günstiger, aber ungenauer. `gpt-5.5` ist bewusst mit in der Liste, aber wegen Kosten/Nutzen nicht als Standard empfohlen. Eigene Modellnamen können bei unterstützter Gradio-Version trotzdem eingetragen werden.",
-                                "Main model for the first audit pass. Recommended: `gpt-5.4-mini`. `gpt-5.4-nano` is cheaper but less accurate. `gpt-5.5` is intentionally included, but not recommended as the default due to cost/benefit. On supported Gradio versions, you can still enter custom model names.",
+                                "Hauptmodell für den ersten Audit-Durchlauf. Für Krea 2 empfohlen: `gpt-5.6-luna` ohne Reasoning. Schwierige Grenzfälle können optional an `gpt-5.6-terra` eskaliert werden. Eigene Modellnamen können bei unterstützter Gradio-Version trotzdem eingetragen werden.",
+                                "Main model for the first audit pass. Recommended for Krea 2: `gpt-5.6-luna` without reasoning. Difficult borderline cases can optionally escalate to `gpt-5.6-terra`. On supported Gradio versions, you can still enter custom model names.",
                             ),
                             **openai_model_dropdown_kwargs(),
+                        )
+                        c_audit_reasoning_effort = gr.Dropdown(
+                            label=tr("Reasoning Effort – Bildaudit", "Reasoning effort – image audit"),
+                            choices=REASONING_EFFORT_CHOICES,
+                            value=S["c_audit_reasoning_effort"],
+                            info=tr(
+                                "Reasoning-Aufwand für jeden normalen Bildaudit-Call. Für Luna und klar strukturierte Extraktion ist `none` der empfohlene schnelle Standard; `low` kann bei schwierigen visuellen Grenzfällen helfen.",
+                                "Reasoning effort for every regular image-audit call. For Luna and structured extraction, `none` is the recommended fast default; `low` may help with difficult visual edge cases.",
+                            ),
                         )
                         c_openai_token_limit = gr.Number(
                             label=tr("OpenAI Token-Limit pro Lauf", "OpenAI token limit per run"),
@@ -2486,21 +2628,30 @@ def build_ui() -> gr.Blocks:
                             ),
                             **openai_model_dropdown_kwargs(),
                         )
+                        c_trigger_reasoning_effort = gr.Dropdown(
+                            label=tr("Reasoning Effort – Trigger-Check", "Reasoning effort – trigger check"),
+                            choices=REASONING_EFFORT_CHOICES,
+                            value=S["c_trigger_reasoning_effort"],
+                            info=tr(
+                                "Wird nur verwendet, wenn der Trigger-Check aktiv ist. `none` reicht normalerweise aus.",
+                                "Used only when trigger checking is enabled. `none` is normally sufficient.",
+                            ),
+                        )
 
                 with gr.Accordion(tr("🧠 Modellstrategie & Eskalation", "🧠 Model strategy & escalation"), open=False):
                     gr.Markdown(tr(
                         "<details>"
                         "<summary><b>ℹ️ Was bedeutet Eskalation und wann brauche ich das?</b></summary>"
                         "\n\n"
-                        "Standardmäßig bewertet ein einziges Modell (`gpt-5.4-mini` empfohlen) "
-                        "alle Bilder. `gpt-5.4-nano` wäre günstiger, hat sich aber als zu "
+                        "Standardmäßig bewertet ein einziges Modell (`gpt-5.6-luna` empfohlen) "
+                        "alle Bilder. Frühere Nano-Modelle haben sich bei schwierigen visuellen Grenzfällen als zu "
                         "ungenau für die Erkennung von Filter-Hauttextur und extremen "
                         "Kamerawinkeln erwiesen – diese Bilder rutschten regelmäßig fälschlich "
                         "in 'train_ready'. Bei **Grenzfällen** – also Bildern, die das "
                         "Hauptmodell nicht klar als "
                         "'gut genug' oder 'rauswerfen' einordnen kann – kann der Curator diese "
                         "Bilder optional an ein **stärkeres zweites Modell** weiterleiten "
-                        "(z. B. `gpt-5.4` oder `claude-opus-4.7`).\n\n"
+                        "(z. B. `gpt-5.6-terra` oder `gpt-5.6-sol`).\n\n"
                         "**Drei Auslöser für Eskalation:**\n\n"
                         "**1. Bei Review:** Das Hauptmodell hat das Bild auf 'review' gesetzt "
                         "(also: 'ich kann mich nicht entscheiden') oder die Bewertung liegt im "
@@ -2517,14 +2668,14 @@ def build_ui() -> gr.Blocks:
                         "<details>"
                         "<summary><b>ℹ️ What is escalation and when do I need it?</b></summary>"
                         "\n\n"
-                        "By default, a single model (`gpt-5.4-mini` recommended) scores all "
-                        "images. `gpt-5.4-nano` is cheaper but proved too inaccurate at "
+                        "By default, a single model (`gpt-5.6-luna` recommended) scores all "
+                        "images. Earlier nano-class models proved too inaccurate at "
                         "spotting filter-smoothed skin and extreme camera angles - those "
                         "images regularly slipped into 'train_ready' incorrectly. For "
                         "**borderline cases** - "
                         "images the main model can't clearly classify as 'keep' or 'reject' - "
                         "the curator can optionally forward these images to a **stronger second "
-                        "model** (e.g. `gpt-5.4` or `claude-opus-4.7`).\n\n"
+                        "model** (e.g. `gpt-5.6-terra` or `gpt-5.6-sol`).\n\n"
                         "**Three escalation triggers:**\n\n"
                         "**1. On review:** Main model marked the image as 'review' (i.e. "
                         "'undecided') or the score falls inside the configured window. The "
@@ -2542,15 +2693,14 @@ def build_ui() -> gr.Blocks:
                         label=tr("Eskalation für schwierige Fälle aktivieren", "Enable escalation for difficult cases"),
                         value=S["c_use_review_escalation"],
                         info=tr(
-                            "Empfohlen: aus. Wenn das Hauptmodell `gpt-5.4-mini` (oder höher) ist, "
-                            "ist die Eskalation in der Regel überflüssig und verdoppelt nur die "
-                            "API-Kosten. Nur einschalten, wenn ein bewusst schwächeres Hauptmodell "
-                            "(z. B. `gpt-5.4-nano`) gewählt wurde und die Bewertungsqualität bei "
-                            "Grenzfällen unbedingt nachgebessert werden soll.",
-                            "Recommended: off. When the main model is `gpt-5.4-mini` (or higher), "
-                            "escalation is usually unnecessary and just doubles API cost. Only "
-                            "enable when intentionally using a weaker main model (e.g. `gpt-5.4-nano`) "
-                            "and you want to improve borderline-case quality.",
+                            "Empfohlen: zunächst aus. `gpt-5.6-luna` übernimmt den Routine-Audit. "
+                            "Aktiviere die Eskalation, wenn schwierige Grenzfälle gezielt durch "
+                            "`gpt-5.6-terra` oder `gpt-5.6-sol` nachgeprüft werden sollen. Zusätzliche "
+                            "Kosten entstehen nur für tatsächlich eskalierte Bilder.",
+                            "Recommended: off initially. `gpt-5.6-luna` handles routine audits. "
+                            "Enable escalation when difficult borderline cases should be rechecked "
+                            "by `gpt-5.6-terra` or `gpt-5.6-sol`. Extra cost applies only to images "
+                            "that are actually escalated.",
                         ),
                     )
                     with gr.Row():
@@ -2559,10 +2709,19 @@ def build_ui() -> gr.Blocks:
                             choices=[""] + OPENAI_MODEL_PRESET_CHOICES,
                             value=S["c_review_escalation_model"],
                             info=tr(
-                                "Stärkeres Modell für die Eskalation. Leer = Eskalation effektiv aus, auch wenn der Schalter oben an ist. Empfohlen: ein Modell der nächsthöheren Klasse (z. B. `gpt-5.4` wenn das Hauptmodell `gpt-5.4-mini` ist).",
-                                "Stronger model for escalation. Empty = escalation effectively off, even if the switch above is on. Recommended: a model from the next-higher tier (e.g. `gpt-5.4` if the main model is `gpt-5.4-mini`).",
+                                "Stärkeres Modell für die Eskalation. Leer = Eskalation effektiv aus, auch wenn der Schalter oben an ist. Für Luna als Hauptmodell empfohlen: `gpt-5.6-terra`.",
+                                "Stronger model for escalation. Empty = escalation effectively off, even if the switch above is on. Recommended with Luna as the main model: `gpt-5.6-terra`.",
                             ),
                             **openai_model_dropdown_kwargs(),
+                        )
+                        c_review_escalation_reasoning_effort = gr.Dropdown(
+                            label=tr("Reasoning Effort – Eskalation", "Reasoning effort – escalation"),
+                            choices=REASONING_EFFORT_CHOICES,
+                            value=S["c_review_escalation_reasoning_effort"],
+                            info=tr(
+                                "Reasoning nur für tatsächlich eskalierte Grenzfälle. `low` ist der empfohlene Ausgangspunkt mit Terra; höhere Stufen erhöhen Laufzeit und Tokenverbrauch.",
+                                "Reasoning only for cases that are actually escalated. `low` is the recommended starting point with Terra; higher levels increase latency and token usage.",
+                            ),
                         )
                     with gr.Row():
                         c_review_escalation_score_min = gr.Slider(
@@ -3364,6 +3523,30 @@ def build_ui() -> gr.Blocks:
                                 "Padding per side around the face, measured in multiples of face size. Recommended: 0.6 (face + hair + upper shoulders, classic headshot). 0.4 = tight face crop. 0.8+ = looser with shoulder area.",
                             ),
                         )
+                    gr.Markdown(tr(
+                        "**Getrennte Rettungsmechanik:** Ein schwaches Full-Body-Bild kann zusätzlich als Medium-Crop geprüft werden. Das Original bleibt ein Full Body; der Crop ist ein eigener Kandidat.",
+                        "**Separate rescue mechanism:** A weak full-body image can additionally be tested as a medium crop. The original remains full body; the crop is a separate candidate.",
+                    ))
+                    with gr.Row():
+                        c_medium_rescue_crop = gr.Checkbox(
+                            label=tr("Medium-Rettungs-Crop aktivieren", "Enable medium rescue crop"),
+                            value=S["c_medium_rescue_crop"],
+                            info=tr(
+                                "Empfohlen: an. Versucht bei schwachen Ganzkörperbildern Gesicht, Schultern, Torso und möglichst Hüfte als brauchbaren Medium Shot zu retten. Verändert das Original nicht.",
+                                "Recommended: on. Tries to rescue face, shoulders, torso and preferably hips from weak full-body images as a usable medium shot. Does not alter the original.",
+                            ),
+                        )
+                        c_medium_rescue_gain = gr.Slider(
+                            label=tr("Mindestvorsprung des Medium-Crops", "Min medium-crop score gain"),
+                            minimum=0,
+                            maximum=20,
+                            step=1,
+                            value=S["c_medium_rescue_gain"],
+                            info=tr(
+                                "Wie viele Punkte besser der Medium-Rettungs-Crop sein muss. Empfohlen: 4, da er zusätzlich eine fehlende Shot-Kategorie abdecken kann.",
+                                "How many points better the medium rescue crop must score. Recommended: 4 because it may also fill a missing shot category.",
+                            ),
+                        )
 
                 with gr.Accordion(tr("📊 Clustering & Diversität", "📊 Clustering & diversity"), open=False):
                     gr.Markdown(tr(
@@ -3726,10 +3909,19 @@ def build_ui() -> gr.Blocks:
                         choices=OPENAI_MODEL_PRESET_CHOICES,
                         value=S["c_profile_normalizer_model"],
                         info=tr(
-                            "Modell für den einen zusätzlichen Profil-Call pro Lauf. Empfehlung: gpt-5.4-mini.",
-                            "Model for the single additional profile call per run. Recommended: gpt-5.4-mini.",
+                            "Modell für den einen zusätzlichen Profil-Call pro Lauf. Für Krea 2 empfohlen: gpt-5.6-terra mit niedrigem Reasoning.",
+                            "Model for the single additional profile call per run. Recommended for Krea 2: gpt-5.6-terra with low reasoning.",
                         ),
                         **openai_model_dropdown_kwargs(),
+                    )
+                    c_profile_reasoning_effort = gr.Dropdown(
+                        label=tr("Reasoning Effort – Subject Profile", "Reasoning effort – subject profile"),
+                        choices=REASONING_EFFORT_CHOICES,
+                        value=S["c_profile_reasoning_effort"],
+                        info=tr(
+                            "Der Profil-Call muss stabile und variable Merkmale über viele Bilder abgleichen. `low` ist der empfohlene Standard; `medium` kann bei widersprüchlichen Datensätzen sinnvoll sein.",
+                            "The profile call reconciles stable and variable traits across many images. `low` is the recommended default; `medium` can help with contradictory datasets.",
+                        ),
                     )
                     with gr.Row():
                         c_profile_sample_threshold = gr.Slider(
@@ -3847,9 +4039,12 @@ def build_ui() -> gr.Blocks:
                         "('red hair'). The blonde majority is absorbed by the "
                         "trigger. The same logic applies to other variable "
                         "attributes (glasses, freckles, tattoos).\n\n"
-                        "**If unsure:** ERNIE is the safer default, Z-Image Base "
-                        "is the clean choice when you specifically train on "
-                        "Z-Image_Base and want maximum inference flexibility."
+                        "**Krea 2 Character** – natural-language captions are generated after selection. "
+                        "Stable identity and body traits such as tattoos are stored in the subject profile "
+                        "and omitted from captions; scene-specific details remain captioned. Selecting this "
+                        "preset also applies the recommended 20-image, 40/35/25 distribution and Luna/Terra "
+                        "model defaults.\n\n"
+                        "**If unsure:** Choose the preset matching the base model."
                         "</details>",
                     ))
                     c_caption_profile = gr.Dropdown(
@@ -3861,12 +4056,12 @@ def build_ui() -> gr.Blocks:
                             "Felder (asiatisch geprägtes Basismodell, redundante "
                             "Anker helfen). Z-Image Base = nur variable Felder "
                             "(stabiles Sprachverständnis, Trigger trägt die "
-                            "Identität). Im Zweifel ERNIE wählen.",
+                            "Identität). Krea 2 Character erzeugt natürliche GPT-Captions und hält stabile Körpermerkmale ausschließlich im Subject Profile.",
                             "Preset schema per base model. ERNIE = all fields "
                             "(Asia-leaning base model, redundant anchors help). "
                             "Z-Image Base = only variable fields (strong language "
-                            "understanding, trigger carries identity). When in "
-                            "doubt pick ERNIE.",
+                            "understanding, trigger carries identity). Krea 2 Character "
+                            "generates natural GPT captions and keeps stable physical traits only in the subject profile.",
                         ),
                     )
                     c_captions = gr.CheckboxGroup(
@@ -3895,10 +4090,43 @@ def build_ui() -> gr.Blocks:
                             "identity. When in doubt trust the preset above.",
                         ),
                     )
+                    c_krea_caption_model = gr.Dropdown(
+                        label=tr("Krea-2-Caption-Modell", "Krea 2 caption model"),
+                        choices=OPENAI_MODEL_PRESET_CHOICES,
+                        value=S["c_krea_caption_model"],
+                        info=tr(
+                            "Nur beim Profil `Krea 2 Character`: Erstellt nach der finalen Bildauswahl natürliche englische Captions aus Originalbild, Audit und bestätigtem Subject Profile. Empfehlung: gpt-5.6-luna.",
+                            "Only for the `Krea 2 Character` profile: creates natural English captions after final image selection using the original image, audit and confirmed subject profile. Recommended: gpt-5.6-luna.",
+                        ),
+                        **openai_model_dropdown_kwargs(),
+                    )
+                    c_krea_caption_reasoning_effort = gr.Dropdown(
+                        label=tr("Reasoning Effort – Krea-Caption", "Reasoning effort – Krea caption"),
+                        choices=REASONING_EFFORT_CHOICES,
+                        value=S["c_krea_caption_reasoning_effort"],
+                        info=tr(
+                            "Reasoning für die finale natürliche Caption jedes ausgewählten Bildes. `none` ist der empfohlene Standard; `low` kann bei komplexen Szenen getestet werden.",
+                            "Reasoning for the final natural caption of each selected image. `none` is the recommended default; `low` can be tested for complex scenes.",
+                        ),
+                    )
                     c_caption_profile.change(
-                        fn=resolve_caption_fields_for_profile,
-                        inputs=[c_caption_profile, c_captions],
-                        outputs=[c_captions],
+                        fn=apply_caption_profile_defaults,
+                        inputs=[
+                            c_caption_profile, c_captions, c_target,
+                            c_ratio_h, c_ratio_m, c_ratio_f,
+                            c_model, c_audit_reasoning_effort,
+                            c_trigger_reasoning_effort, c_review_escalation_reasoning_effort,
+                            c_profile_normalizer_model, c_profile_reasoning_effort,
+                            c_krea_caption_model, c_krea_caption_reasoning_effort,
+                        ],
+                        outputs=[
+                            c_captions, c_target,
+                            c_ratio_h, c_ratio_m, c_ratio_f,
+                            c_model, c_audit_reasoning_effort,
+                            c_trigger_reasoning_effort, c_review_escalation_reasoning_effort,
+                            c_profile_normalizer_model, c_profile_reasoning_effort,
+                            c_krea_caption_model, c_krea_caption_reasoning_effort,
+                        ],
                     )
                     c_captions.change(
                         fn=detect_caption_profile,
@@ -3989,6 +4217,14 @@ def build_ui() -> gr.Blocks:
                                 "Saves original and smart crop side-by-side in `08_smart_crop_pairs`, with both scores in the filename. Recommended: on if you use smart pre-crop – essential for debugging when crops don't look as expected.",
                             ),
                         )
+                    c_controlled_buckets = gr.Checkbox(
+                        label=tr("Kontrollierte Buckets verwenden", "Use controlled buckets"),
+                        value=S["c_controlled_buckets"],
+                        info=tr(
+                            "Standard: aus. Aus behält die natürliche Komposition der ausgewählten Bilder bei. An normalisiert erst beim finalen Export: Headshots 1024×1024, Medium und Full Body 832×1216. IG-Rahmenentfernung und Rettungs-Crops bleiben davon unabhängig.",
+                            "Default: off. Off preserves the natural composition of selected images. On normalizes only during final export: headshots 1024×1024, medium and full body 832×1216. IG-frame removal and rescue crops remain independent.",
+                        ),
+                    )
 
                 # ── Aktionen ──
                 gr.Markdown("---")
@@ -4010,8 +4246,8 @@ def build_ui() -> gr.Blocks:
 
                 # Alle Curator-Inputs als Liste (fuer Save und Start)
                 curator_inputs = [
-                    c_trigger, c_input, c_target, c_api_key, c_model, c_openai_token_limit, c_use_trigger_check, c_trigger_model,
-                    c_use_review_escalation, c_review_escalation_model,
+                    c_trigger, c_input, c_target, c_api_key, c_model, c_audit_reasoning_effort, c_openai_token_limit, c_use_trigger_check, c_trigger_model, c_trigger_reasoning_effort,
+                    c_use_review_escalation, c_review_escalation_model, c_review_escalation_reasoning_effort,
                     c_review_escalation_score_min, c_review_escalation_score_max,
                     c_escalate_on_review, c_escalate_on_conflict, c_escalate_smart_crop, c_smart_crop_escalation_delta,
                     c_ratio_h, c_ratio_m, c_ratio_f,
@@ -4026,15 +4262,16 @@ def build_ui() -> gr.Blocks:
                     c_ig_frame_crop, c_ig_two_stage_bar,
                     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
                     c_smart_crop, c_crop_gain, c_crop_pad,
+                    c_medium_rescue_crop, c_medium_rescue_gain,
                     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,
                     c_use_pose_diversity, c_pose_soft_limit, c_pose_penalty_weight,
                     c_use_arcface, c_arcface_hard, c_arcface_soft, c_arcface_trim,
                     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
                     c_caption_profile,
-                    c_captions,
-                    c_pipeline_mode, c_profile_normalizer_model,
+                    c_captions, c_krea_caption_model, c_krea_caption_reasoning_effort,
+                    c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
                     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
-                    c_exp_review, c_exp_reject, c_exp_compare,
+                    c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
                 ]
 
                 c_start_btn.click(fn=start_curator, inputs=curator_inputs, outputs=[c_log, c_gallery, c_progress, c_status, c_openai_usage])
