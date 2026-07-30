@@ -125,7 +125,7 @@ SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
 Z_IMAGE_BASE_CAPTION_FIELDS: List[str] = [
     "include_freckles",
     "include_tattoos",
-    "include_glasses",
+    "include_glasses_when_variable",
     "include_piercings",
     "include_makeup",
     "include_background",
@@ -144,7 +144,7 @@ Z_IMAGE_BASE_CAPTION_FIELDS: List[str] = [
 # subject profile for QC but deliberately omitted from captions. Captions focus
 # on visible scene-specific attributes and are generated as natural language.
 KREA2_CHARACTER_CAPTION_FIELDS: List[str] = [
-    "include_glasses",
+    "include_glasses_when_variable",
     "include_makeup",
     "include_background",
     "include_lighting",
@@ -247,6 +247,7 @@ DEFAULTS: Dict[str, Any] = {
     # Captions
     "c_caption_profile": "shared_compact",
     "c_captions": list(SHARED_COMPACT_CAPTION_FIELDS),
+    "c_variable_feature_mode": "canonical_deviations",
     "c_krea_caption_model": "gpt-5.6-luna",
     "c_krea_caption_reasoning_effort": "none",
     # Subject Profile / Phase 2
@@ -298,6 +299,7 @@ CAPTION_FIELD_CHOICES: List[str] = [
     "include_freckles",
     "include_tattoos",
     "include_glasses",
+    "include_glasses_when_variable",
     "include_piercings",
     "include_makeup",
     "include_background",
@@ -560,7 +562,7 @@ def save_settings_fn(
     c_use_arcface, c_arcface_hard, c_arcface_soft, c_arcface_trim,
     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
     c_caption_profile,
-    c_captions, c_krea_caption_model, c_krea_caption_reasoning_effort,
+    c_captions, c_variable_feature_mode, c_krea_caption_model, c_krea_caption_reasoning_effort,
     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
@@ -625,6 +627,7 @@ def save_settings_fn(
         "c_arcface_det_size": c_arcface_det_size,
         "c_caption_profile": normalize_caption_profile(c_caption_profile),
         "c_captions": c_captions,
+        "c_variable_feature_mode": c_variable_feature_mode,
         "c_krea_caption_model": c_krea_caption_model,
         "c_krea_caption_reasoning_effort": c_krea_caption_reasoning_effort,
         "c_pipeline_mode": c_pipeline_mode,
@@ -726,6 +729,7 @@ def _profile_summary_markdown(profile: Dict[str, Any]) -> str:
     if not profile:
         return tr("Kein Profil geladen.", "No profile loaded.")
     stable = profile.get("stable_identity", {}) or {}
+    canonical = profile.get("canonical_features", {}) or {}
     markers = profile.get("identity_markers", {}) or {}
     glasses = markers.get("glasses", {}) or {}
     freckles = markers.get("freckles", {}) or {}
@@ -742,6 +746,8 @@ def _profile_summary_markdown(profile: Dict[str, Any]) -> str:
         f"**Body build:** {stable.get('body_build', '-')}",
         f"**Body height impression:** {stable.get('body_height_impression', '-')}",
         f"**Appearance mode:** {profile.get('profile_appearance_mode', '-')}",
+        f"**Canonical hair color:** {canonical.get('hair_color', '-')}",
+        f"**Canonical beard:** {canonical.get('beard_pattern', '-') or '-'} / {canonical.get('beard_color', '-') or '-'}",
         "",
         f"**Glasses:** {glasses.get('canonical_description', '-') if glasses.get('wears_regularly') else 'not regular'}",
         f"**Freckles:** {freckles.get('canonical_description', '-') if freckles.get('has_freckles') else 'not regular'}",
@@ -816,6 +822,13 @@ PROFILE_VOCAB_HAIR_COLOR: List[str] = [
     "gray", "silver", "white", "blue", "pink", "purple", "green",
     "dyed_other", "multicolor", "ombre", "highlights", "not_visible", "unclear",
 ]
+PROFILE_VOCAB_BEARD_PATTERN: List[str] = [
+    "clean_shaven", "stubble", "designer_stubble", "short_beard", "full_beard",
+    "long_beard", "goatee", "mustache_only", "mustache_goatee", "chin_strap",
+    "mutton_chops", "soul_patch", "circle_beard", "handlebar_mustache", "neckbeard", "other",
+]
+PROFILE_VOCAB_BEARD_COLOR: List[str] = ["", "dark", "brown", "blonde", "red", "gray", "white", "salt_pepper", "other"]
+
 PROFILE_VOCAB_HAIR_FORM: List[str] = [
     "loose_straight", "loose_wavy", "loose_curly", "loose_coily",
     "afro_natural", "ponytail", "low_ponytail", "high_ponytail",
@@ -924,6 +937,7 @@ def _empty_editor_payload(status_msg: str) -> Tuple:
         {}, "",  # state, raw_json
         empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown, empty_dropdown,
         empty_info, empty_info, empty_info, empty_info, empty_info, empty_info,
+        empty_dropdown, empty_dropdown, empty_dropdown,  # canonical hair / beard
         False, "",  # glasses
         False, "",  # freckles
         "_kein Profil_", "_kein Profil_", "_kein Profil_",
@@ -957,6 +971,7 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
         )
 
     stable = profile.get("stable_identity", {}) or {}
+    canonical = profile.get("canonical_features", {}) or {}
     markers = profile.get("identity_markers", {}) or {}
     glasses = markers.get("glasses", {}) or {}
     freckles = markers.get("freckles", {}) or {}
@@ -975,6 +990,10 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     hair_tex_val = (stable.get("hair_texture") or "").strip()
     body_val = (stable.get("body_build") or "").strip()
     body_height_val = (stable.get("body_height_impression") or "").strip()
+    variability = profile.get("profile_variability_stats", {}) or {}
+    hair_baseline_val = (canonical.get("hair_color") or (variability.get("hair_color", {}) or {}).get("mode") or "").strip()
+    beard_pattern_val = (canonical.get("beard_pattern") or (variability.get("beard_pattern", {}) or {}).get("mode") or "").strip()
+    beard_color_val = (canonical.get("beard_color") or (variability.get("beard_color", {}) or {}).get("mode") or "").strip()
 
     gender_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_GENDER, gender_val), value=gender_val)
     skin_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_SKIN, skin_val), value=skin_val)
@@ -982,6 +1001,9 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     hair_tex_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_HAIR_TEXTURE, hair_tex_val), value=hair_tex_val)
     body_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_BODY, body_val), value=body_val)
     body_height_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_BODY_HEIGHT, body_height_val), value=body_height_val)
+    hair_baseline_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_HAIR_COLOR, hair_baseline_val), value=hair_baseline_val)
+    beard_pattern_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_BEARD_PATTERN, beard_pattern_val), value=beard_pattern_val)
+    beard_color_dd = gr.update(choices=_normalize_dropdown_choices(PROFILE_VOCAB_BEARD_COLOR, beard_color_val), value=beard_color_val)
 
     counts = aggregate_per_image_traits(profile)
     hair_color_md = _bucket_summary_markdown(
@@ -1070,6 +1092,7 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
         profile, raw_json,
         gender_dd, skin_dd, eyes_dd, hair_tex_dd, body_dd, body_height_dd,
         info("gender"), info("skin_tone"), info("eye_color"), info("hair_texture"), info("body_build"), info("body_height_impression"),
+        hair_baseline_dd, beard_pattern_dd, beard_color_dd,
         bool(glasses.get("wears_regularly", False)),
         str(glasses.get("canonical_description", "") or ""),
         bool(freckles.get("has_freckles", False)),
@@ -1099,6 +1122,9 @@ def save_profile_from_editor(
     hair_texture: str,
     body_build: str,
     body_height_impression: str,
+    hair_color_baseline: str,
+    beard_pattern: str,
+    beard_color: str,
     glasses_regular: bool,
     glasses_desc: str,
     freckles_present: bool,
@@ -1140,6 +1166,12 @@ def save_profile_from_editor(
     stable["hair_texture"] = (hair_texture or "").strip()
     stable["body_build"] = (body_build or "").strip()  # explicit "" erlaubt
     stable["body_height_impression"] = (body_height_impression or "").strip()
+
+    canonical = profile.setdefault("canonical_features", {})
+    canonical["hair_color"] = (hair_color_baseline or "").strip()
+    canonical["eye_color"] = (eye_color or "").strip()
+    canonical["beard_pattern"] = (beard_pattern or "").strip()
+    canonical["beard_color"] = (beard_color or "").strip()
 
     markers = profile.setdefault("identity_markers", {})
     glasses = markers.setdefault("glasses", {"wears_regularly": False, "canonical_description": "", "frequency": ""})
@@ -2162,7 +2194,7 @@ def start_curator(
     use_arcface, arcface_hard, arcface_soft, arcface_trim,
     arcface_min_faces, arcface_model, arcface_det_size,
     caption_profile,
-    caption_options, krea_caption_model, krea_caption_reasoning_effort,
+    caption_options, variable_feature_mode, krea_caption_model, krea_caption_reasoning_effort,
     c_pipeline_mode, c_profile_normalizer_model, profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
     export_review, export_reject, export_crop_compare, controlled_buckets,
@@ -2254,6 +2286,7 @@ def start_curator(
         "ARCFACE_DET_SIZE": int(arcface_det_size),
         "CAPTION_PROFILE": normalize_caption_profile(caption_profile),
         "CAPTION_POLICY": caption_policy,
+        "VARIABLE_FEATURE_CAPTION_MODE": str(variable_feature_mode or "canonical_deviations"),
         "USE_KREA_AI_CAPTIONING": normalize_caption_profile(caption_profile) == "krea2_character",
         "KREA_CAPTION_MODEL": krea_caption_model.strip() or "gpt-5.6-luna",
         "KREA_CAPTION_REASONING_EFFORT": str(krea_caption_reasoning_effort or "none"),
@@ -2300,7 +2333,7 @@ def start_caption_from_profile(
     use_arcface, arcface_hard, arcface_soft, arcface_trim,
     arcface_min_faces, arcface_model, arcface_det_size,
     caption_profile,
-    caption_options, krea_caption_model, krea_caption_reasoning_effort,
+    caption_options, variable_feature_mode, krea_caption_model, krea_caption_reasoning_effort,
     c_pipeline_mode, c_profile_normalizer_model, profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
     export_review, export_reject, export_crop_compare, controlled_buckets,
@@ -2349,6 +2382,7 @@ def start_caption_from_profile(
         "REVIEW_ESCALATION_REASONING_EFFORT": str(review_escalation_reasoning_effort or "low"),
         "CAPTION_PROFILE": normalize_caption_profile(caption_profile),
         "CAPTION_POLICY": caption_policy,
+        "VARIABLE_FEATURE_CAPTION_MODE": str(variable_feature_mode or "canonical_deviations"),
         "USE_KREA_AI_CAPTIONING": normalize_caption_profile(caption_profile) == "krea2_character",
         "KREA_CAPTION_MODEL": krea_caption_model.strip() or "gpt-5.6-luna",
         "KREA_CAPTION_REASONING_EFFORT": str(krea_caption_reasoning_effort or "none"),
@@ -3992,12 +4026,13 @@ def build_ui() -> gr.Blocks:
                         "kommen rein. Vorteil: bessere Steuerbarkeit bei Inferenz "
                         "('Kathi mit roten Haaren' funktioniert sauber, weil der "
                         "Trigger 'blonde' nicht in der Caption mitfährt).\n\n"
-                        "**Wichtig zur Hair-when-variable-Logik:** Wenn jemand in "
-                        "den Trainingsbildern *meistens* blond ist und auf wenigen "
-                        "Bildern rot, captioniert der Curator nur den variablen "
-                        "Fall ('red hair'). Der blonde Mehrheitsfall wird vom "
-                        "Trigger absorbiert. Das gilt analog für andere variable "
-                        "Attribute (Brille, Sommersprossen, Tattoos).\n\n"
+                        "**Regel für variable Identitätsmerkmale:** Das Subject Profile "
+                        "normalisiert Haarfarbe/-form, Augenfarbe, Bart und Brille und "
+                        "legt eine kanonische Baseline fest. Im Standardmodus wird nur "
+                        "eine Abweichung captioniert (z. B. 'red hair' bei canon blond). "
+                        "Alternativ kann bei echter Variation jeder sichtbare Wert "
+                        "captioniert werden. Brillenbegriffe werden dabei auf eine "
+                        "kanonische Beschreibung vereinheitlicht.\n\n"
                         "**Wenn du unsicher bist:** ERNIE ist der robustere Default, "
                         "Z-Image Base ist die saubere Wahl wenn du gezielt auf "
                         "Z-Image_Base trainierst und maximale Inferenz-Flexibilität "
@@ -4033,12 +4068,13 @@ def build_ui() -> gr.Blocks:
                         "style) go in. Benefit: better inference steerability "
                         "('Kathi with red hair' works cleanly because the trigger "
                         "doesn't drag 'blonde' along in every caption).\n\n"
-                        "**Important on hair-when-variable logic:** If a subject "
-                        "is *mostly* blonde across training images and red in only "
-                        "a few, the curator only captions the variable case "
-                        "('red hair'). The blonde majority is absorbed by the "
-                        "trigger. The same logic applies to other variable "
-                        "attributes (glasses, freckles, tattoos).\n\n"
+                        "**Variable identity feature rule:** The Subject Profile "
+                        "normalizes hair color/form, eye color, beard and glasses and "
+                        "stores a canonical baseline. In the default mode only a "
+                        "deviation is captioned (for example 'red hair' when blonde "
+                        "is canonical). Alternatively, every visible value can be "
+                        "captioned once genuine variation is detected. Glasses terms "
+                        "are consolidated into one canonical description.\n\n"
                         "**Krea 2 Character** – natural-language captions are generated after selection. "
                         "Stable identity and body traits such as tattoos are stored in the subject profile "
                         "and omitted from captions; scene-specific details remain captioned. Selecting this "
@@ -4088,6 +4124,24 @@ def build_ui() -> gr.Blocks:
                             "color, body build, constant hair) are omitted with "
                             "Z-Image Base so the trigger word cleanly absorbs "
                             "identity. When in doubt trust the preset above.",
+                        ),
+                    )
+                    c_variable_feature_mode = gr.Dropdown(
+                        label=tr("Regel für variable Identitätsmerkmale", "Variable identity feature rule"),
+                        choices=[
+                            (
+                                tr("Nur Abweichungen von der kanonischen Erscheinung", "Only deviations from the canonical appearance"),
+                                "canonical_deviations",
+                            ),
+                            (
+                                tr("Bei echter Variation jeden sichtbaren Wert captionieren", "Caption every visible value when genuine variation exists"),
+                                "all_visible_when_variable",
+                            ),
+                        ],
+                        value=S.get("c_variable_feature_mode", "canonical_deviations"),
+                        info=tr(
+                            "Standard: Die im Subject Profile festgelegte Grunderscheinung gehört zum Triggerwort; nur Abweichungen werden genannt. Alternative: Sobald echte Variation erkannt ist, wird der jeweilige sichtbare Wert in allen Bildern genannt. Gilt für Haarfarbe/-form, Augenfarbe, Bart und Brillenstatus.",
+                            "Default: the canonical appearance stored in the Subject Profile belongs to the trigger; only deviations are captioned. Alternative: once genuine variation is detected, every visible value is captioned. Applies to hair color/form, eye color, beard and glasses state.",
                         ),
                     )
                     c_krea_caption_model = gr.Dropdown(
@@ -4268,7 +4322,7 @@ def build_ui() -> gr.Blocks:
                     c_use_arcface, c_arcface_hard, c_arcface_soft, c_arcface_trim,
                     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
                     c_caption_profile,
-                    c_captions, c_krea_caption_model, c_krea_caption_reasoning_effort,
+                    c_captions, c_variable_feature_mode, c_krea_caption_model, c_krea_caption_reasoning_effort,
                     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
                     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
                     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
@@ -4329,10 +4383,8 @@ def build_ui() -> gr.Blocks:
                     # ----- Subtab: Stable Identity -----
                     with gr.TabItem(tr("👤 Stable Identity", "👤 Stable identity")):
                         gr.Markdown(tr(
-                            "Diese Werte werden in **jeder** Caption verwendet. Confidence-Anzeige hilft "
-                            "bei der Beurteilung. Body Build ist bei Headshot-Sets bewusst leer.",
-                            "These values are used in **every** caption. Confidence indicators help judge "
-                            "reliability. Body build is intentionally empty on headshot-dominated sets.",
+                            "Diese Werte definieren die **kanonische Identität**. Je Caption-Regel werden sie entweder vom Triggerwort getragen oder ausdrücklich genannt. Confidence-Anzeige hilft bei der Beurteilung. Body Build ist bei Headshot-Sets bewusst leer.",
+                            "These values define the **canonical identity**. Depending on the caption rule, they are either carried by the trigger token or explicitly described. Confidence indicators help judge reliability. Body build is intentionally empty on headshot-dominated sets.",
                         ))
                         with gr.Row():
                             p_gender = gr.Dropdown(
@@ -4388,6 +4440,34 @@ def build_ui() -> gr.Blocks:
                                 allow_custom_value=True,
                             )
                             p_body_height_info = gr.Markdown("—")
+
+                        gr.Markdown(tr("**Kanonische variable Merkmale**", "**Canonical variable features**"))
+                        gr.Markdown(tr(
+                            "Diese Baselines steuern die Regel `nur Abweichungen`: Der kanonische Wert bleibt am Triggerwort, abweichende Werte werden captioniert.",
+                            "These baselines drive the `deviations only` rule: the canonical value stays attached to the trigger token and deviations are captioned.",
+                        ))
+                        with gr.Row():
+                            p_hair_color_baseline = gr.Dropdown(
+                                label=tr("Kanonische Haarfarbe", "Canonical hair color"),
+                                choices=[""] + PROFILE_VOCAB_HAIR_COLOR,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            p_beard_pattern = gr.Dropdown(
+                                label=tr("Kanonischer Bartzustand", "Canonical beard state"),
+                                choices=[""] + PROFILE_VOCAB_BEARD_PATTERN,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
+                            p_beard_color = gr.Dropdown(
+                                label=tr("Kanonische Bartfarbe", "Canonical beard color"),
+                                choices=PROFILE_VOCAB_BEARD_COLOR,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                            )
 
                         gr.Markdown(tr("**Brille (Identity Marker)**", "**Glasses (identity marker)**"))
                         with gr.Row():
@@ -4597,6 +4677,7 @@ def build_ui() -> gr.Blocks:
                     p_state, p_raw_json,
                     p_gender, p_skin, p_eyes, p_hair_texture, p_body, p_body_height,
                     p_gender_info, p_skin_info, p_eyes_info, p_hair_texture_info, p_body_info, p_body_height_info,
+                    p_hair_color_baseline, p_beard_pattern, p_beard_color,
                     p_glasses_regular, p_glasses_desc,
                     p_freckles_present, p_freckles_desc,
                     p_hair_color_md, p_hair_form_md, p_makeup_md,
@@ -4642,6 +4723,7 @@ def build_ui() -> gr.Blocks:
                     inputs=[
                         p_trigger, p_input, p_raw_json,
                         p_gender, p_skin, p_eyes, p_hair_texture, p_body, p_body_height,
+                        p_hair_color_baseline, p_beard_pattern, p_beard_color,
                         p_glasses_regular, p_glasses_desc,
                         p_freckles_present, p_freckles_desc,
                     ],

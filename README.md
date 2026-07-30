@@ -140,7 +140,14 @@ Select the caption preset **`Krea 2 Character`** when preparing a person or char
 
 The profile stores stable identity and body information for consistency checks. Stable traits such as body build, tattoos, permanent piercings, scars and canonical facial features are not repeated in Krea captions; the trigger token carries that identity. Captions instead focus on visible, image-specific information such as framing, pose, action, expression, gaze, clothing, temporary accessories, background, lighting, camera angle and composition.
 
-For the most controllable result, use `Profile then Caption`, review the subject profile, and then start the final caption pass from the profile tab. Only selected training images receive the additional Krea natural-language caption call.
+Hair color/form, eye color, beard state/color and glasses are handled by a shared profile policy. The profile first normalizes each feature and stores a canonical baseline. The UI then offers two caption strategies:
+
+- **Only deviations from the canonical appearance** (default): the baseline belongs to the trigger token. For example, if the subject is canonically blonde, blonde images omit hair color while red/copper images state the deviation.
+- **Caption every visible value when genuine variation exists**: once repeated variation is detected, every visible state is captioned, including the baseline state.
+
+Glasses use structured frame normalization in addition to the canonical text description. Equivalent terms such as round wire-frame glasses, round metal-frame eyeglasses and similar wording can therefore resolve to one profile description, while genuinely different frames, sunglasses or images without glasses remain distinct states.
+
+For the most controllable result, use `Profile then Caption`, review the canonical hair color, eye color, beard state/color and glasses description in the subject-profile tab, and then start the final caption pass. Only selected training images receive the additional Krea natural-language caption call.
 
 ### Crop and export mechanisms
 

@@ -504,13 +504,17 @@ IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
 
 # Caption-Regeln
 CAPTION_PROFILE = "ernie"  # "ernie" | "z_image_base" | "krea2_character" | "custom"
+# How variable visual traits are captioned:
+# - canonical_deviations: canonical baseline belongs to the trigger; only deviations are captioned.
+# - all_visible_when_variable: once genuine variation is detected, caption every visible state.
+VARIABLE_FEATURE_CAPTION_MODE = "canonical_deviations"
 
 # Krea 2 quality-caption mode. Only final selected images are sent for a
 # dedicated natural-language caption after the subject profile is known.
 USE_KREA_AI_CAPTIONING = True
 KREA_CAPTION_MODEL = "gpt-5.6-luna"
 KREA_CAPTION_IMAGE_DETAIL = "high"
-KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v1"
+KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v2-feature-policy"
 CAPTION_POLICY = {
     "include_gender_class": True,
     "include_skin_tone": True, 
@@ -518,6 +522,7 @@ CAPTION_POLICY = {
     "include_freckles": True,
     "include_tattoos": True,
     "include_glasses": True,
+    "include_glasses_when_variable": False,
     "include_piercings": True,
     "include_makeup": True,
     "include_background": True,
@@ -610,7 +615,7 @@ PROFILE_NORMALIZER_MODEL = "gpt-5.6-terra"
 #       kanonische Profil-Brille ueberschrieben werden.
 #   v7: Erweiterte Profile-Vokabulare inkl. hair_length und
 #       body_height_impression; Body-Build ersetzt stocky durch broad_build.
-PROFILE_CACHE_SCHEMA_VERSION = "v10"
+PROFILE_CACHE_SCHEMA_VERSION = "v11"
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
@@ -1336,7 +1341,10 @@ def enforce_caption_policy_profile(profile: Optional[str], policy: Dict[str, Any
             result[key] = False
         result["include_hair_when_variable"] = True
         result["include_eye_color_when_variable"] = True
-        result["include_glasses"] = True
+        result["include_beard_always"] = False
+        result["include_beard_when_variable"] = True
+        result["include_glasses"] = False
+        result["include_glasses_when_variable"] = True
         result["include_makeup"] = True
         result["include_background"] = True
         result["include_lighting"] = True
@@ -4737,6 +4745,344 @@ def resolve_visible_glasses_description(item: Dict[str, Any], profile: Dict[str,
     return profile_desc
 
 
+
+
+def _eye_color_family(token: str) -> str:
+    t = normalize_text(token)
+    if t in {"blue", "gray_blue", "blue_green"}:
+        return "blue_green_family"
+    if t in {"brown", "dark_brown"}:
+        return "brown_family"
+    # Green, hazel, amber and blue-green remain separate. For identity LoRAs
+    # it is safer to caption a possible contact-lens deviation than to merge
+    # genuinely different eye colors into one broad family.
+    return t
+
+
+def _stats_mode_token(stats: Any) -> str:
+    if isinstance(stats, dict):
+        return normalize_text(stats.get("mode", ""))
+    return ""
+
+
+def _feature_deviation(current: str, baseline: str, family_fn=None) -> bool:
+    cur = normalize_text(current)
+    base = normalize_text(baseline)
+    if not cur:
+        return False
+    if not base:
+        return True
+    if family_fn is not None:
+        cur_f = normalize_text(family_fn(cur))
+        base_f = normalize_text(family_fn(base))
+        if cur_f and base_f:
+            return cur_f != base_f
+    return cur != base
+
+
+def get_hair_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_traits: Dict[str, Any], global_rules: Dict[str, Any], active_policy: Dict[str, Any], caption_profile: str) -> Dict[str, Any]:
+    canonical = profile.get("canonical_features", {}) if isinstance(profile, dict) else {}
+    variability = profile.get("profile_variability_stats", {}) if isinstance(profile, dict) else {}
+    color_stats = variability.get("hair_color", {}) if isinstance(variability, dict) else {}
+    form_stats = variability.get("hair_form", {}) if isinstance(variability, dict) else {}
+
+    current_color = normalize_text(image_traits.get("hair_color_base", ""))
+    current_form = normalize_text(image_traits.get("hair_form", ""))
+    baseline_color = normalize_text(canonical.get("hair_color", "")) or _stats_mode_token(color_stats)
+    baseline_form = normalize_text(canonical.get("hair_form", "")) or _stats_mode_token(form_stats)
+
+    color_variable = bool(color_stats.get("variation_detected", color_stats.get("unique", 0) >= 2))
+    form_variable = bool(form_stats.get("variation_detected", form_stats.get("unique", 0) >= 2))
+    mode = normalize_text(globals().get("VARIABLE_FEATURE_CAPTION_MODE", "canonical_deviations"))
+
+    include_all = bool(active_policy.get("include_hair_always"))
+    include_variable = bool(active_policy.get("include_hair_when_variable"))
+    color_deviation = _feature_deviation(current_color, baseline_color, _appearance_hair_family)
+    form_deviation = _feature_deviation(current_form, baseline_form)
+
+    if include_all:
+        include_color = bool(current_color)
+        include_form = bool(current_form)
+    elif include_variable and mode == "all_visible_when_variable":
+        include_color = bool(current_color and color_variable)
+        include_form = bool(current_form and form_variable)
+    elif include_variable:
+        include_color = bool(current_color and color_deviation)
+        include_form = bool(current_form and form_deviation)
+    else:
+        include_color = include_form = False
+
+    phrase = profile_hair_caption(current_color if include_color else "", current_form if include_form else "")
+    return {
+        "phrase": phrase,
+        "must_caption": bool(phrase),
+        "current": current_color,
+        "baseline": baseline_color,
+        "current_form": current_form,
+        "baseline_form": baseline_form,
+        "color_variable": color_variable,
+        "form_variable": form_variable,
+        "mode": mode,
+    }
+
+def get_eye_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_traits: Dict[str, Any], active_policy: Dict[str, Any]) -> Dict[str, Any]:
+    canonical = profile.get("canonical_features", {}) if isinstance(profile, dict) else {}
+    stable_identity = profile.get("stable_identity", {}) if isinstance(profile, dict) else {}
+    stats = (profile.get("profile_variability_stats", {}) or {}).get("eye_color", {}) if isinstance(profile, dict) else {}
+    current = normalize_text(image_traits.get("eye_color_base", "")) or canonical_eye_color(item)
+    baseline = normalize_text(canonical.get("eye_color", "")) or normalize_text(stable_identity.get("eye_color", "")) or _stats_mode_token(stats)
+    variable = bool(stats.get("variation_detected", stats.get("unique", 0) >= 2))
+    mode = normalize_text(globals().get("VARIABLE_FEATURE_CAPTION_MODE", "canonical_deviations"))
+    enabled = bool(active_policy.get("include_eye_color_when_variable"))
+    if enabled and mode == "all_visible_when_variable":
+        must_caption = bool(current and variable)
+    else:
+        must_caption = bool(enabled and current and _feature_deviation(current, baseline, _eye_color_family))
+    phrase = f"{_phrase_from_token(current)} eyes" if must_caption and current else ""
+    return {
+        "phrase": phrase,
+        "must_caption": bool(phrase),
+        "current": current,
+        "baseline": baseline,
+        "variable": variable,
+        "mode": mode,
+    }
+
+def get_beard_feature_state(item: Dict[str, Any], global_rules: Dict[str, Any], active_policy: Dict[str, Any], profile: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    profile = profile or {}
+    canonical = profile.get("canonical_features", {}) if isinstance(profile, dict) else {}
+    beard_rule = global_rules.get("beard_description", {}) if isinstance(global_rules, dict) else {}
+    parsed = normalize_beard_tag(item.get("beard_description", ""))
+    current_pattern = normalize_text(parsed.get("pattern")) if parsed.get("visible") else ""
+    current_color = normalize_text(parsed.get("color")) if parsed.get("visible") else ""
+    baseline_pattern = normalize_text(canonical.get("beard_pattern", "")) or normalize_text(beard_rule.get("mode_pattern", ""))
+    baseline_color = normalize_text(canonical.get("beard_color", "")) or normalize_text(beard_rule.get("mode_color", ""))
+    variable = bool(beard_rule.get("variation_detected", beard_rule.get("variable", False)))
+    mode = normalize_text(globals().get("VARIABLE_FEATURE_CAPTION_MODE", "canonical_deviations"))
+
+    deviation = False
+    if current_pattern:
+        deviation = current_pattern != baseline_pattern
+        if not deviation and current_pattern != "clean_shaven" and current_color and baseline_color:
+            deviation = current_color not in {"other"} and current_color != baseline_color
+
+    enabled_all = bool(active_policy.get("include_beard_always"))
+    enabled_variable = bool(active_policy.get("include_beard_when_variable"))
+    if enabled_all:
+        must_caption = bool(current_pattern)
+    elif enabled_variable and mode == "all_visible_when_variable":
+        must_caption = bool(current_pattern and variable)
+    else:
+        must_caption = bool(enabled_variable and current_pattern and deviation)
+
+    phrase = ""
+    if must_caption:
+        if current_pattern == "clean_shaven":
+            phrase = "clean-shaven"
+        else:
+            phrase = build_beard_caption_tag(item, global_rules) or compact_trait(item.get("beard_description"))
+
+    return {
+        "phrase": phrase,
+        "must_caption": bool(phrase),
+        "current_pattern": current_pattern,
+        "baseline_pattern": baseline_pattern,
+        "current_color": current_color,
+        "baseline_color": baseline_color,
+        "variable": variable,
+        "mode": mode,
+    }
+
+
+def _glasses_shape_family(token: str) -> str:
+    t = normalize_text(token)
+    if t in {"round", "oval"}:
+        return "rounded"
+    if t in {"rectangular", "square"}:
+        return "angular"
+    return t
+
+
+def _glasses_material_family(token: str) -> str:
+    t = normalize_text(token)
+    if t in {"wire_frame", "metal_frame"}:
+        return "metal_frame"
+    if t in {"plastic_frame", "acetate_frame"}:
+        return "plastic_frame"
+    return t
+
+
+def _glasses_lens_family(token: str) -> str:
+    t = normalize_text(token)
+    if t in {"clear_lenses", "blue_light_lenses"}:
+        return "clear_lenses"
+    if t in {"tinted_lenses", "sunglasses", "reflective_lenses"}:
+        return "sunglasses"
+    return t
+
+
+def _canonical_glasses_phrase(shape: str, material: str, lens: str, fallback: str = "") -> str:
+    lens_f = _glasses_lens_family(lens)
+    if lens_f == "sunglasses":
+        shape_txt = _phrase_from_token(_glasses_shape_family(shape))
+        return f"{shape_txt} sunglasses".strip() if shape_txt else "sunglasses"
+    shape_txt = _phrase_from_token(_glasses_shape_family(shape))
+    material_f = _glasses_material_family(material)
+    material_txt = {
+        "metal_frame": "metal-frame",
+        "plastic_frame": "plastic-frame",
+        "rimless": "rimless",
+        "semi_rimless": "semi-rimless",
+        "mixed_material": "mixed-frame",
+    }.get(material_f, "")
+    bits = [b for b in [shape_txt, material_txt, "glasses"] if b]
+    phrase = " ".join(bits).strip()
+    return phrase or compact_trait(fallback) or "eyeglasses"
+
+
+def _glasses_fingerprint(shape: str, material: str, lens: str) -> str:
+    return "|".join([
+        _glasses_shape_family(shape) or "unclear_shape",
+        _glasses_material_family(material) or "unclear_material",
+        _glasses_lens_family(lens) or "clear_lenses",
+    ])
+
+
+def get_glasses_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_traits: Dict[str, Any], active_policy: Dict[str, Any]) -> Dict[str, Any]:
+    markers = profile.get("identity_markers", {}) if isinstance(profile, dict) else {}
+    canonical = profile.get("canonical_features", {}) if isinstance(profile, dict) else {}
+    glasses_profile = markers.get("glasses", {}) if isinstance(markers, dict) else {}
+    variability = (profile.get("profile_variability_stats", {}) or {}).get("glasses", {}) if isinstance(profile, dict) else {}
+    frame_variability = (profile.get("profile_variability_stats", {}) or {}).get("glasses_frame", {}) if isinstance(profile, dict) else {}
+
+    visible = bool(image_traits.get("glasses_visible")) or _profile_bool(item.get("has_glasses_now"))
+    baseline_desc = compact_trait(glasses_profile.get("canonical_description"))
+    baseline_shape = normalize_text(canonical.get("glasses_frame_shape", ""))
+    baseline_material = normalize_text(canonical.get("glasses_frame_material", ""))
+    baseline_lens = normalize_text(canonical.get("glasses_lens_type", ""))
+    baseline_fingerprint = _glasses_fingerprint(baseline_shape, baseline_material, baseline_lens)
+    baseline_family = "regular_glasses" if glasses_profile.get("wears_regularly") else "no_glasses"
+    if baseline_desc and _is_sunglasses_description(baseline_desc):
+        baseline_family = "sunglasses"
+
+    current_shape = normalize_text(image_traits.get("glasses_frame_shape", "")) or normalize_text(item.get("glasses_frame_shape", ""))
+    current_material = normalize_text(image_traits.get("glasses_frame_material", "")) or normalize_text(item.get("glasses_frame_material", ""))
+    current_lens = normalize_text(image_traits.get("glasses_lens_type", "")) or normalize_text(item.get("glasses_lens_type", ""))
+    item_desc = compact_trait(image_traits.get("glasses_description")) or compact_trait(item.get("glasses_description"))
+
+    if visible:
+        current_family = "sunglasses" if _is_sunglasses_description(item_desc) or _glasses_lens_family(current_lens) == "sunglasses" else "regular_glasses"
+        current_fingerprint = _glasses_fingerprint(current_shape, current_material, current_lens)
+        same_regular_frame = (
+            current_family == baseline_family == "regular_glasses"
+            and (
+                current_fingerprint == baseline_fingerprint
+                or (not current_shape and not current_material)
+                or (not baseline_shape and not baseline_material)
+            )
+        )
+        if same_regular_frame:
+            phrase = baseline_desc or _canonical_glasses_phrase(current_shape, current_material, current_lens, item_desc)
+        else:
+            phrase = _canonical_glasses_phrase(current_shape, current_material, current_lens, item_desc)
+    else:
+        current_family = "no_glasses"
+        current_fingerprint = "no_glasses"
+        same_regular_frame = False
+        phrase = ""
+
+    variable = bool(
+        variability.get("variation_detected", variability.get("unique", 0) >= 2)
+        or frame_variability.get("variation_detected", frame_variability.get("unique", 0) >= 2)
+    )
+    mode = normalize_text(globals().get("VARIABLE_FEATURE_CAPTION_MODE", "canonical_deviations"))
+    always = bool(active_policy.get("include_glasses"))
+    when_variable = bool(active_policy.get("include_glasses_when_variable"))
+
+    if always:
+        must_caption = visible and bool(phrase)
+    elif when_variable and mode == "all_visible_when_variable" and variable:
+        must_caption = True
+    elif when_variable:
+        must_caption = current_family != baseline_family
+        if current_family == baseline_family == "regular_glasses":
+            must_caption = not same_regular_frame
+    else:
+        must_caption = False
+
+    if must_caption and current_family == "no_glasses":
+        phrase = "without glasses"
+    elif must_caption and current_family == "regular_glasses":
+        phrase = phrase or baseline_desc or "eyeglasses"
+    elif must_caption and current_family == "sunglasses":
+        phrase = phrase or "sunglasses"
+    else:
+        phrase = "" if not must_caption else phrase
+
+    return {
+        "phrase": phrase,
+        "must_caption": bool(must_caption and phrase),
+        "current_family": current_family,
+        "baseline_family": baseline_family,
+        "current_desc": compact_trait(phrase),
+        "baseline_desc": baseline_desc,
+        "current_fingerprint": current_fingerprint,
+        "baseline_fingerprint": baseline_fingerprint,
+        "variable": variable,
+        "mode": mode,
+    }
+
+def _caption_contains_term(caption: str, term: str) -> bool:
+    c = normalize_compact_text(caption)
+    t = normalize_compact_text(term)
+    return bool(c and t and t in c)
+
+
+def _validate_krea_caption_features(caption: str, feature_states: Dict[str, Dict[str, Any]]) -> Tuple[bool, List[str]]:
+    reasons: List[str] = []
+    text = normalize_compact_text(caption)
+
+    def contains_any(tokens: List[str]) -> bool:
+        return any(normalize_compact_text(t) in text for t in tokens if normalize_compact_text(t))
+
+    for name in ("hair", "eye", "beard", "glasses"):
+        state = feature_states.get(name, {}) or {}
+        phrase = compact_trait(state.get("phrase"))
+        if state.get("must_caption") and phrase and not _caption_contains_term(text, phrase):
+            # Accept common wording variants for a few canonical feature phrases.
+            alternatives: List[str] = []
+            if name == "glasses" and state.get("current_family") == "regular_glasses":
+                alternatives = ["glasses", "eyeglasses", "spectacles"]
+            elif name == "glasses" and state.get("current_family") == "no_glasses":
+                alternatives = ["without glasses", "no glasses"]
+            elif name == "beard" and state.get("current_pattern") == "clean_shaven":
+                alternatives = ["clean-shaven", "clean shaven"]
+            if not contains_any(alternatives):
+                reasons.append(f"missing required {name}: {phrase}")
+
+    eye = feature_states.get("eye", {}) or {}
+    if not eye.get("must_caption") and eye.get("current"):
+        eye_tokens = [f"{_phrase_from_token(eye.get('current'))} eyes"]
+        if contains_any(eye_tokens):
+            reasons.append("canonical eye color should be omitted")
+
+    beard = feature_states.get("beard", {}) or {}
+    if not beard.get("must_caption"):
+        if contains_any(["beard", "stubble", "mustache", "moustache", "goatee", "soul patch", "mutton chops", "chin strap", "clean-shaven", "clean shaven"]):
+            reasons.append("canonical beard state should be omitted")
+
+    glasses = feature_states.get("glasses", {}) or {}
+    if not glasses.get("must_caption"):
+        if contains_any(["glasses", "eyeglasses", "spectacles", "without glasses", "no glasses", "sunglasses"]):
+            reasons.append("canonical glasses state should be omitted")
+
+    hair = feature_states.get("hair", {}) or {}
+    if not hair.get("must_caption"):
+        if contains_any([" hair", "hair ", "braids", "ponytail", "pigtails", "bun", "updo", "dreadlocks", "cornrows", "pixie cut", "bob cut"]):
+            reasons.append("canonical hair state should be omitted")
+
+    return (len(reasons) == 0), reasons
+
 def _simplify_or_phrase(text: str) -> str:
     """
     Reduziert Phrasen mit KI-Unentschiedenheit ('X or Y Z' oder 'X/Y Z') auf
@@ -4908,10 +5254,65 @@ def compute_global_rules(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             "counts": dict(counts.most_common(10)),
         }
 
+    def beard_mode_info(min_fraction_for_stable: float = 0.85) -> Dict[str, Any]:
+        values: List[Tuple[str, str]] = []
+        for i in items:
+            parsed = normalize_beard_tag(str(i.get("beard_description", "")))
+            if not parsed.get("visible"):
+                continue
+            pattern = normalize_text(parsed.get("pattern")) or ""
+            color = normalize_text(parsed.get("color")) or ""
+            if not pattern:
+                continue
+            values.append((pattern, color))
+        if not values:
+            return {"mode": "", "stable": False, "variable": True, "override_candidates": [], "counts": {}, "mode_pattern": "", "mode_color": ""}
+
+        counts = Counter(values)
+        (mode_pattern, mode_color), mode_count = counts.most_common(1)[0]
+        total = max(1, len(values))
+        frac = mode_count / total
+        stable = frac >= min_fraction_for_stable
+
+        def _fmt(pattern: str, color: str) -> str:
+            if pattern == "clean_shaven":
+                return "clean shaven"
+            tag = {
+                "stubble": "stubble",
+                "designer_stubble": "designer stubble",
+                "short_beard": "short beard",
+                "full_beard": "full beard",
+                "long_beard": "long beard",
+                "goatee": "goatee",
+                "mustache_only": "mustache",
+                "mustache_goatee": "mustache and goatee",
+                "chin_strap": "chin strap beard",
+                "mutton_chops": "mutton chops",
+                "soul_patch": "soul patch",
+                "circle_beard": "circle beard",
+                "handlebar_mustache": "handlebar mustache",
+                "neckbeard": "neckbeard",
+                "other": "beard",
+            }.get(pattern, "beard")
+            color_txt = color.replace("_", " ").strip()
+            return f"{color_txt} {tag}".strip() if color_txt and color_txt != "other" else tag
+
+        override_candidates = [] if stable else [_fmt(p, c) for (p, c), _n in counts.most_common(5)]
+        pretty_counts = {_fmt(p, c): n for (p, c), n in counts.most_common(10)}
+        return {
+            "mode": _fmt(mode_pattern, mode_color),
+            "stable": stable,
+            "variable": not stable,
+            "override_candidates": override_candidates,
+            "counts": pretty_counts,
+            "mode_pattern": mode_pattern,
+            "mode_color": mode_color,
+        }
+
     # Wir berechnen globale Regeln NUR für Features, bei denen es die "when_variable" Logik gibt!
     # Brillen, Tattoos etc. sind fest durch CAPTION_POLICY geregelt und brauchen keine Mehrheitsentscheidung.
     rules["hair_description"] = mode_info("hair_description", 0.85)
-    rules["beard_description"] = mode_info("beard_description", 0.85)
+    rules["beard_description"] = beard_mode_info(0.85)
 
     return rules
 
@@ -4995,6 +5396,8 @@ def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
             "glasses_description": row.get("glasses_description", ""),
             "has_glasses_now": row.get("has_glasses_now", False),
             "glasses_frame_shape": row.get("glasses_frame_shape", ""),
+            "glasses_frame_material": row.get("glasses_frame_material", ""),
+            "glasses_lens_type": row.get("glasses_lens_type", ""),
             "makeup_description": row.get("makeup_description", ""),
             "makeup_intensity": row.get("makeup_intensity", ""),
             "tattoos_visible": row.get("tattoos_visible", False),
@@ -5472,6 +5875,13 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
             "hair_texture": _mode_clean(rows, "hair_texture"),
             "body_build": body_build_value,
             "body_height_impression": _mode_clean(rows, "body_height_impression"),
+        },
+        "canonical_features": {
+            "hair_color": Counter([canonical_hair_color(r) for r in rows if canonical_hair_color(r)]).most_common(1)[0][0] if any(canonical_hair_color(r) for r in rows) else "",
+            "hair_form": Counter([canonical_hair_form(r) for r in rows if canonical_hair_form(r)]).most_common(1)[0][0] if any(canonical_hair_form(r) for r in rows) else "",
+            "eye_color": canonical_eye_color({"eye_color": _mode_clean(rows, "eye_color")}),
+            "beard_pattern": "",
+            "beard_color": "",
         },
         "confidence": {
             "gender":       {"level": "fallback", "reasoning": "", "outliers": []},
@@ -5986,6 +6396,11 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
         "freckles_visible": bool(compact_trait(row.get("freckles_description"))),
         "freckles_description": compact_trait(row.get("freckles_description")),
         "glasses_visible": _profile_bool(row.get("has_glasses_now")) or bool(compact_trait(row.get("glasses_description"))),
+        "glasses_description": compact_trait(row.get("glasses_description")),
+        "glasses_frame_shape": normalize_text(row.get("glasses_frame_shape")),
+        "beard_pattern": normalize_text(normalize_beard_tag(row.get("beard_description", "")).get("pattern", "")),
+        "beard_color": normalize_text(normalize_beard_tag(row.get("beard_description", "")).get("color", "")),
+        "beard_visible": bool(normalize_beard_tag(row.get("beard_description", "")).get("visible", False)),
         "tattoo_locations_visible": sorted(set(tattoos_visible)),
         "piercing_locations_visible": sorted(set(piercings_visible)),
         "frame_subtype": normalize_text(row.get("frame_subtype")),
@@ -6001,12 +6416,14 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
 
 def _appearance_hair_family(token: str) -> str:
     t = normalize_text(token)
-    if t in {"blonde", "platinum", "gray", "white"}:
-        return "blonde_light_family"
+    if t in {"blonde", "dark_blonde", "platinum"}:
+        return "blonde_family"
     if t in {"light_brown", "brown", "dark_brown", "black"}:
         return "brown_dark_family"
-    if t in {"auburn", "red", "copper"}:
+    if t in {"strawberry_blonde", "auburn", "red", "copper", "burgundy"}:
         return "red_auburn_family"
+    if t in {"gray", "silver", "white"}:
+        return "gray_white_family"
     if not t:
         return "unknown_hair"
     return f"{t}_family"
@@ -6343,6 +6760,13 @@ def save_subject_profile(profile: Dict[str, Any]) -> None:
                 "body_build": "",
                 "body_height_impression": "",
             },
+            "canonical_features": {
+                "hair_color": "",
+                "hair_form": "",
+                "eye_color": "",
+                "beard_pattern": "",
+                "beard_color": "",
+            },
             "identity_markers": {
                 "glasses": {
                     "wears_regularly": False,
@@ -6380,35 +6804,95 @@ def load_subject_profile_cache(input_hash: str) -> Optional[Dict[str, Any]]:
 def _trait_variance(values: List[str], min_unique: int = 3, max_mode_fraction: float = 0.70) -> Tuple[bool, Dict[str, Any]]:
     clean = [normalize_text(v) for v in values if normalize_text(v) and normalize_text(v) not in {"none", "unknown", "unclear", "not_visible", "n_a"}]
     if not clean:
-        return False, {"total": 0, "unique": 0, "mode": "", "mode_fraction": 0.0, "counts": {}}
+        return False, {"total": 0, "unique": 0, "mode": "", "mode_fraction": 0.0, "minority_count": 0, "variation_detected": False, "counts": {}}
     counts = Counter(clean)
     mode, count = counts.most_common(1)[0]
     total = len(clean)
     unique = len(counts)
     mode_fraction = count / max(1, total)
+    minority_count = total - count
+    # "variable" remains the stronger high-variation signal used for cosplay/
+    # appearance-mode classification. "variation_detected" is intentionally
+    # more permissive and drives the UI caption policy. Two agreeing minority
+    # observations are enough; a single outlier does not force all baseline
+    # images to be captioned in the all-visible mode.
+    variation_detected = unique >= 2 and minority_count >= 2
     variable = unique >= min_unique and mode_fraction <= max_mode_fraction
     return variable, {
         "total": total,
         "unique": unique,
         "mode": mode,
         "mode_fraction": round(mode_fraction, 3),
+        "minority_count": minority_count,
+        "variation_detected": variation_detected,
         "counts": dict(counts.most_common(12)),
     }
 
 
-def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Attach dataset-wide policies for high-variation/cosplay datasets.
+def _state_stats(values: List[str]) -> Dict[str, Any]:
+    clean = [normalize_text(v) for v in values if normalize_text(v)]
+    if not clean:
+        return {"total": 0, "unique": 0, "mode": "", "mode_fraction": 0.0, "minority_count": 0, "variation_detected": False, "counts": {}}
+    counts = Counter(clean)
+    mode, count = counts.most_common(1)[0]
+    total = len(clean)
+    minority_count = total - count
+    return {
+        "total": total,
+        "unique": len(counts),
+        "mode": mode,
+        "mode_fraction": round(count / max(1, total), 3),
+        "minority_count": minority_count,
+        "variation_detected": len(counts) >= 2 and minority_count >= 2,
+        "counts": dict(counts.most_common(12)),
+    }
 
-    The goal is deliberately NOT to detect wigs or contact lenses reliably.
-    Instead, we use measurable dataset variance: if hair or eye color changes
-    strongly across usable images, captions should treat those traits as
-    visible per-image attributes rather than stable identity traits.
+def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Attach canonical baselines and measurable per-feature variation.
+
+    The Subject Profile owns the canonical appearance. Caption policy is a
+    separate UI decision: either only deviations from that canonical baseline
+    are captioned, or every visible state is captioned once genuine variation
+    is detected. Normalization therefore never decides omission by itself.
     """
     per_image = profile.get("per_image_traits", {}) or {}
     trait_rows = list(per_image.values()) if isinstance(per_image, dict) else []
-    hair_color_variable, hair_color_stats = _trait_variance([t.get("hair_color_base", "") for t in trait_rows], min_unique=4, max_mode_fraction=0.72)
-    hair_form_variable, hair_form_stats = _trait_variance([t.get("hair_form", "") for t in trait_rows], min_unique=5, max_mode_fraction=0.70)
-    eye_color_variable, eye_color_stats = _trait_variance([t.get("eye_color_base", "") for t in trait_rows], min_unique=3, max_mode_fraction=0.78)
+
+    hair_color_variable, hair_color_stats = _trait_variance(
+        [t.get("hair_color_base", "") for t in trait_rows], min_unique=4, max_mode_fraction=0.72
+    )
+    hair_form_variable, hair_form_stats = _trait_variance(
+        [t.get("hair_form", "") for t in trait_rows], min_unique=5, max_mode_fraction=0.70
+    )
+    eye_color_variable, eye_color_stats = _trait_variance(
+        [t.get("eye_color_base", "") for t in trait_rows], min_unique=3, max_mode_fraction=0.78
+    )
+
+    beard_patterns = [normalize_text(t.get("beard_pattern", "")) for t in trait_rows if t.get("beard_visible")]
+    beard_colors = [normalize_text(t.get("beard_color", "")) for t in trait_rows if t.get("beard_visible") and normalize_text(t.get("beard_pattern", "")) != "clean_shaven"]
+    beard_pattern_stats = _state_stats(beard_patterns)
+    beard_color_stats = _state_stats(beard_colors)
+
+    glasses_states: List[str] = []
+    for t in trait_rows:
+        desc = normalize_text(t.get("glasses_description", ""))
+        lens = normalize_text(t.get("glasses_lens_type", ""))
+        if any(k in desc for k in ["sunglass", "shades"]) or lens in {"sunglasses", "tinted_lenses", "reflective_lenses"}:
+            glasses_states.append("sunglasses")
+        elif bool(t.get("glasses_visible")):
+            glasses_states.append("regular_glasses")
+        else:
+            glasses_states.append("no_glasses")
+    glasses_stats = _state_stats(glasses_states)
+    regular_glasses_traits = [t for t in trait_rows if bool(t.get("glasses_visible")) and _glasses_lens_family(t.get("glasses_lens_type", "")) != "sunglasses"]
+    glasses_frame_stats = _state_stats([
+        _glasses_fingerprint(t.get("glasses_frame_shape", ""), t.get("glasses_frame_material", ""), t.get("glasses_lens_type", ""))
+        for t in regular_glasses_traits
+    ])
+    glasses_shape_stats = _state_stats([_glasses_shape_family(t.get("glasses_frame_shape", "")) for t in regular_glasses_traits])
+    glasses_material_stats = _state_stats([_glasses_material_family(t.get("glasses_frame_material", "")) for t in regular_glasses_traits])
+    glasses_lens_stats = _state_stats([_glasses_lens_family(t.get("glasses_lens_type", "")) for t in regular_glasses_traits])
+
     eye_appearance_counts = Counter(
         normalize_text(t.get("eye_appearance", "")) for t in trait_rows
         if normalize_text(t.get("eye_appearance", "")) and normalize_text(t.get("eye_appearance", "")) not in {"natural_eyes", "unclear"}
@@ -6431,13 +6915,32 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
     else:
         appearance_mode = "natural_identity"
 
-    eye_variable = eye_color_variable or bool(eye_appearance_counts)
+    canonical = profile.setdefault("canonical_features", {})
+    if not normalize_text(canonical.get("hair_color", "")):
+        canonical["hair_color"] = hair_color_stats.get("mode", "")
+    if not normalize_text(canonical.get("hair_form", "")):
+        canonical["hair_form"] = hair_form_stats.get("mode", "")
+    if not normalize_text(canonical.get("eye_color", "")):
+        canonical["eye_color"] = normalize_text((profile.get("stable_identity", {}) or {}).get("eye_color", "")) or eye_color_stats.get("mode", "")
+    if not normalize_text(canonical.get("beard_pattern", "")):
+        canonical["beard_pattern"] = beard_pattern_stats.get("mode", "")
+    if not normalize_text(canonical.get("beard_color", "")):
+        canonical["beard_color"] = beard_color_stats.get("mode", "")
+    if not normalize_text(canonical.get("glasses_frame_shape", "")):
+        canonical["glasses_frame_shape"] = glasses_shape_stats.get("mode", "")
+    if not normalize_text(canonical.get("glasses_frame_material", "")):
+        canonical["glasses_frame_material"] = glasses_material_stats.get("mode", "")
+    if not normalize_text(canonical.get("glasses_lens_type", "")):
+        canonical["glasses_lens_type"] = glasses_lens_stats.get("mode", "")
+
     policies = profile.setdefault("profile_policies", {})
     policies.update({
         "appearance_mode": appearance_mode,
-        "hair_color_policy": "always_caption_when_visible" if hair_color_variable or appearance_mode in {"cosplay_identity", "high_variation_model_identity"} else "stable_or_caption_deviation",
-        "hair_form_policy": "always_caption_when_visible" if hair_form_variable or appearance_mode in {"cosplay_identity", "high_variation_model_identity"} else "stable_or_caption_deviation",
-        "eye_color_policy": "caption_when_clear_or_variable" if eye_variable else "stable_identity",
+        "hair_color_policy": "variable" if hair_color_stats.get("variation_detected") else "stable",
+        "hair_form_policy": "variable" if hair_form_stats.get("variation_detected") else "stable",
+        "eye_color_policy": "variable" if eye_color_stats.get("variation_detected") or bool(eye_appearance_counts) else "stable",
+        "beard_policy": "variable" if beard_pattern_stats.get("variation_detected") or beard_color_stats.get("variation_detected") else "stable",
+        "glasses_policy": "variable" if glasses_stats.get("variation_detected") or glasses_frame_stats.get("variation_detected") else "stable",
         "makeup_policy": "always_caption_when_visible" if appearance_mode in {"cosplay_identity", "high_variation_model_identity"} else "caption_when_visible",
         "costume_policy": "always_caption_when_visible" if appearance_mode in {"cosplay_identity", "high_variation_model_identity"} else "caption_when_visible",
     })
@@ -6446,36 +6949,36 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
         "hair_color": hair_color_stats,
         "hair_form": hair_form_stats,
         "eye_color": eye_color_stats,
+        "beard_pattern": beard_pattern_stats,
+        "beard_color": beard_color_stats,
+        "glasses": glasses_stats,
+        "glasses_frame": glasses_frame_stats,
+        "glasses_shape": glasses_shape_stats,
+        "glasses_material": glasses_material_stats,
+        "glasses_lens": glasses_lens_stats,
         "eye_appearance_counts": dict(eye_appearance_counts.most_common(10)),
         "look_context_counts": dict(look_counts.most_common(10)),
         "cosplay_fraction": round(cosplay_fraction, 3),
     }
 
-    if eye_variable:
-        stable = profile.setdefault("stable_identity", {})
-        prev_eye = stable.get("eye_color", "")
-        if prev_eye:
-            stable["eye_color"] = ""
-            conf = profile.setdefault("confidence", {})
-            existing = conf.get("eye_color", {})
-            if not isinstance(existing, dict):
-                existing = {"level": str(existing or ""), "reasoning": "", "outliers": []}
-            existing["level"] = "low"
-            existing["reasoning"] = "Demoted because eye color/cosmetic-lens appearance varies across the selected images."
-            existing.setdefault("outliers", [])
-            conf["eye_color"] = existing
-            profile.setdefault("normalizer_notes", []).append(
-                f"Eye color demoted from stable identity (was '{prev_eye}') because it varies across images or cosmetic/circle lenses are detected."
-            )
-
-    if hair_color_variable or hair_form_variable or appearance_mode in {"cosplay_identity", "high_variation_model_identity"}:
-        profile.setdefault("normalizer_notes", []).append(
-            "High hair/look variation detected: hair color/form will be captioned per image when visible instead of treated as a stable identity cue."
+    notes = profile.setdefault("normalizer_notes", [])
+    if hair_color_stats.get("variation_detected"):
+        notes.append(
+            f"Hair-color variation detected. Canonical baseline is '{canonical.get('hair_color','')}'. Caption behavior is controlled by the UI variable-feature mode."
         )
+    if eye_color_stats.get("variation_detected") or eye_appearance_counts:
+        notes.append(
+            f"Eye-color/lens variation detected. Canonical baseline remains '{canonical.get('eye_color','')}' and is not discarded."
+        )
+    if beard_pattern_stats.get("variation_detected") or beard_color_stats.get("variation_detected"):
+        notes.append(
+            f"Beard variation detected. Canonical baseline is '{canonical.get('beard_pattern','')}'."
+        )
+    if glasses_stats.get("variation_detected") or glasses_frame_stats.get("variation_detected"):
+        notes.append("Glasses-state/frame variation detected; the canonical glasses description and structured frame fingerprint remain the terminology anchor.")
     if appearance_mode == "cosplay_identity":
-        profile.setdefault("normalizer_notes", []).append(
-            "Cosplay mode enabled from dataset-wide look_context distribution; costume/headpiece/makeup traits remain per-image attributes."
-        )
+        notes.append("Cosplay mode enabled from dataset-wide look_context distribution; costume/headpiece/makeup traits remain per-image attributes.")
+    profile["normalizer_notes"] = notes[-30:]
     return profile
 
 def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -7011,6 +7514,37 @@ def continue_caption_from_profile() -> None:
     identity_summary = stage.get("identity_summary", {}) or {}
     warnings = stage.get("warnings", []) or []
     valid_candidate_count = int(stage.get("valid_candidate_count", 0) or 0)
+
+    # Backward-compatible profile migration: older paused runs do not yet
+    # contain canonical_features or the generalized hair/eye/beard/glasses
+    # variability statistics. Rebuild only the normalized per-image profile
+    # layer from the already audited rows; no OpenAI call or image audit runs.
+    needs_feature_migration = (
+        subject_profile.get("profile_schema_version") != PROFILE_CACHE_SCHEMA_VERSION
+        or not isinstance(subject_profile.get("canonical_features"), dict)
+        or not isinstance((subject_profile.get("profile_variability_stats") or {}).get("glasses"), dict)
+        or not isinstance((subject_profile.get("profile_variability_stats") or {}).get("beard_pattern"), dict)
+    )
+    if needs_feature_migration:
+        migration_rows = [
+            r for r in all_rows
+            if r.get("base_status") == "keep" and r.get("arcface_flag") != "hard"
+        ]
+        if migration_rows:
+            refreshed_traits: Dict[str, Any] = {}
+            for row in migration_rows:
+                image_id = profile_image_id(row)
+                row["profile_image_id"] = image_id
+                refreshed_traits[image_id] = per_image_profile_traits(row, subject_profile)
+            subject_profile["per_image_traits"] = refreshed_traits
+            subject_profile = attach_profile_variability_policies(subject_profile, migration_rows)
+            subject_profile["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
+            subject_profile["force_only_when_visible"] = True
+            subject_profile.setdefault("normalizer_notes", []).append(
+                "Profile feature policies migrated locally during continue-from-profile; no new audit/API call was used."
+            )
+            save_subject_profile(subject_profile)
+            safe_print("   🧬 Migrated legacy profile to generalized feature-policy schema.")
 
     reranked_selected, reranked_review, reranked_unused = rebuild_selection_from_identity_roles(all_rows, subject_profile)
     if reranked_selected:
@@ -8258,7 +8792,12 @@ def build_beard_caption_tag(item: Dict[str, Any], global_rules: Dict[str, Any]) 
 
     beard_rule = global_rules.get("beard_description", {})
     stable_mode_raw = beard_rule.get("mode", "")
-    stable_color = normalize_beard_tag(stable_mode_raw).get("color") if stable_mode_raw else None
+    stable_pattern = normalize_text(beard_rule.get("mode_pattern", ""))
+    stable_color = normalize_text(beard_rule.get("mode_color", ""))
+    if not stable_pattern and stable_mode_raw:
+        parsed_mode = normalize_beard_tag(stable_mode_raw)
+        stable_pattern = normalize_text(parsed_mode.get("pattern", ""))
+        stable_color = normalize_text(parsed_mode.get("color", ""))
 
     item_pattern = parsed["pattern"]
     item_color = parsed["color"]
@@ -8407,32 +8946,8 @@ def build_local_caption(
     else:
         body_build = compact_trait(item.get("body_build"))
 
-    hair_color = image_traits.get("hair_color_base", "")
-    hair_form = image_traits.get("hair_form", "")
-    profile_hair_tag = profile_hair_caption(hair_color, hair_form)
-
-    hair_desc = compact_trait(item.get("hair_description"))
-    hair_policy_variable = (
-        normalize_text(profile_policies.get("hair_color_policy")) == "always_caption_when_visible"
-        or normalize_text(profile_policies.get("hair_form_policy")) == "always_caption_when_visible"
-    )
-    hair_rule = global_rules.get("hair_description", {}) if isinstance(global_rules, dict) else {}
-    hair_global_variable = bool(isinstance(hair_rule, dict) and hair_rule.get("variable"))
-    if caption_profile in {"ernie", "shared_compact"}:
-        hair_tag = profile_hair_tag or (hair_desc if active_policy.get("include_hair_always") else None)
-        if not hair_tag and active_policy.get("include_hair_when_variable"):
-            hair_tag = build_hair_caption_tag(item, global_rules)
-    elif active_policy.get("include_hair_always"):
-        hair_tag = profile_hair_tag or hair_desc or build_hair_caption_tag(item, global_rules)
-    elif active_policy.get("include_hair_when_variable") and (hair_policy_variable or hair_global_variable):
-        hair_tag = profile_hair_tag or hair_desc or build_hair_caption_tag(item, global_rules)
-    elif active_policy.get("include_hair_when_variable"):
-        # Krea captions only describe hair when the subject profile marks it
-        # as variable/deviating. Other profiles keep the older permissive
-        # fallback behavior.
-        hair_tag = None if caption_profile == "krea2_character" else build_hair_caption_tag(item, global_rules)
-    else:
-        hair_tag = None
+    hair_state = get_hair_feature_state(item, profile, image_traits, global_rules, active_policy, caption_profile)
+    hair_tag = hair_state.get("phrase", "") or None
 
     makeup_token = image_traits.get("makeup_intensity", "")
     makeup_style_token = image_traits.get("makeup_style", "")
@@ -8552,47 +9067,22 @@ def build_local_caption(
         body_build_phrase = _phrase_from_token(body_build)
         trait_bits.append(body_build_phrase if "build" in body_build_phrase else f"{body_build_phrase} build")
 
-    if caption_profile not in {"ernie", "shared_compact"} and hair_tag:
+    if caption_profile not in {"ernie", "shared_compact"} and hair_tag and hair_state.get("must_caption"):
         trait_bits.append(hair_tag)
 
-    if (
-        caption_profile not in {"ernie", "shared_compact"}
-        and active_policy.get("include_eye_color_when_variable")
-        and eye_policy == "caption_when_clear_or_variable"
-        and eye_color
-    ):
-        trait_bits.append(f"{_phrase_from_token(eye_color)} eyes")
+    eye_state = get_eye_feature_state(item, profile, image_traits, active_policy)
+    if caption_profile not in {"ernie", "shared_compact"} and eye_state.get("must_caption") and eye_state.get("phrase"):
+        trait_bits.append(eye_state.get("phrase"))
 
-    beard_rule = global_rules.get("beard_description", {})
-    beard_variable = beard_rule.get("variable", False)
-    beard_mode = normalize_compact_text(beard_rule.get("mode", ""))
+    beard_state = get_beard_feature_state(item, global_rules, active_policy, profile)
+    if beard_state.get("must_caption") and beard_state.get("phrase"):
+        trait_bits.append(beard_state.get("phrase"))
+    elif active_policy["include_beard_always"] and beard_desc:
+        trait_bits.append(beard_desc)
 
-    # Normalisierter Beard-Tag (15 Patterns + Farbe). Konsistenter ueber den
-    # Datensatz hinweg als der KI-Rohtext: "light stubble", "5 o'clock shadow"
-    # und "scruff" werden alle zum gleichen Tag "stubble".
-    beard_caption_tag = build_beard_caption_tag(item, global_rules)
-
-    if active_policy["include_beard_always"]:
-        if beard_caption_tag:
-            trait_bits.append(beard_caption_tag)
-        elif beard_desc:
-            # Fallback wenn der Tag-Builder None liefert (clean_shaven oder
-            # nicht sichtbar) aber User explizit immer captionen will.
-            trait_bits.append(beard_desc)
-    elif active_policy["include_beard_when_variable"]:
-        if beard_variable:
-            if beard_caption_tag:
-                trait_bits.append(beard_caption_tag)
-            elif beard_desc:
-                trait_bits.append(beard_desc)
-        elif not beard_variable and beard_caption_tag and beard_mode:
-            # Stable Mode + Abweichung vom Modus -> Tag rein
-            item_beard_mode = normalize_compact_text(item.get("beard_description", ""))
-            if item_beard_mode and item_beard_mode != beard_mode:
-                trait_bits.append(beard_caption_tag)
-
-    if active_policy["include_glasses"] and glasses_desc:
-        trait_bits.append(glasses_desc)
+    glasses_state = get_glasses_feature_state(item, profile, image_traits, active_policy)
+    if glasses_state.get("must_caption") and glasses_state.get("phrase"):
+        trait_bits.append(glasses_state.get("phrase"))
 
     if active_policy.get("include_freckles") and freckles_desc:
         trait_bits.append(freckles_desc)
@@ -8734,6 +9224,7 @@ def _krea_caption_cache_path(item: Dict[str, Any], subject_profile: Dict[str, An
         KREA_CAPTION_PROMPT_VERSION,
         str(KREA_CAPTION_MODEL),
         str(KREA_CAPTION_REASONING_EFFORT),
+        str(VARIABLE_FEATURE_CAPTION_MODE),
         str(source_key),
         profile_key,
         str(item.get("crop_variant") or "original"),
@@ -8773,7 +9264,18 @@ def build_krea_ai_caption(
                 cached = json.load(f)
             caption = _clean_krea_caption(cached.get("caption", ""))
             if caption and caption != TRIGGER_WORD:
-                return caption
+                image_id = profile_image_id(item)
+                image_traits = (profile.get("per_image_traits", {}) or {}).get(image_id, {}) if isinstance(profile, dict) else {}
+                active_policy = enforce_caption_policy_profile(normalize_caption_profile(globals().get("CAPTION_PROFILE", "ernie")), CAPTION_POLICY)
+                feature_states = {
+                    "hair": get_hair_feature_state(item, profile, image_traits, global_rules, active_policy, "krea2_character"),
+                    "eye": get_eye_feature_state(item, profile, image_traits, active_policy),
+                    "beard": get_beard_feature_state(item, global_rules, active_policy, profile),
+                    "glasses": get_glasses_feature_state(item, profile, image_traits, active_policy),
+                }
+                valid_caption, _reasons = _validate_krea_caption_features(caption, feature_states)
+                if valid_caption:
+                    return caption
         except Exception:
             pass
 
@@ -8783,6 +9285,14 @@ def build_krea_ai_caption(
         image_b64 = _encode_pil_for_api(exported_view)
 
         profile_policies = profile.get("profile_policies", {}) if isinstance(profile, dict) else {}
+        active_policy = enforce_caption_policy_profile(normalize_caption_profile(globals().get("CAPTION_PROFILE", "ernie")), CAPTION_POLICY)
+        image_id = profile_image_id(item)
+        image_traits = (profile.get("per_image_traits", {}) or {}).get(image_id, {}) if isinstance(profile, dict) else {}
+        hair_state = get_hair_feature_state(item, profile, image_traits, global_rules, active_policy, "krea2_character")
+        eye_state = get_eye_feature_state(item, profile, image_traits, active_policy)
+        beard_state = get_beard_feature_state(item, global_rules, active_policy, profile)
+        glasses_state = get_glasses_feature_state(item, profile, image_traits, active_policy)
+        feature_states = {"hair": hair_state, "eye": eye_state, "beard": beard_state, "glasses": glasses_state}
         visible_facts = {
             "shot_type": item.get("shot_type", ""),
             "frame_subtype": item.get("frame_subtype", ""),
@@ -8806,6 +9316,36 @@ def build_krea_ai_caption(
             "mirror_selfie": bool(item.get("mirror_selfie", False)),
             "profile_hair_policy": profile_policies.get("hair_color_policy", ""),
             "profile_eye_policy": profile_policies.get("eye_color_policy", ""),
+            "feature_policy": {
+                "hair": {
+                    "current": hair_state.get("current", ""),
+                    "baseline": hair_state.get("baseline", ""),
+                    "preferred_phrase": hair_state.get("phrase", ""),
+                    "must_caption": bool(hair_state.get("must_caption")),
+                },
+                "eye_color": {
+                    "current": eye_state.get("current", ""),
+                    "baseline": eye_state.get("baseline", ""),
+                    "preferred_phrase": eye_state.get("phrase", ""),
+                    "must_caption": bool(eye_state.get("must_caption")),
+                },
+                "beard": {
+                    "preferred_phrase": beard_state.get("phrase", ""),
+                    "must_caption": bool(beard_state.get("must_caption")),
+                    "baseline_pattern": beard_state.get("baseline_pattern", ""),
+                    "current_pattern": beard_state.get("current_pattern", ""),
+                    "baseline_color": beard_state.get("baseline_color", ""),
+                    "current_color": beard_state.get("current_color", ""),
+                },
+                "glasses": {
+                    "preferred_phrase": glasses_state.get("phrase", ""),
+                    "must_caption": bool(glasses_state.get("must_caption")),
+                    "baseline_desc": glasses_state.get("baseline_desc", ""),
+                    "current_desc": glasses_state.get("current_desc", ""),
+                    "baseline_family": glasses_state.get("baseline_family", ""),
+                    "current_family": glasses_state.get("current_family", ""),
+                },
+            },
         }
 
         instructions = f"""
@@ -8822,9 +9362,9 @@ Identity policy:
 - The trigger word carries stable physical identity.
 - Do NOT describe stable skin tone, body build, body proportions, facial structure,
   freckles, tattoos, permanent piercings, scars or other fixed body markers.
-- Do NOT describe stable hair or eye color unless the supplied profile policy marks
-  them as variable, or the current image clearly deviates from the profile.
-- Glasses, makeup, costume elements and hairstyle changes may be described when visible.
+- Do NOT describe stable hair or eye color unless the supplied feature_policy says must_caption=true.
+- Treat beard and glasses the same way: if feature_policy.must_caption is true, you MUST include the supplied preferred_phrase. If must_caption is false, omit that stable feature.
+- Glasses, makeup, costume elements and hairstyle changes may be described when visible, but follow feature_policy exactly for hair color, eye color, beard and glasses.
 - Do not identify the person, guess a name, exact age, location, brand or relationship.
 - No booru tags, keyword lists, filename, markdown, labels, 'This image shows', hedging,
   explanations, quality scores or training advice.
@@ -8871,6 +9411,9 @@ Identity policy:
         caption = _clean_krea_caption(parsed.get("caption", ""))
         if not caption or caption == TRIGGER_WORD:
             raise ValueError("empty Krea caption")
+        valid_caption, caption_reasons = _validate_krea_caption_features(caption, feature_states)
+        if not valid_caption:
+            raise ValueError("feature policy mismatch: " + "; ".join(caption_reasons))
         if ENABLE_CACHE:
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(
