@@ -27,7 +27,8 @@ Many checks and review steps are optional or configurable in the UI. The main fe
 - Web UI with saved settings and English/German language switching
 - Local pre-filtering and duplicate detection before expensive API calls
 - OpenAI-assisted image review and automatic captioning
-- Dedicated `Krea 2 Character` workflow with dataset-aware natural-language captions
+- Top-level training targets for `ERNIE Image`, `Z-Image Base` and `Krea 2`, each with its own prompt/caption engine defaults
+- Dedicated Krea 2 workflow with dataset-aware natural-language captions
 - Centralized subject profile generation from audited images
 - Profile-guided caption normalization for more consistent dataset-wide captions
 - Separate IG-frame cleanup, headshot smart crop and medium-shot rescue crop
@@ -111,6 +112,7 @@ python dataset_curator_ui.py
    - Other platforms: `python dataset_curator_ui.py` inside the virtual environment
 
 2. In the **Dataset Curator** tab:
+   - `Training target / base model`: choose `ERNIE Image`, `Z-Image Base` or `Krea 2`. This setting selects the prompt family and caption engine and is independent from later caption-field customizations.
    - `Trigger Word`: unique token for your subject (e.g. `aronaLora09`).
    - `Input folder images`: folder with your source images (no subfolder recursion).
    - `Target dataset size`: desired number of final training images.
@@ -128,26 +130,47 @@ python dataset_curator_ui.py
 
 6. Use the `01_train_ready` files and selected pictures from `04_review` for your LoRA training. Also check `02_keep_unused`, `03_caption_remove` and `06_needs_manual_review` for shots that may only need minor manual cleanup, manual selection or recaptioning.
 
-### Krea 2 Character workflow
+### Training targets and caption policies
 
-Select the caption preset **`Krea 2 Character`** when preparing a person or character dataset for Krea 2. Selecting the preset applies the recommended starting configuration:
+The training target is selected at the top of the UI and is the single source of truth for the workflow:
 
-- target size: **20 images**,
+- **ERNIE Image** uses explicit structured captions with visible identity anchors.
+- **Z-Image Base** uses compact structured captions and keeps stable identity mainly on the trigger token.
+- **Krea 2** uses a dedicated natural-language GPT caption pass after final image selection.
+
+Changing individual caption fields no longer changes the training target or disables its caption engine. The UI only marks the target rules as **individually customized**.
+
+### Krea 2 workflow
+
+Selecting **`Krea 2`** applies the recommended starting configuration:
+
+- target size: **20 train-ready images**,
 - shot distribution: **40% headshot / 35% medium / 25% full body**,
 - primary audit: **`gpt-5.6-luna`**,
 - subject-profile normalization: **`gpt-5.6-terra`**,
 - final natural-language captions: **`gpt-5.6-luna`**.
 
-The profile stores stable identity and body information for consistency checks. Stable traits such as body build, tattoos, permanent piercings, scars and canonical facial features are not repeated in Krea captions; the trigger token carries that identity. Captions instead focus on visible, image-specific information such as framing, pose, action, expression, gaze, clothing, temporary accessories, background, lighting, camera angle and composition.
+The profile stores stable identity and body information for consistency checks. Stable traits such as body build, tattoos, canonical piercings, scars and canonical facial features are not repeated in Krea captions; the trigger token carries that identity. Captions instead focus on visible, image-specific information such as framing, pose, action, expression, gaze, clothing, temporary accessories, background, lighting, camera angle and composition.
 
 Hair color/form, eye color, beard state/color and glasses are handled by a shared profile policy. The profile first normalizes each feature and stores a canonical baseline. The UI then offers two caption strategies:
 
 - **Only deviations from the canonical appearance** (default): the baseline belongs to the trigger token. For example, if the subject is canonically blonde, blonde images omit hair color while red/copper images state the deviation.
 - **Caption every visible value when genuine variation exists**: once repeated variation is detected, every visible state is captioned, including the baseline state.
 
-Glasses use structured frame normalization in addition to the canonical text description. Equivalent terms such as round wire-frame glasses, round metal-frame eyeglasses and similar wording can therefore resolve to one profile description, while genuinely different frames, sunglasses or images without glasses remain distinct states.
+Hair base color and color modifiers are stored separately, so `brown hair with blonde highlights` remains canonically brown while the highlights can still be captioned. Eye-color statistics only use images where the eyes are sufficiently visible and not distorted by grayscale, strong tints, sunglasses or cosmetic-lens signals.
 
-For the most controllable result, use `Profile then Caption`, review the canonical hair color, eye color, beard state/color and glasses description in the subject-profile tab, and then start the final caption pass. Only selected training images receive the additional Krea natural-language caption call.
+Glasses use structured frame normalization and a position field (`on_face`, `on_head`, `held`, `hanging_from_clothing`). Equivalent wording can resolve to one canonical frame, while genuinely different frames, sunglasses, no-glasses images or a different wearing position remain distinct states.
+
+The Subject Profile stores two piercing layers:
+
+- `piercing_inventory`: every repeatedly observed body piercing and item of ear jewelry, editable in the UI with the roles `canonical`, `variable`, `accessory` or `ignore`.
+- `piercing_baseline`: only entries explicitly classified as canonical.
+
+Krea/Z-Image captions omit canonical piercings, but include visible `variable` piercings and `accessory` ear jewelry using normalized location-aware wording such as `septum ring`, `lower-lip stud` or `hoop earring`.
+
+After final exclusions, the curator backfills from clean keep candidates so the configured target refers to actual files in `01_train_ready`, not to images later moved to `caption_remove` or removed by identity checks.
+
+For the most controllable result, use `Profile then Caption`, review the canonical appearance and piercing roles in the Subject Profile tab, and then start the final caption pass.
 
 ### Crop and export mechanisms
 

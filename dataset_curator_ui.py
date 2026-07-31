@@ -112,8 +112,8 @@ SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
 # (Hautfarbe, Augenfarbe, Koerperbau, konstante Frisur, Geschlechts-Klasse)
 # werden NICHT captioniert, damit der LoRA-Trigger sie als Person-Identitaet
 # absorbiert statt sie als austauschbare Caption-Tokens zu lernen.
-# Variable Attribute (Hair-when-variable, Brille, Sommersprossen, Tattoos,
-# Piercings, Make-up, Kleidung, Pose, Gaze, Ausdruck, Hintergrund,
+# Variable Attribute (Hair-when-variable, abweichende Brillen, variable
+# Piercings/Ohrschmuck, Make-up, Kleidung, Pose, Gaze, Ausdruck, Hintergrund,
 # Beleuchtung, Bildstil) bleiben drin, weil sie zwischen Bildern wechseln
 # und das LoRA sie als situative Marker lernen soll.
 # Begruendung: Z-Image_Base ist ein 6B-Parameter Single-Stream DiT, dessen
@@ -123,8 +123,6 @@ SHARED_COMPACT_CAPTION_FIELDS: List[str] = [
 # Steuerbarkeit (z.B. 'Kathi mit roten Haaren' wird unsauber, weil der
 # Trigger 'blonde' mitschleppt).
 Z_IMAGE_BASE_CAPTION_FIELDS: List[str] = [
-    "include_freckles",
-    "include_tattoos",
     "include_glasses_when_variable",
     "include_piercings",
     "include_makeup",
@@ -145,6 +143,7 @@ Z_IMAGE_BASE_CAPTION_FIELDS: List[str] = [
 # on visible scene-specific attributes and are generated as natural language.
 KREA2_CHARACTER_CAPTION_FIELDS: List[str] = [
     "include_glasses_when_variable",
+    "include_piercings",
     "include_makeup",
     "include_background",
     "include_lighting",
@@ -245,7 +244,8 @@ DEFAULTS: Dict[str, Any] = {
     "c_arcface_model": "buffalo_l",
     "c_arcface_det_size": 640,
     # Captions
-    "c_caption_profile": "shared_compact",
+    "c_training_target": "ernie",
+    "c_caption_profile": "ernie",  # legacy settings key
     "c_captions": list(SHARED_COMPACT_CAPTION_FIELDS),
     "c_variable_feature_mode": "canonical_deviations",
     "c_krea_caption_model": "gpt-5.6-luna",
@@ -327,7 +327,7 @@ CAPTION_PROFILE_PRESETS: Dict[str, List[str]] = {
     # stabile Person-Identitaet, Captions beschreiben nur was zwischen
     # Bildern wechselt.
     "z_image_base": list(Z_IMAGE_BASE_CAPTION_FIELDS),
-    "krea2_character": list(KREA2_CHARACTER_CAPTION_FIELDS),
+    "krea2": list(KREA2_CHARACTER_CAPTION_FIELDS),
     # Legacy-Alias: bestehende Configs mit "shared_compact" werden
     # automatisch wie ERNIE behandelt (das war urspruenglich das einzige
     # Profil, faktisch ERNIE-Style).
@@ -335,65 +335,47 @@ CAPTION_PROFILE_PRESETS: Dict[str, List[str]] = {
 }
 
 
-def normalize_caption_profile(value: Optional[str]) -> str:
+def normalize_training_target(value: Optional[str]) -> str:
     v = (value or "").strip().lower()
-    # Legacy-Alias "shared_compact" wird zu "ernie" - das war historisch
-    # das einzige Profil und entspricht der ERNIE-Strategie.
-    if v == "shared_compact":
+    if v in {"ernie", "shared_compact"}:
         return "ernie"
-    if v in {"ernie", "z_image_base", "krea2_character"}:
-        return v
-    if v in CAPTION_PROFILE_PRESETS:
-        return v
-    return "custom"
+    if v in {"z_image_base", "z-image_base", "zimage", "z_image"}:
+        return "z_image_base"
+    if v in {"krea2", "krea_2", "krea2_character", "krea_2_character"}:
+        return "krea2"
+    return "ernie"
 
 
-def caption_profile_choices() -> List[Tuple[str, str]]:
+def caption_profile_for_training_target(value: Optional[str]) -> str:
+    target = normalize_training_target(value)
+    return "krea2_character" if target == "krea2" else target
+
+
+def training_target_choices() -> List[Tuple[str, str]]:
     return [
-        (
-            tr(
-                "ERNIE (alle Felder, robust für asiatisch geprägtes Basismodell)",
-                "ERNIE (all fields, robust for Asia-leaning base model)",
-            ),
-            "ernie",
-        ),
-        (
-            tr(
-                "Z-Image Base (nur veränderliche Felder, Trigger-Wort trägt die Identität)",
-                "Z-Image Base (only variable fields, trigger word carries identity)",
-            ),
-            "z_image_base",
-        ),
-        (
-            tr(
-                "Krea 2 Character (natürliche GPT-Captions, stabile Körpermerkmale nur im Profil)",
-                "Krea 2 Character (natural GPT captions, stable physical traits only in profile)",
-            ),
-            "krea2_character",
-        ),
-        (tr("Custom", "Custom"), "custom"),
+        (tr("ERNIE Image", "ERNIE Image"), "ernie"),
+        (tr("Z-Image Base", "Z-Image Base"), "z_image_base"),
+        (tr("Krea 2", "Krea 2"), "krea2"),
     ]
 
 
-def get_caption_preset_values(profile: Optional[str]) -> List[str]:
-    normalized = normalize_caption_profile(profile)
+def get_caption_preset_values(target: Optional[str]) -> List[str]:
+    normalized = normalize_training_target(target)
     if normalized in CAPTION_PROFILE_PRESETS:
         return list(CAPTION_PROFILE_PRESETS[normalized])
     return list(DEFAULTS["c_captions"])
 
 
-def resolve_caption_fields_for_profile(
-    profile: Optional[str],
+def resolve_caption_fields_for_target(
+    target: Optional[str],
     current_fields: Optional[List[str]] = None,
 ) -> List[str]:
-    normalized = normalize_caption_profile(profile)
-    if normalized == "custom":
-        return list(current_fields) if current_fields is not None else list(DEFAULTS["c_captions"])
+    normalized = normalize_training_target(target)
     return get_caption_preset_values(normalized)
 
 
-def apply_caption_profile_defaults(
-    profile: Optional[str],
+def apply_training_target_defaults(
+    target: Optional[str],
     current_fields: Optional[List[str]],
     target_size: int,
     ratio_h: float,
@@ -408,60 +390,48 @@ def apply_caption_profile_defaults(
     krea_caption_model: str,
     krea_caption_reasoning_effort: str,
 ):
-    """Apply Krea-specific recommendations without changing other profiles."""
-    normalized = normalize_caption_profile(profile)
-    fields = resolve_caption_fields_for_profile(normalized, current_fields)
-    if normalized == "krea2_character":
+    """Load target defaults. Later checkbox edits never change the target."""
+    normalized = normalize_training_target(target)
+    fields = resolve_caption_fields_for_target(normalized, current_fields)
+    if normalized == "krea2":
         return (
-            fields,
-            20,
-            0.40,
-            0.35,
-            0.25,
-            "gpt-5.6-luna",
-            "none",
-            "none",
-            "low",
-            "gpt-5.6-terra",
-            "low",
-            "gpt-5.6-luna",
-            "none",
+            fields, 20, 0.40, 0.35, 0.25,
+            "gpt-5.6-luna", "none", "none", "low",
+            "gpt-5.6-terra", "low", "gpt-5.6-luna", "none",
         )
     return (
-        fields,
-        target_size,
-        ratio_h,
-        ratio_m,
-        ratio_f,
-        audit_model,
-        audit_reasoning_effort,
-        trigger_reasoning_effort,
-        escalation_reasoning_effort,
-        profile_model,
-        profile_reasoning_effort,
-        krea_caption_model,
-        krea_caption_reasoning_effort,
+        fields, target_size, ratio_h, ratio_m, ratio_f,
+        audit_model, audit_reasoning_effort, trigger_reasoning_effort,
+        escalation_reasoning_effort, profile_model, profile_reasoning_effort,
+        krea_caption_model, krea_caption_reasoning_effort,
     )
 
 
-def detect_caption_profile(selected_fields: Optional[List[str]]) -> str:
+def caption_policy_adjustment_note(target: Optional[str], selected_fields: Optional[List[str]]) -> str:
+    normalized = normalize_training_target(target)
+    preset = set(CAPTION_PROFILE_PRESETS.get(normalized, []))
     selected = set(selected_fields or [])
-    for profile, preset_fields in CAPTION_PROFILE_PRESETS.items():
-        if selected == set(preset_fields):
-            return profile
-    return "custom"
+    if selected == preset:
+        return tr("✅ Standardregeln des Trainingsziels aktiv.", "✅ Training-target default rules active.")
+    return tr(
+        "🛠️ Caption-Regeln individuell angepasst. Trainingsziel und Caption-Engine bleiben unverändert.",
+        "🛠️ Caption rules customized. Training target and caption engine remain unchanged.",
+    )
 
 
 def load_settings() -> Dict[str, Any]:
     """Laedt gespeicherte Einstellungen, ergaenzt fehlende mit Defaults."""
     settings = dict(DEFAULTS)
+    saved: Dict[str, Any] = {}
     if os.path.isfile(SETTINGS_PATH):
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            settings.update(saved)
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                saved = loaded
+                settings.update(saved)
         except Exception:
-            pass
+            saved = {}
 
     # If settings file exists but is missing keys (e.g. only language was saved),
     # ensure missing keys are filled from DEFAULTS.
@@ -493,6 +463,9 @@ def load_settings() -> Dict[str, Any]:
     # API Key aus Umgebungsvariable wenn nicht gespeichert
     if not settings.get("c_api_key"):
         settings["c_api_key"] = os.environ.get("OPENAI_API_KEY", "")
+    legacy_target = saved.get("c_training_target") or saved.get("c_caption_profile") or settings.get("c_training_target")
+    settings["c_training_target"] = normalize_training_target(legacy_target)
+    settings["c_caption_profile"] = settings["c_training_target"]
     return settings
 
 
@@ -561,7 +534,7 @@ def save_settings_fn(
     c_use_pose_diversity, c_pose_soft_limit, c_pose_penalty_weight,
     c_use_arcface, c_arcface_hard, c_arcface_soft, c_arcface_trim,
     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
-    c_caption_profile,
+    c_training_target,
     c_captions, c_variable_feature_mode, c_krea_caption_model, c_krea_caption_reasoning_effort,
     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
@@ -625,7 +598,8 @@ def save_settings_fn(
         "c_arcface_min_faces": c_arcface_min_faces,
         "c_arcface_model": c_arcface_model,
         "c_arcface_det_size": c_arcface_det_size,
-        "c_caption_profile": normalize_caption_profile(c_caption_profile),
+        "c_training_target": normalize_training_target(c_training_target),
+        "c_caption_profile": normalize_training_target(c_training_target),
         "c_captions": c_captions,
         "c_variable_feature_mode": c_variable_feature_mode,
         "c_krea_caption_model": c_krea_caption_model,
@@ -734,7 +708,7 @@ def _profile_summary_markdown(profile: Dict[str, Any]) -> str:
     glasses = markers.get("glasses", {}) or {}
     freckles = markers.get("freckles", {}) or {}
     tattoos = markers.get("tattoo_inventory", []) or []
-    piercings = markers.get("piercing_baseline", []) or []
+    piercings = markers.get("piercing_inventory", []) or markers.get("piercing_baseline", []) or []
     per_image = profile.get("per_image_traits", {}) or {}
     lines = [
         f"### {profile.get('subject_id', '') or 'Subject'}",
@@ -752,7 +726,7 @@ def _profile_summary_markdown(profile: Dict[str, Any]) -> str:
         f"**Glasses:** {glasses.get('canonical_description', '-') if glasses.get('wears_regularly') else 'not regular'}",
         f"**Freckles:** {freckles.get('canonical_description', '-') if freckles.get('has_freckles') else 'not regular'}",
         f"**Tattoos in inventory:** {len(tattoos)}",
-        f"**Baseline piercings:** {len(piercings)}",
+        f"**Piercings/accessories in inventory:** {len(piercings)}",
         f"**Per-image trait rows:** {len(per_image)}",
         f"**Force only when visible:** {profile.get('force_only_when_visible', True)}",
     ]
@@ -903,7 +877,7 @@ def _normalize_dropdown_choices(vocab: List[str], current: str) -> List[str]:
 def aggregate_per_image_traits(profile: Dict[str, Any]) -> Dict[str, List[Tuple[str, int]]]:
     """Bucket-Counts ueber per_image_traits, sortiert nach Haeufigkeit absteigend."""
     per_image = (profile or {}).get("per_image_traits", {}) or {}
-    fields = ["hair_color_base", "hair_form", "eye_color_base", "eye_appearance", "makeup_intensity", "makeup_style", "look_context"]
+    fields = ["hair_color_base", "hair_color_modifier", "hair_form", "eye_color_base", "eye_appearance", "makeup_intensity", "makeup_style", "look_context", "glasses_position"]
     result: Dict[str, List[Tuple[str, int]]] = {}
     for field in fields:
         counts: Dict[str, int] = {}
@@ -941,7 +915,7 @@ def _empty_editor_payload(status_msg: str) -> Tuple:
         False, "",  # glasses
         False, "",  # freckles
         "_kein Profil_", "_kein Profil_", "_kein Profil_",
-        "_kein Profil_", "_kein Profil_", "_kein Profil_",
+        "_kein Profil_", [], "_kein Profil_",
         # Bucket-edit dropdowns (3x from + 3x to)
         empty_dropdown, empty_dropdown, empty_dropdown,
         empty_dropdown, empty_dropdown, empty_dropdown,
@@ -1011,6 +985,13 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
         counts.get("hair_color_base", []),
         PROFILE_VOCAB_HAIR_COLOR,
     )
+    hair_modifier_counts = counts.get("hair_color_modifier", [])
+    if hair_modifier_counts:
+        hair_color_md += "\n\n" + _bucket_summary_markdown(
+            tr("Haarfarb-Modifier", "Hair-color modifiers"),
+            hair_modifier_counts,
+            ["highlights", "blonde_highlights", "red_highlights", "ombre", "balayage"],
+        )
     hair_form_md = _bucket_summary_markdown(
         tr("Frisur / Form (per Bild)", "Hair form (per image)"),
         counts.get("hair_form", []),
@@ -1056,7 +1037,7 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     makeup_to_dd = gr.update(choices=PROFILE_VOCAB_MAKEUP, value=(makeup_present[0] if makeup_present else PROFILE_VOCAB_MAKEUP[0]))
 
     tattoo_inv = markers.get("tattoo_inventory", []) or []
-    piercing_inv = markers.get("piercing_baseline", []) or []
+    piercing_inv = markers.get("piercing_inventory", []) or markers.get("piercing_baseline", []) or []
     if tattoo_inv:
         tattoo_md = "**" + tr("Tattoo-Inventar", "Tattoo inventory") + f"** ({len(tattoo_inv)})\n\n"
         for t in tattoo_inv:
@@ -1064,12 +1045,17 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     else:
         tattoo_md = tr("**Tattoo-Inventar:** _keine erfasst_", "**Tattoo inventory:** _none recorded_")
 
-    if piercing_inv:
-        piercing_md = "**" + tr("Baseline-Piercings", "Baseline piercings") + f"** ({len(piercing_inv)})\n\n"
-        for p in piercing_inv:
-            piercing_md += f"- `{p.get('location','')}` — {p.get('canonical_description','')} _({p.get('frequency','')})_\n"
-    else:
-        piercing_md = tr("**Baseline-Piercings:** _keine erfasst_", "**Baseline piercings:** _none recorded_")
+    piercing_rows = []
+    for p_item in piercing_inv:
+        if not isinstance(p_item, dict):
+            continue
+        piercing_rows.append([
+            str(p_item.get("location", "") or ""),
+            str(p_item.get("canonical_description", "") or ""),
+            str(p_item.get("frequency", "") or ""),
+            str(p_item.get("category", "body_piercing") or "body_piercing"),
+            str(p_item.get("role", "variable") or "variable"),
+        ])
 
     notes = profile.get("normalizer_notes", []) or []
     if notes:
@@ -1098,7 +1084,7 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
         bool(freckles.get("has_freckles", False)),
         str(freckles.get("canonical_description", "") or ""),
         hair_color_md, hair_form_md, makeup_md,
-        tattoo_md, piercing_md, notes_md,
+        tattoo_md, piercing_rows, notes_md,
         color_from_dd, form_from_dd, makeup_from_dd,
         color_to_dd, form_to_dd, makeup_to_dd,
         _identity_clusters_markdown(profile), _identity_clusters_table(profile),
@@ -1129,6 +1115,7 @@ def save_profile_from_editor(
     glasses_desc: str,
     freckles_present: bool,
     freckles_desc: str,
+    piercing_table: Any,
 ) -> str:
     """Speichert die Editor-Werte zurueck ins _subject_profile.json.
 
@@ -1180,6 +1167,49 @@ def save_profile_from_editor(
     freckles = markers.setdefault("freckles", {"has_freckles": False, "canonical_description": "", "frequency": ""})
     freckles["has_freckles"] = bool(freckles_present)
     freckles["canonical_description"] = (freckles_desc or "").strip()
+
+    piercing_records: List[Dict[str, Any]] = []
+    if hasattr(piercing_table, "to_dict"):
+        try:
+            piercing_records = list(piercing_table.to_dict("records"))
+        except Exception:
+            piercing_records = []
+    elif isinstance(piercing_table, dict) and "data" in piercing_table:
+        headers = piercing_table.get("headers") or ["location", "canonical_description", "frequency", "category", "role"]
+        for row in piercing_table.get("data") or []:
+            piercing_records.append(row if isinstance(row, dict) else {headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))})
+    elif isinstance(piercing_table, list):
+        headers = ["location", "canonical_description", "frequency", "category", "role"]
+        for row in piercing_table:
+            if isinstance(row, dict):
+                piercing_records.append(row)
+            elif isinstance(row, (list, tuple)):
+                piercing_records.append({headers[i]: row[i] if i < len(row) else "" for i in range(len(headers))})
+
+    clean_inventory = []
+    for rec in piercing_records:
+        loc = str(rec.get("location", "") or "").strip()
+        desc = str(rec.get("canonical_description", "") or "").strip()
+        if not loc or not desc:
+            continue
+        category = str(rec.get("category", "body_piercing") or "body_piercing").strip()
+        if category not in {"body_piercing", "ear_jewelry"}:
+            category = "ear_jewelry" if loc.startswith("ear_") else "body_piercing"
+        role = str(rec.get("role", "variable") or "variable").strip()
+        if role not in {"canonical", "variable", "accessory", "ignore"}:
+            role = "accessory" if category == "ear_jewelry" else "variable"
+        clean_inventory.append({
+            "location": loc,
+            "canonical_description": desc,
+            "frequency": str(rec.get("frequency", "") or ""),
+            "category": category,
+            "role": role,
+        })
+    markers["piercing_inventory"] = clean_inventory
+    markers["piercing_baseline"] = [
+        {"location": x["location"], "canonical_description": x["canonical_description"], "frequency": x["frequency"]}
+        for x in clean_inventory if x.get("role") == "canonical"
+    ]
 
     profile["force_only_when_visible"] = True
 
@@ -2193,7 +2223,7 @@ def start_curator(
     use_pose_diversity, pose_soft_limit, pose_penalty_weight,
     use_arcface, arcface_hard, arcface_soft, arcface_trim,
     arcface_min_faces, arcface_model, arcface_det_size,
-    caption_profile,
+    training_target,
     caption_options, variable_feature_mode, krea_caption_model, krea_caption_reasoning_effort,
     c_pipeline_mode, c_profile_normalizer_model, profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
@@ -2284,10 +2314,11 @@ def start_curator(
         "ARCFACE_MIN_FACES_FOR_CENTROID": int(arcface_min_faces),
         "ARCFACE_MODEL_PACK": str(arcface_model).strip() or "buffalo_l",
         "ARCFACE_DET_SIZE": int(arcface_det_size),
-        "CAPTION_PROFILE": normalize_caption_profile(caption_profile),
+        "TRAINING_TARGET": normalize_training_target(training_target),
+        "CAPTION_PROFILE": caption_profile_for_training_target(training_target),
         "CAPTION_POLICY": caption_policy,
         "VARIABLE_FEATURE_CAPTION_MODE": str(variable_feature_mode or "canonical_deviations"),
-        "USE_KREA_AI_CAPTIONING": normalize_caption_profile(caption_profile) == "krea2_character",
+        "USE_KREA_AI_CAPTIONING": normalize_training_target(training_target) == "krea2",
         "KREA_CAPTION_MODEL": krea_caption_model.strip() or "gpt-5.6-luna",
         "KREA_CAPTION_REASONING_EFFORT": str(krea_caption_reasoning_effort or "none"),
         "PIPELINE_MODE": c_pipeline_mode,
@@ -2332,7 +2363,7 @@ def start_caption_from_profile(
     use_pose_diversity, pose_soft_limit, pose_penalty_weight,
     use_arcface, arcface_hard, arcface_soft, arcface_trim,
     arcface_min_faces, arcface_model, arcface_det_size,
-    caption_profile,
+    training_target,
     caption_options, variable_feature_mode, krea_caption_model, krea_caption_reasoning_effort,
     c_pipeline_mode, c_profile_normalizer_model, profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
@@ -2380,10 +2411,11 @@ def start_caption_from_profile(
         "OPENAI_TOKEN_LIMIT_TOTAL": int(openai_token_limit or 0),
         "TRIGGER_CHECK_REASONING_EFFORT": str(trigger_reasoning_effort or "none"),
         "REVIEW_ESCALATION_REASONING_EFFORT": str(review_escalation_reasoning_effort or "low"),
-        "CAPTION_PROFILE": normalize_caption_profile(caption_profile),
+        "TRAINING_TARGET": normalize_training_target(training_target),
+        "CAPTION_PROFILE": caption_profile_for_training_target(training_target),
         "CAPTION_POLICY": caption_policy,
         "VARIABLE_FEATURE_CAPTION_MODE": str(variable_feature_mode or "canonical_deviations"),
-        "USE_KREA_AI_CAPTIONING": normalize_caption_profile(caption_profile) == "krea2_character",
+        "USE_KREA_AI_CAPTIONING": normalize_training_target(training_target) == "krea2",
         "KREA_CAPTION_MODEL": krea_caption_model.strip() or "gpt-5.6-luna",
         "KREA_CAPTION_REASONING_EFFORT": str(krea_caption_reasoning_effort or "none"),
         "PIPELINE_MODE": "profile_then_caption",
@@ -2574,6 +2606,20 @@ def build_ui() -> gr.Blocks:
             # ==============================================================
             with gr.TabItem(tr("📸 Dataset Curator", "📸 Dataset Curator")):
 
+                c_training_target = gr.Dropdown(
+                    label=tr("Trainingsziel / Basismodell", "Training target / base model"),
+                    choices=training_target_choices(),
+                    value=normalize_training_target(S.get("c_training_target")),
+                    info=tr(
+                        "Legt die Prompt-Familie, Caption-Engine und empfohlenen Standardwerte fest. Änderungen an einzelnen Caption-Regeln ändern dieses Trainingsziel nicht.",
+                        "Selects the prompt family, caption engine and recommended defaults. Editing individual caption rules never changes this training target.",
+                    ),
+                )
+                gr.Markdown(tr(
+                    "**Pipeline-Auswahl:** ERNIE und Z-Image verwenden strukturierte lokale Captions; Krea 2 verwendet nach der Auswahl natürliche GPT-Captions.",
+                    "**Pipeline selection:** ERNIE and Z-Image use structured local captions; Krea 2 uses natural GPT captions after selection.",
+                ))
+
                 with gr.Row():
                     with gr.Column(scale=2):
                         gr.Markdown(tr("### Basis-Einstellungen", "### Basic Settings"))
@@ -2602,8 +2648,8 @@ def build_ui() -> gr.Blocks:
                             step=1,
                             value=S["c_target"],
                             info=tr(
-                                "Wie viele Bilder das finale Training-Set haben soll. Qualität geht vor Füllmaterial. Für Krea 2 Character setzt das Preset 20 als Ziel; 12 hochwertige Bilder gelten als kompaktes Minimum.",
-                                "How many images the final training set should contain. Quality over filler images. The Krea 2 Character preset sets a target of 20; 12 high-quality images are a compact minimum.",
+                                "Wie viele Bilder das finale Training-Set haben soll. Qualität geht vor Füllmaterial. Das Trainingsziel Krea 2 setzt 20 als Empfehlung; 12 hochwertige Bilder gelten als kompaktes Minimum.",
+                                "How many images the final training set should contain. Quality over filler images. The Krea 2 training target recommends 20; 12 high-quality images are a compact minimum.",
                             ),
                         )
                         c_api_key = gr.Textbox(
@@ -4005,10 +4051,9 @@ def build_ui() -> gr.Blocks:
                         "der Bilder. Du kannst auswählen, welche Merkmale in die Captions "
                         "aufgenommen werden – das beeinflusst, wie das LoRA später auf "
                         "Prompts reagiert.\n\n"
-                        "**Caption-Preset:**\n\n"
-                        "Bündel passender Felder für ein bestimmtes Basismodell. "
-                        "Du kannst die Einzelfelder nach Auswahl trotzdem manuell "
-                        "anpassen.\n\n"
+                        "**Trainingsziel und Caption-Policy:**\n\n"
+                        "Das oben gewählte Trainingsziel bestimmt Workflow, Promptfamilie und Caption-Engine. "
+                        "Die Einzelfelder hier steuern nur, welche Merkmale diese Engine verwenden darf.\n\n"
                         "**Aktive Caption-Felder:**\n\n"
                         "Welche Eigenschaften gehen in die Beschreibung? Die "
                         "Antwort hängt am Basismodell:\n\n"
@@ -4022,7 +4067,7 @@ def build_ui() -> gr.Blocks:
                         "Körperbau, konstante Frisur) werden weggelassen, damit das "
                         "Trigger-Wort die Person-Identität sauber absorbiert. Nur "
                         "variable Sachen (Kleidung, Pose, Hintergrund, Brille wenn "
-                        "wechselnd, Hair-when-variable, Make-up, Tattoos, Bildstil) "
+                        "wechselnd, Hair-when-variable, variable Piercings/Ohrschmuck, Make-up, Bildstil) "
                         "kommen rein. Vorteil: bessere Steuerbarkeit bei Inferenz "
                         "('Kathi mit roten Haaren' funktioniert sauber, weil der "
                         "Trigger 'blonde' nicht in der Caption mitfährt).\n\n"
@@ -4048,9 +4093,9 @@ def build_ui() -> gr.Blocks:
                         "The curator generates captions automatically from the AI image "
                         "analysis. You pick which attributes go into the captions – this "
                         "affects how the LoRA later reacts to prompts.\n\n"
-                        "**Caption preset:**\n\n"
-                        "Bundle of fields suitable for a particular base model. "
-                        "You can fine-tune individual fields afterwards.\n\n"
+                        "**Training target and caption policy:**\n\n"
+                        "The training target selected above chooses the workflow, prompt family and caption engine. "
+                        "The fields here only control which facts that engine may use.\n\n"
                         "**Active caption fields:**\n\n"
                         "Which attributes go into the description? The answer "
                         "depends on the base model:\n\n"
@@ -4064,7 +4109,7 @@ def build_ui() -> gr.Blocks:
                         "color, body build, consistent hair) are omitted so the "
                         "trigger word cleanly absorbs the person identity. Only "
                         "variable things (clothing, pose, background, glasses if "
-                        "they vary, hair-when-variable, makeup, tattoos, visual "
+                        "they vary, hair-when-variable, variable piercings or ear jewelry, makeup, visual "
                         "style) go in. Benefit: better inference steerability "
                         "('Kathi with red hair' works cleanly because the trigger "
                         "doesn't drag 'blonde' along in every caption).\n\n"
@@ -4075,31 +4120,18 @@ def build_ui() -> gr.Blocks:
                         "is canonical). Alternatively, every visible value can be "
                         "captioned once genuine variation is detected. Glasses terms "
                         "are consolidated into one canonical description.\n\n"
-                        "**Krea 2 Character** – natural-language captions are generated after selection. "
+                        "**Krea 2** – natural-language captions are generated after selection. "
                         "Stable identity and body traits such as tattoos are stored in the subject profile "
                         "and omitted from captions; scene-specific details remain captioned. Selecting this "
-                        "preset also applies the recommended 20-image, 40/35/25 distribution and Luna/Terra "
+                        "training target also applies the recommended 20-image, 40/35/25 distribution and Luna/Terra "
                         "model defaults.\n\n"
-                        "**If unsure:** Choose the preset matching the base model."
+                        "**If unsure:** Choose the training target matching the base model."
                         "</details>",
                     ))
-                    c_caption_profile = gr.Dropdown(
-                        label=tr("Caption-Voreinstellung", "Caption preset"),
-                        choices=caption_profile_choices(),
-                        value=normalize_caption_profile(S.get("c_caption_profile")) or "ernie",
-                        info=tr(
-                            "Voreingestelltes Schema je Basismodell. ERNIE = alle "
-                            "Felder (asiatisch geprägtes Basismodell, redundante "
-                            "Anker helfen). Z-Image Base = nur variable Felder "
-                            "(stabiles Sprachverständnis, Trigger trägt die "
-                            "Identität). Krea 2 Character erzeugt natürliche GPT-Captions und hält stabile Körpermerkmale ausschließlich im Subject Profile.",
-                            "Preset schema per base model. ERNIE = all fields "
-                            "(Asia-leaning base model, redundant anchors help). "
-                            "Z-Image Base = only variable fields (strong language "
-                            "understanding, trigger carries identity). Krea 2 Character "
-                            "generates natural GPT captions and keeps stable physical traits only in the subject profile.",
-                        ),
-                    )
+                    gr.Markdown(tr(
+                        "Das Trainingsziel wird oben gewählt. Die folgenden Felder passen nur die Caption-Policy an; die gewählte Prompt-Familie und Caption-Engine bleiben aktiv.",
+                        "Choose the training target at the top. The fields below only customize caption policy; the selected prompt family and caption engine remain active.",
+                    ))
                     c_captions = gr.CheckboxGroup(
                         label=tr("Aktive Caption-Felder", "Active caption fields"),
                         choices=CAPTION_FIELD_CHOICES,
@@ -4109,8 +4141,8 @@ def build_ui() -> gr.Blocks:
                             "werden. Empfehlung pro Basismodell: bei ERNIE "
                             "alle Felder einschließen, bei Z-Image Base nur "
                             "variable Felder (Kleidung, Pose, Hintergrund, "
-                            "Brille-wenn-variabel, Hair-when-variable, Sommersprossen, "
-                            "Tattoos, Make-up, Visual-Style). Permanente Merkmale "
+                            "Brille-wenn-variabel, Hair-when-variable, variable Piercings/"
+                            "Ohrschmuck, Make-up, Visual-Style). Permanente Merkmale "
                             "(Hautton, Augenfarbe, Körperbau, konstante Haare) "
                             "lässt man bei Z-Image Base weg, damit das Trigger-Wort "
                             "die Identität sauber absorbiert. Im Zweifel auf das "
@@ -4119,12 +4151,15 @@ def build_ui() -> gr.Blocks:
                             "Recommendation per base model: for ERNIE include "
                             "all fields; for Z-Image Base only variable fields "
                             "(clothing, pose, background, glasses-when-variable, "
-                            "hair-when-variable, freckles, tattoos, makeup, "
+                            "hair-when-variable, variable piercings/ear jewelry, makeup, "
                             "visual style). Persistent features (skin tone, eye "
                             "color, body build, constant hair) are omitted with "
                             "Z-Image Base so the trigger word cleanly absorbs "
                             "identity. When in doubt trust the preset above.",
                         ),
+                    )
+                    c_caption_policy_status = gr.Markdown(
+                        caption_policy_adjustment_note(S.get("c_training_target"), S.get("c_captions"))
                     )
                     c_variable_feature_mode = gr.Dropdown(
                         label=tr("Regel für variable Identitätsmerkmale", "Variable identity feature rule"),
@@ -4149,8 +4184,8 @@ def build_ui() -> gr.Blocks:
                         choices=OPENAI_MODEL_PRESET_CHOICES,
                         value=S["c_krea_caption_model"],
                         info=tr(
-                            "Nur beim Profil `Krea 2 Character`: Erstellt nach der finalen Bildauswahl natürliche englische Captions aus Originalbild, Audit und bestätigtem Subject Profile. Empfehlung: gpt-5.6-luna.",
-                            "Only for the `Krea 2 Character` profile: creates natural English captions after final image selection using the original image, audit and confirmed subject profile. Recommended: gpt-5.6-luna.",
+                            "Nur beim Trainingsziel `Krea 2`: Erstellt nach der finalen Bildauswahl natürliche englische Captions aus Originalbild, Audit und bestätigtem Subject Profile. Empfehlung: gpt-5.6-luna.",
+                            "Only for the `Krea 2` training target: creates natural English captions after final image selection using the original image, audit and confirmed subject profile. Recommended: gpt-5.6-luna.",
                         ),
                         **openai_model_dropdown_kwargs(),
                     )
@@ -4163,10 +4198,10 @@ def build_ui() -> gr.Blocks:
                             "Reasoning for the final natural caption of each selected image. `none` is the recommended default; `low` can be tested for complex scenes.",
                         ),
                     )
-                    c_caption_profile.change(
-                        fn=apply_caption_profile_defaults,
+                    c_target_defaults_event = c_training_target.change(
+                        fn=apply_training_target_defaults,
                         inputs=[
-                            c_caption_profile, c_captions, c_target,
+                            c_training_target, c_captions, c_target,
                             c_ratio_h, c_ratio_m, c_ratio_f,
                             c_model, c_audit_reasoning_effort,
                             c_trigger_reasoning_effort, c_review_escalation_reasoning_effort,
@@ -4182,10 +4217,16 @@ def build_ui() -> gr.Blocks:
                             c_krea_caption_model, c_krea_caption_reasoning_effort,
                         ],
                     )
+
+                    c_target_defaults_event.then(
+                        fn=caption_policy_adjustment_note,
+                        inputs=[c_training_target, c_captions],
+                        outputs=[c_caption_policy_status],
+                    )
                     c_captions.change(
-                        fn=detect_caption_profile,
-                        inputs=[c_captions],
-                        outputs=[c_caption_profile],
+                        fn=caption_policy_adjustment_note,
+                        inputs=[c_training_target, c_captions],
+                        outputs=[c_caption_policy_status],
                     )
 
                 with gr.Accordion(tr("💾 Export-Optionen", "💾 Export options"), open=False):
@@ -4321,7 +4362,7 @@ def build_ui() -> gr.Blocks:
                     c_use_pose_diversity, c_pose_soft_limit, c_pose_penalty_weight,
                     c_use_arcface, c_arcface_hard, c_arcface_soft, c_arcface_trim,
                     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
-                    c_caption_profile,
+                    c_training_target,
                     c_captions, c_variable_feature_mode, c_krea_caption_model, c_krea_caption_reasoning_effort,
                     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
                     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
@@ -4588,8 +4629,20 @@ def build_ui() -> gr.Blocks:
                         with gr.Row():
                             with gr.Column():
                                 p_tattoo_md = gr.Markdown("_kein Profil geladen_")
-                            with gr.Column():
-                                p_piercing_md = gr.Markdown("_kein Profil geladen_")
+                            with gr.Column(scale=2):
+                                p_piercing_md = gr.Dataframe(
+                                    headers=["location", "canonical_description", "frequency", "category", "role"],
+                                    column_count=(5, "fixed"),
+                                    datatype=["str", "str", "str", "str", "str"],
+                                    value=[],
+                                    interactive=True,
+                                    row_count=(0, "dynamic"),
+                                    label=tr("Piercing- und Ohrschmuck-Inventar", "Piercing and ear-jewelry inventory"),
+                                )
+                                gr.Markdown(tr(
+                                    "Rollen: `canonical` = Grunderscheinung · `variable` = sichtbare Abweichung · `accessory` = austauschbarer Ohrschmuck · `ignore` = nie captionieren.",
+                                    "Roles: `canonical` = baseline appearance · `variable` = visible variation · `accessory` = swappable ear jewelry · `ignore` = never caption.",
+                                ))
 
                     # ----- Subtab: Identity Clustering -----
                     with gr.TabItem(tr("🧩 Identity Clustering", "🧩 Identity clustering")):
@@ -4726,6 +4779,7 @@ def build_ui() -> gr.Blocks:
                         p_hair_color_baseline, p_beard_pattern, p_beard_color,
                         p_glasses_regular, p_glasses_desc,
                         p_freckles_present, p_freckles_desc,
+                        p_piercing_md,
                     ],
                     outputs=[p_status],
                 )

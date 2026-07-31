@@ -502,8 +502,12 @@ TRIGGER_CACHE_DIR = os.path.join(CACHE_DIR, "trigger")
 SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "08_smart_crop_pairs")
 IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
 
-# Caption-Regeln
-CAPTION_PROFILE = "ernie"  # "ernie" | "z_image_base" | "krea2_character" | "custom"
+# Trainingsziel und Caption-Regeln
+# TRAINING_TARGET waehlt die Pipeline/Prompt-Familie. CAPTION_PROFILE bleibt als
+# Rueckwaertskompatibilitaets-Alias fuer alte Configs, darf aber nicht mehr aus
+# einzelnen Caption-Checkboxen abgeleitet werden.
+TRAINING_TARGET = "ernie"  # "ernie" | "z_image_base" | "krea2"
+CAPTION_PROFILE = "ernie"  # legacy alias, wird beim Config-Load aus TRAINING_TARGET gesetzt
 # How variable visual traits are captioned:
 # - canonical_deviations: canonical baseline belongs to the trigger; only deviations are captioned.
 # - all_visible_when_variable: once genuine variation is detected, caption every visible state.
@@ -514,7 +518,7 @@ VARIABLE_FEATURE_CAPTION_MODE = "canonical_deviations"
 USE_KREA_AI_CAPTIONING = True
 KREA_CAPTION_MODEL = "gpt-5.6-luna"
 KREA_CAPTION_IMAGE_DETAIL = "high"
-KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v2-feature-policy"
+KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v3-training-target"
 CAPTION_POLICY = {
     "include_gender_class": True,
     "include_skin_tone": True, 
@@ -615,7 +619,7 @@ PROFILE_NORMALIZER_MODEL = "gpt-5.6-terra"
 #       kanonische Profil-Brille ueberschrieben werden.
 #   v7: Erweiterte Profile-Vokabulare inkl. hair_length und
 #       body_height_impression; Body-Build ersetzt stocky durch broad_build.
-PROFILE_CACHE_SCHEMA_VERSION = "v11"
+PROFILE_CACHE_SCHEMA_VERSION = "v12"
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
@@ -673,6 +677,20 @@ ENABLE_SUBJECT_SANITY_CHECK = True
 SUBJECT_MIN_TORSO_LANDMARKS = 2
 # Mindest-Sichtbarkeit pro Landmark (MediaPipe-Visibility, 0..1)
 SUBJECT_LANDMARK_VIS_MIN = 0.55
+
+
+def _normalize_training_target_bootstrap(value: Optional[str]) -> str:
+    v = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if v in {"z_image_base", "zimage", "z_image"}:
+        return "z_image_base"
+    if v in {"krea2", "krea_2", "krea2_character", "krea_2_character"}:
+        return "krea2"
+    return "ernie"
+
+
+def _caption_profile_for_target_bootstrap(value: Optional[str]) -> str:
+    target = _normalize_training_target_bootstrap(value)
+    return "krea2_character" if target == "krea2" else target
 
 
 # ── UI-Config Override ────────────────────────────────────────────────────────
@@ -736,6 +754,18 @@ if isinstance(globals().get("_ui_cfg"), dict) and "USE_CONTROLLED_BUCKETS" in _u
 elif isinstance(globals().get("_ui_cfg"), dict) and "USE_AI_TOOLKIT_CROP_PROFILES" in _ui_cfg:
     USE_CONTROLLED_BUCKETS = bool(_ui_cfg.get("USE_AI_TOOLKIT_CROP_PROFILES"))
 USE_AI_TOOLKIT_CROP_PROFILES = bool(USE_CONTROLLED_BUCKETS)
+
+# TRAINING_TARGET is the single source of truth for prompt family and caption
+# engine. Legacy CAPTION_PROFILE values are migrated, but individual caption
+# checkboxes never change the target.
+if isinstance(globals().get("_ui_cfg"), dict) and "TRAINING_TARGET" in _ui_cfg:
+    TRAINING_TARGET = _normalize_training_target_bootstrap(_ui_cfg.get("TRAINING_TARGET"))
+elif isinstance(globals().get("_ui_cfg"), dict) and "CAPTION_PROFILE" in _ui_cfg:
+    TRAINING_TARGET = _normalize_training_target_bootstrap(_ui_cfg.get("CAPTION_PROFILE"))
+else:
+    TRAINING_TARGET = _normalize_training_target_bootstrap(TRAINING_TARGET)
+CAPTION_PROFILE = _caption_profile_for_target_bootstrap(TRAINING_TARGET)
+USE_KREA_AI_CAPTIONING = TRAINING_TARGET == "krea2"
 
 # Keep environment and in-script config consistent (also helps if other libs/tools
 # look at OPENAI_API_KEY).
@@ -1308,50 +1338,79 @@ def clean_audit_string(text: Optional[str]) -> str:
 # ============================================================
 
 
-def normalize_caption_profile(value: Optional[str]) -> str:
+def normalize_training_target(value: Optional[str]) -> str:
     v = normalize_text(value)
     if v in {"ernie", "shared_compact"}:
-        return "shared_compact"
-    if v in {"z_image_base", "krea2_character", "custom"}:
-        return v
-    return "shared_compact"
+        return "ernie"
+    if v in {"z_image_base", "z-image_base", "zimage", "z_image"}:
+        return "z_image_base"
+    if v in {"krea2", "krea_2", "krea2_character", "krea_2_character"}:
+        return "krea2"
+    return "ernie"
+
+
+def caption_profile_for_training_target(value: Optional[str]) -> str:
+    target = normalize_training_target(value)
+    return "krea2_character" if target == "krea2" else target
+
+
+def normalize_caption_profile(value: Optional[str]) -> str:
+    # Legacy helper: old configs/reports may still contain caption-profile names.
+    return caption_profile_for_training_target(value)
+
+
+def training_target_audit_guidance(target: Optional[str] = None) -> str:
+    t = normalize_training_target(target or globals().get("TRAINING_TARGET", "ernie"))
+    if t == "krea2":
+        return (
+            "TRAINING TARGET: Krea 2 character LoRA. Preserve natural-language-relevant "
+            "scene facts, full-person usefulness, body orientation, camera framing, temporary "
+            "appearance changes and exact visible accessories. Keep stable identity facts raw; "
+            "the Subject Profile decides later whether they belong to the trigger or caption."
+        )
+    if t == "z_image_base":
+        return (
+            "TRAINING TARGET: Z-Image Base character LoRA. Prioritize compact, controllable "
+            "visual attributes and reliable separation of stable identity from variable traits."
+        )
+    return (
+        "TRAINING TARGET: ERNIE Image character LoRA. Capture visible identity anchors as well "
+        "as scene-specific details because the downstream caption policy is intentionally explicit."
+    )
+
+
+def training_target_profile_guidance(target: Optional[str] = None) -> str:
+    t = normalize_training_target(target or globals().get("TRAINING_TARGET", "ernie"))
+    if t == "krea2":
+        return (
+            "For Krea 2, treat the Subject Profile as the canonical identity and terminology layer. "
+            "Record all recurring piercings/accessories in inventories even when they are not canonical."
+        )
+    if t == "z_image_base":
+        return "For Z-Image Base, favor a clean canonical identity and explicit variable-feature policies."
+    return "For ERNIE, retain reliable visible identity anchors for explicit downstream captions."
 
 
 def enforce_caption_policy_profile(profile: Optional[str], policy: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply non-negotiable field rules for known training profiles."""
-    normalized = normalize_caption_profile(profile)
+    """Return the explicit caption policy without changing the training target.
+
+    Target-specific recommendations are applied by the UI preset. Once the user
+    changes a checkbox, that choice remains authoritative; it may not switch the
+    caption engine and is not silently re-enabled/disabled here. Missing keys are
+    filled conservatively for backward compatibility only.
+    """
     result = dict(policy or {})
-    if normalized in {"ernie", "shared_compact"}:
-        result["include_body_build"] = True
-        result["include_tattoos"] = True
-        result["include_eye_color"] = True
-    elif normalized == "krea2_character":
-        # Stable physical identity is carried by the trigger word. The profile
-        # still records these traits for QC, but captions omit them.
-        for key in (
-            "include_gender_class",
-            "include_skin_tone",
-            "include_body_build",
-            "include_freckles",
-            "include_tattoos",
-            "include_piercings",
-            "include_eye_color",
-            "include_hair_always",
-        ):
-            result[key] = False
-        result["include_hair_when_variable"] = True
-        result["include_eye_color_when_variable"] = True
-        result["include_beard_always"] = False
-        result["include_beard_when_variable"] = True
-        result["include_glasses"] = False
-        result["include_glasses_when_variable"] = True
-        result["include_makeup"] = True
-        result["include_background"] = True
-        result["include_lighting"] = True
-        result["include_gaze"] = True
-        result["include_expression"] = True
-        result["include_costume_accessories"] = True
-        result["include_visual_style"] = True
+    for key in (
+        "include_gender_class", "include_skin_tone", "include_body_build",
+        "include_freckles", "include_tattoos", "include_glasses",
+        "include_glasses_when_variable", "include_piercings", "include_makeup",
+        "include_background", "include_lighting", "include_gaze",
+        "include_expression", "include_hair_always", "include_hair_when_variable",
+        "include_eye_color_when_variable", "include_costume_accessories",
+        "include_beard_always", "include_beard_when_variable",
+        "include_mirror_selfie_marker", "include_eye_color", "include_visual_style",
+    ):
+        result.setdefault(key, False)
     return result
 
 
@@ -2793,7 +2852,7 @@ def cache_path_for_file(file_hash: str) -> str:
 #   v12: Cosplay-/High-Variation-Felder ohne Herkunftserkennung:
 #        eye_appearance, look_context, makeup_style, costume_accessories
 #        plus datasetweite Hair-/Eye-Variability-Policies fuer Stable Profile.
-AUDIT_CACHE_SCHEMA_VERSION = "v14"
+AUDIT_CACHE_SCHEMA_VERSION = "v15"
 EARLY_RESULT_CACHE_SCHEMA_VERSION = "v1"
 
 
@@ -2815,6 +2874,7 @@ def audit_cache_key(
         str(base_hash),
         (model or "").strip().lower(),
         str(reasoning_effort or "none"),
+        normalize_training_target(globals().get("TRAINING_TARGET", "ernie")),
     ])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -3798,6 +3858,11 @@ def build_api_schema() -> Dict[str, Any]:
                 "type": "string",
                 "description": "If glasses/sunglasses are visible: clear_lenses, tinted_lenses, sunglasses, reflective_lenses, blue_light_lenses, unclear. Empty string if no glasses."
             },
+            "glasses_position": {
+                "type": "string",
+                "enum": ["on_face", "on_head", "held", "hanging_from_clothing", "other", "not_visible"],
+                "description": "Where the glasses are in this image. Use on_face only when worn over the eyes. Use not_visible when no glasses are visible."
+            },
             "tattoo_inventory_now": {
                 "type": "array",
                 "description": (
@@ -3915,6 +3980,7 @@ def build_api_schema() -> Dict[str, Any]:
             "glasses_frame_shape",
             "glasses_frame_material",
             "glasses_lens_type",
+            "glasses_position",
             "tattoo_inventory_now",
             "piercing_inventory_now",
             "quality_sharpness",
@@ -3944,6 +4010,8 @@ def openai_audit_image(
     instructions = f"""
 You are auditing a single image for a person LoRA training dataset for a realistic image model.
 Trigger word: "{TRIGGER_WORD}".
+
+{training_target_audit_guidance()}
 
 Return only raw visible facts about THIS ONE IMAGE.
 Do not compare against a dataset.
@@ -4217,6 +4285,14 @@ glasses_frame_material:
 glasses_lens_type:
   clear_lenses | tinted_lenses | sunglasses | reflective_lenses |
   blue_light_lenses | unclear
+
+glasses_position:
+  on_face | on_head | held | hanging_from_clothing | other | not_visible
+
+Hair color rule:
+  hair_description may describe highlights, ombre or streaks, but keep the underlying
+  base color explicit whenever visible, e.g. "brown hair with blonde highlights".
+  Do not use "highlights" or "ombre" as if it were a complete base hair color.
 
 frame_subtype:
   close_up | portrait | selfie | mirror_selfie | three_quarter_body |
@@ -4787,6 +4863,7 @@ def get_hair_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_
     form_stats = variability.get("hair_form", {}) if isinstance(variability, dict) else {}
 
     current_color = normalize_text(image_traits.get("hair_color_base", ""))
+    current_modifier = normalize_text(image_traits.get("hair_color_modifier", ""))
     current_form = normalize_text(image_traits.get("hair_form", ""))
     baseline_color = normalize_text(canonical.get("hair_color", "")) or _stats_mode_token(color_stats)
     baseline_form = normalize_text(canonical.get("hair_form", "")) or _stats_mode_token(form_stats)
@@ -4813,12 +4890,27 @@ def get_hair_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_
         include_color = include_form = False
 
     phrase = profile_hair_caption(current_color if include_color else "", current_form if include_form else "")
+    if current_modifier and (include_color or include_variable or include_all):
+        modifier_phrase = {
+            "blonde_highlights": "blonde highlights",
+            "red_highlights": "red highlights",
+            "highlights": "highlights",
+            "ombre": "ombre coloring",
+            "balayage": "balayage",
+        }.get(current_modifier, _phrase_from_token(current_modifier))
+        if phrase:
+            phrase = f"{phrase} with {modifier_phrase}"
+        elif current_color:
+            phrase = f"{_phrase_from_token(current_color)} hair with {modifier_phrase}"
+        else:
+            phrase = modifier_phrase
     return {
         "phrase": phrase,
         "must_caption": bool(phrase),
         "current": current_color,
         "baseline": baseline_color,
         "current_form": current_form,
+        "current_modifier": current_modifier,
         "baseline_form": baseline_form,
         "color_variable": color_variable,
         "form_variable": form_variable,
@@ -4829,7 +4921,8 @@ def get_eye_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_t
     canonical = profile.get("canonical_features", {}) if isinstance(profile, dict) else {}
     stable_identity = profile.get("stable_identity", {}) if isinstance(profile, dict) else {}
     stats = (profile.get("profile_variability_stats", {}) or {}).get("eye_color", {}) if isinstance(profile, dict) else {}
-    current = normalize_text(image_traits.get("eye_color_base", "")) or canonical_eye_color(item)
+    reliable = bool(image_traits.get("eye_color_reliable"))
+    current = normalize_text(image_traits.get("eye_color_base", "")) if reliable else ""
     baseline = normalize_text(canonical.get("eye_color", "")) or normalize_text(stable_identity.get("eye_color", "")) or _stats_mode_token(stats)
     variable = bool(stats.get("variation_detected", stats.get("unique", 0) >= 2))
     mode = normalize_text(globals().get("VARIABLE_FEATURE_CAPTION_MODE", "canonical_deviations"))
@@ -4837,7 +4930,10 @@ def get_eye_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_t
     if enabled and mode == "all_visible_when_variable":
         must_caption = bool(current and variable)
     else:
-        must_caption = bool(enabled and current and _feature_deviation(current, baseline, _eye_color_family))
+        # Eye color is especially error-prone. A single contrary audit is not
+        # enough to establish a real identity variation; require at least two
+        # reliable minority observations before captioning deviations.
+        must_caption = bool(enabled and variable and current and _feature_deviation(current, baseline, _eye_color_family))
     phrase = f"{_phrase_from_token(current)} eyes" if must_caption and current else ""
     return {
         "phrase": phrase,
@@ -4845,6 +4941,7 @@ def get_eye_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_t
         "current": current,
         "baseline": baseline,
         "variable": variable,
+        "reliable": reliable,
         "mode": mode,
     }
 
@@ -4956,6 +5053,7 @@ def get_glasses_feature_state(item: Dict[str, Any], profile: Dict[str, Any], ima
     frame_variability = (profile.get("profile_variability_stats", {}) or {}).get("glasses_frame", {}) if isinstance(profile, dict) else {}
 
     visible = bool(image_traits.get("glasses_visible")) or _profile_bool(item.get("has_glasses_now"))
+    current_position = normalize_text(image_traits.get("glasses_position", "")) or infer_glasses_position(item)
     baseline_desc = compact_trait(glasses_profile.get("canonical_description"))
     baseline_shape = normalize_text(canonical.get("glasses_frame_shape", ""))
     baseline_material = normalize_text(canonical.get("glasses_frame_material", ""))
@@ -4991,6 +5089,10 @@ def get_glasses_feature_state(item: Dict[str, Any], profile: Dict[str, Any], ima
         same_regular_frame = False
         phrase = ""
 
+    if current_family != "no_glasses" and current_position != "on_face":
+        current_fingerprint = f"{current_fingerprint}|{current_position}"
+        same_regular_frame = False
+
     variable = bool(
         variability.get("variation_detected", variability.get("unique", 0) >= 2)
         or frame_variability.get("variation_detected", frame_variability.get("unique", 0) >= 2)
@@ -5014,6 +5116,12 @@ def get_glasses_feature_state(item: Dict[str, Any], profile: Dict[str, Any], ima
         phrase = "without glasses"
     elif must_caption and current_family == "regular_glasses":
         phrase = phrase or baseline_desc or "eyeglasses"
+        if current_position == "on_head":
+            phrase = f"{phrase} resting on the head"
+        elif current_position == "held":
+            phrase = f"holding {phrase}"
+        elif current_position == "hanging_from_clothing":
+            phrase = f"{phrase} hanging from the clothing"
     elif must_caption and current_family == "sunglasses":
         phrase = phrase or "sunglasses"
     else:
@@ -5029,6 +5137,7 @@ def get_glasses_feature_state(item: Dict[str, Any], profile: Dict[str, Any], ima
         "current_fingerprint": current_fingerprint,
         "baseline_fingerprint": baseline_fingerprint,
         "variable": variable,
+        "position": current_position,
         "mode": mode,
     }
 
@@ -5052,7 +5161,15 @@ def _validate_krea_caption_features(caption: str, feature_states: Dict[str, Dict
             # Accept common wording variants for a few canonical feature phrases.
             alternatives: List[str] = []
             if name == "glasses" and state.get("current_family") == "regular_glasses":
-                alternatives = ["glasses", "eyeglasses", "spectacles"]
+                position = normalize_text(state.get("position", ""))
+                if position == "on_head":
+                    alternatives = ["glasses on the head", "glasses on her head", "glasses on his head", "glasses resting on", "glasses pushed up"]
+                elif position == "held":
+                    alternatives = ["holding glasses", "held glasses", "glasses in hand"]
+                elif position == "hanging_from_clothing":
+                    alternatives = ["glasses hanging", "glasses on the collar", "glasses on the shirt", "glasses at the neckline"]
+                else:
+                    alternatives = ["glasses", "eyeglasses", "spectacles"]
             elif name == "glasses" and state.get("current_family") == "no_glasses":
                 alternatives = ["without glasses", "no glasses"]
             elif name == "beard" and state.get("current_pattern") == "clean_shaven":
@@ -5080,6 +5197,18 @@ def _validate_krea_caption_features(caption: str, feature_states: Dict[str, Dict
     if not hair.get("must_caption"):
         if contains_any([" hair", "hair ", "braids", "ponytail", "pigtails", "bun", "updo", "dreadlocks", "cornrows", "pixie cut", "bob cut"]):
             reasons.append("canonical hair state should be omitted")
+
+    piercings = feature_states.get("piercings", {}) or {}
+    if piercings.get("must_caption"):
+        for phrase in piercings.get("phrases", []) or []:
+            anchor = _piercing_caption_anchor(str(phrase))
+            alternatives = [anchor]
+            if anchor in {"lower lip", "labret"}:
+                alternatives.extend(["lower-lip", "labret"])
+            if anchor == "earring":
+                alternatives.extend(["earrings", "ear jewelry"])
+            if not contains_any(alternatives):
+                reasons.append(f"missing required piercing/accessory: {phrase}")
 
     return (len(reasons) == 0), reasons
 
@@ -5398,6 +5527,7 @@ def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
             "glasses_frame_shape": row.get("glasses_frame_shape", ""),
             "glasses_frame_material": row.get("glasses_frame_material", ""),
             "glasses_lens_type": row.get("glasses_lens_type", ""),
+            "glasses_position": row.get("glasses_position", ""),
             "makeup_description": row.get("makeup_description", ""),
             "makeup_intensity": row.get("makeup_intensity", ""),
             "tattoos_visible": row.get("tattoos_visible", False),
@@ -5417,6 +5547,7 @@ def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
         "trigger": SAFE_TRIGGER,
         "normalizer_model": str(PROFILE_NORMALIZER_MODEL).strip().lower(),
         "reasoning_effort": str(PROFILE_REASONING_EFFORT),
+        "training_target": normalize_training_target(globals().get("TRAINING_TARGET", "ernie")),
         "items": relevant,
     }
     return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -5603,6 +5734,21 @@ def subject_profile_schema() -> Dict[str, Any]:
                             "additionalProperties": False,
                         },
                     },
+                    "piercing_inventory": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "location": {"type": "string"},
+                                "canonical_description": {"type": "string"},
+                                "frequency": {"type": "string"},
+                                "category": {"type": "string", "enum": ["body_piercing", "ear_jewelry"]},
+                                "role": {"type": "string", "enum": ["canonical", "variable", "accessory", "ignore"]},
+                            },
+                            "required": ["location", "canonical_description", "frequency", "category", "role"],
+                            "additionalProperties": False,
+                        },
+                    },
                     "piercing_baseline": {
                         "type": "array",
                         "items": {
@@ -5627,7 +5773,7 @@ def subject_profile_schema() -> Dict[str, Any]:
                         "additionalProperties": False,
                     },
                 },
-                "required": ["glasses", "tattoo_inventory", "piercing_baseline", "freckles"],
+                "required": ["glasses", "tattoo_inventory", "piercing_inventory", "piercing_baseline", "freckles"],
                 "additionalProperties": False,
             },
             "normalizer_notes": {
@@ -5666,6 +5812,7 @@ def _profile_sample_payload(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "glasses_frame_shape": row.get("glasses_frame_shape", ""),
                 "glasses_frame_material": row.get("glasses_frame_material", ""),
                 "glasses_lens_type": row.get("glasses_lens_type", ""),
+            "glasses_position": row.get("glasses_position", ""),
                 "makeup_description": row.get("makeup_description", ""),
                 "makeup_intensity": row.get("makeup_intensity", ""),
                 "makeup_style": row.get("makeup_style", ""),
@@ -5691,6 +5838,8 @@ def call_subject_profile_normalizer(rows: List[Dict[str, Any]], input_hash: str,
 You consolidate raw per-image audits into one Subject Identity Profile for a person LoRA dataset.
 All input images are intended to show the same subject. Some outliers may exist.
 
+{training_target_profile_guidance()}
+
 Important:
 - Stable identity traits must be canonical and consistent across captions.
 - Use single, clean tokens or short phrases. No hedge words, no 'or'-phrases, no 'none visible'.
@@ -5711,7 +5860,8 @@ Important:
   sunglasses in downstream captions and must not be normalized to the profile glasses description.
 - Prefer a non-sunglasses canonical_description unless sunglasses are genuinely the regular baseline.
 - Freckles are a flexible visibility-dependent identity marker: if they recur across the face in a substantial subset of images, preserve them as a canonical marker, but they must still only be captioned when visible in the current image.
-- Piercing baseline includes locations visible in at least about 40% of sampled usable images.
+- Piercing inventory must list every repeatedly observed piercing or ear-jewelry location, even below the canonical threshold. Classify ear locations as ear_jewelry/accessory by default and other locations as body_piercing/variable unless clearly canonical.
+- Piercing baseline includes only inventory entries that are canonical and visible in at least about 40% of sampled usable images.
 - Tattoo inventory is the union of visible tattoos, grouped by location. Mention only visible markers later.
 - Force-only-when-visible policy: markers like glasses, tattoos and piercings must not be captioned in images where they are not visible.
 
@@ -5724,6 +5874,7 @@ Confidence object format (REQUIRED for each stable trait):
 
 Return JSON only.
 """
+    instructions = instructions.replace("{training_target_profile_guidance()}", training_target_profile_guidance())
 
     user_payload = {
         "trigger_word": TRIGGER_WORD,
@@ -5750,6 +5901,7 @@ Return JSON only.
             "glasses_frame_shape": GLASSES_FRAME_SHAPE_VOCAB,
             "glasses_frame_material": GLASSES_FRAME_MATERIAL_VOCAB,
             "glasses_lens_type": GLASSES_LENS_TYPE_VOCAB,
+            "glasses_position": ["on_face", "on_head", "held", "hanging_from_clothing", "other", "not_visible"],
             "frame_subtype": FRAME_SUBTYPE_VOCAB,
             "gaze_category": GAZE_VOCAB,
             "expression_category": EXPRESSION_VOCAB,
@@ -5911,6 +6063,7 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
                 "frequency": f"{len(freckles_rows)}/{n}",
             },
             "tattoo_inventory": inv_items(tattoos_by_loc, min_fraction=0.0),
+            "piercing_inventory": [],
             "piercing_baseline": inv_items(piercings_by_loc, min_fraction=0.40),
         },
         "normalizer_notes": [f"Fallback profile used. {reason}".strip()],
@@ -5930,10 +6083,19 @@ def canonical_hair_color(row: Dict[str, Any]) -> str:
     ]))
     if not text:
         return ""
-    if _contains_any(text, ["highlight", "highlights", "streaks"]):
-        return "highlights"
-    if _contains_any(text, ["ombre", "balayage"]):
-        return "ombre"
+    # Highlights/ombre/balayage are modifiers, not the base color. Remove the
+    # modifier phrase before detecting the underlying canonical color, e.g.
+    # "brown hair with blonde highlights" -> base=brown, modifier=blonde_highlights.
+    base_text = re.sub(
+        r"\b(?:blonde|blond|red|copper|auburn|light|dark|colored|coloured)?\s*(?:highlights?|streaks?)\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    base_text = re.sub(r"\b(?:ombre|ombré|balayage)(?:\s+coloring)?\b", " ", base_text, flags=re.IGNORECASE)
+    base_text = re.sub(r"\s+", " ", base_text).strip()
+    text = base_text or text
+    # Continue scanning the cleaned description for the underlying color.
     if _contains_any(text, ["multi-colored", "multicolored", "multi color", "multicolor", "rainbow"]):
         return "multicolor"
     if _contains_any(text, ["platinum", "white-blonde", "white blonde", "very light blonde", "very light ash", "silver blonde"]):
@@ -5977,6 +6139,66 @@ def canonical_hair_color(row: Dict[str, Any]) -> str:
     return ""
 
 
+
+
+def canonical_hair_color_modifier(row: Dict[str, Any]) -> str:
+    text = normalize_text(" ".join([
+        str(row.get("hair_description", "")),
+        str(row.get("hair_texture", "")),
+    ]))
+    if not text:
+        return ""
+    if _contains_any(text, ["balayage"]):
+        return "balayage"
+    if _contains_any(text, ["ombre", "ombré"]):
+        return "ombre"
+    if _contains_any(text, ["highlight", "highlights", "streaks"]):
+        if _contains_any(text, ["blonde highlight", "blond highlight", "light highlight"]):
+            return "blonde_highlights"
+        if _contains_any(text, ["red highlight", "copper highlight", "auburn highlight"]):
+            return "red_highlights"
+        return "highlights"
+    return ""
+
+
+def eye_color_is_reliable(row: Dict[str, Any]) -> bool:
+    color = normalize_text(row.get("eye_color", ""))
+    if not color or not _profile_bool(row.get("face_visible")):
+        return False
+    if bool(row.get("is_grayscale_filter")):
+        return False
+    if normalize_text(row.get("visual_style_type")) in {"black_and_white", "heavy_smoothing", "beauty_filter"}:
+        return False
+    if normalize_text(row.get("occlusion_type")) in {"sunglasses_occluding_eyes", "mask", "hat_shadow", "motion_blur", "face_partly_out_of_frame"}:
+        return False
+    if normalize_text(row.get("gaze_category")) in {"eyes_closed", "partly_closed"}:
+        return False
+    if normalize_text(row.get("eye_appearance")) in {"colored_contact_lenses", "circle_lenses", "cosmetic_lenses", "unnatural_eye_color", "unclear"}:
+        return False
+    if normalize_text(row.get("glasses_lens_type")) in {"sunglasses", "tinted_lenses", "reflective_lenses"}:
+        return False
+    if float(row.get("main_face_ratio", 0.0) or 0.0) < 0.035:
+        return False
+    if float(row.get("color_tint_strength", 0.0) or 0.0) >= 0.55:
+        return False
+    return True
+
+
+def infer_glasses_position(row: Dict[str, Any]) -> str:
+    explicit = normalize_text(row.get("glasses_position", ""))
+    allowed = {"on_face", "on_head", "held", "hanging_from_clothing", "other", "not_visible"}
+    if explicit in allowed:
+        return explicit
+    desc = normalize_text(row.get("glasses_description", ""))
+    if not (_profile_bool(row.get("has_glasses_now")) or desc):
+        return "not_visible"
+    if any(k in desc for k in ["on head", "on top of head", "on top of her head", "on top of his head", "atop head", "resting on head", "resting on top", "pushed up", "in hair"]):
+        return "on_head"
+    if any(k in desc for k in ["holding", "held", "in hand"]):
+        return "held"
+    if any(k in desc for k in ["hanging", "on shirt", "from collar", "on neckline"]):
+        return "hanging_from_clothing"
+    return "on_face"
 
 def canonical_eye_color(row: Dict[str, Any]) -> str:
     text = normalize_text(str(row.get("eye_color", "")))
@@ -6357,16 +6579,119 @@ def _inventory_map(profile: Dict[str, Any], marker_key: str) -> Dict[str, str]:
     if marker_key == "tattoos":
         items = markers.get("tattoo_inventory", [])
     elif marker_key == "piercings":
-        items = markers.get("piercing_baseline", [])
+        items = markers.get("piercing_inventory", []) or markers.get("piercing_baseline", [])
     else:
         items = []
     out: Dict[str, str] = {}
     for item in items or []:
+        if marker_key == "piercings" and normalize_text(item.get("role", "")) == "ignore":
+            continue
         loc = normalize_text(item.get("location"))
         desc = compact_trait(item.get("canonical_description"))
         if loc and desc:
             out[loc] = desc
     return out
+
+
+def _piercing_inventory_by_location(profile: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    markers = (profile or {}).get("identity_markers", {}) if isinstance(profile, dict) else {}
+    items = markers.get("piercing_inventory", []) or markers.get("piercing_baseline", []) or []
+    out: Dict[str, Dict[str, Any]] = {}
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
+        loc = _canonical_piercing_location(entry.get("location"))
+        if not loc:
+            continue
+        role = normalize_text(entry.get("role", "")) or (
+            "accessory" if _piercing_category(loc) == "ear_jewelry" else "canonical"
+        )
+        out[loc] = {
+            "location": loc,
+            "canonical_description": compact_trait(entry.get("canonical_description")) or "piercing",
+            "frequency": str(entry.get("frequency", "") or ""),
+            "category": normalize_text(entry.get("category", "")) or _piercing_category(loc),
+            "role": role,
+        }
+    return out
+
+
+def get_visible_piercing_state(
+    item: Dict[str, Any],
+    profile: Dict[str, Any],
+    image_traits: Dict[str, Any],
+    active_policy: Dict[str, Any],
+    caption_profile: str,
+) -> Dict[str, Any]:
+    """Resolve visible piercings/ear jewelry against editable profile roles.
+
+    ERNIE/all-fields profiles may describe every visible non-ignored marker.
+    Z-Image/Krea profiles omit canonical body markers and describe only visible
+    `variable` or `accessory` entries. This keeps the trigger responsible for
+    the canon while still separating temporary jewelry from identity.
+    """
+    if not active_policy.get("include_piercings"):
+        return {"phrases": [], "must_caption": False, "entries": []}
+
+    inventory = _piercing_inventory_by_location(profile)
+    locations = image_traits.get("piercing_locations_visible", [])
+    if not isinstance(locations, list):
+        locations = []
+
+    raw_by_location: Dict[str, str] = {}
+    for raw in item.get("piercing_inventory_now") or []:
+        if not isinstance(raw, dict):
+            continue
+        loc = _canonical_piercing_location(raw.get("location"))
+        raw_by_location[loc] = _canonicalize_piercing_description(loc, str(raw.get("description", "")))
+        if loc not in locations:
+            locations.append(loc)
+
+    resolved: List[Dict[str, Any]] = []
+    for loc_raw in locations:
+        loc = _canonical_piercing_location(loc_raw)
+        if not loc:
+            continue
+        meta = dict(inventory.get(loc, {}))
+        if not meta:
+            meta = {
+                "location": loc,
+                "canonical_description": raw_by_location.get(loc) or "piercing",
+                "frequency": "",
+                "category": _piercing_category(loc),
+                "role": "accessory" if _piercing_category(loc) == "ear_jewelry" else "variable",
+            }
+        role = normalize_text(meta.get("role", "")) or "variable"
+        if role == "ignore":
+            continue
+        # Stable body markers belong to the trigger in identity-focused targets.
+        if caption_profile not in {"ernie", "shared_compact"} and role == "canonical":
+            continue
+        if normalize_text(meta.get("category")) == "ear_jewelry":
+            phrase = raw_by_location.get(loc) or compact_trait(meta.get("canonical_description")) or "earring"
+        else:
+            phrase = compact_trait(meta.get("canonical_description")) or raw_by_location.get(loc) or "piercing"
+        if phrase:
+            resolved.append({**meta, "canonical_description": phrase})
+
+    phrases = _dedupe_phrase_list([str(x.get("canonical_description", "")) for x in resolved])
+    return {
+        "phrases": phrases,
+        "must_caption": bool(phrases),
+        "entries": resolved,
+    }
+
+
+def _piercing_caption_anchor(phrase: str) -> str:
+    t = normalize_compact_text(phrase)
+    for anchor in (
+        "septum", "lower lip", "lower-lip", "labret", "upper lip", "upper-lip",
+        "nose", "eyebrow", "navel", "ear gauge", "earring", "lip", "piercing",
+    ):
+        if anchor in t:
+            return anchor.replace("-", " ")
+    words = t.split()
+    return " ".join(words[-2:]) if len(words) >= 2 else t
 
 
 def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
@@ -6384,9 +6709,11 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
 
     return {
         "hair_color_base": canonical_hair_color(row),
+        "hair_color_modifier": canonical_hair_color_modifier(row),
         "hair_form": canonical_hair_form(row),
         "hair_length": canonical_hair_length(row),
-        "eye_color_base": canonical_eye_color(row),
+        "eye_color_base": canonical_eye_color(row) if eye_color_is_reliable(row) else "",
+        "eye_color_reliable": eye_color_is_reliable(row),
         "eye_appearance": canonical_eye_appearance(row),
         "body_height_impression": canonical_body_height_impression(row),
         "makeup_intensity": canonical_makeup_intensity(row),
@@ -6410,6 +6737,7 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
         "visual_style_type": normalize_text(row.get("visual_style_type")),
         "glasses_frame_material": normalize_text(row.get("glasses_frame_material")),
         "glasses_lens_type": normalize_text(row.get("glasses_lens_type")),
+        "glasses_position": infer_glasses_position(row),
     }
 
 
@@ -6865,8 +7193,12 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
         [t.get("hair_form", "") for t in trait_rows], min_unique=5, max_mode_fraction=0.70
     )
     eye_color_variable, eye_color_stats = _trait_variance(
-        [t.get("eye_color_base", "") for t in trait_rows], min_unique=3, max_mode_fraction=0.78
+        [t.get("eye_color_base", "") for t in trait_rows if bool(t.get("eye_color_reliable"))], min_unique=3, max_mode_fraction=0.78
     )
+    hair_modifier_stats = _state_stats([
+        t.get("hair_color_modifier", "") for t in trait_rows
+        if normalize_text(t.get("hair_color_modifier", ""))
+    ])
 
     beard_patterns = [normalize_text(t.get("beard_pattern", "")) for t in trait_rows if t.get("beard_visible")]
     beard_colors = [normalize_text(t.get("beard_color", "")) for t in trait_rows if t.get("beard_visible") and normalize_text(t.get("beard_pattern", "")) != "clean_shaven"]
@@ -6892,6 +7224,10 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
     glasses_shape_stats = _state_stats([_glasses_shape_family(t.get("glasses_frame_shape", "")) for t in regular_glasses_traits])
     glasses_material_stats = _state_stats([_glasses_material_family(t.get("glasses_frame_material", "")) for t in regular_glasses_traits])
     glasses_lens_stats = _state_stats([_glasses_lens_family(t.get("glasses_lens_type", "")) for t in regular_glasses_traits])
+    glasses_position_stats = _state_stats([
+        normalize_text(t.get("glasses_position", "")) for t in trait_rows
+        if normalize_text(t.get("glasses_position", ""))
+    ])
 
     eye_appearance_counts = Counter(
         normalize_text(t.get("eye_appearance", "")) for t in trait_rows
@@ -6948,6 +7284,7 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
     profile["profile_variability_stats"] = {
         "hair_color": hair_color_stats,
         "hair_form": hair_form_stats,
+        "hair_color_modifier": hair_modifier_stats,
         "eye_color": eye_color_stats,
         "beard_pattern": beard_pattern_stats,
         "beard_color": beard_color_stats,
@@ -6956,6 +7293,7 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
         "glasses_shape": glasses_shape_stats,
         "glasses_material": glasses_material_stats,
         "glasses_lens": glasses_lens_stats,
+        "glasses_position": glasses_position_stats,
         "eye_appearance_counts": dict(eye_appearance_counts.most_common(10)),
         "look_context_counts": dict(look_counts.most_common(10)),
         "cosplay_fraction": round(cosplay_fraction, 3),
@@ -6979,6 +7317,116 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
     if appearance_mode == "cosplay_identity":
         notes.append("Cosplay mode enabled from dataset-wide look_context distribution; costume/headpiece/makeup traits remain per-image attributes.")
     profile["normalizer_notes"] = notes[-30:]
+    return profile
+
+
+def _canonical_piercing_location(location: str) -> str:
+    loc = normalize_text(location)
+    aliases = {
+        "lip_labret": "lip_lower",
+        "labret": "lip_lower",
+        "lower_lip": "lip_lower",
+        "septum": "nose_septum",
+        "nose_ring_septum": "nose_septum",
+        "left_ear_lobe": "ear_lobe_left",
+        "right_ear_lobe": "ear_lobe_right",
+        "left_ear_helix": "ear_helix_left",
+        "right_ear_helix": "ear_helix_right",
+    }
+    return aliases.get(loc, loc or "other")
+
+
+def _piercing_category(location: str) -> str:
+    return "ear_jewelry" if _canonical_piercing_location(location).startswith("ear_") else "body_piercing"
+
+
+def _canonicalize_piercing_description(location: str, description: str) -> str:
+    loc = _canonical_piercing_location(location)
+    desc = normalize_compact_text(description)
+    color = ""
+    for c in ("gold", "silver", "black", "rose gold"):
+        if c in desc:
+            color = c
+            break
+    prefix = (color + " ") if color else ""
+    if loc.startswith("ear_"):
+        if any(k in desc for k in ["gauge", "plug", "tunnel"]):
+            return f"{prefix}ear gauge".strip()
+        if any(k in desc for k in ["dangling", "drop earring", "dangle"]):
+            return f"{prefix}dangling earring".strip()
+        if any(k in desc for k in ["hoop", "ring"]):
+            return f"{prefix}hoop earring".strip()
+        return f"{prefix}stud earring".strip() if "stud" in desc else (f"{prefix}earring".strip())
+    if loc == "nose_septum":
+        return f"{prefix}septum ring".strip()
+    if loc.startswith("nose_"):
+        return f"{prefix}nose ring".strip() if any(k in desc for k in ["ring", "hoop"]) else f"{prefix}nose stud".strip()
+    if loc in {"lip_lower", "lip_labret"}:
+        return f"{prefix}lower-lip ring".strip() if any(k in desc for k in ["ring", "hoop"]) else f"{prefix}lower-lip stud".strip()
+    if loc.startswith("lip_"):
+        return f"{prefix}lip ring".strip() if any(k in desc for k in ["ring", "hoop"]) else f"{prefix}lip stud".strip()
+    if loc.startswith("eyebrow_"):
+        return f"{prefix}eyebrow piercing".strip()
+    if loc == "navel":
+        return f"{prefix}navel piercing".strip()
+    return compact_trait(description) or "piercing"
+
+
+def attach_piercing_inventory(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep all observed piercings visible in the profile, separate from canon."""
+    total = max(1, len(rows))
+    observations: Dict[str, List[str]] = defaultdict(list)
+    image_hits: Counter = Counter()
+    for row in rows:
+        seen_locations = set()
+        for entry in row.get("piercing_inventory_now") or []:
+            loc = _canonical_piercing_location(entry.get("location"))
+            desc = _canonicalize_piercing_description(loc, str(entry.get("description", "")))
+            observations[loc].append(desc)
+            seen_locations.add(loc)
+        for loc in seen_locations:
+            image_hits[loc] += 1
+
+    markers = profile.setdefault("identity_markers", {})
+    existing = {
+        _canonical_piercing_location(x.get("location")): x
+        for x in (markers.get("piercing_inventory", []) or [])
+        if isinstance(x, dict) and normalize_text(x.get("location"))
+    }
+    inventory = []
+    for loc in sorted(observations):
+        desc_counts = Counter(observations[loc])
+        canonical_desc, canonical_count = desc_counts.most_common(1)[0]
+        hits = int(image_hits.get(loc, 0))
+        category = _piercing_category(loc)
+        if category == "ear_jewelry" and len(desc_counts) >= 2 and (canonical_count / max(1, len(observations[loc]))) < 0.70:
+            canonical_desc = "earring"
+        old = existing.get(loc, {})
+        role = normalize_text(old.get("role", ""))
+        if role not in {"canonical", "variable", "accessory", "ignore"}:
+            if category == "ear_jewelry":
+                role = "accessory"
+            elif (hits / total) >= 0.40:
+                role = "canonical"
+            else:
+                role = "variable"
+        inventory.append({
+            "location": loc,
+            "canonical_description": canonical_desc,
+            "frequency": f"{hits}/{total}",
+            "category": category,
+            "role": role,
+        })
+
+    markers["piercing_inventory"] = inventory
+    markers["piercing_baseline"] = [
+        {
+            "location": x["location"],
+            "canonical_description": x["canonical_description"],
+            "frequency": x["frequency"],
+        }
+        for x in inventory if x.get("role") == "canonical"
+    ]
     return profile
 
 def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -7056,6 +7504,7 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         per_image[image_id] = per_image_profile_traits(row, profile)
 
     profile["per_image_traits"] = per_image
+    profile = attach_piercing_inventory(profile, rows)
     profile = attach_profile_variability_policies(profile, rows)
     profile["input_hash"] = input_hash
     profile["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
@@ -7358,6 +7807,66 @@ def needs_caption_remove(row: Dict[str, Any]) -> bool:
     return False
 
 
+
+def backfill_train_ready_selection(
+    selected: List[Dict[str, Any]],
+    candidate_pool: List[Dict[str, Any]],
+    target_size: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Fill replacements after caption-remove/hard-review exclusions.
+
+    TARGET_DATASET_SIZE refers to usable images in 01_train_ready, not to rows
+    that later move to caption_remove. Existing selected rows are kept; clean
+    high-quality keep candidates are appended until the actual train-ready
+    count reaches the target or no safe candidate remains.
+    """
+    target = int(target_size or TARGET_DATASET_SIZE)
+    out = list(selected)
+    selected_names = {r.get("original_filename") for r in out}
+    clean_count = sum(1 for r in out if not needs_caption_remove(r) and r.get("arcface_flag") != "hard")
+    if clean_count >= target:
+        return out, []
+
+    desired = quotas_for_target(target, {
+        "headshot": sum(1 for r in candidate_pool if r.get("shot_type") == "headshot"),
+        "medium": sum(1 for r in candidate_pool if r.get("shot_type") == "medium"),
+        "full_body": sum(1 for r in candidate_pool if r.get("shot_type") == "full_body"),
+    })
+    shot_counts = Counter(r.get("shot_type") for r in out if not needs_caption_remove(r))
+
+    candidates = []
+    for row in candidate_pool:
+        if row.get("original_filename") in selected_names:
+            continue
+        if row.get("base_status") != "keep" or row.get("arcface_flag") == "hard":
+            continue
+        if needs_caption_remove(row):
+            continue
+        role = normalize_text(row.get("identity_cluster_role", ""))
+        if role in {"review", "exclude"}:
+            continue
+        candidates.append(row)
+
+    added: List[Dict[str, Any]] = []
+    while clean_count < target and candidates:
+        def score(row: Dict[str, Any]) -> float:
+            shot = row.get("shot_type", "headshot")
+            quota_gap = max(0, int(desired.get(shot, 0)) - int(shot_counts.get(shot, 0)))
+            return float(adjusted_pick_score(row, out)) + (8.0 if quota_gap > 0 else 0.0)
+        best = max(candidates, key=score)
+        candidates.remove(best)
+        best.setdefault("status_notes", []).append("backfill_after_final_bucket_exclusion")
+        best["selected"] = True
+        out.append(best)
+        added.append(best)
+        selected_names.add(best.get("original_filename"))
+        shot_counts[best.get("shot_type", "headshot")] += 1
+        clean_count += 1
+
+    if added:
+        safe_print(f"   🔄 Backfill added {len(added)} replacement image(s); actual train-ready target={target}.")
+    return out, added
+
 def write_caption_stage_reports(
     *,
     all_rows: List[Dict[str, Any]],
@@ -7397,7 +7906,7 @@ def write_caption_stage_reports(
         "head_pose_bucket", "occlusion_type", "background_description",
         "lighting_description", "lighting_type", "background_type", "hair_texture",
         "has_glasses_now", "glasses_frame_shape",
-        "glasses_frame_material", "glasses_lens_type", "issues",
+        "glasses_frame_material", "glasses_lens_type", "glasses_position", "issues",
         "short_reason", "local_override_reasons", "duplicate_of", "duplicate_method",
         "duplicate_distance", "main_face_ratio", "secondary_face_area_ratio",
         "face_count_local", "width", "height",
@@ -7444,10 +7953,11 @@ def write_caption_stage_reports(
         "subject_profile_normalizer_model": (subject_profile or {}).get("normalizer_model", ""),
         "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
         "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
-        "caption_profile": normalize_caption_profile(CAPTION_PROFILE),
+        "training_target": normalize_training_target(TRAINING_TARGET),
+        "caption_profile": caption_profile_for_training_target(TRAINING_TARGET),
         "audit_model": AI_MODEL,
-        "krea_ai_captioning": bool(normalize_caption_profile(CAPTION_PROFILE) == "krea2_character" and USE_KREA_AI_CAPTIONING),
-        "krea_caption_model": KREA_CAPTION_MODEL if normalize_caption_profile(CAPTION_PROFILE) == "krea2_character" else "",
+        "krea_ai_captioning": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_AI_CAPTIONING),
+        "krea_caption_model": KREA_CAPTION_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" else "",
         "controlled_buckets": bool(USE_CONTROLLED_BUCKETS),
         "medium_rescue_crop_enabled": bool(ENABLE_MEDIUM_RESCUE_CROP),
         "caption_stage_continued_from_profile": True,
@@ -7524,6 +8034,7 @@ def continue_caption_from_profile() -> None:
         or not isinstance(subject_profile.get("canonical_features"), dict)
         or not isinstance((subject_profile.get("profile_variability_stats") or {}).get("glasses"), dict)
         or not isinstance((subject_profile.get("profile_variability_stats") or {}).get("beard_pattern"), dict)
+        or not isinstance(((subject_profile.get("identity_markers") or {}).get("piercing_inventory")), list)
     )
     if needs_feature_migration:
         migration_rows = [
@@ -7537,6 +8048,7 @@ def continue_caption_from_profile() -> None:
                 row["profile_image_id"] = image_id
                 refreshed_traits[image_id] = per_image_profile_traits(row, subject_profile)
             subject_profile["per_image_traits"] = refreshed_traits
+            subject_profile = attach_piercing_inventory(subject_profile, migration_rows)
             subject_profile = attach_profile_variability_policies(subject_profile, migration_rows)
             subject_profile["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
             subject_profile["force_only_when_visible"] = True
@@ -7555,6 +8067,14 @@ def continue_caption_from_profile() -> None:
         selected_sorted = reranked_selected
         review_items = reranked_review
         unselected_keep = reranked_unused
+
+    selected_sorted, backfill_added = backfill_train_ready_selection(
+        selected_sorted, list(unselected_keep) + list(all_rows), TARGET_DATASET_SIZE
+    )
+    if backfill_added:
+        added_names = {r.get("original_filename") for r in backfill_added}
+        unselected_keep = [r for r in unselected_keep if r.get("original_filename") not in added_names]
+        warnings.append(f"Backfilled {len(backfill_added)} image(s) so 01_train_ready can reach the requested target after caption-remove/review exclusions.")
 
     clean_caption_output_dirs()
     row_index = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
@@ -8995,22 +9515,8 @@ def build_local_caption(
     elif bool(item.get("tattoos_visible", False)):
         tattoo_bits.append(compact_trait(item.get("tattoos_description")) or "visible tattoos")
 
-    piercing_bits: List[str] = []
-    visible_piercing_locations = image_traits.get("piercing_locations_visible", [])
-    if visible_piercing_locations:
-        for loc in visible_piercing_locations:
-            desc = piercing_map.get(loc, "")
-            if not desc:
-                for p in item.get("piercing_inventory_now") or []:
-                    if normalize_text(p.get("location")) == loc:
-                        desc = compact_trait(p.get("description")) or "piercing"
-                        break
-            if desc:
-                piercing_bits.append(desc)
-    else:
-        fallback_piercing = compact_trait(item.get("piercings_description"))
-        if fallback_piercing:
-            piercing_bits.append(fallback_piercing)
+    piercing_state = get_visible_piercing_state(item, profile, image_traits, active_policy, caption_profile)
+    piercing_bits: List[str] = list(piercing_state.get("phrases", []) or [])
 
     # Earring-Doubletten dedupen: 'small hoop earring' und 'small hoop' sind
     # die gleiche Information - die KI liefert manchmal beide, weil sie sich
@@ -9272,6 +9778,7 @@ def build_krea_ai_caption(
                     "eye": get_eye_feature_state(item, profile, image_traits, active_policy),
                     "beard": get_beard_feature_state(item, global_rules, active_policy, profile),
                     "glasses": get_glasses_feature_state(item, profile, image_traits, active_policy),
+                    "piercings": get_visible_piercing_state(item, profile, image_traits, active_policy, "krea2_character"),
                 }
                 valid_caption, _reasons = _validate_krea_caption_features(caption, feature_states)
                 if valid_caption:
@@ -9292,7 +9799,8 @@ def build_krea_ai_caption(
         eye_state = get_eye_feature_state(item, profile, image_traits, active_policy)
         beard_state = get_beard_feature_state(item, global_rules, active_policy, profile)
         glasses_state = get_glasses_feature_state(item, profile, image_traits, active_policy)
-        feature_states = {"hair": hair_state, "eye": eye_state, "beard": beard_state, "glasses": glasses_state}
+        piercing_state = get_visible_piercing_state(item, profile, image_traits, active_policy, "krea2_character")
+        feature_states = {"hair": hair_state, "eye": eye_state, "beard": beard_state, "glasses": glasses_state, "piercings": piercing_state}
         visible_facts = {
             "shot_type": item.get("shot_type", ""),
             "frame_subtype": item.get("frame_subtype", ""),
@@ -9305,9 +9813,13 @@ def build_krea_ai_caption(
             "gaze": item.get("gaze_direction", ""),
             "clothing": item.get("clothing_description", ""),
             "makeup": item.get("makeup_description", ""),
-            "glasses": item.get("glasses_description", ""),
-            "hair": item.get("hair_description", ""),
-            "eye_color": item.get("eye_color", ""),
+            "glasses": glasses_state.get("current_desc", ""),
+            "glasses_position": glasses_state.get("position", ""),
+            "hair": hair_state.get("phrase", "") or item.get("hair_description", ""),
+            "hair_color_modifier": hair_state.get("current_modifier", ""),
+            "eye_color": eye_state.get("current", "") if eye_state.get("reliable") else "",
+            "eye_color_reliable": bool(eye_state.get("reliable")),
+            "visible_piercings_and_ear_jewelry": piercing_state.get("phrases", []),
             "background": item.get("background_description", ""),
             "lighting": item.get("lighting_description", ""),
             "composition": item.get("composition_description", ""),
@@ -9344,6 +9856,12 @@ def build_krea_ai_caption(
                     "current_desc": glasses_state.get("current_desc", ""),
                     "baseline_family": glasses_state.get("baseline_family", ""),
                     "current_family": glasses_state.get("current_family", ""),
+                    "position": glasses_state.get("position", ""),
+                },
+                "piercings_and_ear_jewelry": {
+                    "preferred_phrases": piercing_state.get("phrases", []),
+                    "must_caption": bool(piercing_state.get("must_caption")),
+                    "entries": piercing_state.get("entries", []),
                 },
             },
         }
@@ -9365,6 +9883,7 @@ Identity policy:
 - Do NOT describe stable hair or eye color unless the supplied feature_policy says must_caption=true.
 - Treat beard and glasses the same way: if feature_policy.must_caption is true, you MUST include the supplied preferred_phrase. If must_caption is false, omit that stable feature.
 - Glasses, makeup, costume elements and hairstyle changes may be described when visible, but follow feature_policy exactly for hair color, eye color, beard and glasses.
+- For piercings and ear jewelry, include every preferred phrase when piercings_and_ear_jewelry.must_caption=true. Canonical fixed piercings are already omitted by the profile policy; never invent or relocate jewelry.
 - Do not identify the person, guess a name, exact age, location, brand or relationship.
 - No booru tags, keyword lists, filename, markdown, labels, 'This image shows', hedging,
   explanations, quality scores or training advice.
@@ -9439,9 +9958,9 @@ def build_caption(
     global_rules: Dict[str, Any],
     subject_profile: Optional[Dict[str, Any]] = None,
 ) -> str:
-    profile_name = normalize_caption_profile(globals().get("CAPTION_PROFILE", "ernie"))
+    profile_name = caption_profile_for_training_target(globals().get("TRAINING_TARGET", globals().get("CAPTION_PROFILE", "ernie")))
     use_ai = (
-        profile_name == "krea2_character"
+        normalize_training_target(globals().get("TRAINING_TARGET", "ernie")) == "krea2"
         and bool(USE_KREA_AI_CAPTIONING)
         and bool(item.get("selected") or item.get("output_bucket") == "train_ready")
     )
@@ -10678,6 +11197,10 @@ def main() -> None:
             f"copies in 06_needs_manual_review."
         )
 
+    selected, backfill_added = backfill_train_ready_selection(selected, valid_candidates, TARGET_DATASET_SIZE)
+    if backfill_added:
+        warnings.append(f"Backfilled {len(backfill_added)} image(s) after hard/caption-remove exclusions to preserve the train-ready target.")
+
     selected_names = {r["original_filename"] for r in selected}
     for row in all_rows:
         if row["original_filename"] in selected_names:
@@ -11067,6 +11590,7 @@ def main() -> None:
         "glasses_frame_shape",
         "glasses_frame_material",
         "glasses_lens_type",
+        "glasses_position",
         "costume_accessories",
         "issues",
         "short_reason",
@@ -11132,10 +11656,11 @@ def main() -> None:
         "subject_profile_normalizer_model": (subject_profile or {}).get("normalizer_model", ""),
         "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
         "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
-        "caption_profile": normalize_caption_profile(CAPTION_PROFILE),
+        "training_target": normalize_training_target(TRAINING_TARGET),
+        "caption_profile": caption_profile_for_training_target(TRAINING_TARGET),
         "audit_model": AI_MODEL,
-        "krea_ai_captioning": bool(normalize_caption_profile(CAPTION_PROFILE) == "krea2_character" and USE_KREA_AI_CAPTIONING),
-        "krea_caption_model": KREA_CAPTION_MODEL if normalize_caption_profile(CAPTION_PROFILE) == "krea2_character" else "",
+        "krea_ai_captioning": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_AI_CAPTIONING),
+        "krea_caption_model": KREA_CAPTION_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" else "",
         "controlled_buckets": bool(USE_CONTROLLED_BUCKETS),
         "medium_rescue_crop_enabled": bool(ENABLE_MEDIUM_RESCUE_CROP),
     }
