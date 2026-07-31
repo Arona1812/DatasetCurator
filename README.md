@@ -152,7 +152,38 @@ Selecting **`Krea 2`** applies the recommended starting configuration:
 
 The profile stores stable identity and body information for consistency checks. Stable traits such as body build, tattoos, canonical piercings, scars and canonical facial features are not repeated in Krea captions; the trigger token carries that identity. Captions instead focus on visible, image-specific information such as framing, pose, action, expression, gaze, clothing, temporary accessories, background, lighting, camera angle and composition.
 
+#### Automatic Krea caption repair
+
+Krea 2 can perform one automatic repair attempt when the primary caption is empty, the API call fails, or the caption violates the confirmed Subject Profile / caption policy.
+
+The validator now also enforces the tattoo checkbox. When `include_tattoos` is disabled, any tattoo wording in a GPT caption is treated as a policy violation and sent to the repair model. When enabled, only tattoos visible in the exported image may be described.
+
+UI settings:
+
+- `Use automatic caption repair attempt`: enabled by default
+- `Krea 2 caption repair model`: default `gpt-5.6-terra`
+- `Reasoning effort – caption repair`: default `low`
+
+The repair call receives the exported image, visible audit facts, the first caption (when available), and the exact validation errors. It rewrites only that one caption; audit, selection and Subject Profile are not repeated. A deterministic local caption is used only when both the primary and repair attempts fail.
+
+The audit exports now include:
+
+- `caption_source`: `gpt_primary`, `gpt_repair`, `local_fallback`, or cache source
+- `caption_model`
+- `caption_retry_count`
+- `caption_validation_error`
+
+The dataset report also shows counts for primary captions, repaired captions and remaining local fallbacks.
+
 Hair color/form, eye color, beard state/color and glasses are handled by a shared profile policy. The profile first normalizes each feature and stores a canonical baseline. The UI then offers two caption strategies:
+
+#### Soft canon representation during selection
+
+When continuing from a confirmed Subject Profile, the final selector can softly promote images matching the user-confirmed canonical hair color. The default target is three canon images with a diminishing `+6 / +4 / +2` bonus. The bonus is only applied when the candidate is no more than five `quality_total` points behind the best alternative in the same selection step.
+
+This does not change the headshot/medium/full-body quotas, never promotes review or reject rows automatically, and never turns the target into a hard minimum. The report records the canonical color, selected count, eligible keep candidates and canon candidates still located in review or reject.
+
+Black and dark brown remain distinct values. Only selected close blonde variants receive a reduced match strength for a blonde canon.
 
 - **Only deviations from the canonical appearance** (default): the baseline belongs to the trigger token. For example, if the subject is canonically blonde, blonde images omit hair color while red/copper images state the deviation.
 - **Caption every visible value when genuine variation exists**: once repeated variation is detected, every visible state is captioned, including the baseline state.

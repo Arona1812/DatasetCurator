@@ -231,6 +231,10 @@ DEFAULTS: Dict[str, Any] = {
     "c_max_outfit": 4,
     "c_max_session": 5,
     "c_use_diversity": True,
+    # Weiche Repräsentation der im Subject Profile bestätigten Canon-Haarfarbe
+    "c_use_canon_representation": True,
+    "c_canon_representation_target": 3,
+    "c_canon_max_quality_gap": 5.0,
     # Pose-Diversity
     "c_use_pose_diversity": True,
     "c_pose_soft_limit": 2,
@@ -250,6 +254,9 @@ DEFAULTS: Dict[str, Any] = {
     "c_variable_feature_mode": "canonical_deviations",
     "c_krea_caption_model": "gpt-5.6-luna",
     "c_krea_caption_reasoning_effort": "none",
+    "c_use_krea_caption_repair": True,
+    "c_krea_caption_repair_model": "gpt-5.6-terra",
+    "c_krea_caption_repair_reasoning_effort": "low",
     # Subject Profile / Phase 2
     "c_pipeline_mode": "single_pass",
     "c_profile_normalizer_model": "gpt-5.6-terra",
@@ -531,11 +538,13 @@ def save_settings_fn(
     c_smart_crop, c_crop_gain, c_crop_pad,
     c_medium_rescue_crop, c_medium_rescue_gain,
     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,
+    c_use_canon_representation, c_canon_representation_target, c_canon_max_quality_gap,
     c_use_pose_diversity, c_pose_soft_limit, c_pose_penalty_weight,
     c_use_arcface, c_arcface_hard, c_arcface_soft, c_arcface_trim,
     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
     c_training_target,
     c_captions, c_variable_feature_mode, c_krea_caption_model, c_krea_caption_reasoning_effort,
+    c_use_krea_caption_repair, c_krea_caption_repair_model, c_krea_caption_repair_reasoning_effort,
     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
@@ -588,6 +597,9 @@ def save_settings_fn(
         "c_medium_rescue_gain": c_medium_rescue_gain,
         "c_use_cluster": c_use_cluster, "c_max_outfit": c_max_outfit,
         "c_max_session": c_max_session, "c_use_diversity": c_use_diversity,
+        "c_use_canon_representation": bool(c_use_canon_representation),
+        "c_canon_representation_target": int(c_canon_representation_target),
+        "c_canon_max_quality_gap": float(c_canon_max_quality_gap),
         "c_use_pose_diversity": c_use_pose_diversity,
         "c_pose_soft_limit": c_pose_soft_limit,
         "c_pose_penalty_weight": c_pose_penalty_weight,
@@ -604,6 +616,9 @@ def save_settings_fn(
         "c_variable_feature_mode": c_variable_feature_mode,
         "c_krea_caption_model": c_krea_caption_model,
         "c_krea_caption_reasoning_effort": c_krea_caption_reasoning_effort,
+        "c_use_krea_caption_repair": bool(c_use_krea_caption_repair),
+        "c_krea_caption_repair_model": c_krea_caption_repair_model,
+        "c_krea_caption_repair_reasoning_effort": c_krea_caption_repair_reasoning_effort,
         "c_pipeline_mode": c_pipeline_mode,
         "c_profile_normalizer_model": c_profile_normalizer_model,
         "c_profile_reasoning_effort": c_profile_reasoning_effort,
@@ -2220,11 +2235,13 @@ def start_curator(
     enable_smart_crop, crop_min_gain, crop_padding,
     enable_medium_rescue_crop, medium_rescue_min_gain,
     use_clustering, max_outfit, max_session, use_diversity,
+    c_use_canon_representation, c_canon_representation_target, c_canon_max_quality_gap,
     use_pose_diversity, pose_soft_limit, pose_penalty_weight,
     use_arcface, arcface_hard, arcface_soft, arcface_trim,
     arcface_min_faces, arcface_model, arcface_det_size,
     training_target,
     caption_options, variable_feature_mode, krea_caption_model, krea_caption_reasoning_effort,
+    use_krea_caption_repair, krea_caption_repair_model, krea_caption_repair_reasoning_effort,
     c_pipeline_mode, c_profile_normalizer_model, profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
     export_review, export_reject, export_crop_compare, controlled_buckets,
@@ -2304,6 +2321,9 @@ def start_curator(
         "MAX_PER_OUTFIT_CLUSTER": int(max_outfit),
         "MAX_PER_SESSION_CLUSTER": int(max_session),
         "ENABLE_DIVERSITY_PENALTIES": use_diversity,
+        "ENABLE_CANON_REPRESENTATION_BONUS": bool(c_use_canon_representation),
+        "CANON_REPRESENTATION_TARGET": int(c_canon_representation_target),
+        "CANON_REPRESENTATION_MAX_QUALITY_GAP": float(c_canon_max_quality_gap),
         "ENABLE_POSE_DIVERSITY": bool(use_pose_diversity),
         "POSE_DIVERSITY_SOFT_LIMIT": int(pose_soft_limit),
         "POSE_DIVERSITY_PENALTY_WEIGHT": float(pose_penalty_weight),
@@ -2321,6 +2341,9 @@ def start_curator(
         "USE_KREA_AI_CAPTIONING": normalize_training_target(training_target) == "krea2",
         "KREA_CAPTION_MODEL": krea_caption_model.strip() or "gpt-5.6-luna",
         "KREA_CAPTION_REASONING_EFFORT": str(krea_caption_reasoning_effort or "none"),
+        "USE_KREA_CAPTION_REPAIR": bool(use_krea_caption_repair),
+        "KREA_CAPTION_REPAIR_MODEL": krea_caption_repair_model.strip() or "gpt-5.6-terra",
+        "KREA_CAPTION_REPAIR_REASONING_EFFORT": str(krea_caption_repair_reasoning_effort or "low"),
         "PIPELINE_MODE": c_pipeline_mode,
         "PROFILE_NORMALIZER_MODEL": c_profile_normalizer_model.strip() or "gpt-5.6-terra",
         "PROFILE_REASONING_EFFORT": str(profile_reasoning_effort or "low"),
@@ -2360,11 +2383,13 @@ def start_caption_from_profile(
     enable_smart_crop, crop_min_gain, crop_padding,
     enable_medium_rescue_crop, medium_rescue_min_gain,
     use_clustering, max_outfit, max_session, use_diversity,
+    c_use_canon_representation, c_canon_representation_target, c_canon_max_quality_gap,
     use_pose_diversity, pose_soft_limit, pose_penalty_weight,
     use_arcface, arcface_hard, arcface_soft, arcface_trim,
     arcface_min_faces, arcface_model, arcface_det_size,
     training_target,
     caption_options, variable_feature_mode, krea_caption_model, krea_caption_reasoning_effort,
+    use_krea_caption_repair, krea_caption_repair_model, krea_caption_repair_reasoning_effort,
     c_pipeline_mode, c_profile_normalizer_model, profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
     export_review, export_reject, export_crop_compare, controlled_buckets,
@@ -2418,6 +2443,9 @@ def start_caption_from_profile(
         "USE_KREA_AI_CAPTIONING": normalize_training_target(training_target) == "krea2",
         "KREA_CAPTION_MODEL": krea_caption_model.strip() or "gpt-5.6-luna",
         "KREA_CAPTION_REASONING_EFFORT": str(krea_caption_reasoning_effort or "none"),
+        "USE_KREA_CAPTION_REPAIR": bool(use_krea_caption_repair),
+        "KREA_CAPTION_REPAIR_MODEL": krea_caption_repair_model.strip() or "gpt-5.6-terra",
+        "KREA_CAPTION_REPAIR_REASONING_EFFORT": str(krea_caption_repair_reasoning_effort or "low"),
         "PIPELINE_MODE": "profile_then_caption",
         "CONTINUE_FROM_PROFILE": True,
         "PROFILE_NORMALIZER_MODEL": c_profile_normalizer_model.strip() or "gpt-5.6-terra",
@@ -2440,6 +2468,16 @@ def start_caption_from_profile(
         "RATIO_HEADSHOT": round(ratio_h, 2),
         "RATIO_MEDIUM": round(ratio_m, 2),
         "RATIO_FULL_BODY": round(ratio_f, 2),
+        "USE_SESSION_OUTFIT_CLUSTERING": use_clustering,
+        "MAX_PER_OUTFIT_CLUSTER": int(max_outfit),
+        "MAX_PER_SESSION_CLUSTER": int(max_session),
+        "ENABLE_DIVERSITY_PENALTIES": use_diversity,
+        "ENABLE_CANON_REPRESENTATION_BONUS": bool(c_use_canon_representation),
+        "CANON_REPRESENTATION_TARGET": int(c_canon_representation_target),
+        "CANON_REPRESENTATION_MAX_QUALITY_GAP": float(c_canon_max_quality_gap),
+        "ENABLE_POSE_DIVERSITY": bool(use_pose_diversity),
+        "POSE_DIVERSITY_SOFT_LIMIT": int(pose_soft_limit),
+        "POSE_DIVERSITY_PENALTY_WEIGHT": float(pose_penalty_weight),
     }
 
     train_dir = os.path.join(output_root_for(input_folder, trigger_word), "01_train_ready")
@@ -3717,6 +3755,42 @@ def build_ui() -> gr.Blocks:
                         ),
                     )
 
+                    gr.Markdown(tr(
+                        "**Weiche Canon-Repräsentation:** Nach Bestätigung des Subject Profiles erhält die gewählte kanonische Haarfarbe einen abnehmenden Auswahlbonus. Die Headshot-/Medium-/Full-Body-Quoten bleiben unverändert. Review- und Reject-Bilder werden niemals automatisch hochgesetzt.",
+                        "**Soft canon representation:** After the Subject Profile is confirmed, the selected canonical hair color receives a diminishing selection bonus. Headshot/medium/full-body quotas remain unchanged. Review and reject images are never promoted automatically.",
+                    ))
+                    c_use_canon_representation = gr.Checkbox(
+                        label=tr("Canon-Repräsentation bei der Auswahl fördern", "Promote canon representation during selection"),
+                        value=S["c_use_canon_representation"],
+                        info=tr(
+                            "Wirkt erst beim Captioning aus dem bestätigten Profil. Der Bonus gilt nur für bereits geeignete Keep-Kandidaten innerhalb der jeweiligen Shot-Kategorie.",
+                            "Takes effect when continuing from the confirmed profile. The bonus only applies to already eligible keep candidates within the current shot category.",
+                        ),
+                    )
+                    with gr.Row():
+                        c_canon_representation_target = gr.Slider(
+                            label=tr("Weiches Canon-Ziel", "Soft canon target"),
+                            minimum=0,
+                            maximum=5,
+                            step=1,
+                            value=S["c_canon_representation_target"],
+                            info=tr(
+                                "Gewünschte Mindestanzahl guter Bilder mit der bestätigten Canon-Haarfarbe. Standard bei 20 Bildern: 3. Kein hartes Minimum.",
+                                "Desired minimum number of good images with the confirmed canonical hair color. Default for 20 images: 3. Not a hard minimum.",
+                            ),
+                        )
+                        c_canon_max_quality_gap = gr.Slider(
+                            label=tr("Max. Qualitätsabstand für Canon-Bonus", "Max quality gap for canon bonus"),
+                            minimum=0,
+                            maximum=15,
+                            step=0.5,
+                            value=S["c_canon_max_quality_gap"],
+                            info=tr(
+                                "Ein Canon-Kandidat erhält nur dann den Bonus, wenn er höchstens so viele Quality-Total-Punkte hinter der besten Alternative liegt. Standard: 5.",
+                                "A canon candidate only receives the bonus if it is no more than this many quality-total points behind the best alternative. Default: 5.",
+                            ),
+                        )
+
                 with gr.Accordion(tr("🧭 Kopfpose-Diversität", "🧭 Head pose diversity"), open=False):
                     gr.Markdown(tr(
                         "<details>"
@@ -4198,6 +4272,34 @@ def build_ui() -> gr.Blocks:
                             "Reasoning for the final natural caption of each selected image. `none` is the recommended default; `low` can be tested for complex scenes.",
                         ),
                     )
+                    c_use_krea_caption_repair = gr.Checkbox(
+                        label=tr("Automatischen Caption-Reparaturversuch verwenden", "Use automatic caption repair attempt"),
+                        value=S["c_use_krea_caption_repair"],
+                        info=tr(
+                            "Wenn die erste Krea-Caption leer ist oder gegen Profil-/Caption-Regeln verstößt, wird nur dieses Bild einmal mit dem Reparaturmodell neu captioniert. Audit, Profil und Auswahl werden nicht wiederholt.",
+                            "If the first Krea caption is empty or violates profile/caption rules, only that image is captioned once more with the repair model. Audit, profile and selection are not repeated.",
+                        ),
+                    )
+                    with gr.Row():
+                        c_krea_caption_repair_model = gr.Dropdown(
+                            label=tr("Krea-2-Caption-Reparaturmodell", "Krea 2 caption repair model"),
+                            choices=OPENAI_MODEL_PRESET_CHOICES,
+                            value=S["c_krea_caption_repair_model"],
+                            info=tr(
+                                "Wird ausschließlich nach einem fehlgeschlagenen oder regelwidrigen ersten Caption-Versuch aufgerufen. Empfehlung: gpt-5.6-terra.",
+                                "Called only after a failed or policy-invalid first caption attempt. Recommended: gpt-5.6-terra.",
+                            ),
+                            **openai_model_dropdown_kwargs(),
+                        )
+                        c_krea_caption_repair_reasoning_effort = gr.Dropdown(
+                            label=tr("Reasoning Effort – Caption-Reparatur", "Reasoning effort – caption repair"),
+                            choices=REASONING_EFFORT_CHOICES,
+                            value=S["c_krea_caption_repair_reasoning_effort"],
+                            info=tr(
+                                "Der Reparaturversuch erhält die konkrete Validierungsfehlermeldung und die erste Caption. `low` ist der empfohlene Standard.",
+                                "The repair attempt receives the exact validation error and first caption. `low` is the recommended default.",
+                            ),
+                        )
                     c_target_defaults_event = c_training_target.change(
                         fn=apply_training_target_defaults,
                         inputs=[
@@ -4359,11 +4461,13 @@ def build_ui() -> gr.Blocks:
                     c_smart_crop, c_crop_gain, c_crop_pad,
                     c_medium_rescue_crop, c_medium_rescue_gain,
                     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,
+                    c_use_canon_representation, c_canon_representation_target, c_canon_max_quality_gap,
                     c_use_pose_diversity, c_pose_soft_limit, c_pose_penalty_weight,
                     c_use_arcface, c_arcface_hard, c_arcface_soft, c_arcface_trim,
                     c_arcface_min_faces, c_arcface_model, c_arcface_det_size,
                     c_training_target,
                     c_captions, c_variable_feature_mode, c_krea_caption_model, c_krea_caption_reasoning_effort,
+                    c_use_krea_caption_repair, c_krea_caption_repair_model, c_krea_caption_repair_reasoning_effort,
                     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
                     c_profile_sample_threshold, c_profile_sample_size, c_profile_ui_per_image_threshold,
                     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,

@@ -106,6 +106,7 @@ TRIGGER_CHECK_REASONING_EFFORT = "none"
 REVIEW_ESCALATION_REASONING_EFFORT = "low"
 PROFILE_REASONING_EFFORT = "low"
 KREA_CAPTION_REASONING_EFFORT = "none"
+KREA_CAPTION_REPAIR_REASONING_EFFORT = "low"
 
 # Optionale Eskalation für schwierige Fälle:
 # Erstes Audit läuft mit AI_MODEL. Falls ein Bild im Grenzbereich liegt,
@@ -517,8 +518,10 @@ VARIABLE_FEATURE_CAPTION_MODE = "canonical_deviations"
 # dedicated natural-language caption after the subject profile is known.
 USE_KREA_AI_CAPTIONING = True
 KREA_CAPTION_MODEL = "gpt-5.6-luna"
+USE_KREA_CAPTION_REPAIR = True
+KREA_CAPTION_REPAIR_MODEL = "gpt-5.6-terra"
 KREA_CAPTION_IMAGE_DETAIL = "high"
-KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v3-training-target"
+KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v5-canon-selection-tattoo-policy"
 CAPTION_POLICY = {
     "include_gender_class": True,
     "include_skin_tone": True, 
@@ -600,6 +603,16 @@ IDENTITY_CLUSTER_MAX_CORE_SHARE = 0.60
 IDENTITY_CLUSTER_CORE_OVERFLOW_PENALTY = 18.0
 IDENTITY_CLUSTER_TRAIN_ROLES = {"core", "variation", "body_reference"}
 IDENTITY_CLUSTER_NONTRAIN_ROLES = {"review", "exclude"}
+
+# Weiche Canon-Repräsentation bei der finalen Auswahl. Diese Logik greift erst
+# nach dem bestätigten Subject Profile, weil die kanonische Erscheinung eine
+# bewusste Nutzerentscheidung sein kann und nicht zwingend der Statistik folgt.
+# Sie verändert niemals die Shot-Type-Quoten und zieht weder Review- noch
+# Reject-Bilder automatisch in den Trainingssatz.
+ENABLE_CANON_REPRESENTATION_BONUS = True
+CANON_REPRESENTATION_TARGET = 3
+CANON_REPRESENTATION_MAX_QUALITY_GAP = 5.0
+CANON_REPRESENTATION_BONUS_SCHEDULE = [6.0, 4.0, 2.0, 1.0, 0.5]
 
 # Body build soll nicht verworfen werden, nur weil das Dataset headshot-lastig
 # ist, wenn wenigstens einige brauchbare Medium-/Fullbody-Bilder vorhanden sind.
@@ -5147,6 +5160,28 @@ def _caption_contains_term(caption: str, term: str) -> bool:
     return bool(c and t and t in c)
 
 
+def get_visible_tattoo_state(
+    item: Dict[str, Any],
+    profile: Optional[Dict[str, Any]],
+    active_policy: Dict[str, Any],
+) -> Dict[str, Any]:
+    visible: List[str] = []
+    for entry in item.get("tattoo_inventory_now") or []:
+        if not isinstance(entry, dict):
+            continue
+        desc = compact_trait(entry.get("description"))
+        loc = _phrase_from_token(entry.get("location", ""))
+        phrase = desc or (f"tattoo on the {loc}" if loc else "tattoo")
+        if phrase:
+            visible.append(phrase)
+    if not visible and bool(item.get("tattoos_visible", False)):
+        fallback = compact_trait(item.get("tattoos_description")) or "visible tattoo"
+        visible.append(fallback)
+    visible = _dedupe_phrase_list(visible)
+    must_caption = bool(active_policy.get("include_tattoos", False) and visible)
+    return {"phrases": visible, "visible": bool(visible), "must_caption": must_caption}
+
+
 def _validate_krea_caption_features(caption: str, feature_states: Dict[str, Dict[str, Any]]) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
     text = normalize_compact_text(caption)
@@ -5209,6 +5244,14 @@ def _validate_krea_caption_features(caption: str, feature_states: Dict[str, Dict
                 alternatives.extend(["earrings", "ear jewelry"])
             if not contains_any(alternatives):
                 reasons.append(f"missing required piercing/accessory: {phrase}")
+
+    tattoos = feature_states.get("tattoos", {}) or {}
+    tattoo_tokens = ["tattoo", "tattoos", "tattooed", "inked"]
+    if tattoos.get("must_caption"):
+        if tattoos.get("visible") and not contains_any(tattoo_tokens):
+            reasons.append("missing required visible tattoo")
+    elif contains_any(tattoo_tokens):
+        reasons.append("tattoos should be omitted by caption policy")
 
     return (len(reasons) == 0), reasons
 
@@ -6996,7 +7039,11 @@ def rebuild_selection_from_identity_roles(
     """
     apply_identity_cluster_roles_to_rows(all_rows, profile)
     has_roles = any(r.get("identity_cluster_role") for r in all_rows)
-    if not has_roles:
+    has_canon_selection = bool(
+        ENABLE_CANON_REPRESENTATION_BONUS
+        and normalize_text((profile.get("canonical_features", {}) or {}).get("hair_color", ""))
+    )
+    if not has_roles and not has_canon_selection:
         return [], [], []
 
     train_candidates: List[Dict[str, Any]] = []
@@ -7006,6 +7053,12 @@ def rebuild_selection_from_identity_roles(
         if row.get("arcface_flag") == "hard" or row.get("base_status") == "reject":
             continue
         role = str(row.get("identity_cluster_role", "") or "").strip().lower()
+        if not has_roles:
+            if row.get("base_status") == "keep":
+                train_candidates.append(row)
+            elif row.get("base_status") == "review":
+                review_items.append(row)
+            continue
         if role in IDENTITY_CLUSTER_TRAIN_ROLES:
             train_candidates.append(row)
         elif role == "review" or row.get("base_status") == "review":
@@ -7020,7 +7073,7 @@ def rebuild_selection_from_identity_roles(
     if not train_candidates:
         return [], [], []
 
-    selected = choose_final_dataset(train_candidates)
+    selected = choose_final_dataset(train_candidates, profile)
     selected = crop_dedup_selected(selected)
     selected, final_duplicate_rows = dedup_final_selected_scene_variants(selected)
     selected_names = {r.get("original_filename") for r in selected}
@@ -7812,6 +7865,7 @@ def backfill_train_ready_selection(
     selected: List[Dict[str, Any]],
     candidate_pool: List[Dict[str, Any]],
     target_size: Optional[int] = None,
+    subject_profile: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Fill replacements after caption-remove/hard-review exclusions.
 
@@ -7852,8 +7906,17 @@ def backfill_train_ready_selection(
         def score(row: Dict[str, Any]) -> float:
             shot = row.get("shot_type", "headshot")
             quota_gap = max(0, int(desired.get(shot, 0)) - int(shot_counts.get(shot, 0)))
-            return float(adjusted_pick_score(row, out)) + (8.0 if quota_gap > 0 else 0.0)
+            return (
+                float(adjusted_pick_score(row, out))
+                + (8.0 if quota_gap > 0 else 0.0)
+                + canon_representation_bonus(row, out, subject_profile, candidates)
+            )
         best = max(candidates, key=score)
+        applied_canon_bonus = canon_representation_bonus(best, out, subject_profile, candidates)
+        if applied_canon_bonus > 0:
+            best["canon_representation_bonus_applied"] = round(applied_canon_bonus, 3)
+            best["canonical_hair_match_strength"] = round(canonical_hair_match_strength(best, subject_profile), 3)
+            best.setdefault("status_notes", []).append("backfilled_with_soft_canon_representation_bonus")
         candidates.remove(best)
         best.setdefault("status_notes", []).append("backfill_after_final_bucket_exclusion")
         best["selected"] = True
@@ -7910,7 +7973,9 @@ def write_caption_stage_reports(
         "short_reason", "local_override_reasons", "duplicate_of", "duplicate_method",
         "duplicate_distance", "main_face_ratio", "secondary_face_area_ratio",
         "face_count_local", "width", "height",
-        "file_size_mb", "arcface_distance_to_centroid", "arcface_flag", "final_caption",
+        "file_size_mb", "arcface_distance_to_centroid", "arcface_flag",
+        "canonical_hair_match_strength", "canon_representation_bonus_applied",
+        "caption_source", "caption_model", "caption_retry_count", "caption_validation_error", "final_caption",
     ]
 
     csv_path = os.path.join(OUTPUT_ROOT, f"dataset_audit_{SAFE_TRIGGER}.csv")
@@ -7953,11 +8018,25 @@ def write_caption_stage_reports(
         "subject_profile_normalizer_model": (subject_profile or {}).get("normalizer_model", ""),
         "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
         "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
+        "variable_feature_mode": str(VARIABLE_FEATURE_CAPTION_MODE),
+        "canon_representation_enabled": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("enabled", False),
+        "canonical_hair_color": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("canonical_hair_color", ""),
+        "canon_representation_target": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("target", 0),
+        "canon_representation_selected": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("selected", 0),
+        "canon_representation_eligible_keep": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("eligible_keep_candidates", 0),
+        "canon_representation_review_candidates": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("review_candidates", 0),
+        "canon_representation_reject_candidates": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("reject_candidates", 0),
+        "canon_representation_max_quality_gap": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("max_quality_gap", 0),
         "training_target": normalize_training_target(TRAINING_TARGET),
         "caption_profile": caption_profile_for_training_target(TRAINING_TARGET),
         "audit_model": AI_MODEL,
         "krea_ai_captioning": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_AI_CAPTIONING),
         "krea_caption_model": KREA_CAPTION_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" else "",
+        "krea_caption_repair_enabled": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_CAPTION_REPAIR),
+        "krea_caption_repair_model": KREA_CAPTION_REPAIR_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_CAPTION_REPAIR else "",
+        "caption_primary_count": sum(1 for r in selected_sorted if r.get("caption_source") == "gpt_primary"),
+        "caption_repair_count": sum(1 for r in selected_sorted if r.get("caption_source") == "gpt_repair"),
+        "caption_local_fallback_count": sum(1 for r in selected_sorted if r.get("caption_source") == "local_fallback"),
         "controlled_buckets": bool(USE_CONTROLLED_BUCKETS),
         "medium_rescue_crop_enabled": bool(ENABLE_MEDIUM_RESCUE_CROP),
         "caption_stage_continued_from_profile": True,
@@ -8069,12 +8148,24 @@ def continue_caption_from_profile() -> None:
         unselected_keep = reranked_unused
 
     selected_sorted, backfill_added = backfill_train_ready_selection(
-        selected_sorted, list(unselected_keep) + list(all_rows), TARGET_DATASET_SIZE
+        selected_sorted, list(unselected_keep) + list(all_rows), TARGET_DATASET_SIZE, subject_profile
     )
     if backfill_added:
         added_names = {r.get("original_filename") for r in backfill_added}
         unselected_keep = [r for r in unselected_keep if r.get("original_filename") not in added_names]
         warnings.append(f"Backfilled {len(backfill_added)} image(s) so 01_train_ready can reach the requested target after caption-remove/review exclusions.")
+
+    canon_summary = canon_representation_summary(all_rows, selected_sorted, subject_profile)
+    if canon_summary.get("enabled") and canon_summary.get("selected", 0) < canon_summary.get("target", 0):
+        warnings.append(
+            "Canonical hair representation below soft target: "
+            f"{canon_summary.get('selected', 0)}/{canon_summary.get('target', 0)} "
+            f"for '{canon_summary.get('canonical_hair_color', '')}'. "
+            f"Eligible keep={canon_summary.get('eligible_keep_candidates', 0)}, "
+            f"review={canon_summary.get('review_candidates', 0)}, "
+            f"reject={canon_summary.get('reject_candidates', 0)}. "
+            "Review/reject candidates are never promoted automatically."
+        )
 
     clean_caption_output_dirs()
     row_index = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
@@ -8948,6 +9039,100 @@ def face_orientation_penalty(item: Dict[str, Any]) -> float:
     return 0.0
 
 
+def _selection_profile_traits(row: Dict[str, Any], profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(profile, dict):
+        return {}
+    per_image = profile.get("per_image_traits", {}) or {}
+    image_id = row.get("profile_image_id") or profile_image_id(row)
+    traits = per_image.get(image_id, {}) if isinstance(per_image, dict) else {}
+    return traits if isinstance(traits, dict) else {}
+
+
+def canonical_hair_match_strength(row: Dict[str, Any], profile: Optional[Dict[str, Any]]) -> float:
+    """Return 0..1 match strength against the user-confirmed canonical hair color.
+
+    Exact enum matches receive 1.0. Closely related blonde variants may count as
+    near-canonical because the UI intentionally keeps them as separate visible
+    values while still allowing a blonde canon to be represented by useful
+    dark-/platinum-blonde photos. Black and dark brown remain distinct.
+    """
+    if not isinstance(profile, dict):
+        return 0.0
+    canonical = normalize_text((profile.get("canonical_features", {}) or {}).get("hair_color", ""))
+    if not canonical:
+        return 0.0
+    traits = _selection_profile_traits(row, profile)
+    current = normalize_text(traits.get("hair_color_base", "")) or canonical_hair_color(row)
+    if not current:
+        return 0.0
+    if current == canonical:
+        return 1.0
+
+    near_map = {
+        "blonde": {"dark_blonde": 0.90, "platinum": 0.85, "strawberry_blonde": 0.50},
+        "dark_blonde": {"blonde": 0.90, "platinum": 0.70},
+        "platinum": {"blonde": 0.85, "dark_blonde": 0.70},
+        "strawberry_blonde": {"blonde": 0.50},
+    }
+    return float((near_map.get(canonical, {}) or {}).get(current, 0.0))
+
+
+def canonical_hair_representation_count(selected: List[Dict[str, Any]], profile: Optional[Dict[str, Any]]) -> int:
+    # Only full/near matches count toward the target. Reduced strawberry-blonde
+    # matches can receive a small bonus but do not silently satisfy a blonde canon.
+    return sum(1 for row in selected if canonical_hair_match_strength(row, profile) >= 0.70)
+
+
+def canon_representation_bonus(
+    item: Dict[str, Any],
+    selected: List[Dict[str, Any]],
+    profile: Optional[Dict[str, Any]],
+    competing_pool: Optional[List[Dict[str, Any]]] = None,
+) -> float:
+    if not bool(ENABLE_CANON_REPRESENTATION_BONUS) or not isinstance(profile, dict):
+        return 0.0
+    target = max(0, int(CANON_REPRESENTATION_TARGET or 0))
+    current_count = canonical_hair_representation_count(selected, profile)
+    if target <= 0 or current_count >= target:
+        return 0.0
+
+    strength = canonical_hair_match_strength(item, profile)
+    if strength <= 0.0:
+        return 0.0
+
+    pool = competing_pool or [item]
+    best_quality = max((float(r.get("quality_total", 0) or 0) for r in pool), default=0.0)
+    item_quality = float(item.get("quality_total", 0) or 0)
+    if (best_quality - item_quality) > float(CANON_REPRESENTATION_MAX_QUALITY_GAP):
+        return 0.0
+
+    schedule = list(CANON_REPRESENTATION_BONUS_SCHEDULE or [])
+    base_bonus = float(schedule[current_count]) if current_count < len(schedule) else 0.0
+    return base_bonus * strength
+
+
+def canon_representation_summary(
+    all_rows: List[Dict[str, Any]],
+    selected: List[Dict[str, Any]],
+    profile: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    canonical = ""
+    if isinstance(profile, dict):
+        canonical = normalize_text((profile.get("canonical_features", {}) or {}).get("hair_color", ""))
+    def count(rows, predicate=lambda r: True):
+        return sum(1 for r in rows if predicate(r) and canonical_hair_match_strength(r, profile) >= 0.70)
+    return {
+        "enabled": bool(ENABLE_CANON_REPRESENTATION_BONUS and canonical),
+        "canonical_hair_color": canonical,
+        "target": int(CANON_REPRESENTATION_TARGET or 0),
+        "selected": count(selected),
+        "eligible_keep_candidates": count(all_rows, lambda r: r.get("base_status") == "keep" and r.get("arcface_flag") != "hard"),
+        "review_candidates": count(all_rows, lambda r: r.get("base_status") == "review" or normalize_text(r.get("identity_cluster_role")) == "review"),
+        "reject_candidates": count(all_rows, lambda r: r.get("base_status") == "reject" or r.get("arcface_flag") == "hard"),
+        "max_quality_gap": float(CANON_REPRESENTATION_MAX_QUALITY_GAP),
+    }
+
+
 def adjusted_pick_score(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> float:
     # Identity ist das primäre Ziel – 3× stärker gewichtet als bisher
     base = float(item.get("quality_identity_usefulness", 0)) * 3.0
@@ -9018,7 +9203,7 @@ def cluster_caps_allow(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> 
     return True
 
 
-def choose_final_dataset(clean_keep_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def choose_final_dataset(clean_keep_items: List[Dict[str, Any]], subject_profile: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     available_counts = Counter(i["shot_type"] for i in clean_keep_items)
     quotas = quotas_for_target(TARGET_DATASET_SIZE, available_counts)
 
@@ -9041,9 +9226,19 @@ def choose_final_dataset(clean_keep_items: List[Dict[str, Any]]) -> List[Dict[st
                 fallback = [p for p in pool if p["original_filename"] not in selected_ids]
                 if not fallback:
                     break
-                best = max(fallback, key=lambda x: adjusted_pick_score(x, selected))
+                scoring_pool = fallback
             else:
-                best = max(remaining, key=lambda x: adjusted_pick_score(x, selected))
+                scoring_pool = remaining
+            best = max(
+                scoring_pool,
+                key=lambda x: adjusted_pick_score(x, selected)
+                + canon_representation_bonus(x, selected, subject_profile, scoring_pool),
+            )
+            applied_canon_bonus = canon_representation_bonus(best, selected, subject_profile, scoring_pool)
+            if applied_canon_bonus > 0:
+                best["canon_representation_bonus_applied"] = round(applied_canon_bonus, 3)
+                best["canonical_hair_match_strength"] = round(canonical_hair_match_strength(best, subject_profile), 3)
+                best.setdefault("status_notes", []).append("selected_with_soft_canon_representation_bonus")
             selected.append(best)
             selected_ids.add(best["original_filename"])
             picked += 1
@@ -9730,6 +9925,9 @@ def _krea_caption_cache_path(item: Dict[str, Any], subject_profile: Dict[str, An
         KREA_CAPTION_PROMPT_VERSION,
         str(KREA_CAPTION_MODEL),
         str(KREA_CAPTION_REASONING_EFFORT),
+        str(bool(USE_KREA_CAPTION_REPAIR)),
+        str(KREA_CAPTION_REPAIR_MODEL),
+        str(KREA_CAPTION_REPAIR_REASONING_EFFORT),
         str(VARIABLE_FEATURE_CAPTION_MODE),
         str(source_key),
         profile_key,
@@ -9751,56 +9949,172 @@ def _clean_krea_caption(text: str) -> str:
     return caption.strip()
 
 
+def _set_caption_metadata(
+    item: Dict[str, Any],
+    *,
+    source: str,
+    model: str,
+    retry_count: int,
+    validation_error: str = "",
+) -> None:
+    """Persist caption provenance on the row for CSV/JSONL/report diagnostics."""
+    item["caption_source"] = str(source or "")
+    item["caption_model"] = str(model or "")
+    item["caption_retry_count"] = int(retry_count or 0)
+    item["caption_validation_error"] = str(validation_error or "")
+
+
+def _call_krea_caption_model(
+    *,
+    model: str,
+    reasoning_effort: str,
+    instructions: str,
+    text_payload: Dict[str, Any],
+    image_b64: str,
+    phase_label: str,
+) -> str:
+    payload = {
+        "instructions": instructions,
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": json.dumps(text_payload, ensure_ascii=False)},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/jpeg;base64,{image_b64}",
+                    "detail": KREA_CAPTION_IMAGE_DETAIL,
+                },
+            ],
+        }],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "krea2_caption",
+                "schema": {
+                    "type": "object",
+                    "properties": {"caption": {"type": "string"}},
+                    "required": ["caption"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 300,
+        "store": False,
+        "temperature": 0.1,
+        "_reasoning_effort": reasoning_effort,
+    }
+    data = responses_api_call(model, payload, phase_label=phase_label)
+    parsed = json.loads(extract_response_text(data))
+    return _clean_krea_caption(parsed.get("caption", ""))
+
+
+def _save_krea_caption_cache(
+    cache_path: str,
+    *,
+    caption: str,
+    source: str,
+    model: str,
+    retry_count: int,
+    validation_error: str = "",
+) -> None:
+    if not ENABLE_CACHE:
+        return
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "caption": caption,
+                "caption_source": source,
+                "model": model,
+                "retry_count": int(retry_count or 0),
+                "validation_error": validation_error,
+                "primary_model": KREA_CAPTION_MODEL,
+                "repair_enabled": bool(USE_KREA_CAPTION_REPAIR),
+                "repair_model": KREA_CAPTION_REPAIR_MODEL,
+                "prompt_version": KREA_CAPTION_PROMPT_VERSION,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
 def build_krea_ai_caption(
     item: Dict[str, Any],
     global_rules: Dict[str, Any],
     subject_profile: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Generate one dataset-aware natural-language Krea 2 caption.
+    """Generate a dataset-aware Krea 2 caption with one automatic repair attempt.
 
-    The subject profile is used as an omission map: stable physical identity
-    remains attached to the trigger word, while visible scene-specific details
-    are described. A local deterministic caption is used on API/cache failure.
+    Flow:
+      1. Generate with the primary caption model.
+      2. Validate against the confirmed Subject Profile and caption policy.
+      3. If generation or validation fails, call the configured repair model once
+         with the original attempt and exact validation errors.
+      4. Use the deterministic local caption only if both AI attempts fail.
     """
     profile = subject_profile or {}
     cache_path = _krea_caption_cache_path(item, profile)
+
+    profile_policies = profile.get("profile_policies", {}) if isinstance(profile, dict) else {}
+    active_policy = enforce_caption_policy_profile(
+        normalize_caption_profile(globals().get("CAPTION_PROFILE", "ernie")),
+        CAPTION_POLICY,
+    )
+    image_id = profile_image_id(item)
+    image_traits = (
+        (profile.get("per_image_traits", {}) or {}).get(image_id, {})
+        if isinstance(profile, dict)
+        else {}
+    )
+    hair_state = get_hair_feature_state(item, profile, image_traits, global_rules, active_policy, "krea2_character")
+    eye_state = get_eye_feature_state(item, profile, image_traits, active_policy)
+    beard_state = get_beard_feature_state(item, global_rules, active_policy, profile)
+    glasses_state = get_glasses_feature_state(item, profile, image_traits, active_policy)
+    piercing_state = get_visible_piercing_state(item, profile, image_traits, active_policy, "krea2_character")
+    tattoo_state = get_visible_tattoo_state(item, profile, active_policy)
+    feature_states = {
+        "hair": hair_state,
+        "eye": eye_state,
+        "beard": beard_state,
+        "glasses": glasses_state,
+        "piercings": piercing_state,
+        "tattoos": tattoo_state,
+    }
+
+    # A valid cache entry is still revalidated against the current profile.
     if ENABLE_CACHE and os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            caption = _clean_krea_caption(cached.get("caption", ""))
-            if caption and caption != TRIGGER_WORD:
-                image_id = profile_image_id(item)
-                image_traits = (profile.get("per_image_traits", {}) or {}).get(image_id, {}) if isinstance(profile, dict) else {}
-                active_policy = enforce_caption_policy_profile(normalize_caption_profile(globals().get("CAPTION_PROFILE", "ernie")), CAPTION_POLICY)
-                feature_states = {
-                    "hair": get_hair_feature_state(item, profile, image_traits, global_rules, active_policy, "krea2_character"),
-                    "eye": get_eye_feature_state(item, profile, image_traits, active_policy),
-                    "beard": get_beard_feature_state(item, global_rules, active_policy, profile),
-                    "glasses": get_glasses_feature_state(item, profile, image_traits, active_policy),
-                    "piercings": get_visible_piercing_state(item, profile, image_traits, active_policy, "krea2_character"),
-                }
-                valid_caption, _reasons = _validate_krea_caption_features(caption, feature_states)
-                if valid_caption:
-                    return caption
+            cached_caption = _clean_krea_caption(cached.get("caption", ""))
+            valid_cached, cached_reasons = _validate_krea_caption_features(cached_caption, feature_states)
+            if cached_caption and cached_caption != TRIGGER_WORD and valid_cached:
+                _set_caption_metadata(
+                    item,
+                    source=str(cached.get("caption_source") or "cache"),
+                    model=str(cached.get("model") or KREA_CAPTION_MODEL),
+                    retry_count=int(cached.get("retry_count") or 0),
+                    validation_error=str(cached.get("validation_error") or ""),
+                )
+                return cached_caption
+            if cached_reasons:
+                safe_print(
+                    f"   ℹ️ Ignoring invalid Krea caption cache for {item.get('original_filename', '')}: "
+                    + "; ".join(cached_reasons)
+                )
         except Exception:
             pass
 
     fallback = build_local_caption(item, global_rules, profile)
+    primary_caption = ""
+    primary_errors: List[str] = []
+    repair_errors: List[str] = []
+
     try:
         exported_view = body_aware_crop(str(item.get("original_path") or ""), item)
         image_b64 = _encode_pil_for_api(exported_view)
 
-        profile_policies = profile.get("profile_policies", {}) if isinstance(profile, dict) else {}
-        active_policy = enforce_caption_policy_profile(normalize_caption_profile(globals().get("CAPTION_PROFILE", "ernie")), CAPTION_POLICY)
-        image_id = profile_image_id(item)
-        image_traits = (profile.get("per_image_traits", {}) or {}).get(image_id, {}) if isinstance(profile, dict) else {}
-        hair_state = get_hair_feature_state(item, profile, image_traits, global_rules, active_policy, "krea2_character")
-        eye_state = get_eye_feature_state(item, profile, image_traits, active_policy)
-        beard_state = get_beard_feature_state(item, global_rules, active_policy, profile)
-        glasses_state = get_glasses_feature_state(item, profile, image_traits, active_policy)
-        piercing_state = get_visible_piercing_state(item, profile, image_traits, active_policy, "krea2_character")
-        feature_states = {"hair": hair_state, "eye": eye_state, "beard": beard_state, "glasses": glasses_state, "piercings": piercing_state}
         visible_facts = {
             "shot_type": item.get("shot_type", ""),
             "frame_subtype": item.get("frame_subtype", ""),
@@ -9820,6 +10134,7 @@ def build_krea_ai_caption(
             "eye_color": eye_state.get("current", "") if eye_state.get("reliable") else "",
             "eye_color_reliable": bool(eye_state.get("reliable")),
             "visible_piercings_and_ear_jewelry": piercing_state.get("phrases", []),
+            "visible_tattoos": tattoo_state.get("phrases", []) if tattoo_state.get("must_caption") else [],
             "background": item.get("background_description", ""),
             "lighting": item.get("lighting_description", ""),
             "composition": item.get("composition_description", ""),
@@ -9863,6 +10178,11 @@ def build_krea_ai_caption(
                     "must_caption": bool(piercing_state.get("must_caption")),
                     "entries": piercing_state.get("entries", []),
                 },
+                "tattoos": {
+                    "preferred_phrases": tattoo_state.get("phrases", []),
+                    "visible": bool(tattoo_state.get("visible")),
+                    "must_caption": bool(tattoo_state.get("must_caption")),
+                },
             },
         }
 
@@ -9879,7 +10199,8 @@ environment, camera angle, depth of field, lighting, composition and visible med
 Identity policy:
 - The trigger word carries stable physical identity.
 - Do NOT describe stable skin tone, body build, body proportions, facial structure,
-  freckles, tattoos, permanent piercings, scars or other fixed body markers.
+  freckles, permanent piercings, scars or other fixed body markers.
+- Tattoos: follow feature_policy.tattoos literally. If must_caption=false, omit all tattoos even when visible. If must_caption=true, mention only tattoos visible in the exported image.
 - Do NOT describe stable hair or eye color unless the supplied feature_policy says must_caption=true.
 - Treat beard and glasses the same way: if feature_policy.must_caption is true, you MUST include the supplied preferred_phrase. If must_caption is false, omit that stable feature.
 - Glasses, makeup, costume elements and hairstyle changes may be described when visible, but follow feature_policy exactly for hair color, eye color, beard and glasses.
@@ -9890,68 +10211,131 @@ Identity policy:
 - Do not mention removed social-media frames or invisible/cropped-out details.
 """.strip()
 
-        payload = {
-            "instructions": instructions,
-            "input": [{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": json.dumps(visible_facts, ensure_ascii=False)},
-                    {
-                        "type": "input_image",
-                        "image_url": f"data:image/jpeg;base64,{image_b64}",
-                        "detail": KREA_CAPTION_IMAGE_DETAIL,
-                    },
-                ],
-            }],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "krea2_caption",
-                    "schema": {
-                        "type": "object",
-                        "properties": {"caption": {"type": "string"}},
-                        "required": ["caption"],
-                        "additionalProperties": False,
-                    },
-                    "strict": True,
-                }
-            },
-            "max_output_tokens": 300,
-            "store": False,
-            "temperature": 0.1,
-            "_reasoning_effort": KREA_CAPTION_REASONING_EFFORT,
-        }
-        data = responses_api_call(
-            KREA_CAPTION_MODEL,
-            payload,
-            phase_label=f"krea_caption:{item.get('original_filename', '')}",
-        )
-        parsed = json.loads(extract_response_text(data))
-        caption = _clean_krea_caption(parsed.get("caption", ""))
-        if not caption or caption == TRIGGER_WORD:
-            raise ValueError("empty Krea caption")
-        valid_caption, caption_reasons = _validate_krea_caption_features(caption, feature_states)
-        if not valid_caption:
-            raise ValueError("feature policy mismatch: " + "; ".join(caption_reasons))
-        if ENABLE_CACHE:
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "caption": caption,
-                        "model": KREA_CAPTION_MODEL,
-                        "prompt_version": KREA_CAPTION_PROMPT_VERSION,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-        return caption
-    except Exception as exc:
+        # Primary attempt.
+        try:
+            primary_caption = _call_krea_caption_model(
+                model=KREA_CAPTION_MODEL,
+                reasoning_effort=KREA_CAPTION_REASONING_EFFORT,
+                instructions=instructions,
+                text_payload=visible_facts,
+                image_b64=image_b64,
+                phase_label=f"krea_caption:{item.get('original_filename', '')}",
+            )
+            if not primary_caption or primary_caption == TRIGGER_WORD:
+                primary_errors = ["empty Krea caption"]
+            else:
+                valid_primary, primary_errors = _validate_krea_caption_features(primary_caption, feature_states)
+                if valid_primary:
+                    _set_caption_metadata(
+                        item,
+                        source="gpt_primary",
+                        model=KREA_CAPTION_MODEL,
+                        retry_count=0,
+                    )
+                    _save_krea_caption_cache(
+                        cache_path,
+                        caption=primary_caption,
+                        source="gpt_primary",
+                        model=KREA_CAPTION_MODEL,
+                        retry_count=0,
+                    )
+                    return primary_caption
+        except Exception as exc:
+            primary_errors = [f"primary API error: {exc}"]
+
+        primary_error_text = "; ".join(primary_errors) or "unknown primary caption failure"
         safe_print(
-            f"   ⚠️ Krea caption API failed for {item.get('original_filename', '')}: {exc}; using local caption."
+            f"   ↻ Krea caption validation failed for {item.get('original_filename', '')}: "
+            f"{primary_error_text}"
+        )
+
+        # One automatic repair attempt. It receives the exact reason the first
+        # attempt failed, so no full audit/profile rerun is necessary.
+        if bool(USE_KREA_CAPTION_REPAIR):
+            repair_instructions = f"""
+You repair one invalid Krea 2 LoRA training caption.
+Return exactly one corrected fluent English caption and nothing else.
+The corrected caption MUST begin with the exact trigger token: {TRIGGER_WORD},
+Follow the supplied feature_policy literally, and fix every listed validation error.
+Do not add stable identity traits merely to make the sentence more descriptive.
+Preserve accurate useful scene details from the previous attempt when possible.
+""".strip()
+            repair_payload = {
+                "visible_facts": visible_facts,
+                "previous_caption": primary_caption,
+                "validation_errors": primary_errors,
+                "required_action": "Return a fully rewritten valid caption, not an explanation.",
+            }
+            try:
+                repaired_caption = _call_krea_caption_model(
+                    model=KREA_CAPTION_REPAIR_MODEL,
+                    reasoning_effort=KREA_CAPTION_REPAIR_REASONING_EFFORT,
+                    instructions=repair_instructions,
+                    text_payload=repair_payload,
+                    image_b64=image_b64,
+                    phase_label=f"krea_caption_repair:{item.get('original_filename', '')}",
+                )
+                if not repaired_caption or repaired_caption == TRIGGER_WORD:
+                    repair_errors = ["empty repaired Krea caption"]
+                else:
+                    valid_repair, repair_errors = _validate_krea_caption_features(repaired_caption, feature_states)
+                    if valid_repair:
+                        _set_caption_metadata(
+                            item,
+                            source="gpt_repair",
+                            model=KREA_CAPTION_REPAIR_MODEL,
+                            retry_count=1,
+                            validation_error=primary_error_text,
+                        )
+                        _save_krea_caption_cache(
+                            cache_path,
+                            caption=repaired_caption,
+                            source="gpt_repair",
+                            model=KREA_CAPTION_REPAIR_MODEL,
+                            retry_count=1,
+                            validation_error=primary_error_text,
+                        )
+                        safe_print(
+                            f"   ✅ Caption repaired with {KREA_CAPTION_REPAIR_MODEL}: "
+                            f"{item.get('original_filename', '')}"
+                        )
+                        return repaired_caption
+            except Exception as exc:
+                repair_errors = [f"repair API error: {exc}"]
+
+        repair_error_text = "; ".join(repair_errors)
+        combined_error = primary_error_text
+        if repair_error_text:
+            combined_error += " | repair: " + repair_error_text
+        _set_caption_metadata(
+            item,
+            source="local_fallback",
+            model="local_deterministic",
+            retry_count=1 if bool(USE_KREA_CAPTION_REPAIR) else 0,
+            validation_error=combined_error,
+        )
+        safe_print(
+            f"   ⚠️ Krea caption attempts failed for {item.get('original_filename', '')}: "
+            f"{combined_error}; using local caption."
         )
         return fallback
 
+    except Exception as exc:
+        # Preparation failures (for example an unreadable image) cannot be
+        # repaired through a second API request because the image payload is unavailable.
+        error_text = f"caption preparation error: {exc}"
+        _set_caption_metadata(
+            item,
+            source="local_fallback",
+            model="local_deterministic",
+            retry_count=0,
+            validation_error=error_text,
+        )
+        safe_print(
+            f"   ⚠️ Krea caption preparation failed for {item.get('original_filename', '')}: "
+            f"{exc}; using local caption."
+        )
+        return fallback
 
 def build_caption(
     item: Dict[str, Any],
@@ -11606,6 +11990,10 @@ def main() -> None:
         "file_size_mb",
         "arcface_distance_to_centroid",
         "arcface_flag",
+        "caption_source",
+        "caption_model",
+        "caption_retry_count",
+        "caption_validation_error",
         "final_caption",
     ]
 
@@ -11661,6 +12049,11 @@ def main() -> None:
         "audit_model": AI_MODEL,
         "krea_ai_captioning": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_AI_CAPTIONING),
         "krea_caption_model": KREA_CAPTION_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" else "",
+        "krea_caption_repair_enabled": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_CAPTION_REPAIR),
+        "krea_caption_repair_model": KREA_CAPTION_REPAIR_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_CAPTION_REPAIR else "",
+        "caption_primary_count": sum(1 for r in selected_sorted if r.get("caption_source") == "gpt_primary"),
+        "caption_repair_count": sum(1 for r in selected_sorted if r.get("caption_source") == "gpt_repair"),
+        "caption_local_fallback_count": sum(1 for r in selected_sorted if r.get("caption_source") == "local_fallback"),
         "controlled_buckets": bool(USE_CONTROLLED_BUCKETS),
         "medium_rescue_crop_enabled": bool(ENABLE_MEDIUM_RESCUE_CROP),
     }
