@@ -19,6 +19,7 @@ import sys
 import threading
 import signal
 import time
+import uuid
 from glob import glob
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -79,6 +80,12 @@ if not os.path.isfile(VENV_PYTHON):
 _active_process: Optional[subprocess.Popen] = None
 _active_process_lock = threading.RLock()
 _cancel_requested = threading.Event()
+
+# Cross-thread / cross-worker run registry.  Gradio callbacks normally share the
+# same process, but relying only on a Python global made cancellation fragile.
+# The PID and cooperative cancel marker are therefore persisted in one tiny
+# state file beside the application.
+ACTIVE_RUN_STATE_PATH = os.path.join(SCRIPT_DIR, "_active_run_state.json")
 
 
 # ============================================================
@@ -646,6 +653,88 @@ def save_settings_fn(
 # HILFSFUNKTIONEN
 # ============================================================
 
+def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _read_active_run_state() -> Dict[str, Any]:
+    try:
+        with open(ACTIVE_RUN_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+            return str(pid) in (result.stdout or "") and "No tasks" not in (result.stdout or "")
+        except Exception:
+            return True  # do not discard a potentially valid registry entry
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _write_active_run_state(proc: subprocess.Popen, run_id: str, cancel_file: str, config_path: str) -> None:
+    _atomic_write_json(ACTIVE_RUN_STATE_PATH, {
+        "schema_version": "v2",
+        "pid": int(proc.pid),
+        "run_id": run_id,
+        "cancel_file": cancel_file,
+        "config_path": config_path,
+        "started_at": time.time(),
+    })
+
+
+def _clear_active_run_state(expected_pid: Optional[int] = None) -> None:
+    state = _read_active_run_state()
+    if expected_pid is not None and state:
+        try:
+            if int(state.get("pid", -1)) != int(expected_pid):
+                return
+        except Exception:
+            return
+    try:
+        if os.path.exists(ACTIVE_RUN_STATE_PATH):
+            os.remove(ACTIVE_RUN_STATE_PATH)
+    except Exception:
+        pass
+
+
+def _touch_cancel_marker(path: str, reason: str = "ui_cancel") -> bool:
+    if not path:
+        return False
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"cancelled_at": time.time(), "reason": reason}, f)
+        return True
+    except Exception:
+        return False
+
+
 def _cleanup_stale_configs():
     for cfg in (CURATOR_CONFIG, VIDEO_CONFIG):
         try:
@@ -653,6 +742,18 @@ def _cleanup_stale_configs():
                 os.remove(cfg)
         except Exception:
             pass
+
+    # A state file from a previous crashed UI must not survive a new UI start.
+    state = _read_active_run_state()
+    pid = state.get("pid")
+    if not pid or not _pid_is_running(pid):
+        cancel_file = str(state.get("cancel_file") or "")
+        try:
+            if cancel_file and os.path.exists(cancel_file):
+                os.remove(cancel_file)
+        except Exception:
+            pass
+        _clear_active_run_state()
 
 
 _cleanup_stale_configs()
@@ -2059,72 +2160,147 @@ def format_openai_usage_text(requests_count: int, input_tokens: int, output_toke
     )
 
 
-def _terminate_process_tree(proc: subprocess.Popen, graceful_timeout: float = 3.0) -> None:
-    """Terminate the active runner and any child processes without blocking the UI queue."""
-    if proc.poll() is not None:
-        return
+def _terminate_pid_tree(pid: int, proc: Optional[subprocess.Popen] = None, graceful_timeout: float = 2.0) -> bool:
+    """Terminate a PID and its descendants. Works even if the Popen global was lost."""
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
 
+    if proc is not None and proc.poll() is not None:
+        return True
+    if proc is None and not _pid_is_running(pid):
+        return True
+
+    terminated = False
     if sys.platform == "win32":
-        # taskkill /T also terminates descendants (for example ffmpeg).  The
-        # curator itself usually has no children, but using the process tree
-        # avoids orphaned workers after a cancel action.
         try:
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=max(2.0, graceful_timeout + 1.0),
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=max(3.0, graceful_timeout + 1.0),
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
+            terminated = result.returncode == 0 or not _pid_is_running(pid)
         except Exception:
+            terminated = False
+
+        # taskkill can fail in unusual shells or permission contexts.  Keep a
+        # direct Popen kill and PowerShell Stop-Process as independent fallbacks.
+        if not terminated and proc is not None:
             try:
-                proc.terminate()
+                proc.kill()
+                terminated = True
+            except Exception:
+                pass
+        if not terminated:
+            try:
+                result = subprocess.run(
+                    [
+                        "powershell", "-NoProfile", "-NonInteractive",
+                        "-Command", f"Stop-Process -Id {pid} -Force -ErrorAction SilentlyContinue",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=3,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                terminated = result.returncode == 0 or not _pid_is_running(pid)
             except Exception:
                 pass
     else:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            terminated = True
         except Exception:
             try:
-                proc.terminate()
+                os.kill(pid, signal.SIGTERM)
+                terminated = True
             except Exception:
                 pass
 
-    try:
-        proc.wait(timeout=graceful_timeout)
-        return
-    except Exception:
-        pass
+    deadline = time.time() + max(0.2, graceful_timeout)
+    while time.time() < deadline:
+        if proc is not None:
+            if proc.poll() is not None:
+                return True
+        elif not _pid_is_running(pid):
+            return True
+        time.sleep(0.05)
 
     if sys.platform != "win32":
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
         except Exception:
             try:
-                proc.kill()
+                os.kill(pid, signal.SIGKILL)
             except Exception:
                 pass
-    else:
+    elif proc is not None and proc.poll() is None:
         try:
             proc.kill()
         except Exception:
             pass
 
+    if proc is not None:
+        return proc.poll() is not None
+    return not _pid_is_running(pid)
+
+
+def _terminate_process_tree(proc: subprocess.Popen, graceful_timeout: float = 2.0) -> bool:
+    return _terminate_pid_tree(proc.pid, proc=proc, graceful_timeout=graceful_timeout)
+
 
 def kill_process():
-    """Request cancellation and terminate the current subprocess immediately."""
+    """Cooperatively request cancellation, then force-stop the registered PID tree."""
     _cancel_requested.set()
+
     with _active_process_lock:
         proc = _active_process
 
-    if proc is None or proc.poll() is not None:
-        _cleanup_stale_configs()
-        return tr("⏹ Kein aktiver Prozess.", "⏹ No active process.")
+    state = _read_active_run_state()
+    cancel_file = str(state.get("cancel_file") or "")
+    marker_written = _touch_cancel_marker(cancel_file)
 
-    _terminate_process_tree(proc)
-    _cleanup_stale_configs()
-    return tr("⏹ Abbruch angefordert – Prozess wurde beendet.", "⏹ Cancellation requested – process terminated.")
+    pids: List[int] = []
+    if proc is not None:
+        pids.append(int(proc.pid))
+    try:
+        state_pid = int(state.get("pid", 0) or 0)
+        if state_pid > 0 and state_pid not in pids:
+            pids.append(state_pid)
+    except Exception:
+        pass
+
+    if not pids:
+        _cleanup_stale_configs()
+        return tr(
+            "⏹ Kein aktiver Prozess registriert. Abbruchsignal wurde gesetzt.",
+            "⏹ No active process registered. Cancellation marker was set.",
+        )
+
+    stopped = False
+    for pid in pids:
+        matching_proc = proc if proc is not None and int(proc.pid) == pid else None
+        stopped = _terminate_pid_tree(pid, proc=matching_proc, graceful_timeout=1.5) or stopped
+
+    if stopped:
+        return tr(
+            f"⏹ Abgebrochen – Prozessbaum beendet (PID {pids[0]}).",
+            f"⏹ Cancelled – process tree stopped (PID {pids[0]}).",
+        )
+    marker_note_de = "; kooperatives Signal gesetzt" if marker_written else ""
+    marker_note_en = "; cooperative marker written" if marker_written else ""
+    return tr(
+        f"⚠️ Abbruch angefordert, Prozess konnte noch nicht bestätigt beendet werden{marker_note_de}.",
+        f"⚠️ Cancellation requested, process termination not yet confirmed{marker_note_en}.",
+    )
 
 
 # ============================================================
@@ -2147,6 +2323,20 @@ def run_script(
                 "⚠️ A process is already running. Cancel it or wait for it to finish.",
             ), format_openai_usage_text(0, 0, 0, 0)
             return
+
+    run_id = uuid.uuid4().hex
+    cancel_file = os.path.join(SCRIPT_DIR, f"_cancel_{run_id}.flag")
+    try:
+        if os.path.exists(cancel_file):
+            os.remove(cancel_file)
+    except Exception:
+        pass
+
+    # Never mutate the shared UI dictionary in-place.  The child receives a
+    # unique cooperative cancellation marker for exactly this run.
+    config_data = dict(config_data)
+    config_data["RUN_ID"] = run_id
+    config_data["CANCEL_FILE"] = cancel_file
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config_data, f, ensure_ascii=False, indent=2)
@@ -2187,6 +2377,7 @@ def run_script(
     )
     with _active_process_lock:
         _active_process = proc
+    _write_active_run_state(proc, run_id, cancel_file, config_path)
 
     log_lines: List[str] = []
     progress = 0.0
@@ -2289,6 +2480,12 @@ def run_script(
             if _active_process is proc:
                 _active_process = None
 
+        _clear_active_run_state(expected_pid=proc.pid)
+        try:
+            if os.path.exists(cancel_file):
+                os.remove(cancel_file)
+        except Exception:
+            pass
         try:
             if os.path.exists(config_path):
                 os.remove(config_path)
@@ -4609,7 +4806,6 @@ def build_ui() -> gr.Blocks:
                     fn=kill_process,
                     outputs=[c_status],
                     queue=False,
-                    cancels=[c_run_event],
                     show_progress="hidden",
                 )
 
@@ -5098,7 +5294,6 @@ def build_ui() -> gr.Blocks:
                     fn=kill_process,
                     outputs=[p_status_run],
                     queue=False,
-                    cancels=[p_run_event],
                     show_progress="hidden",
                 )
 
@@ -5215,7 +5410,6 @@ def build_ui() -> gr.Blocks:
                     fn=kill_process,
                     outputs=[v_status],
                     queue=False,
-                    cancels=[v_run_event],
                     show_progress="hidden",
                 )
 

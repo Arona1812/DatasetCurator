@@ -1,4 +1,5 @@
 import os
+import sys
 os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
 
 import logging
@@ -86,6 +87,11 @@ except ImportError:
 #   2) Environment variable OPENAI_API_KEY
 # If neither is set, the script will error when the first API call is attempted.
 API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+# Per-run cooperative cancellation marker supplied by the UI.  It remains
+# empty for command-line runs, preserving standalone behavior.
+RUN_ID = ""
+CANCEL_FILE = ""
 
 # Hauptmodell für Bildaudit + Triggerwortprüfung
 # gpt-5.4-mini liefert deutlich treffsicherere Audits als nano:
@@ -900,6 +906,66 @@ def performance_snapshot() -> Dict[str, Any]:
     }
 
 
+class RunCancelled(RuntimeError):
+    """Raised when the UI requests cooperative cancellation."""
+
+
+_cancel_notice_printed = False
+
+
+def cancellation_requested() -> bool:
+    path = str(globals().get("CANCEL_FILE") or "").strip()
+    return bool(path and os.path.exists(path))
+
+
+def raise_if_cancelled(context: str = "") -> None:
+    global _cancel_notice_printed
+    if not cancellation_requested():
+        return
+    if not _cancel_notice_printed:
+        suffix = f" during {context}" if context else ""
+        safe_print(f"⏹ Cancellation requested{suffix}. Stopping safely...")
+        _cancel_notice_printed = True
+    raise RunCancelled(context or "cancelled")
+
+
+def interruptible_sleep(seconds: float, context: str = "sleep") -> None:
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        raise_if_cancelled(context)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
+
+
+def run_cancellable_call(label: str, func: Callable[..., Any], *args, **kwargs) -> Any:
+    """Run a blocking call in a daemon thread and poll the cancel marker.
+
+    This is primarily used for HTTP calls.  If cancellation is requested, the
+    curator process can exit immediately instead of waiting for a long socket
+    timeout; the daemon request thread cannot keep the process alive.
+    """
+    box: Dict[str, Any] = {}
+    errors: Dict[str, BaseException] = {}
+
+    def _worker() -> None:
+        try:
+            box["result"] = func(*args, **kwargs)
+        except BaseException as exc:  # propagate in the caller thread
+            errors["error"] = exc
+
+    thread = threading.Thread(target=_worker, daemon=True, name=f"cancel:{label}")
+    thread.start()
+    while thread.is_alive():
+        raise_if_cancelled(label)
+        thread.join(timeout=0.2)
+    raise_if_cancelled(label)
+    if "error" in errors:
+        raise errors["error"]
+    return box.get("result")
+
+
 reset_performance_stats()
 
 
@@ -920,6 +986,8 @@ def start_phase_heartbeat(label: str, interval: float = HEARTBEAT_INTERVAL_SECON
 
     def _heartbeat() -> None:
         while not stop_event.wait(interval):
+            if cancellation_requested():
+                return
             elapsed = format_elapsed(time.time() - started_at)
             safe_print(f"   ⏳ still working: {label} | elapsed={elapsed}")
 
@@ -945,11 +1013,15 @@ def stop_phase_heartbeat(
 
 
 def run_with_heartbeat(label: str, func: Callable[..., Any], *args, **kwargs) -> Any:
+    raise_if_cancelled(label)
     started_at, stop_event, thread = start_phase_heartbeat(label)
     try:
         result = func(*args, **kwargs)
+        raise_if_cancelled(label)
         stop_phase_heartbeat(label, started_at, stop_event, thread, success=True)
         return result
+    except RunCancelled:
+        raise
     except Exception:
         stop_phase_heartbeat(label, started_at, stop_event, thread, success=False)
         raise
@@ -997,6 +1069,8 @@ def _load_file_hash_index() -> None:
                 _FILE_HASH_INDEX = entries if isinstance(entries, dict) else {}
             else:
                 _FILE_HASH_INDEX = {}
+        except RunCancelled:
+            raise
         except Exception:
             _FILE_HASH_INDEX = {}
 
@@ -1008,6 +1082,8 @@ def _path_is_persistently_cacheable(path: str) -> bool:
         for root in roots:
             if root and os.path.commonpath([ap, os.path.normcase(os.path.abspath(root))]) == os.path.normcase(os.path.abspath(root)):
                 return True
+    except RunCancelled:
+        raise
     except Exception:
         pass
     return False
@@ -1029,6 +1105,8 @@ def flush_file_hash_index() -> None:
         try:
             _atomic_write_json(FILE_HASH_INDEX_PATH, payload)
             _FILE_HASH_INDEX_DIRTY = 0
+        except RunCancelled:
+            raise
         except Exception:
             pass
 
@@ -1044,6 +1122,8 @@ def file_sha1(path: str, chunk_size: int = 1024 * 1024) -> str:
     try:
         stat = os.stat(path)
         signature = {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+    except RunCancelled:
+        raise
     except Exception:
         signature = None
 
@@ -1664,6 +1744,8 @@ class OpenAITokenBudgetExceeded(RuntimeError):
 def openai_token_limit_enabled() -> bool:
     try:
         return int(OPENAI_TOKEN_LIMIT_TOTAL or 0) > 0
+    except RunCancelled:
+        raise
     except Exception:
         return False
 
@@ -1704,6 +1786,8 @@ def _extract_usage_int(usage: Dict[str, Any], *keys: str) -> int:
             continue
         try:
             return int(value)
+        except RunCancelled:
+            raise
         except Exception:
             continue
     return 0
@@ -1798,6 +1882,8 @@ def get_file_mtime_bucket(path: str, seconds_bucket: int = 6 * 3600) -> str:
     try:
         ts = int(os.path.getmtime(path))
         return str(ts // seconds_bucket)
+    except RunCancelled:
+        raise
     except Exception:
         return "unknown"
 
@@ -1850,6 +1936,8 @@ def generate_headshot_crop(
             os.close(tmp_fd)
             cropped.save(tmp_path, "JPEG", quality=100)
             return tmp_path
+    except RunCancelled:
+        raise
     except Exception:
         return None
 
@@ -1905,6 +1993,8 @@ def generate_medium_rescue_crop(
             os.close(tmp_fd)
             cropped.save(tmp_path, "JPEG", quality=100)
             return tmp_path, bbox
+    except RunCancelled:
+        raise
     except Exception:
         return None, None
 
@@ -1936,6 +2026,8 @@ def local_blur_variance(image_path: str) -> float:
             new_h = max(1, int(round(h * scale)))
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
         return float(cv2.Laplacian(img, cv2.CV_64F).var())
+    except RunCancelled:
+        raise
     except Exception:
         return -1.0
 
@@ -1981,6 +2073,8 @@ def local_blur_variance_in_face(image_path: str, face_bbox: Optional[List[int]])
             interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
             crop = cv2.resize(crop, (new_w, new_h), interpolation=interp)
         return float(cv2.Laplacian(crop, cv2.CV_64F).var())
+    except RunCancelled:
+        raise
     except Exception:
         return -1.0
 
@@ -2024,6 +2118,8 @@ def subject_torso_landmark_count(image_path: str) -> int:
                     and 0.0 <= lm.y <= 1.0):
                 count += 1
         return count
+    except RunCancelled:
+        raise
     except Exception:
         return -1
 
@@ -2039,6 +2135,8 @@ def local_exposure_median(image_path: str) -> float:
             img = ImageOps.exif_transpose(img).convert("L")
             arr = np.asarray(img, dtype=np.uint8)
             return float(np.median(arr))
+    except RunCancelled:
+        raise
     except Exception:
         return 128.0
 
@@ -2194,6 +2292,8 @@ def local_colorfulness_metrics(image_path: str) -> Dict[str, Any]:
                 result["color_tint_label"] = tint_label
                 result["color_tint_strength"] = round(tint_strength, 3)
         return result
+    except RunCancelled:
+        raise
     except Exception:
         return result
 
@@ -2223,6 +2323,8 @@ def early_duplicate_pick_score(image_path: str, phash_value: Optional[int] = Non
         main_face_ratio = float(metrics.get("main_face_ratio") or 0.0)
         face_count = int(metrics.get("face_count_local") or 0)
         pose_ratio = bbox_area_ratio(metrics.get("pose_bbox"), width, height)
+    except RunCancelled:
+        raise
     except Exception:
         pass
 
@@ -2289,6 +2391,8 @@ def early_duplicate_pick_score_resolution_strict(image_path: str, phash_value: O
             precomputed_metrics={"blur_variance_full": blur_variance},
         )
         main_face_ratio = float(metrics.get("main_face_ratio") or 0.0)
+    except RunCancelled:
+        raise
     except Exception:
         pass
 
@@ -2306,6 +2410,8 @@ def early_duplicate_pick_score_resolution_strict(image_path: str, phash_value: O
 def local_filesize_kb(image_path: str) -> float:
     try:
         return os.path.getsize(image_path) / 1024.0
+    except RunCancelled:
+        raise
     except Exception:
         return 9999.0
 
@@ -2346,6 +2452,8 @@ def detect_and_crop_ig_frame(image_path: str, source_hash: Optional[str] = None)
                 "reason": reason,
                 "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             })
+        except RunCancelled:
+            raise
         except Exception:
             pass
 
@@ -2373,6 +2481,8 @@ def detect_and_crop_ig_frame(image_path: str, source_hash: Optional[str] = None)
                     perf_count("ig_positive_hit")
                     perf_add_time("ig_frame", time.perf_counter() - started)
                     return cached_path
+        except RunCancelled:
+            raise
         except Exception:
             pass
 
@@ -2578,6 +2688,8 @@ def detect_and_crop_ig_frame(image_path: str, source_hash: Optional[str] = None)
         perf_add_time("ig_frame", time.perf_counter() - started)
         return cached_path
 
+    except RunCancelled:
+        raise
     except Exception as exc:
         perf_count("ig_error")
         perf_add_time("ig_frame", time.perf_counter() - started)
@@ -2779,6 +2891,8 @@ def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dic
         try:
             h = compute_phash(p)
             phash_cache[p] = h
+        except RunCancelled:
+            raise
         except Exception:
             h = None
         hashes.append((p, h))
@@ -2854,6 +2968,8 @@ def load_cached_local_quick_metrics(file_hash: str) -> Optional[Dict[str, Any]]:
         if isinstance(metrics, dict):
             perf_count("local_quick_hit")
             return metrics
+    except RunCancelled:
+        raise
     except Exception:
         pass
     perf_count("local_quick_miss")
@@ -2874,6 +2990,8 @@ def save_cached_local_quick_metrics(file_hash: str, metrics: Dict[str, Any]) -> 
     }
     try:
         _atomic_write_json(local_quick_cache_path(file_hash), payload)
+    except RunCancelled:
+        raise
     except Exception:
         pass
 
@@ -2900,6 +3018,8 @@ def _init_local_vision_models() -> None:
                     enable_segmentation=False,
                     min_detection_confidence=0.5,
                 )
+            except RunCancelled:
+                raise
             except Exception:
                 MP_FACE = None
                 MP_POSE = None
@@ -2907,6 +3027,8 @@ def _init_local_vision_models() -> None:
             try:
                 cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
                 HAAR_CASCADE = cv2.CascadeClassifier(cascade_path)
+            except RunCancelled:
+                raise
             except Exception:
                 HAAR_CASCADE = None
         perf_count("local_vision_models_initialized")
@@ -2961,6 +3083,8 @@ def load_cached_local_analysis(file_hash: str) -> Optional[Dict[str, Any]]:
             return None
         perf_count("local_analysis_hit")
         return metrics
+    except RunCancelled:
+        raise
     except Exception:
         perf_count("local_analysis_miss")
         return None
@@ -2977,6 +3101,8 @@ def save_cached_local_analysis(file_hash: str, metrics: Dict[str, Any]) -> None:
     }
     try:
         _atomic_write_json(local_analysis_cache_path(file_hash), payload)
+    except RunCancelled:
+        raise
     except Exception:
         pass
 
@@ -3038,6 +3164,8 @@ def local_subject_metrics(
         else:
             try:
                 metrics["phash"] = compute_phash(image_path)
+            except RunCancelled:
+                raise
             except Exception:
                 metrics["phash"] = None
 
@@ -3050,6 +3178,8 @@ def local_subject_metrics(
             if MP_FACE is not None or MP_POSE is not None:
                 try:
                     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                except RunCancelled:
+                    raise
                 except Exception:
                     rgb = None
 
@@ -3074,6 +3204,8 @@ def local_subject_metrics(
                             main_area = max(1, sorted_boxes[0][2] * sorted_boxes[0][3])
                             sec_area = sorted_boxes[1][2] * sorted_boxes[1][3]
                             metrics["secondary_face_area_ratio"] = round(sec_area / main_area, 4)
+                except RunCancelled:
+                    raise
                 except Exception:
                     pass
 
@@ -3091,6 +3223,8 @@ def local_subject_metrics(
                             main_area = max(1, sorted_faces[0][2] * sorted_faces[0][3])
                             sec_area = sorted_faces[1][2] * sorted_faces[1][3]
                             metrics["secondary_face_area_ratio"] = round(sec_area / main_area, 4)
+                except RunCancelled:
+                    raise
                 except Exception:
                     pass
 
@@ -3122,6 +3256,8 @@ def local_subject_metrics(
                         metrics["torso_landmark_count"] = torso_count
                     else:
                         metrics["torso_landmark_count"] = 0
+                except RunCancelled:
+                    raise
                 except Exception:
                     pass
 
@@ -3267,12 +3403,16 @@ def dataset_fingerprint(image_paths: List[str]) -> str:
     for path in sorted(image_paths, key=lambda p: p.lower()):
         try:
             rel_path = os.path.relpath(path, INPUT_FOLDER)
+        except RunCancelled:
+            raise
         except Exception:
             rel_path = path
         try:
             st = os.stat(path)
             size = int(st.st_size)
             mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+        except RunCancelled:
+            raise
         except Exception:
             size = -1
             mtime_ns = -1
@@ -3300,6 +3440,8 @@ def load_cached_early_results(dataset_fp: str, settings_fp: str) -> Optional[Dic
             return None
         perf_count("early_result_hit")
         return data
+    except RunCancelled:
+        raise
     except Exception:
         perf_count("early_result_miss")
         return None
@@ -3392,6 +3534,8 @@ def load_cached_audit(file_hash: str) -> Optional[Dict[str, Any]]:
             data = json.load(f)
         perf_count("audit_hit")
         return data
+    except RunCancelled:
+        raise
     except Exception:
         perf_count("audit_miss")
         return None
@@ -3432,6 +3576,8 @@ def load_cached_trigger_check(trigger_word: str) -> Optional[Dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
+    except RunCancelled:
+        raise
     except Exception:
         return None
 
@@ -3459,6 +3605,8 @@ def load_clip_embedding_cached(file_hash: str) -> Optional[np.ndarray]:
     try:
         vec = np.load(path)
         return vec.astype(np.float32)
+    except RunCancelled:
+        raise
     except Exception:
         return None
 
@@ -3494,6 +3642,8 @@ def _init_clip_model() -> bool:
             perf_add_time("clip_model_init", time.perf_counter() - started)
             safe_print(f"   CLIP ready ({CLIP_MODEL_NAME}, {CLIP_DEVICE})")
             return True
+        except RunCancelled:
+            raise
         except Exception as exc:
             CLIP_MODEL = None
             CLIP_PREPROCESS = None
@@ -3532,6 +3682,8 @@ def compute_clip_embedding(image_path: str, file_hash: str) -> Optional[np.ndarr
         perf_count("clip_computed")
         perf_add_time("clip", time.perf_counter() - started)
         return vec
+    except RunCancelled:
+        raise
     except Exception:
         perf_add_time("clip", time.perf_counter() - started)
         return None
@@ -3573,6 +3725,8 @@ def _init_arcface_app():
                     det_size=(ARCFACE_DET_SIZE, ARCFACE_DET_SIZE))
         ARCFACE_APP = app
         safe_print(f"   ArcFace ready ({ARCFACE_MODEL_PACK}, providers={providers[0]})")
+    except RunCancelled:
+        raise
     except Exception as e:
         safe_print(f"   ⚠️ ArcFace init failed ({e}); identity check disabled.")
         ARCFACE_APP = None
@@ -3590,6 +3744,8 @@ def load_arcface_embedding_cached(file_hash: str) -> Optional[np.ndarray]:
     try:
         vec = np.load(path)
         return vec.astype(np.float32)
+    except RunCancelled:
+        raise
     except Exception:
         return None
 
@@ -3657,6 +3813,8 @@ def compute_arcface_embedding(image_path: str, file_hash: str) -> Optional[np.nd
 
         save_arcface_embedding_cached(file_hash, emb)
         return emb
+    except RunCancelled:
+        raise
     except Exception:
         return None
 
@@ -3994,7 +4152,9 @@ def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "
             if reasoning_effort and model_name.startswith(("gpt-5.4", "gpt-5.5", "gpt-5.6")):
                 request_payload.pop("temperature", None)
 
-            response = requests.post(
+            response = run_cancellable_call(
+                attempt_label,
+                requests.post,
                 "https://api.openai.com/v1/responses",
                 headers=headers,
                 json=request_payload,
@@ -4003,6 +4163,8 @@ def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "
             if response.status_code >= 400:
                 try:
                     err = response.json()
+                except RunCancelled:
+                    raise
                 except Exception:
                     err = {"error": {"message": response.text}}
                 message = err.get("error", {}).get("message", f"HTTP {response.status_code}")
@@ -4036,14 +4198,16 @@ def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "
             perf_count("openai_requests_actual")
             delay = max(0.0, float(SLEEP_BETWEEN_CALLS or 0.0))
             if delay > 0:
-                time.sleep(delay)
+                interruptible_sleep(delay, context=f"post-API delay: {phase_label}")
                 with _PERF_LOCK:
                     PERFORMANCE_STATS["artificial_wait_seconds"] = float(
                         PERFORMANCE_STATS.get("artificial_wait_seconds", 0.0)
                     ) + delay
             return data
-        except OpenAITokenBudgetExceeded:
+        except (OpenAITokenBudgetExceeded, RunCancelled):
             stop_phase_heartbeat(attempt_label, started_at, stop_event, thread, success=False)
+            raise
+        except RunCancelled:
             raise
         except Exception as e:
             stop_phase_heartbeat(attempt_label, started_at, stop_event, thread, success=False)
@@ -4054,7 +4218,7 @@ def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "
             safe_print(
                 f"   ↳ API error in {phase_label}, retry {attempt}/{MAX_RETRIES} in {sleep_s:.1f}s: {e}"
             )
-            time.sleep(sleep_s)
+            interruptible_sleep(sleep_s, context=f"API retry wait: {phase_label}")
     raise RuntimeError(f"Responses-API fehlgeschlagen: {last_error}")
 
 
@@ -4969,6 +5133,8 @@ def apply_local_score_adjustments(row: Dict[str, Any]) -> Dict[str, Any]:
     """Wendet deterministische lokale Soft-Penalties auf den finalen Score an."""
     try:
         current_score = float(row.get("quality_total", 0) or 0)
+    except RunCancelled:
+        raise
     except Exception:
         current_score = 0.0
 
@@ -6066,6 +6232,8 @@ def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
 def _quality_tier(row: Dict[str, Any]) -> str:
     try:
         q = float(row.get("quality_total", 0))
+    except RunCancelled:
+        raise
     except Exception:
         q = 0.0
     if q >= 75:
@@ -6461,6 +6629,8 @@ Return JSON only.
             raise ValueError(f"Responses API returned incomplete output: {incomplete_reason}")
         parsed = _parse_json_object_text(extract_response_text(data))
         _validate_subject_profile_core(parsed)
+    except RunCancelled:
+        raise
     except Exception as exc:
         primary_error = str(exc)
         safe_print(
@@ -7635,6 +7805,8 @@ def load_profile_override() -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
+    except RunCancelled:
+        raise
     except Exception as e:
         safe_print(f"   ⚠️ Could not read profile override file: {e}")
         return {}
@@ -7696,6 +7868,8 @@ def load_subject_profile_cache(input_hash: str) -> Optional[Dict[str, Any]]:
             and str(profile.get("normalizer_model", "")).strip().lower() != "fallback_local"
         ):
             return profile
+    except RunCancelled:
+        raise
     except Exception:
         return None
     return None
@@ -8027,6 +8201,8 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         )
         try:
             profile = call_subject_profile_normalizer(sample, input_hash, total_count=len(rows))
+        except RunCancelled:
+            raise
         except Exception as e:
             safe_print(f"   ⚠️ Subject profile normalizer failed; using local fallback: {e}")
             profile = fallback_subject_profile(sample if sample else rows, input_hash, reason=str(e))
@@ -8226,6 +8402,8 @@ def load_confirmed_subject_profile(stage: Optional[Dict[str, Any]] = None) -> Di
             if isinstance(data, dict):
                 data["force_only_when_visible"] = True
                 return data
+        except RunCancelled:
+            raise
         except Exception as e:
             safe_print(f"   ⚠️ Could not read confirmed subject profile: {e}")
     profile = (stage or {}).get("subject_profile", {}) if isinstance(stage, dict) else {}
@@ -8242,6 +8420,8 @@ def clean_caption_output_dirs() -> None:
             if name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".txt")):
                 try:
                     os.remove(os.path.join(folder, name))
+                except RunCancelled:
+                    raise
                 except Exception:
                     pass
 
@@ -8291,6 +8471,8 @@ def build_reject_export_text(
     caption_text = ""
     try:
         caption_text = build_caption(row, global_rules or {}, subject_profile or {})
+    except RunCancelled:
+        raise
     except Exception:
         caption_text = ""
 
@@ -8706,7 +8888,8 @@ def continue_caption_from_profile() -> None:
     # 04_review fuer spaetere manuelle Bearbeitung bereits captioned.
     counters = {"train_ready": 1, "keep_unused": 1, "caption_remove": 1, "review": 1}
 
-    for row in selected_sorted:
+    for row_index, row in enumerate(selected_sorted, start=1):
+        raise_if_cancelled(f"train export {row_index}/{len(selected_sorted)}")
         needs_text_cleanup = needs_caption_remove(row)
         if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
             bucket = "caption_remove"
@@ -8724,7 +8907,8 @@ def continue_caption_from_profile() -> None:
 
     if EXPORT_REVIEW_IMAGES:
         review_export = sorted(review_items, key=lambda r: -int(r.get("quality_total", 0)))
-        for row in review_export:
+        for row_index, row in enumerate(review_export, start=1):
+            raise_if_cancelled(f"review export {row_index}/{len(review_export)}")
             needs_text_cleanup = needs_caption_remove(row)
             if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
                 bucket = "caption_remove"
@@ -8739,23 +8923,29 @@ def continue_caption_from_profile() -> None:
             try:
                 _write_captioned_image(row, out_dir, new_basename, global_rules, subject_profile)
                 _sync_row_update(row_index, row)
+            except RunCancelled:
+                raise
             except Exception as e:
                 safe_print(f"   ⚠️ Review export failed for {row.get('original_filename','')}: {e}")
 
     keep_unused_sorted = sorted(unselected_keep, key=lambda r: -int(r.get("quality_total", 0)))
-    for row in keep_unused_sorted:
+    for row_index, row in enumerate(keep_unused_sorted, start=1):
+        raise_if_cancelled(f"keep-unused export {row_index}/{len(keep_unused_sorted)}")
         new_basename = f"{SAFE_TRIGGER}_unused_{counters['keep_unused']:03d}"
         counters["keep_unused"] += 1
         row["output_bucket"] = "keep_unused"
         try:
             _write_captioned_image(row, KEEP_UNUSED_DIR, new_basename, global_rules, subject_profile)
             _sync_row_update(row_index, row)
+        except RunCancelled:
+            raise
         except Exception as e:
             safe_print(f"   ⚠️ Keep-unused export failed for {row.get('original_filename','')}: {e}")
 
     if EXPORT_REJECT_IMAGES:
         reject_export = sorted(reject_items, key=lambda r: -int(r.get("quality_total", 0)))
         for idx, row in enumerate(reject_export, start=1):
+            raise_if_cancelled(f"reject export {idx}/{len(reject_export)}")
             new_basename = f"{SAFE_TRIGGER}_reject_{idx:03d}"
             img_out = os.path.join(REJECT_DIR, f"{new_basename}.jpg")
             txt_out = os.path.join(REJECT_DIR, f"{new_basename}.txt")
@@ -8768,6 +8958,8 @@ def continue_caption_from_profile() -> None:
                 with open(txt_out, "w", encoding="utf-8") as ft:
                     ft.write(build_reject_export_text(row, global_rules, subject_profile))
                 _sync_row_update(row_index, row)
+            except RunCancelled:
+                raise
             except Exception as e:
                 safe_print(f"   ⚠️ Reject export failed for {row.get('original_filename','')}: {e}")
 
@@ -9253,6 +9445,8 @@ def _safe_float_value(value: Any, default: float = 0.0) -> float:
         if value is None or value == "":
             return default
         return float(value)
+    except RunCancelled:
+        raise
     except Exception:
         return default
 
@@ -10634,6 +10828,8 @@ def build_krea_ai_caption(
                     f"   ℹ️ Ignoring invalid Krea caption cache for {item.get('original_filename', '')}: "
                     + "; ".join(cached_reasons)
                 )
+        except RunCancelled:
+            raise
         except Exception:
             pass
 
@@ -10771,6 +10967,8 @@ Identity policy:
                         retry_count=0,
                     )
                     return primary_caption
+        except RunCancelled:
+            raise
         except Exception as exc:
             primary_errors = [f"primary API error: {exc}"]
 
@@ -10831,6 +11029,10 @@ Preserve accurate useful scene details from the previous attempt when possible.
                             f"{item.get('original_filename', '')}"
                         )
                         return repaired_caption
+            except RunCancelled:
+                raise
+            except RunCancelled:
+                raise
             except Exception as exc:
                 repair_errors = [f"repair API error: {exc}"]
 
@@ -10851,6 +11053,10 @@ Preserve accurate useful scene details from the previous attempt when possible.
         )
         return fallback
 
+    except RunCancelled:
+        raise
+    except RunCancelled:
+        raise
     except Exception as exc:
         # Preparation failures (for example an unreadable image) cannot be
         # repaired through a second API request because the image payload is unavailable.
@@ -11318,6 +11524,7 @@ def generate_dashboard(all_rows: List[Dict[str, Any]], selected: List[Dict[str, 
     return "\n".join(lines)
 
 def main() -> None:
+    raise_if_cancelled("startup")
     reset_performance_stats()
     warnings: List[str] = []
     budget_limit_reached = False
@@ -11356,6 +11563,8 @@ def main() -> None:
             budget_limit_reached = True
             warnings.append(str(e))
             safe_print(f"🛑 {e}")
+        except RunCancelled:
+            raise
         except Exception as e:
             warnings.append(f"Trigger-word check failed: {e}")
 
@@ -11448,6 +11657,7 @@ def main() -> None:
     # PASS 1: Audit pro Bild
     _audit_loop_started = time.perf_counter()
     for idx, image_path in enumerate(image_paths, start=1):
+        raise_if_cancelled(f"image audit {idx}/{len(image_paths)}")
         original_filename = os.path.basename(image_path)
         safe_print(f"[{idx}/{len(image_paths)}] {original_filename}")
 
@@ -11630,6 +11840,8 @@ def main() -> None:
                             row["main_face_bbox"] = [x_abs, y_abs, w_abs, h_abs]
                             row["main_face_ratio"] = bbox_area_ratio(row["main_face_bbox"], img_w, img_h)
                             row.setdefault("status_notes", []).append("used_ai_face_bbox")
+                    except RunCancelled:
+                        raise
                     except Exception as e:
                         safe_print(f"   ⚠️ Error while parsing AI face bbox: {e}")
             # ---------------------------------------------------------
@@ -11894,12 +12106,16 @@ def main() -> None:
                                             "ai_bbox": ai_bbox,
                                             "winner": "original",  # Original gewinnt automatisch
                                         })
+                        except RunCancelled:
+                            raise
                         except Exception as crop_e:
                             safe_print(f"   ⚠️ Smart pre-crop failed: {crop_e}")
                         finally:
                             if crop_path and os.path.exists(crop_path):
                                 try:
                                     os.remove(crop_path)
+                                except RunCancelled:
+                                    raise
                                 except Exception:
                                     pass
 
@@ -12026,15 +12242,21 @@ def main() -> None:
                                 all_rows.append(rescue_row)
                             else:
                                 safe_print("   ❌ Medium rescue rejected: gain too small")
+                    except RunCancelled:
+                        raise
                     except Exception as rescue_e:
                         safe_print(f"   ⚠️ Medium rescue failed: {rescue_e}")
                     finally:
                         try:
                             if os.path.exists(rescue_path):
                                 os.remove(rescue_path)
+                        except RunCancelled:
+                            raise
                         except Exception:
                             pass
 
+        except RunCancelled:
+            raise
         except Exception as e:
             tb = traceback.format_exc()
             safe_print(f"   ❌ Error: {e}")
@@ -12146,6 +12368,8 @@ def main() -> None:
                         "manually move it back into 01_train_ready.\n"
                     )
                 hard_flag_counter += 1
+            except RunCancelled:
+                raise
             except Exception as e:
                 safe_print(f"   ⚠️ Failed to move hard-flagged image {hf_row.get('original_filename','')}: {e}")
 
@@ -12286,6 +12510,8 @@ def main() -> None:
                 cropped.save(img_out, "JPEG", quality=100)
                 with open(txt_out, "w", encoding="utf-8") as f:
                     f.write(row["final_caption"])
+            except RunCancelled:
+                raise
             except Exception:
                 pass
 
@@ -12308,6 +12534,8 @@ def main() -> None:
             cropped.save(img_out, "JPEG", quality=100)
             with open(txt_out, "w", encoding="utf-8") as f:
                 f.write(row["final_caption"])
+        except RunCancelled:
+            raise
         except Exception:
             pass
 
@@ -12326,6 +12554,8 @@ def main() -> None:
                 else:
                     cropped = body_aware_crop(row["original_path"], row)
                     cropped.save(img_out, "JPEG", quality=100)
+            except RunCancelled:
+                raise
             except Exception as export_err:
                 safe_print(f"   ⚠️ Failed to export reject image: {row.get('original_filename','')} – {export_err}")
 
@@ -12333,6 +12563,8 @@ def main() -> None:
             try:
                 with open(txt_out, "w", encoding="utf-8") as ft:
                     ft.write(build_reject_export_text(row, global_rules, subject_profile))
+            except RunCancelled:
+                raise
             except Exception as txt_err:
                 safe_print(f"   ⚠️ Failed to write reject text file: {row.get('original_filename','')} – {txt_err}")
 
@@ -12354,6 +12586,7 @@ def main() -> None:
                 continue
 
             for idx2, row in enumerate(second_choice, start=1):
+                raise_if_cancelled(f"second-choice export {idx2}/{len(second_choice)}")
                 try:
                     new_basename = f"{SAFE_TRIGGER}_second_{st}_{idx2:03d}"
                     img_out = os.path.join(SECOND_CHOICE_DIR, f"{new_basename}.jpg")
@@ -12365,6 +12598,8 @@ def main() -> None:
                     caption_text = row.get("final_caption") or ""
                     with open(txt_out, "w", encoding="utf-8") as f2:
                         f2.write(caption_text)
+                except RunCancelled:
+                    raise
                 except Exception as e:
                     pass
 
@@ -12393,6 +12628,7 @@ def main() -> None:
                 pair["winner"] += "_not_selected"
 
         for pair_idx, pair in enumerate(crop_pairs, start=1):
+            raise_if_cancelled(f"smart-crop export {pair_idx}/{len(crop_pairs)}")
             try:
                 orig_fn   = pair["original_filename"]
                 orig_path = pair["original_path"]
@@ -12448,6 +12684,8 @@ def main() -> None:
                     finally:
                         try:
                             os.remove(crop_tmp)
+                        except RunCancelled:
+                            raise
                         except Exception:
                             pass
                 elif crop_row_data:
@@ -12466,6 +12704,8 @@ def main() -> None:
 
                 safe_print(f"   Pair {pair_idx:03d}: {orig_fn[:35]} | winner: {winner}")
 
+            except RunCancelled:
+                raise
             except Exception as ep:
                 safe_print(f"   ⚠️ Comparison export for pair {pair_idx} failed: {ep}")
 
@@ -12737,4 +12977,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RunCancelled:
+        try:
+            flush_file_hash_index()
+        except RunCancelled:
+            raise
+        except Exception:
+            pass
+        safe_print("⏹ RUN_CANCELLED")
+        raise SystemExit(130)

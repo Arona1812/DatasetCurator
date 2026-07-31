@@ -364,3 +364,15 @@ The Curator, Subject Profile caption continuation, and Video Processor now use a
 - Cancelled runs retain their current progress instead of being shown as 100% complete.
 - Temporary UI configuration files are cleaned up after cancellation.
 - A second run cannot start while an active process is still running.
+
+### Cooperative and registry-backed cancellation
+
+Cancellation no longer relies only on Gradio cancelling the active generator or on an in-memory `Popen` reference.
+
+- Each run receives its own cancellation marker and persistent PID registry.
+- The Stop button is executed immediately and is no longer configured with Gradio's `cancels=[run_event]`, which could detach the UI generator before the subprocess was stopped.
+- The UI writes the cooperative marker first, then terminates the complete process tree. It can recover the PID from disk even if the in-memory process reference is unavailable.
+- The curator checks the marker between images, exports, retry waits and API phases.
+- Blocking OpenAI requests run in a daemon worker and are polled for cancellation, so the run does not have to wait for the HTTP timeout.
+- Windows still uses `taskkill /T /F`, with direct process and PowerShell fallbacks. The video processor uses the same cooperative marker.
+- Cancelled runs exit with code 130 and are shown as cancelled rather than failed or completed.

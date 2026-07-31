@@ -33,6 +33,8 @@ SAMPLE_FPS = 2                            # Wie viele Frames pro Sekunde geprüf
 SIMILARITY_THRESHOLD = 0.45               # Ab wann ein Gesicht als "richtige Person" gilt (0.4 bis 0.6 ist gut)
 MIN_SHARPNESS = 50.0                      # Mindestschärfe (Laplace-Varianz), um Blur direkt zu verwerfen
 INSIGHTFACE_USE_CUDA = False              # Aus = CPU erzwingen. Verhindert ONNXRuntime-CUDA-DLL-Fehler bei fehlendem CUDA/cuDNN.
+RUN_ID = ""
+CANCEL_FILE = ""
 
 # ── UI-Config Override ────────────────────────────────────────────────────────
 _UI_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_video_config.json")
@@ -47,6 +49,21 @@ if os.path.exists(_UI_CONFIG_PATH):
         print(f"⚠️ Failed to load UI config: {_e}")
 # ==========================================
 
+class RunCancelled(RuntimeError):
+    pass
+
+
+def cancellation_requested():
+    return bool(CANCEL_FILE and os.path.exists(str(CANCEL_FILE)))
+
+
+def raise_if_cancelled(context=""):
+    if cancellation_requested():
+        suffix = f" during {context}" if context else ""
+        print(f"Cancellation requested{suffix}. Stopping safely...", flush=True)
+        raise RunCancelled(context or "cancelled")
+
+
 def get_sharpness(img):
     """Berechnet die Schärfe über die Varianz des Laplace-Operators."""
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -58,6 +75,7 @@ def compute_similarity(emb1, emb2):
 
 def process_minute_chunk(chunk_frames, video_name, minute_idx):
     """Clustert die Frames einer Minute nach Winkel und speichert die besten 5."""
+    raise_if_cancelled(f"minute {minute_idx}")
     if not chunk_frames:
         return
     
@@ -81,6 +99,7 @@ def process_minute_chunk(chunk_frames, video_name, minute_idx):
     
     # Speichere die ausgewählten Frames
     for idx, item in enumerate(selected):
+        raise_if_cancelled(f"saving minute {minute_idx}")
         out_name = f"{video_name}_min{minute_idx:03d}_{idx+1}.jpg"
         out_path = os.path.join(TARGET_FOLDER, out_name)
         # 100% Qualität erzwingen, passend zum dataset_curator
@@ -93,6 +112,7 @@ def process_minute_chunk(chunk_frames, video_name, minute_idx):
                   f"unsupported by the local filesystem encoding.")
 
 def main():
+    raise_if_cancelled("startup")
     os.makedirs(TARGET_FOLDER, exist_ok=True)
     
     # InsightFace initialisieren
@@ -123,7 +143,8 @@ def main():
         
     print(f"Videos found: {len(video_files)}")
 
-    for video_path in video_files:
+    for video_index, video_path in enumerate(video_files, start=1):
+        raise_if_cancelled(f"video {video_index}/{len(video_files)}")
         video_name = os.path.splitext(os.path.basename(video_path))[0]
         print(f"\nProcessing video: {video_name}")
         
@@ -141,6 +162,7 @@ def main():
         frame_count = 0
         
         while cap.isOpened():
+            raise_if_cancelled(f"video frame {frame_count}")
             ret, frame = cap.read()
             if not ret:
                 break
