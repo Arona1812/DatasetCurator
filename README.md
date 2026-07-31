@@ -26,6 +26,7 @@ Many checks and review steps are optional or configurable in the UI. The main fe
 
 - Web UI with saved settings and English/German language switching
 - Local pre-filtering and duplicate detection before expensive API calls
+- Persistent local-analysis, IG-frame decision, file-hash, CLIP and API caches for fast repeated runs
 - OpenAI-assisted image review and automatic captioning
 - Top-level training targets for `ERNIE Image`, `Z-Image Base` and `Krea 2`, each with its own prompt/caption engine defaults
 - Dedicated Krea 2 workflow with dataset-aware natural-language captions
@@ -216,6 +217,23 @@ The curator treats three mechanisms separately:
    - on: export headshots at `1024×1024` and medium/full-body images at `832×1216`.
 
 There is no legacy mode that forces every image into a square crop.
+
+### Performance and cache behavior
+
+All caches remain inside `curated_<trigger>/_cache`; the curator does not write a second cache tree to `%LOCALAPPDATA%`.
+
+Repeated runs now avoid the main sources of unnecessary work:
+
+- the optional one-second request delay is applied only after a real successful OpenAI request, never after a cache hit,
+- the IG-frame remover caches both positive and negative decisions,
+- IG-frame detection runs on a preview with a maximum edge of 1024 px while the final crop is taken from the original image,
+- local blur/color/pHash/face/pose metrics are cached per image,
+- quick-reject metrics are cached separately so repeatedly rejected images do not need to be decoded again,
+- singleton pHash groups are not scored with face/pose analysis,
+- CLIP, MediaPipe and Haar models are initialized lazily and are not loaded during fully cached runs,
+- a single `file_hash_index.json` reuses SHA-1 hashes while file size and nanosecond modification time remain unchanged.
+
+The Markdown dataset report contains a `Performance` section with stage timings, artificial API wait time and cache counters such as audit, IG, local-analysis, CLIP, ArcFace and file-hash hits/misses.
 
 ### 2. Video Processor
 

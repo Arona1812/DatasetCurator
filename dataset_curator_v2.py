@@ -14,6 +14,7 @@ import shutil
 import threading
 import traceback
 import warnings
+import atexit
 from collections import Counter, defaultdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -476,8 +477,17 @@ USE_AI_TOOLKIT_CROP_PROFILES = USE_CONTROLLED_BUCKETS
 ENABLE_CACHE = True  # Nutzt vorhandene API-/Analyse-Ergebnisse wieder, spart Zeit und Kosten
 MAX_RETRIES = 8
 RETRY_BASE_SECONDS = 5.0
+# Optional polite delay after a REAL successful OpenAI request. It is applied
+# centrally in the Responses wrapper and never on cache hits or local work.
 SLEEP_BETWEEN_CALLS = 1.0
 HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+# Performance/cache internals. Caches intentionally remain inside the curated
+# dataset folder; no data is moved to LOCALAPPDATA.
+LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION = "v1"
+FILE_HASH_INDEX_SCHEMA_VERSION = "v1"
+IG_FRAME_ANALYSIS_MAX_SIDE = 1024
+FILE_HASH_INDEX_FLUSH_EVERY = 25
 
 # --------------------------------
 # Export
@@ -500,6 +510,8 @@ CACHE_DIR = os.path.join(OUTPUT_ROOT, "_cache")
 CLIP_CACHE_DIR = os.path.join(CACHE_DIR, "clip")
 ARCFACE_CACHE_DIR = os.path.join(CACHE_DIR, "arcface")
 TRIGGER_CACHE_DIR = os.path.join(CACHE_DIR, "trigger")
+LOCAL_ANALYSIS_CACHE_DIR = os.path.join(CACHE_DIR, "local_analysis")
+FILE_HASH_INDEX_PATH = os.path.join(CACHE_DIR, "file_hash_index.json")
 SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "08_smart_crop_pairs")
 IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
 
@@ -672,7 +684,8 @@ IG_FRAME_TWO_STAGE_BAR_DETECT = True
 # damit vorhandene Caches neu berechnet werden.
 # v1 = Original (nur Seiten + simple Top/Bottom-Gradienten)
 # v2 = + Zweistufige Bar-Detection (Android-Nav-Bars, Drop-Shadows)
-IG_FRAME_CACHE_VERSION = 2
+# v3 = negative decisions cached + detection on a <=1024px preview
+IG_FRAME_CACHE_VERSION = 3
 
 
 # ── SUBJECT-SANITY-CHECK (Gliedmassen-/Winkel-Filter) ──────────────────────────
@@ -724,6 +737,8 @@ _UI_PROTECTED_KEYS = {
     "IG_FRAME_CACHE_VERSION",
     "PROFILE_CACHE_SCHEMA_VERSION",
     "AUDIT_CACHE_SCHEMA_VERSION",
+    "LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION",
+    "FILE_HASH_INDEX_SCHEMA_VERSION",
 }
 if os.path.exists(_UI_CONFIG_PATH):
     try:
@@ -756,6 +771,8 @@ if os.path.exists(_UI_CONFIG_PATH):
     CLIP_CACHE_DIR = os.path.join(CACHE_DIR, "clip")
     ARCFACE_CACHE_DIR = os.path.join(CACHE_DIR, "arcface")
     TRIGGER_CACHE_DIR = os.path.join(CACHE_DIR, "trigger")
+    LOCAL_ANALYSIS_CACHE_DIR = os.path.join(CACHE_DIR, "local_analysis")
+    FILE_HASH_INDEX_PATH = os.path.join(CACHE_DIR, "file_hash_index.json")
     SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "08_smart_crop_pairs")
     IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
 
@@ -800,6 +817,7 @@ for folder in [
     CLIP_CACHE_DIR,
     ARCFACE_CACHE_DIR,
     TRIGGER_CACHE_DIR,
+    LOCAL_ANALYSIS_CACHE_DIR,
 ]:
     os.makedirs(folder, exist_ok=True)
 
@@ -815,43 +833,14 @@ if ENABLE_IG_FRAME_CROP:
 
 MP_FACE = None
 MP_POSE = None
-if HAVE_MP:
-    try:
-        MP_FACE = mp.solutions.face_detection.FaceDetection(
-            model_selection=1,
-            min_detection_confidence=0.5
-        )
-        MP_POSE = mp.solutions.pose.Pose(
-            static_image_mode=True,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5
-        )
-    except Exception:
-        MP_FACE = None
-        MP_POSE = None
-
 HAAR_CASCADE = None
-if HAVE_CV2:
-    try:
-        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        HAAR_CASCADE = cv2.CascadeClassifier(cascade_path)
-    except Exception:
-        HAAR_CASCADE = None
+LOCAL_VISION_INIT_ATTEMPTED = False
+LOCAL_VISION_INIT_LOCK = threading.Lock()
 
 CLIP_MODEL = None
 CLIP_PREPROCESS = None
-if USE_CLIP_DUPLICATE_SCORING and HAVE_CLIP:
-    try:
-        CLIP_MODEL, _, CLIP_PREPROCESS = open_clip.create_model_and_transforms(
-            CLIP_MODEL_NAME,
-            pretrained=CLIP_PRETRAINED,
-            device=CLIP_DEVICE,
-        )
-        CLIP_MODEL.eval()
-    except Exception:
-        CLIP_MODEL = None
-        CLIP_PREPROCESS = None
+CLIP_INIT_ATTEMPTED = False
+CLIP_INIT_LOCK = threading.Lock()
 
 # ── ArcFace-Modell (lazy init) ────────────────────────────────────────
 # Wird erst beim ersten Gebrauch initialisiert, um Startup-Zeit zu sparen
@@ -870,6 +859,48 @@ def safe_print(msg: str) -> None:
         print(msg)
     except UnicodeEncodeError:
         print(msg.encode("utf-8", errors="replace").decode("utf-8"))
+
+
+_PERF_LOCK = threading.Lock()
+PERFORMANCE_STATS: Dict[str, Any] = {}
+
+
+def reset_performance_stats() -> None:
+    global PERFORMANCE_STATS
+    with _PERF_LOCK:
+        PERFORMANCE_STATS = {
+            "run_started_monotonic": time.perf_counter(),
+            "timings": defaultdict(float),
+            "cache": Counter(),
+            "artificial_wait_seconds": 0.0,
+        }
+
+
+def perf_add_time(name: str, seconds: float) -> None:
+    with _PERF_LOCK:
+        PERFORMANCE_STATS.setdefault("timings", defaultdict(float))[name] += max(0.0, float(seconds))
+
+
+def perf_count(name: str, amount: int = 1) -> None:
+    with _PERF_LOCK:
+        PERFORMANCE_STATS.setdefault("cache", Counter())[name] += int(amount)
+
+
+def performance_snapshot() -> Dict[str, Any]:
+    with _PERF_LOCK:
+        started = float(PERFORMANCE_STATS.get("run_started_monotonic", time.perf_counter()))
+        timings = dict(PERFORMANCE_STATS.get("timings", {}))
+        cache = dict(PERFORMANCE_STATS.get("cache", {}))
+        wait_s = float(PERFORMANCE_STATS.get("artificial_wait_seconds", 0.0))
+    return {
+        "total_seconds": round(max(0.0, time.perf_counter() - started), 3),
+        "timings_seconds": {k: round(float(v), 3) for k, v in sorted(timings.items())},
+        "cache_counts": {k: int(v) for k, v in sorted(cache.items())},
+        "artificial_wait_seconds": round(wait_s, 3),
+    }
+
+
+reset_performance_stats()
 
 
 def format_elapsed(seconds: float) -> str:
@@ -933,7 +964,103 @@ def slugify_filename(text: str) -> str:
 SAFE_TRIGGER = slugify_filename(TRIGGER_WORD)
 
 
+_FILE_HASH_INDEX_LOCK = threading.Lock()
+_FILE_HASH_INDEX_LOADED = False
+_FILE_HASH_INDEX_DIRTY = 0
+_FILE_HASH_INDEX: Dict[str, Dict[str, Any]] = {}
+
+
+def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _load_file_hash_index() -> None:
+    global _FILE_HASH_INDEX_LOADED, _FILE_HASH_INDEX
+    if _FILE_HASH_INDEX_LOADED:
+        return
+    with _FILE_HASH_INDEX_LOCK:
+        if _FILE_HASH_INDEX_LOADED:
+            return
+        _FILE_HASH_INDEX_LOADED = True
+        if not ENABLE_CACHE or not os.path.isfile(FILE_HASH_INDEX_PATH):
+            _FILE_HASH_INDEX = {}
+            return
+        try:
+            with open(FILE_HASH_INDEX_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if payload.get("schema_version") == FILE_HASH_INDEX_SCHEMA_VERSION:
+                entries = payload.get("entries", {})
+                _FILE_HASH_INDEX = entries if isinstance(entries, dict) else {}
+            else:
+                _FILE_HASH_INDEX = {}
+        except Exception:
+            _FILE_HASH_INDEX = {}
+
+
+def _path_is_persistently_cacheable(path: str) -> bool:
+    try:
+        ap = os.path.normcase(os.path.abspath(path))
+        roots = [INPUT_FOLDER, OUTPUT_ROOT]
+        for root in roots:
+            if root and os.path.commonpath([ap, os.path.normcase(os.path.abspath(root))]) == os.path.normcase(os.path.abspath(root)):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def flush_file_hash_index() -> None:
+    global _FILE_HASH_INDEX_DIRTY
+    if not ENABLE_CACHE:
+        return
+    _load_file_hash_index()
+    with _FILE_HASH_INDEX_LOCK:
+        if _FILE_HASH_INDEX_DIRTY <= 0:
+            return
+        payload = {
+            "schema_version": FILE_HASH_INDEX_SCHEMA_VERSION,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "entries": _FILE_HASH_INDEX,
+        }
+        try:
+            _atomic_write_json(FILE_HASH_INDEX_PATH, payload)
+            _FILE_HASH_INDEX_DIRTY = 0
+        except Exception:
+            pass
+
+
+atexit.register(flush_file_hash_index)
+
+
 def file_sha1(path: str, chunk_size: int = 1024 * 1024) -> str:
+    global _FILE_HASH_INDEX_DIRTY
+    started = time.perf_counter()
+    persistent = ENABLE_CACHE and _path_is_persistently_cacheable(path)
+    key = os.path.normcase(os.path.abspath(path))
+    try:
+        stat = os.stat(path)
+        signature = {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+    except Exception:
+        signature = None
+
+    if persistent and signature is not None:
+        _load_file_hash_index()
+        with _FILE_HASH_INDEX_LOCK:
+            entry = _FILE_HASH_INDEX.get(key)
+            if (
+                isinstance(entry, dict)
+                and entry.get("size") == signature["size"]
+                and entry.get("mtime_ns") == signature["mtime_ns"]
+                and isinstance(entry.get("sha1"), str)
+            ):
+                perf_count("file_hash_hit")
+                perf_add_time("file_hash", time.perf_counter() - started)
+                return entry["sha1"]
+
     h = hashlib.sha1()
     with open(path, "rb") as f:
         while True:
@@ -941,7 +1068,19 @@ def file_sha1(path: str, chunk_size: int = 1024 * 1024) -> str:
             if not chunk:
                 break
             h.update(chunk)
-    return h.hexdigest()
+    digest = h.hexdigest()
+    perf_count("file_hash_miss")
+    perf_add_time("file_hash", time.perf_counter() - started)
+
+    if persistent and signature is not None:
+        should_flush = False
+        with _FILE_HASH_INDEX_LOCK:
+            _FILE_HASH_INDEX[key] = {**signature, "sha1": digest}
+            _FILE_HASH_INDEX_DIRTY += 1
+            should_flush = _FILE_HASH_INDEX_DIRTY >= int(FILE_HASH_INDEX_FLUSH_EVERY)
+        if should_flush:
+            flush_file_hash_index()
+    return digest
 
 
 def file_size_mb(path: str) -> float:
@@ -2058,7 +2197,7 @@ def local_colorfulness_metrics(image_path: str) -> Dict[str, Any]:
     except Exception:
         return result
 
-def early_duplicate_pick_score(image_path: str) -> Tuple[float, Dict[str, float]]:
+def early_duplicate_pick_score(image_path: str, phash_value: Optional[int] = None) -> Tuple[float, Dict[str, float]]:
     """
     Schneller, deterministischer Lokalscore für Early-pHash-Gruppen.
     Bevorzugt scharfe, hochauflösende Bilder mit klar erkennbarem Hauptgesicht.
@@ -2076,7 +2215,11 @@ def early_duplicate_pick_score(image_path: str) -> Tuple[float, Dict[str, float]
     pose_ratio = 0.0
 
     try:
-        metrics = local_subject_metrics(image_path, phash_cache=None)
+        metrics = local_subject_metrics(
+            image_path,
+            phash_cache={image_path: phash_value} if phash_value is not None else None,
+            precomputed_metrics={"blur_variance_full": blur_variance},
+        )
         main_face_ratio = float(metrics.get("main_face_ratio") or 0.0)
         face_count = int(metrics.get("face_count_local") or 0)
         pose_ratio = bbox_area_ratio(metrics.get("pose_bbox"), width, height)
@@ -2102,7 +2245,7 @@ def early_duplicate_pick_score(image_path: str) -> Tuple[float, Dict[str, float]
     }
 
 
-def early_duplicate_pick_score_resolution_strict(image_path: str) -> Tuple[float, Dict[str, float]]:
+def early_duplicate_pick_score_resolution_strict(image_path: str, phash_value: Optional[int] = None) -> Tuple[float, Dict[str, float]]:
     """
     Strikte Auswahl-Logik fuer Loop 1 (exact duplicates, threshold=1).
 
@@ -2140,7 +2283,11 @@ def early_duplicate_pick_score_resolution_strict(image_path: str) -> Tuple[float
     # die Sekundaer-Sortierung im Pass mitgeliefert (siehe _early_phash_dedup_pass).
     main_face_ratio = 0.0
     try:
-        metrics = local_subject_metrics(image_path, phash_cache=None)
+        metrics = local_subject_metrics(
+            image_path,
+            phash_cache={image_path: phash_value} if phash_value is not None else None,
+            precomputed_metrics={"blur_variance_full": blur_variance},
+        )
         main_face_ratio = float(metrics.get("main_face_ratio") or 0.0)
     except Exception:
         pass
@@ -2167,60 +2314,98 @@ def local_filesize_kb(image_path: str) -> float:
 # Instagram-Frame Auto-Crop
 # ============================================================
 
-def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
-    """
-    Erkennt Instagram-Story-Rahmen (farbige Balken, Blur-Hintergründe,
-    Gradient-Verläufe links/rechts und ggf. oben/unten) und schneidet sie weg.
+def detect_and_crop_ig_frame(image_path: str, source_hash: Optional[str] = None) -> Optional[str]:
+    """Detect and remove Instagram-style frames with positive AND negative caching.
 
-    Zweistufige Erkennung:
-    1. Frame-Indikator: Prüft ob die äußeren ~15% pro Seite ein Frame-Pattern
-       haben (median_row_std < 15 = jede Zeile im Strip ist nahezu einfarbig,
-       auch wenn sich die Farbe von Zeile zu Zeile ändert → Gradient/Blur/Solid).
-    2. Kanten-Lokalisierung: Findet die genaue Grenze zwischen Frame und Foto
-       über horizontale Farbgradienten mit Symmetrie-Fallback.
-
-    Gibt den Pfad der permanent gespeicherten, gecroppten Datei zurück
-    (in IG_FRAME_CROP_DIR), oder None wenn kein Frame erkannt wurde.
-    Bei wiederholtem Aufruf wird das existierende Ergebnis wiederverwendet.
+    Detection runs on a preview whose longest side is at most
+    IG_FRAME_ANALYSIS_MAX_SIDE. The final crop is always taken from the
+    full-resolution source image. A tiny JSON decision is persisted even when
+    no frame is found, making warm runs essentially a cache lookup.
     """
     if not ENABLE_IG_FRAME_CROP:
         return None
 
+    started = time.perf_counter()
+    src_hash = source_hash or file_sha1(image_path)
+    cached_path = os.path.join(
+        IG_FRAME_CROP_DIR, f"{src_hash}_ig_cropped_v{IG_FRAME_CACHE_VERSION}.jpg"
+    )
+    decision_path = os.path.join(
+        IG_FRAME_CROP_DIR, f"{src_hash}_ig_decision_v{IG_FRAME_CACHE_VERSION}.json"
+    )
+
+    def save_decision(frame_detected: bool, bbox: Optional[List[int]], reason: str) -> None:
+        if not ENABLE_CACHE:
+            return
+        try:
+            _atomic_write_json(decision_path, {
+                "schema_version": f"v{IG_FRAME_CACHE_VERSION}",
+                "source_hash": src_hash,
+                "frame_detected": bool(frame_detected),
+                "crop_bbox": bbox,
+                "reason": reason,
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+        except Exception:
+            pass
+
+    if ENABLE_CACHE and os.path.isfile(decision_path):
+        try:
+            with open(decision_path, "r", encoding="utf-8") as f:
+                decision = json.load(f)
+            if (
+                decision.get("schema_version") == f"v{IG_FRAME_CACHE_VERSION}"
+                and decision.get("source_hash") == src_hash
+            ):
+                if not decision.get("frame_detected", False):
+                    perf_count("ig_negative_hit")
+                    perf_add_time("ig_frame", time.perf_counter() - started)
+                    return None
+                bbox = decision.get("crop_bbox")
+                if os.path.isfile(cached_path):
+                    perf_count("ig_positive_hit")
+                    perf_add_time("ig_frame", time.perf_counter() - started)
+                    return cached_path
+                if isinstance(bbox, list) and len(bbox) == 4:
+                    with Image.open(image_path) as source:
+                        source = ImageOps.exif_transpose(source).convert("RGB")
+                        source.crop(tuple(int(v) for v in bbox)).save(cached_path, "JPEG", quality=100)
+                    perf_count("ig_positive_hit")
+                    perf_add_time("ig_frame", time.perf_counter() - started)
+                    return cached_path
+        except Exception:
+            pass
+
     try:
         from scipy.ndimage import uniform_filter1d
 
-        # Cache-Pfad basierend auf Datei-Hash
-        src_hash = file_sha1(image_path)
-        cached_path = os.path.join(IG_FRAME_CROP_DIR, f"{src_hash}_ig_cropped_v{IG_FRAME_CACHE_VERSION}.jpg")
-        if os.path.exists(cached_path):
-            return cached_path
-
-        pil_img = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
-        img = np.array(pil_img, dtype=np.float32)
-        h, w = img.shape[:2]
-
-        if w < 400 or h < 400:
+        with Image.open(image_path) as opened:
+            pil_img = ImageOps.exif_transpose(opened).convert("RGB")
+        orig_w, orig_h = pil_img.size
+        if orig_w < 400 or orig_h < 400:
+            save_decision(False, None, "source_too_small")
+            perf_count("ig_negative_computed")
+            perf_add_time("ig_frame", time.perf_counter() - started)
             return None
 
-        # ── STUFE 1: Frame-Indikator via Zeilen-Uniformität ──
-        # Echte IG-Rahmen (solid, blur, gradient) haben pro Zeile fast
-        # identische Pixelwerte innerhalb des Randstreifens.
-        # median_row_std < 15 = Frame-Pattern, >= 15 = normaler Bildinhalt.
-        # Wir testen mehrere Probe-Breiten (schmal → breit), weil ein
-        # zu breiter Probe-Strip bei schmalen Rahmen in das Foto hineinragt
-        # und fälschlicherweise hohe Varianz zeigt.
-        # Mindestens 2 von 4 Breiten müssen Frame-Pattern bestätigen, damit
-        # ein einzelner Grenzwert-Treffer bei der schmalsten Probe kein
-        # False Positive auslöst.
+        analysis = pil_img.copy()
+        analysis.thumbnail(
+            (int(IG_FRAME_ANALYSIS_MAX_SIDE), int(IG_FRAME_ANALYSIS_MAX_SIDE)),
+            Image.Resampling.BILINEAR,
+        )
+        img = np.asarray(analysis, dtype=np.float32)
+        h, w = img.shape[:2]
+        scale_x = orig_w / float(w)
+        scale_y = orig_h / float(h)
+        min_border_px = max(4, int(round(IG_FRAME_MIN_BORDER_PX / scale_x)))
+        min_content_w = max(100, int(round(IG_FRAME_MIN_CONTENT_PX / scale_x)))
+        min_content_h = max(100, int(round(IG_FRAME_MIN_CONTENT_PX / scale_y)))
 
         def is_frame_side(side: str) -> bool:
             hits = 0
             for divisor in [20, 14, 10, 7]:
-                pw = max(20, w // divisor)
-                if side == "left":
-                    strip = img[:, :pw, :]
-                else:
-                    strip = img[:, w - pw:, :]
+                pw = max(12, w // divisor)
+                strip = img[:, :pw, :] if side == "left" else img[:, w - pw:, :]
                 row_stds = strip.std(axis=1).mean(axis=1)
                 if float(np.median(row_stds)) < 15.0:
                     hits += 1
@@ -2228,20 +2413,16 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
 
         left_is_frame = is_frame_side("left")
         right_is_frame = is_frame_side("right")
-
         if not left_is_frame and not right_is_frame:
+            save_decision(False, None, "no_frame_side")
+            perf_count("ig_negative_computed")
+            perf_add_time("ig_frame", time.perf_counter() - started)
             return None
 
-        # ── STUFE 2: Exakte Kanten-Lokalisierung ──
-        h_grad = np.abs(np.diff(img, axis=1)).mean(axis=2)  # (h, w-1)
-        col_score_strict = uniform_filter1d(
-            (h_grad > 20).sum(axis=0) / h, size=3
-        )
-        col_score_relaxed = uniform_filter1d(
-            (h_grad > 10).sum(axis=0) / h, size=3
-        )
+        h_grad = np.abs(np.diff(img, axis=1)).mean(axis=2)
+        col_score_strict = uniform_filter1d((h_grad > 20).sum(axis=0) / h, size=3)
+        col_score_relaxed = uniform_filter1d((h_grad > 10).sum(axis=0) / h, size=3)
 
-        # Linke Kante suchen (nur wenn links als Frame erkannt)
         left_edge = 0
         if left_is_frame:
             left_zone = col_score_strict[: w // 3]
@@ -2250,16 +2431,12 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
                 best = left_cands[np.argmax(left_zone[left_cands])]
                 left_edge = int(best) + 1
             else:
-                # Gradient ist so weich dass keine scharfe Kante existiert.
-                # Fallback: Zeile-für-Zeile row_std scannen und finden wo
-                # der Inhalt beginnt (row_std springt über 15).
-                for col in range(max(10, w // 20), w // 3):
+                for col in range(max(6, w // 20), w // 3):
                     strip = img[:, col:col + 5, :]
                     if float(np.median(strip.std(axis=1).mean(axis=1))) >= 15.0:
                         left_edge = col
                         break
 
-        # Rechte Kante suchen (nur wenn rechts als Frame erkannt)
         right_edge = w
         if right_is_frame:
             r_off = 2 * w // 3
@@ -2269,7 +2446,7 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
                 best = right_cands[np.argmax(right_zone[right_cands])]
                 right_edge = int(r_off + best)
             else:
-                for col in range(w - max(10, w // 20), 2 * w // 3, -1):
+                for col in range(w - max(6, w // 20), 2 * w // 3, -1):
                     strip = img[:, col - 5:col, :]
                     if float(np.median(strip.std(axis=1).mean(axis=1))) >= 15.0:
                         right_edge = col
@@ -2277,17 +2454,14 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
 
         left_border = left_edge
         right_border = w - right_edge
-
-        # Symmetrie-Fallback: wenn nur eine Seite per Stufe-1 erkannt wurde,
-        # aber die andere Seite eine schwächere Kante hat
-        if left_is_frame and not right_is_frame and left_border >= IG_FRAME_MIN_BORDER_PX:
+        if left_is_frame and not right_is_frame and left_border >= min_border_px:
             sym = w - left_border
             for col in range(max(0, sym - 25), min(len(col_score_relaxed), sym + 26)):
                 if col_score_relaxed[col] > 0.12:
                     right_edge = col
                     right_border = w - right_edge
                     break
-        elif right_is_frame and not left_is_frame and right_border >= IG_FRAME_MIN_BORDER_PX:
+        elif right_is_frame and not left_is_frame and right_border >= min_border_px:
             sym = right_border
             for col in range(max(0, sym - 25), min(w // 3, sym + 26)):
                 if col_score_relaxed[col] > 0.12:
@@ -2295,61 +2469,31 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
                     left_border = left_edge
                     break
 
-        # Mindestens eine Seite muss signifikanten Rand haben
-        has_frame = (
-            left_border >= IG_FRAME_MIN_BORDER_PX
-            or right_border >= IG_FRAME_MIN_BORDER_PX
-        )
-        if not has_frame:
+        if not (left_border >= min_border_px or right_border >= min_border_px):
+            save_decision(False, None, "border_below_minimum")
+            perf_count("ig_negative_computed")
+            perf_add_time("ig_frame", time.perf_counter() - started)
+            return None
+        if max(left_border, right_border) / float(w) > 0.30:
+            save_decision(False, None, "border_too_wide")
+            perf_count("ig_negative_computed")
+            perf_add_time("ig_frame", time.perf_counter() - started)
             return None
 
-        # ── False-Positive-Filter ──
-        # Kein einzelner Rand breiter als 30% der Bildbreite
-        max_border = max(left_border, right_border)
-        if max_border / w > 0.30:
-            return None
-
-        # ── Vertikale Kanten (oben/unten) ──
         v_grad = np.abs(np.diff(img, axis=0)).mean(axis=2)
-        row_score = uniform_filter1d(
-            (v_grad > 20).sum(axis=1) / w, size=3
-        )
-
+        row_score = uniform_filter1d((v_grad > 20).sum(axis=1) / w, size=3)
         top_zone = row_score[: int(h * 0.4)]
         top_cands = np.where(top_zone > 0.25)[0]
         top_edge = int(top_cands[np.argmax(top_zone[top_cands])] + 1) if len(top_cands) > 0 else 0
-
         bot_off = int(h * 0.7)
         bot_zone = row_score[bot_off:]
         bot_cands = np.where(bot_zone > 0.20)[0]
         bottom_edge = int(bot_off + bot_cands[np.argmax(bot_zone[bot_cands])]) if len(bot_cands) > 0 else h
 
-        # ── Zweistufige Bar-Detection (fuer Android-Nav-Bars, IG-Shadow-Frames) ──
-        # Die gradienten-basierte Suche oben verpasst zwei haeufige Faelle:
-        #   1) Grosse schwarze Android-Nav-Bar, die weit ueber der 70%-Marke
-        #      beginnt (Suchzone ist dann komplett innerhalb der Bar → kein Gradient).
-        #   2) Weiche Schatten-Gradienten oben/unten (Drop-Shadows um innere Fotos),
-        #      die der row_score>0.25-Schwelle nicht genuegen.
-        # Diese Zusatz-Detection triggert NUR, wenn bereits ein Seitenrahmen gefunden
-        # wurde. Damit wird verhindert, dass dunkle Kopfkissen o.ae. fuer eine Bar
-        # gehalten werden.
-        def _detect_bar_two_stage(side: str) -> int:
-            """
-            Zweistufige Erkennung einer uniformen Bar am oberen/unteren Rand.
-            Stufe A: Row-std < 15 -> fast einfarbige Zeile.
-            Stufe B: Ab Ende von Stufe A weiter suchen, wenn die Bar eine
-            typische dunkle (<60) oder helle (>200) Farbe hat — auch wenn
-            die Zeile UI-Elemente (Icons, Buttons) enthaelt, solange die
-            dominante Farbe dieselbe bleibt (>55% Pixel). Fuer Android-
-            Nav-Bars mit schwarzem Hintergrund + weisse Nav-Icons.
-            """
+        def detect_bar_two_stage(side: str) -> int:
             max_rows = int(h * 0.5)
-            if side == "bottom":
-                rows_region = img[h - max_rows:, :, :][::-1]  # von unten
-            else:
-                rows_region = img[:max_rows, :, :]
+            rows_region = img[h - max_rows:, :, :][::-1] if side == "bottom" else img[:max_rows, :, :]
             row_stds_local = rows_region.std(axis=1).mean(axis=1)
-
             stage_a = 0
             gap_a = 0
             for i, std_v in enumerate(row_stds_local):
@@ -2362,23 +2506,16 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
                         break
             if stage_a == 0:
                 return 0
-
             ref_mean = float(rows_region[:stage_a].mean())
             is_dark_bar = ref_mean < 60.0
             is_bright_bar = ref_mean > 200.0
             if not (is_dark_bar or is_bright_bar):
-                # Uniforme aber "mittelhelle" Zone (z.B. bunter IG-Frame ohne
-                # UI-Overlays): Stufe B uebspringen, Stage-A-Laenge zurueckgeben.
                 return stage_a
-
             stage_b = stage_a
             gap_b = 0
             for i in range(stage_a, len(row_stds_local)):
                 row_px = rows_region[i]
-                if is_dark_bar:
-                    dominant_mask = (row_px < 40).all(axis=-1)
-                else:
-                    dominant_mask = (row_px > 220).all(axis=-1)
+                dominant_mask = (row_px < 40).all(axis=-1) if is_dark_bar else (row_px > 220).all(axis=-1)
                 dominant_ratio = float(dominant_mask.sum()) / float(row_px.shape[0])
                 if dominant_ratio > 0.55:
                     stage_b = i + 1
@@ -2389,28 +2526,21 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
                         break
             return stage_b
 
-        # Nur anwenden, wenn mindestens eine Seite als Frame erkannt wurde
-        # (sonst False-Positives bei normalen dunklen Bildelementen wie Kissen,
-        #  Haaren, dunklen Hintergruenden).
         if IG_FRAME_TWO_STAGE_BAR_DETECT and (left_is_frame or right_is_frame):
-            bar_top = _detect_bar_two_stage("top")
-            bar_bot = _detect_bar_two_stage("bottom")
-            # Die bereits gefundene Kante nur erweitern, nicht verengen
+            bar_top = detect_bar_two_stage("top")
+            bar_bot = detect_bar_two_stage("bottom")
             if bar_top > top_edge:
                 top_edge = bar_top
             if bar_bot > 0 and (h - bar_bot) < bottom_edge:
                 bottom_edge = h - bar_bot
 
-        # ── UI-Elemente / Captions entfernen ──
         inner = img[top_edge:bottom_edge, left_edge:right_edge, :]
         inner_h = inner.shape[0]
-
         content_top = 0
         for r in range(0, min(inner_h // 3, 300), 2):
             if inner[r, :, :].var() > 300:
                 content_top = r
                 break
-
         content_bottom = inner_h
         for r in range(inner_h - 1, max(2 * inner_h // 3, inner_h - 300), -2):
             if inner[r, :, :].var() > 300:
@@ -2419,23 +2549,39 @@ def detect_and_crop_ig_frame(image_path: str) -> Optional[str]:
 
         final_top = top_edge + content_top
         final_bottom = top_edge + content_bottom
-
-        # ── Ergebnis-Validierung ──
-        content_w = right_edge - left_edge
-        content_h = final_bottom - final_top
-
-        if content_w < IG_FRAME_MIN_CONTENT_PX or content_h < IG_FRAME_MIN_CONTENT_PX:
+        if (right_edge - left_edge) < min_content_w or (final_bottom - final_top) < min_content_h:
+            save_decision(False, None, "content_too_small")
+            perf_count("ig_negative_computed")
+            perf_add_time("ig_frame", time.perf_counter() - started)
             return None
 
-        total_removed = left_border + right_border + final_top + (h - final_bottom)
+        x1 = max(0, int(round(left_edge * scale_x)))
+        y1 = max(0, int(round(final_top * scale_y)))
+        x2 = min(orig_w, int(round(right_edge * scale_x)))
+        y2 = min(orig_h, int(round(final_bottom * scale_y)))
+        if (x2 - x1) < IG_FRAME_MIN_CONTENT_PX or (y2 - y1) < IG_FRAME_MIN_CONTENT_PX:
+            save_decision(False, None, "full_resolution_content_too_small")
+            perf_count("ig_negative_computed")
+            perf_add_time("ig_frame", time.perf_counter() - started)
+            return None
+        total_removed = x1 + (orig_w - x2) + y1 + (orig_h - y2)
         if total_removed < 40:
+            save_decision(False, None, "removed_area_too_small")
+            perf_count("ig_negative_computed")
+            perf_add_time("ig_frame", time.perf_counter() - started)
             return None
 
-        cropped = pil_img.crop((left_edge, final_top, right_edge, final_bottom))
-        cropped.save(cached_path, "JPEG", quality=100)
+        bbox = [x1, y1, x2, y2]
+        pil_img.crop(tuple(bbox)).save(cached_path, "JPEG", quality=100)
+        save_decision(True, bbox, "frame_detected")
+        perf_count("ig_positive_computed")
+        perf_add_time("ig_frame", time.perf_counter() - started)
         return cached_path
 
-    except Exception:
+    except Exception as exc:
+        perf_count("ig_error")
+        perf_add_time("ig_frame", time.perf_counter() - started)
+        safe_print(f"   ⚠️ IG frame detection failed: {exc}")
         return None
 
 
@@ -2466,23 +2612,32 @@ def local_quick_reject(image_path: str, width: int, height: int) -> Optional[str
     return None
 
 
-def local_quick_reject_post_crop(image_path: str, width: int, height: int) -> Optional[str]:
-    """
-    Vorfilter, die NACH dem IG-Frame-Crop laufen sollen: Blur und Exposure.
-    Dateigroesse wurde schon vor dem IG-Crop geprueft (dort ist sie noch
-    die Original-Filesize).
+def local_quick_reject_post_crop(
+    image_path: str,
+    width: int,
+    height: int,
+    metrics_out: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Cheap post-IG prefilters with reusable metric output.
 
-    Der Blur-Check arbeitet mit der auflösungs-normierten Laplacian-Varianz
-    (Stufe 1); der eigentliche Face-Bbox-Check (Stufe 2) laeuft spaeter in
-    local_status_override nach der Face-Detection.
+    When a complete local-analysis cache is supplied through metrics_out, no
+    image decode is repeated. On a cold run the calculated quick metrics are
+    retained and passed into local_subject_metrics by the main loop.
     """
+    metrics = metrics_out if isinstance(metrics_out, dict) else {}
     if USE_BLUR_FILTER:
-        variance = local_blur_variance(image_path)
+        variance = float(metrics.get("blur_variance_full", -1.0) or -1.0)
+        if variance < 0:
+            variance = local_blur_variance(image_path)
+            metrics["blur_variance_full"] = variance
         if variance >= 0 and variance < HARD_MIN_BLUR_VARIANCE:
             return f"blur_variance_too_low_{variance:.1f}"
 
     if USE_EXPOSURE_FILTER:
-        median = local_exposure_median(image_path)
+        median = float(metrics.get("exposure_median", -1.0) or -1.0)
+        if median < 0:
+            median = local_exposure_median(image_path)
+            metrics["exposure_median"] = median
         if median < HARD_MAX_DARK_MEDIAN:
             return f"image_too_dark_median_{median:.0f}"
         if median > HARD_MIN_BRIGHT_MEDIAN:
@@ -2538,9 +2693,18 @@ def _early_phash_dedup_pass(
     )
     for group in groups:
         members: List[Tuple[str, int]] = group["members"]
+        # No winner scoring is needed when every member survives. This avoids
+        # expensive face/pose analysis for the overwhelmingly common singleton groups.
+        if len(members) <= keep_n:
+            for member_path, _ in members:
+                survivor_set.add(member_path)
+                survivors.append(member_path)
+            perf_count("early_phash_groups_skipped_scoring")
+            continue
+
         ranked_members = []
-        for member_path, _ in members:
-            score_cache[member_path] = pick_fn(member_path)
+        for member_path, member_phash in members:
+            score_cache[member_path] = pick_fn(member_path, member_phash)
             ranked_members.append((member_path, *score_cache[member_path]))
 
         if prefer_resolution_strict:
@@ -2666,7 +2830,177 @@ def early_phash_dedup(image_paths: List[str]) -> Tuple[List[str], List[str], Dic
     return survivors, unique_duplicates, phash_cache
 
 
-def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+def local_quick_cache_path(file_hash: str) -> str:
+    return os.path.join(LOCAL_ANALYSIS_CACHE_DIR, f"{file_hash}.quick.json")
+
+
+def load_cached_local_quick_metrics(file_hash: str) -> Optional[Dict[str, Any]]:
+    if not ENABLE_CACHE or not file_hash:
+        return None
+    path = local_quick_cache_path(file_hash)
+    if not os.path.isfile(path):
+        perf_count("local_quick_miss")
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if payload.get("schema_version") != LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION:
+            perf_count("local_quick_miss")
+            return None
+        if payload.get("settings_fingerprint") != local_analysis_settings_fingerprint():
+            perf_count("local_quick_miss")
+            return None
+        metrics = payload.get("metrics")
+        if isinstance(metrics, dict):
+            perf_count("local_quick_hit")
+            return metrics
+    except Exception:
+        pass
+    perf_count("local_quick_miss")
+    return None
+
+
+def save_cached_local_quick_metrics(file_hash: str, metrics: Dict[str, Any]) -> None:
+    if not ENABLE_CACHE or not file_hash:
+        return
+    payload = {
+        "schema_version": LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION,
+        "settings_fingerprint": local_analysis_settings_fingerprint(),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "metrics": {
+            "blur_variance_full": metrics.get("blur_variance_full", -1.0),
+            "exposure_median": metrics.get("exposure_median", -1.0),
+        },
+    }
+    try:
+        _atomic_write_json(local_quick_cache_path(file_hash), payload)
+    except Exception:
+        pass
+
+
+def _init_local_vision_models() -> None:
+    """Lazy-init MediaPipe/Haar only when an uncached local analysis needs it."""
+    global MP_FACE, MP_POSE, HAAR_CASCADE, LOCAL_VISION_INIT_ATTEMPTED
+    if LOCAL_VISION_INIT_ATTEMPTED:
+        return
+    with LOCAL_VISION_INIT_LOCK:
+        if LOCAL_VISION_INIT_ATTEMPTED:
+            return
+        LOCAL_VISION_INIT_ATTEMPTED = True
+        started = time.perf_counter()
+        if HAVE_MP:
+            try:
+                MP_FACE = mp.solutions.face_detection.FaceDetection(
+                    model_selection=1,
+                    min_detection_confidence=0.5,
+                )
+                MP_POSE = mp.solutions.pose.Pose(
+                    static_image_mode=True,
+                    model_complexity=1,
+                    enable_segmentation=False,
+                    min_detection_confidence=0.5,
+                )
+            except Exception:
+                MP_FACE = None
+                MP_POSE = None
+        if HAVE_CV2:
+            try:
+                cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                HAAR_CASCADE = cv2.CascadeClassifier(cascade_path)
+            except Exception:
+                HAAR_CASCADE = None
+        perf_count("local_vision_models_initialized")
+        perf_add_time("local_vision_model_init", time.perf_counter() - started)
+
+
+def local_analysis_cache_path(file_hash: str) -> str:
+    return os.path.join(LOCAL_ANALYSIS_CACHE_DIR, f"{file_hash}.json")
+
+
+def local_analysis_settings_fingerprint() -> str:
+    payload = {
+        "schema": LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION,
+        "have_cv2": bool(HAVE_CV2),
+        "have_mp": bool(HAVE_MP),
+        "use_phash": bool(USE_PHASH_DUPLICATE_SCORING),
+        "grayscale": [
+            GRAYSCALE_SATURATION_THRESHOLD,
+            GRAYSCALE_CHANNEL_DELTA_THRESHOLD,
+            GRAYSCALE_RELAXED_SATURATION_THRESHOLD,
+            GRAYSCALE_RELAXED_CHANNEL_DELTA_THRESHOLD,
+            GRAYSCALE_PIXEL_DELTA_THRESHOLD,
+            GRAYSCALE_PIXEL_SHARE_THRESHOLD,
+        ],
+        "tint": [TINT_MIN_ASYMMETRY, TINT_STRONG_ASYMMETRY, TINT_MIN_STRENGTH_FOR_CAPTION],
+        "subject_landmark_vis": SUBJECT_LANDMARK_VIS_MIN,
+        "blur_normalize": BLUR_NORMALIZE_LONG_EDGE,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def load_cached_local_analysis(file_hash: str) -> Optional[Dict[str, Any]]:
+    if not ENABLE_CACHE or not file_hash:
+        return None
+    path = local_analysis_cache_path(file_hash)
+    if not os.path.isfile(path):
+        perf_count("local_analysis_miss")
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if payload.get("schema_version") != LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION:
+            perf_count("local_analysis_miss")
+            return None
+        if payload.get("settings_fingerprint") != local_analysis_settings_fingerprint():
+            perf_count("local_analysis_miss")
+            return None
+        metrics = payload.get("metrics")
+        if not isinstance(metrics, dict):
+            perf_count("local_analysis_miss")
+            return None
+        perf_count("local_analysis_hit")
+        return metrics
+    except Exception:
+        perf_count("local_analysis_miss")
+        return None
+
+
+def save_cached_local_analysis(file_hash: str, metrics: Dict[str, Any]) -> None:
+    if not ENABLE_CACHE or not file_hash:
+        return
+    payload = {
+        "schema_version": LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION,
+        "settings_fingerprint": local_analysis_settings_fingerprint(),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "metrics": metrics,
+    }
+    try:
+        _atomic_write_json(local_analysis_cache_path(file_hash), payload)
+    except Exception:
+        pass
+
+
+def local_subject_metrics(
+    image_path: str,
+    phash_cache: Optional[Dict[str, int]] = None,
+    file_hash: Optional[str] = None,
+    precomputed_metrics: Optional[Dict[str, Any]] = None,
+    allow_persistent_cache: bool = True,
+    cache_already_checked: bool = False,
+) -> Dict[str, Any]:
+    started = time.perf_counter()
+    effective_hash = file_hash or (file_sha1(image_path) if allow_persistent_cache else "")
+    if allow_persistent_cache and effective_hash and not cache_already_checked:
+        cached = load_cached_local_analysis(effective_hash)
+        if cached is not None:
+            result = dict(cached)
+            if phash_cache and image_path in phash_cache:
+                result["phash"] = phash_cache[image_path]
+            result["mtime_bucket"] = get_file_mtime_bucket(image_path)
+            perf_add_time("local_analysis", time.perf_counter() - started)
+            return result
+
     width, height = image_dimensions(image_path)
     metrics: Dict[str, Any] = {
         "width": width,
@@ -2675,9 +3009,9 @@ def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]]
         "face_count_local": 0,
         "main_face_bbox": None,
         "main_face_ratio": 0.0,
-        "secondary_face_area_ratio": 0.0,  # 2.-grösstes Gesicht / grösstes Gesicht (0..1). 0.0 = nur ein Gesicht.
+        "secondary_face_area_ratio": 0.0,
         "pose_bbox": None,
-        "torso_landmark_count": -1,  # -1 = MediaPipe nicht gelaufen / nicht verfuegbar
+        "torso_landmark_count": -1,
         "phash": None,
         "mtime_bucket": get_file_mtime_bucket(image_path),
         "color_saturation_mean": 0.0,
@@ -2685,11 +3019,20 @@ def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]]
         "is_grayscale_filter": False,
         "color_tint_label": "",
         "color_tint_strength": 0.0,
+        "blur_variance_full": -1.0,
+        "exposure_median": -1.0,
     }
+    if isinstance(precomputed_metrics, dict):
+        metrics.update({k: v for k, v in precomputed_metrics.items() if v is not None})
+
+    if float(metrics.get("blur_variance_full", -1.0)) < 0 and USE_BLUR_FILTER:
+        metrics["blur_variance_full"] = local_blur_variance(image_path)
+    if float(metrics.get("exposure_median", -1.0)) < 0 and USE_EXPOSURE_FILTER:
+        metrics["exposure_median"] = local_exposure_median(image_path)
+
     metrics.update(local_colorfulness_metrics(image_path))
 
     if USE_PHASH_DUPLICATE_SCORING:
-        # Aus Early-Dedup-Cache wiederverwenden wenn vorhanden
         if phash_cache and image_path in phash_cache:
             metrics["phash"] = phash_cache[image_path]
         else:
@@ -2698,96 +3041,94 @@ def local_subject_metrics(image_path: str, phash_cache: Optional[Dict[str, int]]
             except Exception:
                 metrics["phash"] = None
 
-    if not HAVE_CV2:
-        return metrics
+    _init_local_vision_models()
+    if HAVE_CV2:
+        img_bgr = cv2.imread(image_path)
+        if img_bgr is not None:
+            h, w = img_bgr.shape[:2]
+            rgb = None
+            if MP_FACE is not None or MP_POSE is not None:
+                try:
+                    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                except Exception:
+                    rgb = None
 
-    img_bgr = cv2.imread(image_path)
-    if img_bgr is None:
-        return metrics
+            if MP_FACE is not None and rgb is not None:
+                try:
+                    face_result = MP_FACE.process(rgb)
+                    if face_result and face_result.detections:
+                        boxes = []
+                        for det in face_result.detections:
+                            bbox = det.location_data.relative_bounding_box
+                            x = clamp_int(int(bbox.xmin * w), 0, w - 1)
+                            y = clamp_int(int(bbox.ymin * h), 0, h - 1)
+                            bw = clamp_int(int(bbox.width * w), 1, w)
+                            bh = clamp_int(int(bbox.height * h), 1, h)
+                            boxes.append((x, y, bw, bh, float(det.score[0])))
+                        metrics["face_count_local"] = len(boxes)
+                        sorted_boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+                        best = sorted_boxes[0]
+                        metrics["main_face_bbox"] = [best[0], best[1], best[2], best[3]]
+                        metrics["main_face_ratio"] = bbox_area_ratio(metrics["main_face_bbox"], w, h)
+                        if len(sorted_boxes) >= 2:
+                            main_area = max(1, sorted_boxes[0][2] * sorted_boxes[0][3])
+                            sec_area = sorted_boxes[1][2] * sorted_boxes[1][3]
+                            metrics["secondary_face_area_ratio"] = round(sec_area / main_area, 4)
+                except Exception:
+                    pass
 
-    h, w = img_bgr.shape[:2]
+            if metrics["face_count_local"] == 0 and HAAR_CASCADE is not None:
+                try:
+                    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+                    faces = HAAR_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+                    if len(faces) > 0:
+                        metrics["face_count_local"] = len(faces)
+                        sorted_faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+                        x, y, bw, bh = sorted_faces[0]
+                        metrics["main_face_bbox"] = [int(x), int(y), int(bw), int(bh)]
+                        metrics["main_face_ratio"] = bbox_area_ratio(metrics["main_face_bbox"], w, h)
+                        if len(sorted_faces) >= 2:
+                            main_area = max(1, sorted_faces[0][2] * sorted_faces[0][3])
+                            sec_area = sorted_faces[1][2] * sorted_faces[1][3]
+                            metrics["secondary_face_area_ratio"] = round(sec_area / main_area, 4)
+                except Exception:
+                    pass
 
-    if MP_FACE is not None:
-        try:
-            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            face_result = MP_FACE.process(rgb)
-            if face_result and face_result.detections:
-                boxes = []
-                for det in face_result.detections:
-                    bbox = det.location_data.relative_bounding_box
-                    x = clamp_int(int(bbox.xmin * w), 0, w - 1)
-                    y = clamp_int(int(bbox.ymin * h), 0, h - 1)
-                    bw = clamp_int(int(bbox.width * w), 1, w)
-                    bh = clamp_int(int(bbox.height * h), 1, h)
-                    boxes.append((x, y, bw, bh, float(det.score[0])))
-                metrics["face_count_local"] = len(boxes)
-                # Boxes nach Area sortieren (groesstes zuerst), dann Verhaeltnis 2./1. berechnen.
-                # Genutzt von local_status_override fuer dominance-aware multiple_people-Override.
-                sorted_boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-                best = sorted_boxes[0]
-                metrics["main_face_bbox"] = [best[0], best[1], best[2], best[3]]
-                metrics["main_face_ratio"] = bbox_area_ratio(metrics["main_face_bbox"], w, h)
-                if len(sorted_boxes) >= 2:
-                    main_area = max(1, sorted_boxes[0][2] * sorted_boxes[0][3])
-                    sec_area = sorted_boxes[1][2] * sorted_boxes[1][3]
-                    metrics["secondary_face_area_ratio"] = round(sec_area / main_area, 4)
-        except Exception:
-            pass
+            if MP_POSE is not None and rgb is not None:
+                try:
+                    pose_result = MP_POSE.process(rgb)
+                    if pose_result and pose_result.pose_landmarks:
+                        xs, ys = [], []
+                        for lm in pose_result.pose_landmarks.landmark:
+                            if lm.visibility >= 0.45 and 0.0 <= lm.x <= 1.0 and 0.0 <= lm.y <= 1.0:
+                                xs.append(int(lm.x * w))
+                                ys.append(int(lm.y * h))
+                        if len(xs) >= 8:
+                            x1, x2 = max(0, min(xs)), min(w, max(xs))
+                            y1, y2 = max(0, min(ys)), min(h, max(ys))
+                            if x2 > x1 and y2 > y1:
+                                metrics["pose_bbox"] = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+                        torso_idx = (11, 12, 23, 24)
+                        lms = pose_result.pose_landmarks.landmark
+                        torso_count = 0
+                        for landmark_idx in torso_idx:
+                            if landmark_idx >= len(lms):
+                                continue
+                            lm = lms[landmark_idx]
+                            if (lm.visibility >= SUBJECT_LANDMARK_VIS_MIN
+                                    and 0.0 <= lm.x <= 1.0
+                                    and 0.0 <= lm.y <= 1.0):
+                                torso_count += 1
+                        metrics["torso_landmark_count"] = torso_count
+                    else:
+                        metrics["torso_landmark_count"] = 0
+                except Exception:
+                    pass
 
-    if metrics["face_count_local"] == 0 and HAAR_CASCADE is not None:
-        try:
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            faces = HAAR_CASCADE.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-            if len(faces) > 0:
-                metrics["face_count_local"] = len(faces)
-                sorted_faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-                x, y, bw, bh = sorted_faces[0]
-                metrics["main_face_bbox"] = [int(x), int(y), int(bw), int(bh)]
-                metrics["main_face_ratio"] = bbox_area_ratio(metrics["main_face_bbox"], w, h)
-                if len(sorted_faces) >= 2:
-                    main_area = max(1, sorted_faces[0][2] * sorted_faces[0][3])
-                    sec_area = sorted_faces[1][2] * sorted_faces[1][3]
-                    metrics["secondary_face_area_ratio"] = round(sec_area / main_area, 4)
-        except Exception:
-            pass
-
-    if MP_POSE is not None:
-        try:
-            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            pose_result = MP_POSE.process(rgb)
-            if pose_result and pose_result.pose_landmarks:
-                xs, ys = [], []
-                for lm in pose_result.pose_landmarks.landmark:
-                    if lm.visibility >= 0.45 and 0.0 <= lm.x <= 1.0 and 0.0 <= lm.y <= 1.0:
-                        xs.append(int(lm.x * w))
-                        ys.append(int(lm.y * h))
-                if len(xs) >= 8:
-                    x1, x2 = max(0, min(xs)), min(w, max(xs))
-                    y1, y2 = max(0, min(ys)), min(h, max(ys))
-                    if x2 > x1 and y2 > y1:
-                        metrics["pose_bbox"] = [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
-
-                # Torso-Landmark-Count mitberechnen (vermeidet zweiten
-                # MediaPipe-Call spaeter in subject_torso_landmark_count).
-                # Indizes: 11/12 = Schultern, 23/24 = Hueften.
-                torso_idx = (11, 12, 23, 24)
-                lms = pose_result.pose_landmarks.landmark
-                torso_count = 0
-                for idx in torso_idx:
-                    if idx >= len(lms):
-                        continue
-                    lm = lms[idx]
-                    if (lm.visibility >= SUBJECT_LANDMARK_VIS_MIN
-                            and 0.0 <= lm.x <= 1.0
-                            and 0.0 <= lm.y <= 1.0):
-                        torso_count += 1
-                metrics["torso_landmark_count"] = torso_count
-            else:
-                # Pose-Detection hat nichts gefunden -> 0 Landmarks
-                metrics["torso_landmark_count"] = 0
-        except Exception:
-            pass
-
+    if allow_persistent_cache and effective_hash:
+        save_cached_local_analysis(effective_hash, metrics)
+    perf_count("local_analysis_computed")
+    perf_add_time("local_analysis", time.perf_counter() - started)
     return metrics
 
 
@@ -2943,6 +3284,7 @@ def dataset_fingerprint(image_paths: List[str]) -> str:
 def load_cached_early_results(dataset_fp: str, settings_fp: str) -> Optional[Dict[str, Any]]:
     path = early_result_cache_path()
     if not ENABLE_CACHE or not os.path.exists(path):
+        perf_count("early_result_miss")
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -2954,9 +3296,12 @@ def load_cached_early_results(dataset_fp: str, settings_fp: str) -> Optional[Dic
         if data.get("dataset_fingerprint") != dataset_fp:
             return None
         if data.get("settings_fingerprint") != settings_fp:
+            perf_count("early_result_miss")
             return None
+        perf_count("early_result_hit")
         return data
     except Exception:
+        perf_count("early_result_miss")
         return None
 
 
@@ -3040,11 +3385,15 @@ def apply_early_static_rejects(image_paths: List[str]) -> Tuple[List[str], List[
 def load_cached_audit(file_hash: str) -> Optional[Dict[str, Any]]:
     path = cache_path_for_file(file_hash)
     if not ENABLE_CACHE or not os.path.exists(path):
+        perf_count("audit_miss")
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        perf_count("audit_hit")
+        return data
     except Exception:
+        perf_count("audit_miss")
         return None
 
 
@@ -3121,27 +3470,70 @@ def save_clip_embedding_cached(file_hash: str, vec: np.ndarray) -> None:
     np.save(path, vec.astype(np.float32))
 
 
+def _init_clip_model() -> bool:
+    global CLIP_MODEL, CLIP_PREPROCESS, CLIP_INIT_ATTEMPTED
+    if CLIP_MODEL is not None and CLIP_PREPROCESS is not None:
+        return True
+    if CLIP_INIT_ATTEMPTED or not USE_CLIP_DUPLICATE_SCORING or not HAVE_CLIP:
+        return False
+    with CLIP_INIT_LOCK:
+        if CLIP_MODEL is not None and CLIP_PREPROCESS is not None:
+            return True
+        if CLIP_INIT_ATTEMPTED:
+            return False
+        CLIP_INIT_ATTEMPTED = True
+        started = time.perf_counter()
+        try:
+            CLIP_MODEL, _, CLIP_PREPROCESS = open_clip.create_model_and_transforms(
+                CLIP_MODEL_NAME,
+                pretrained=CLIP_PRETRAINED,
+                device=CLIP_DEVICE,
+            )
+            CLIP_MODEL.eval()
+            perf_count("clip_model_initialized")
+            perf_add_time("clip_model_init", time.perf_counter() - started)
+            safe_print(f"   CLIP ready ({CLIP_MODEL_NAME}, {CLIP_DEVICE})")
+            return True
+        except Exception as exc:
+            CLIP_MODEL = None
+            CLIP_PREPROCESS = None
+            perf_add_time("clip_model_init", time.perf_counter() - started)
+            safe_print(f"   ⚠️ CLIP init failed ({exc}); semantic duplicate scoring disabled.")
+            return False
+
+
 def compute_clip_embedding(image_path: str, file_hash: str) -> Optional[np.ndarray]:
-    if not USE_CLIP_DUPLICATE_SCORING or not HAVE_CLIP or CLIP_MODEL is None or CLIP_PREPROCESS is None:
+    started = time.perf_counter()
+    if not USE_CLIP_DUPLICATE_SCORING or not HAVE_CLIP:
         return None
 
+    # Cache is checked BEFORE model initialization. Fully cached runs therefore
+    # never load PyTorch/OpenCLIP weights at all.
     cached = load_clip_embedding_cached(file_hash)
     if cached is not None:
+        perf_count("clip_hit")
+        perf_add_time("clip", time.perf_counter() - started)
         return cached
+    perf_count("clip_miss")
+
+    if not _init_clip_model():
+        perf_add_time("clip", time.perf_counter() - started)
+        return None
 
     try:
-        img = Image.open(image_path)
-        img = ImageOps.exif_transpose(img).convert("RGB")
-        tensor = CLIP_PREPROCESS(img).unsqueeze(0).to(CLIP_DEVICE)
-
+        with Image.open(image_path) as opened:
+            img = ImageOps.exif_transpose(opened).convert("RGB")
+            tensor = CLIP_PREPROCESS(img).unsqueeze(0).to(CLIP_DEVICE)
         with torch.no_grad():
             features = CLIP_MODEL.encode_image(tensor)
             features = features / features.norm(dim=-1, keepdim=True)
             vec = features[0].detach().cpu().numpy().astype(np.float32)
-
         save_clip_embedding_cached(file_hash, vec)
+        perf_count("clip_computed")
+        perf_add_time("clip", time.perf_counter() - started)
         return vec
     except Exception:
+        perf_add_time("clip", time.perf_counter() - started)
         return None
 
 
@@ -3223,7 +3615,9 @@ def compute_arcface_embedding(image_path: str, file_hash: str) -> Optional[np.nd
 
     cached = load_arcface_embedding_cached(file_hash)
     if cached is not None:
+        perf_count("arcface_hit")
         return cached
+    perf_count("arcface_miss")
 
     app = _init_arcface_app()
     if app is None:
@@ -3637,6 +4031,16 @@ def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "
                     raise OpenAITokenBudgetExceeded(
                         f"OpenAI token limit reached after {phase_label}: {used:,} / {limit:,} tokens used."
                     )
+            api_elapsed = time.time() - started_at
+            perf_add_time("openai_api", api_elapsed)
+            perf_count("openai_requests_actual")
+            delay = max(0.0, float(SLEEP_BETWEEN_CALLS or 0.0))
+            if delay > 0:
+                time.sleep(delay)
+                with _PERF_LOCK:
+                    PERFORMANCE_STATS["artificial_wait_seconds"] = float(
+                        PERFORMANCE_STATS.get("artificial_wait_seconds", 0.0)
+                    ) + delay
             return data
         except OpenAITokenBudgetExceeded:
             stop_phase_heartbeat(attempt_label, started_at, stop_event, thread, success=False)
@@ -8062,6 +8466,7 @@ def write_caption_stage_reports(
     warnings: List[str],
     valid_candidate_count: int,
 ) -> None:
+    _report_started = time.perf_counter()
     csv_fields = [
         "original_filename", "base_status", "selected", "output_bucket", "new_basename",
         "quality_total", "quality_total_before_local_penalties", "grundscore", "score_nach_eskalation", "quality_sharpness",
@@ -8111,6 +8516,8 @@ def write_caption_stage_reports(
     jsonl_path = os.path.join(OUTPUT_ROOT, f"dataset_audit_{SAFE_TRIGGER}.jsonl")
     write_jsonl(jsonl_path, make_json_safe(all_rows))
 
+    flush_file_hash_index()
+    performance_summary = performance_snapshot()
     summary = {
         "input_images": len(all_rows),
         "kept_clean_candidates_before_selection": valid_candidate_count,
@@ -8170,10 +8577,12 @@ def write_caption_stage_reports(
         "global_rules": global_rules,
         "identity_check": identity_summary,
         "subject_profile": subject_profile_report_summary(subject_profile),
+        "performance": performance_summary,
     }
 
     md_path = os.path.join(OUTPUT_ROOT, f"dataset_report_{SAFE_TRIGGER}.md")
     save_report_md(md_path, report)
+    perf_add_time("report_write", time.perf_counter() - _report_started)
 
     safe_print("")
     safe_print("=" * 70)
@@ -10766,6 +11175,28 @@ def save_report_md(path: str, report: Dict[str, Any]) -> None:
                     f"total_tokens={usage.get('total_tokens', 0)}"
                 )
         lines.append("")
+    performance = report.get("performance", {}) or {}
+    if performance:
+        lines.append("## Performance")
+        lines.append("")
+        lines.append(f"- total_seconds: {performance.get('total_seconds', 0)}")
+        lines.append(f"- artificial_api_wait_seconds: {performance.get('artificial_wait_seconds', 0)}")
+        timings = performance.get("timings_seconds", {}) or {}
+        if timings:
+            lines.append("")
+            lines.append("### Timings")
+            lines.append("")
+            for name, seconds in timings.items():
+                lines.append(f"- `{name}`: {seconds}s")
+        cache_counts = performance.get("cache_counts", {}) or {}
+        if cache_counts:
+            lines.append("")
+            lines.append("### Cache statistics")
+            lines.append("")
+            for name, count in cache_counts.items():
+                lines.append(f"- `{name}`: {count}")
+        lines.append("")
+
     if report.get("warnings"):
         lines.append("## Warnings")
         lines.append("")
@@ -10887,6 +11318,7 @@ def generate_dashboard(all_rows: List[Dict[str, Any]], selected: List[Dict[str, 
     return "\n".join(lines)
 
 def main() -> None:
+    reset_performance_stats()
     warnings: List[str] = []
     budget_limit_reached = False
 
@@ -10930,13 +11362,16 @@ def main() -> None:
     for w in warnings:
         safe_print(f"⚠️ {w}")
 
+    _scan_started = time.perf_counter()
     image_paths = iter_input_images(INPUT_FOLDER)
+    perf_add_time("input_scan", time.perf_counter() - _scan_started)
     if not image_paths:
         safe_print("No images found.")
         return
 
     safe_print(f"Images found: {len(image_paths)}")
 
+    _early_started = time.perf_counter()
     dataset_fp = dataset_fingerprint(image_paths)
     settings_fp = early_result_settings_fingerprint()
     cached_early = load_cached_early_results(dataset_fp, settings_fp)
@@ -10987,6 +11422,7 @@ def main() -> None:
             f"{len(early_reject_rows)} early rejects, {len(early_dup_paths)} early duplicates"
         )
 
+    perf_add_time("early_filter_dedupe", time.perf_counter() - _early_started)
     safe_print(f"Starting audit for trigger word: {TRIGGER_WORD}")
     safe_print("")
 
@@ -11010,6 +11446,7 @@ def main() -> None:
         })
 
     # PASS 1: Audit pro Bild
+    _audit_loop_started = time.perf_counter()
     for idx, image_path in enumerate(image_paths, start=1):
         original_filename = os.path.basename(image_path)
         safe_print(f"[{idx}/{len(image_paths)}] {original_filename}")
@@ -11036,6 +11473,7 @@ def main() -> None:
                     f"[{idx}/{len(image_paths)}] ig_frame_detect {original_filename}",
                     detect_and_crop_ig_frame,
                     image_path,
+                    source_hash=file_hash,
                 )
                 if ig_cropped_path:
                     # Dimensionen und Hash des bereinigten Bildes übernehmen
@@ -11066,11 +11504,17 @@ def main() -> None:
                         continue
 
             # ── Vorfilter STUFE 2: Blur/Exposure auf gecroptem Bild ────────
-            # Diese Checks laufen NACH dem IG-Crop, damit z.B. ein schwarzer
-            # Android-Nav-Bar die Helligkeits-Mediane nicht verfaelscht und
-            # die Laplacian-Varianz nur den echten Bildinhalt bewertet.
-            quick_reject_reason = local_quick_reject_post_crop(image_path, width, height)
+            # A complete local-analysis cache also contains these quick metrics,
+            # so a warm run does not decode the image again.
+            cached_local_meta = load_cached_local_analysis(file_hash)
+            cached_quick_metrics = None if cached_local_meta is not None else load_cached_local_quick_metrics(file_hash)
+            quick_metrics: Dict[str, Any] = dict(cached_local_meta or cached_quick_metrics or {})
+            quick_reject_reason = local_quick_reject_post_crop(
+                image_path, width, height, metrics_out=quick_metrics
+            )
             if quick_reject_reason:
+                if cached_local_meta is None and cached_quick_metrics is None:
+                    save_cached_local_quick_metrics(file_hash, quick_metrics)
                 row.update({
                     "width": width,
                     "height": height,
@@ -11086,12 +11530,21 @@ def main() -> None:
 
             primary_audit_cache_key = audit_cache_key(file_hash, AI_MODEL, "primary_audit")
             cached = load_cached_audit(primary_audit_cache_key)
-            local_meta = run_with_heartbeat(
-                f"[{idx}/{len(image_paths)}] local_subject_metrics {original_filename}",
-                local_subject_metrics,
-                image_path,
-                phash_cache=phash_cache,
-            )
+            if cached_local_meta is not None:
+                local_meta = dict(cached_local_meta)
+                if phash_cache and image_path in phash_cache:
+                    local_meta["phash"] = phash_cache[image_path]
+                safe_print("   ↳ Local analysis cache used")
+            else:
+                local_meta = run_with_heartbeat(
+                    f"[{idx}/{len(image_paths)}] local_subject_metrics {original_filename}",
+                    local_subject_metrics,
+                    image_path,
+                    phash_cache=phash_cache,
+                    file_hash=file_hash,
+                    precomputed_metrics=quick_metrics,
+                    cache_already_checked=True,
+                )
             row.update(local_meta)
             row["file_hash"] = file_hash
 
@@ -11254,7 +11707,6 @@ def main() -> None:
                 safe_print(f"   ↳ {row['short_reason']}")
 
             all_rows.append(row)
-            time.sleep(SLEEP_BETWEEN_CALLS)
 
             # ─────────────────────────────────────────────────────────────
             # SMART PRE-CROP: Post-API, basierend auf AI-BBox
@@ -11288,12 +11740,13 @@ def main() -> None:
 
                             crop_primary_cache_key = audit_cache_key(crop_hash, AI_MODEL, "primary_crop_audit")
                             cached_crop = load_cached_audit(crop_primary_cache_key)
-                            # Lokale Metriken (pHash, Pose etc.) IMMER berechnen,
-                            # auch bei Cache-Hit, damit Duplikaterkennung funktioniert.
+                            # Lokale Metriken (pHash, Pose etc.) immer bereitstellen;
+                            # bei Cache-Hit werden sie aus dem lokalen Analyse-Cache geladen.
                             crop_local_meta = run_with_heartbeat(
                                 f"[{idx}/{len(image_paths)}] crop_local_subject_metrics {original_filename}",
                                 local_subject_metrics,
                                 crop_path,
+                                file_hash=crop_hash,
                             )
                             if cached_crop:
                                 crop_audit = cached_crop["audit"] if "audit" in cached_crop else cached_crop
@@ -11412,7 +11865,6 @@ def main() -> None:
                                         f"   ✅ Crop accepted: score={crop_score:.1f} | status={c_base}"
                                     )
                                     all_rows.append(crop_row)
-                                    time.sleep(SLEEP_BETWEEN_CALLS)
                                     # Pair fuer spaetere Vergleichs-Export registrieren
                                     if EXPORT_SMART_CROP_COMPARISON:
                                         crop_pairs.append({
@@ -11489,6 +11941,7 @@ def main() -> None:
                             f"[{idx}/{len(image_paths)}] medium_rescue_local_metrics {original_filename}",
                             local_subject_metrics,
                             rescue_path,
+                            file_hash=rescue_hash,
                         )
                         if cached_rescue:
                             rescue_audit = cached_rescue.get("audit", cached_rescue)
@@ -11571,7 +12024,6 @@ def main() -> None:
                                     f"   ✅ Medium rescue accepted: score={rescue_row.get('quality_total', 0):.1f} | status={r_base}"
                                 )
                                 all_rows.append(rescue_row)
-                                time.sleep(SLEEP_BETWEEN_CALLS)
                             else:
                                 safe_print("   ❌ Medium rescue rejected: gain too small")
                     except Exception as rescue_e:
@@ -11604,7 +12056,10 @@ def main() -> None:
         if budget_limit_reached:
             break
 
+    perf_add_time("audit_loop_total", time.perf_counter() - _audit_loop_started)
+
     # PASS 2: Duplicate-Filter
+    _selection_started = time.perf_counter()
     mark_duplicates(all_rows)
 
     # PASS 3: Globale Regeln
@@ -12017,7 +12472,10 @@ def main() -> None:
         safe_print(f"✅ Smart-crop comparisons: {SMART_CROP_COMPARISON_DIR}")
 
 
+    perf_add_time("selection_profile_export", time.perf_counter() - _selection_started)
+
     # PASS 6: Reports
+    _report_started = time.perf_counter()
     csv_fields = [
         "original_filename",
         "base_status",
@@ -12140,6 +12598,8 @@ def main() -> None:
         json_rows.append(row_copy)
     write_jsonl(jsonl_path, json_rows)
 
+    flush_file_hash_index()
+    performance_summary = performance_snapshot()
     summary = {
         "input_images": len(all_rows),
         "kept_clean_candidates_before_selection": len(valid_candidates),
@@ -12181,6 +12641,15 @@ def main() -> None:
         "caption_local_fallback_count": sum(1 for r in selected_sorted if r.get("caption_source") == "local_fallback"),
         "controlled_buckets": bool(USE_CONTROLLED_BUCKETS),
         "medium_rescue_crop_enabled": bool(ENABLE_MEDIUM_RESCUE_CROP),
+        "performance_total_seconds": performance_summary.get("total_seconds", 0.0),
+        "cache_audit_hits": performance_summary.get("cache_counts", {}).get("audit_hit", 0),
+        "cache_audit_misses": performance_summary.get("cache_counts", {}).get("audit_miss", 0),
+        "cache_local_analysis_hits": performance_summary.get("cache_counts", {}).get("local_analysis_hit", 0),
+        "cache_local_analysis_computed": performance_summary.get("cache_counts", {}).get("local_analysis_computed", 0),
+        "cache_ig_positive_hits": performance_summary.get("cache_counts", {}).get("ig_positive_hit", 0),
+        "cache_ig_negative_hits": performance_summary.get("cache_counts", {}).get("ig_negative_hit", 0),
+        "cache_clip_hits": performance_summary.get("cache_counts", {}).get("clip_hit", 0),
+        "cache_clip_misses": performance_summary.get("cache_counts", {}).get("clip_miss", 0),
     }
     openai_usage_summary = build_openai_usage_summary()
     summary.update({
@@ -12234,10 +12703,12 @@ def main() -> None:
         "global_rules": global_rules,
         "identity_check": identity_summary,
         "subject_profile": subject_profile_report_summary(subject_profile),
+        "performance": performance_summary,
     }
 
     md_path = os.path.join(OUTPUT_ROOT, f"dataset_report_{SAFE_TRIGGER}.md")
     save_report_md(md_path, report)
+    perf_add_time("report_write", time.perf_counter() - _report_started)
 
     safe_print("")
     safe_print("=" * 70)
