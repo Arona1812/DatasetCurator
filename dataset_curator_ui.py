@@ -17,6 +17,7 @@ import inspect
 import subprocess
 import sys
 import threading
+import signal
 import time
 from glob import glob
 from pathlib import Path
@@ -76,6 +77,8 @@ if not os.path.isfile(VENV_PYTHON):
     VENV_PYTHON = sys.executable
 
 _active_process: Optional[subprocess.Popen] = None
+_active_process_lock = threading.RLock()
+_cancel_requested = threading.Event()
 
 
 # ============================================================
@@ -2056,20 +2059,72 @@ def format_openai_usage_text(requests_count: int, input_tokens: int, output_toke
     )
 
 
-def kill_process():
-    global _active_process
-    if _active_process and _active_process.poll() is None:
+def _terminate_process_tree(proc: subprocess.Popen, graceful_timeout: float = 3.0) -> None:
+    """Terminate the active runner and any child processes without blocking the UI queue."""
+    if proc.poll() is not None:
+        return
+
+    if sys.platform == "win32":
+        # taskkill /T also terminates descendants (for example ffmpeg).  The
+        # curator itself usually has no children, but using the process tree
+        # avoids orphaned workers after a cancel action.
         try:
-            _active_process.terminate()
-            _active_process.wait(timeout=5)
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(2.0, graceful_timeout + 1.0),
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
         except Exception:
             try:
-                _active_process.kill()
+                proc.terminate()
             except Exception:
                 pass
-    _active_process = None
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    try:
+        proc.wait(timeout=graceful_timeout)
+        return
+    except Exception:
+        pass
+
+    if sys.platform != "win32":
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def kill_process():
+    """Request cancellation and terminate the current subprocess immediately."""
+    _cancel_requested.set()
+    with _active_process_lock:
+        proc = _active_process
+
+    if proc is None or proc.poll() is not None:
+        _cleanup_stale_configs()
+        return tr("⏹ Kein aktiver Prozess.", "⏹ No active process.")
+
+    _terminate_process_tree(proc)
     _cleanup_stale_configs()
-    return tr("⏹ Prozess abgebrochen.", "⏹ Process cancelled.")
+    return tr("⏹ Abbruch angefordert – Prozess wurde beendet.", "⏹ Cancellation requested – process terminated.")
 
 
 # ============================================================
@@ -2083,6 +2138,15 @@ def run_script(
     image_scan_folder: Optional[str] = None,
 ) -> Generator:
     global _active_process
+
+    with _active_process_lock:
+        existing = _active_process
+        if existing is not None and existing.poll() is None:
+            yield "", [], 0.0, tr(
+                "⚠️ Es läuft bereits ein Prozess. Bitte zuerst abbrechen oder warten.",
+                "⚠️ A process is already running. Cancel it or wait for it to finish.",
+            ), format_openai_usage_text(0, 0, 0, 0)
+            return
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(config_data, f, ensure_ascii=False, indent=2)
@@ -2107,12 +2171,22 @@ def run_script(
         env=env,
     )
     if sys.platform == "win32":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        popen_kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    else:
+        # Gives the runner its own process group so cancellation can also stop
+        # descendants such as ffmpeg.
+        popen_kwargs["start_new_session"] = True
 
-    _active_process = subprocess.Popen(
+    _cancel_requested.clear()
+    proc = subprocess.Popen(
         [VENV_PYTHON, script_path],
         **popen_kwargs,
     )
+    with _active_process_lock:
+        _active_process = proc
 
     log_lines: List[str] = []
     progress = 0.0
@@ -2128,9 +2202,17 @@ def run_script(
     openai_output_tokens = 0
     openai_total_tokens = 0
     openai_usage_text = format_openai_usage_text(0, 0, 0, 0)
+    rc: Optional[int] = None
 
     try:
-        for line in _active_process.stdout:
+        stdout = proc.stdout
+        if stdout is None:
+            raise RuntimeError("Subprocess stdout is unavailable")
+
+        for line in stdout:
+            if _cancel_requested.is_set():
+                break
+
             line = line.rstrip("\n\r")
             log_lines.append(line)
 
@@ -2186,27 +2268,32 @@ def run_script(
                 status_de = f"⏳ Läuft... ({int(progress*100)}%)"
                 status_en = f"⏳ Running... ({int(progress*100)}%)"
 
-            yield log_text, images, progress, tr(
-                status_de,
-                status_en,
-            ), openai_usage_text
+            yield log_text, images, progress, tr(status_de, status_en), openai_usage_text
 
     except Exception as e:
-        log_lines.append(tr(f"\n⚠️ Fehler: {e}", f"\n⚠️ Error: {e}"))
+        if not _cancel_requested.is_set():
+            log_lines.append(tr(f"\n⚠️ Fehler: {e}", f"\n⚠️ Error: {e}"))
+    finally:
+        if _cancel_requested.is_set() and proc.poll() is None:
+            _terminate_process_tree(proc)
 
-    try:
-        rc = _active_process.wait(timeout=30)
-    except Exception:
-        _active_process.kill()
-        rc = -1
+        try:
+            rc = proc.wait(timeout=10)
+        except Exception:
+            _terminate_process_tree(proc, graceful_timeout=1.0)
+            rc = proc.poll()
+            if rc is None:
+                rc = -1
 
-    _active_process = None
+        with _active_process_lock:
+            if _active_process is proc:
+                _active_process = None
 
-    try:
-        if os.path.exists(config_path):
-            os.remove(config_path)
-    except Exception:
-        pass
+        try:
+            if os.path.exists(config_path):
+                os.remove(config_path)
+        except Exception:
+            pass
 
     if image_scan_folder:
         images = load_gallery_images(scan_images(image_scan_folder))
@@ -2217,8 +2304,15 @@ def run_script(
     if last_progress_idx > 0:
         avg_seconds_per_item = total_elapsed / last_progress_idx
 
-    status = (
-        tr(
+    was_cancelled = _cancel_requested.is_set()
+    if was_cancelled:
+        status = tr(
+            f"⏹ Abgebrochen nach {format_duration(total_elapsed)}.",
+            f"⏹ Cancelled after {format_duration(total_elapsed)}.",
+        )
+        final_progress = progress
+    elif rc == 0:
+        status = tr(
             (
                 f"✅ Fertig! {last_progress_idx}/{last_progress_total} Bilder | "
                 f"Ø {avg_seconds_per_item:.1f} s/Bild | Gesamt {format_duration(total_elapsed)}"
@@ -2232,10 +2326,15 @@ def run_script(
             if avg_seconds_per_item is not None and last_progress_total > 0
             else f"✅ Done! ({len(log_lines)} lines)",
         )
-        if rc == 0
-        else tr(f"❌ Fehlercode {rc}", f"❌ Exit code {rc}")
-    )
-    yield log_text, images, 1.0, status, openai_usage_text
+        final_progress = 1.0
+    else:
+        status = tr(f"❌ Fehlercode {rc}", f"❌ Exit code {rc}")
+        final_progress = progress
+
+    # Clear only after the final status has been derived.  A new run also
+    # clears the flag before launching, so this cannot leak across runs.
+    _cancel_requested.clear()
+    yield log_text, images, final_progress, status, openai_usage_text
 
 
 # ============================================================
@@ -4499,8 +4598,20 @@ def build_ui() -> gr.Blocks:
                     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
                 ]
 
-                c_start_btn.click(fn=start_curator, inputs=curator_inputs, outputs=[c_log, c_gallery, c_progress, c_status, c_openai_usage])
-                c_stop_btn.click(fn=kill_process, outputs=[c_status])
+                c_run_event = c_start_btn.click(
+                    fn=start_curator,
+                    inputs=curator_inputs,
+                    outputs=[c_log, c_gallery, c_progress, c_status, c_openai_usage],
+                    concurrency_id="dataset_curator_process",
+                    concurrency_limit=1,
+                )
+                c_stop_btn.click(
+                    fn=kill_process,
+                    outputs=[c_status],
+                    queue=False,
+                    cancels=[c_run_event],
+                    show_progress="hidden",
+                )
 
             # ==============================================================
             # TAB 2: SUBJECT PROFILE (Phase 3 UI gate)
@@ -4843,6 +4954,7 @@ def build_ui() -> gr.Blocks:
                         variant="primary",
                         scale=2,
                     )
+                    p_stop_btn = gr.Button(tr("⏹ Abbrechen", "⏹ Cancel"), variant="stop", scale=1)
 
                 # Live log + gallery für Phase 3 Continue-Run
                 with gr.Row():
@@ -4970,14 +5082,24 @@ def build_ui() -> gr.Blocks:
                 def _sync_trigger_input(trigger_value, input_value):
                     return trigger_value, input_value
 
-                p_continue_btn.click(
+                p_sync_event = p_continue_btn.click(
                     fn=_sync_trigger_input,
                     inputs=[p_trigger, p_input],
                     outputs=[c_trigger, c_input],
-                ).then(
+                )
+                p_run_event = p_sync_event.then(
                     fn=start_caption_from_profile,
                     inputs=curator_inputs,  # dieselbe Liste wie der ehemalige Continue-Button im Curator-Tab
                     outputs=[p_log, p_gallery, p_progress, p_status_run, p_openai_usage],
+                    concurrency_id="dataset_curator_process",
+                    concurrency_limit=1,
+                )
+                p_stop_btn.click(
+                    fn=kill_process,
+                    outputs=[p_status_run],
+                    queue=False,
+                    cancels=[p_run_event],
+                    show_progress="hidden",
                 )
 
             # ==============================================================
@@ -5082,8 +5204,20 @@ def build_ui() -> gr.Blocks:
                         v_gallery = gr.Gallery(label=tr("Extrahierte Frames", "Extracted frames"), columns=3, rows=3, height=340, object_fit="cover")
 
                 video_inputs = [v_source, v_target, v_ref, v_fpm, v_fps, v_sim, v_sharp]
-                v_start_btn.click(fn=start_video, inputs=video_inputs, outputs=[v_log, v_gallery, v_progress, v_status, v_openai_usage])
-                v_stop_btn.click(fn=kill_process, outputs=[v_status])
+                v_run_event = v_start_btn.click(
+                    fn=start_video,
+                    inputs=video_inputs,
+                    outputs=[v_log, v_gallery, v_progress, v_status, v_openai_usage],
+                    concurrency_id="dataset_curator_process",
+                    concurrency_limit=1,
+                )
+                v_stop_btn.click(
+                    fn=kill_process,
+                    outputs=[v_status],
+                    queue=False,
+                    cancels=[v_run_event],
+                    show_progress="hidden",
+                )
 
             # ==============================================================
             # TAB 4: ERGEBNISSE

@@ -352,3 +352,15 @@ The profile JSON records:
 - `normalizer_primary_error`
 
 A retry rebuilds only the Subject Profile response. It does not repeat the individual image audits.
+
+### Immediate and process-safe cancellation
+
+The Curator, Subject Profile caption continuation, and Video Processor now use an immediate cancellation action that is not queued behind the active Gradio generator.
+
+- Cancel callbacks use `queue=False` and cancel the associated Gradio run event.
+- The active subprocess is stored and accessed under a thread lock.
+- On Windows, cancellation terminates the complete process tree with `taskkill /T /F`; on Unix-like systems it terminates the dedicated process group.
+- The log streamer keeps its own subprocess reference, avoiding races when the UI requests cancellation.
+- Cancelled runs retain their current progress instead of being shown as 100% complete.
+- Temporary UI configuration files are cleaned up after cancellation.
+- A second run cannot start while an active process is still running.
