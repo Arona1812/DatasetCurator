@@ -1084,10 +1084,36 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     total = profile.get("total_usable_images", "?")
     model = profile.get("normalizer_model", "?")
     schema = profile.get("profile_schema_version", "?")
-    status = tr(
-        f"✅ Profil geladen — Sample {sample}/{total} | {model} | schema {schema}",
-        f"✅ Profile loaded — sample {sample}/{total} | {model} | schema {schema}",
-    )
+    retry_count = int(profile.get("normalizer_retry_count", 0) or 0)
+    primary_error = str(profile.get("normalizer_primary_error", "") or "").strip()
+    if not primary_error:
+        for note in profile.get("normalizer_notes", []) or []:
+            note_text = str(note or "").strip()
+            if note_text.lower().startswith("fallback profile used"):
+                primary_error = note_text
+                break
+    if str(model).strip().lower() == "fallback_local":
+        short_error = primary_error[:240] + ("…" if len(primary_error) > 240 else "")
+        status = tr(
+            f"⚠️ Lokales Fallback-Profil geladen — Terra-Normalisierung fehlgeschlagen. "
+            f"Sample {sample}/{total} | schema {schema}"
+            + (f" | Ursache: {short_error}" if short_error else ""),
+            f"⚠️ Local fallback profile loaded — Terra normalization failed. "
+            f"Sample {sample}/{total} | schema {schema}"
+            + (f" | Cause: {short_error}" if short_error else ""),
+        )
+    elif retry_count:
+        status = tr(
+            f"✅ Profil geladen — automatische Normalizer-Reparatur erfolgreich | "
+            f"Sample {sample}/{total} | {model} | schema {schema}",
+            f"✅ Profile loaded — automatic normalizer repair succeeded | "
+            f"sample {sample}/{total} | {model} | schema {schema}",
+        )
+    else:
+        status = tr(
+            f"✅ Profil geladen — Sample {sample}/{total} | {model} | schema {schema}",
+            f"✅ Profile loaded — sample {sample}/{total} | {model} | schema {schema}",
+        )
 
     return (
         profile, raw_json,

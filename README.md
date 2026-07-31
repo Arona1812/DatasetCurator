@@ -313,3 +313,24 @@ The UI exposes separate `reasoning.effort` selectors for:
 - final Krea 2 captions
 
 Recommended Krea 2 defaults are `none` for routine audits, trigger checks and final captions, and `low` for Terra-based escalation and subject-profile reconciliation. GPT-5.6 also supports `medium`, `high`, `xhigh` and `max`; higher settings increase latency and token use. Selecting the Krea 2 preset restores these recommended stage-specific values.
+
+### Automatic Subject Profile normalizer repair
+
+The Subject Profile stage now treats malformed or incomplete structured JSON as a recoverable model error instead of immediately replacing the whole profile with local fallback values.
+
+- all `output_text` parts from the Responses API are concatenated before JSON parsing;
+- harmless Markdown fences or trailing text are removed locally;
+- the profile output budget is increased because reasoning tokens count against `max_output_tokens`;
+- an incomplete or invalid primary response triggers one automatic retry with the configured Subject Profile model and reasoning effort;
+- only if both model responses fail is `fallback_local` used;
+- fallback profiles are not silently reused from the profile cache;
+- profile schema `v13` invalidates earlier fallback caches;
+- the Profile UI shows a prominent warning and the original parsing error when a local fallback profile is loaded.
+
+The profile JSON records:
+
+- `normalizer_source`: `gpt_primary`, `gpt_retry`, or `local_fallback`
+- `normalizer_retry_count`
+- `normalizer_primary_error`
+
+A retry rebuilds only the Subject Profile response. It does not repeat the individual image audits.

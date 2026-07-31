@@ -632,7 +632,7 @@ PROFILE_NORMALIZER_MODEL = "gpt-5.6-terra"
 #       kanonische Profil-Brille ueberschrieben werden.
 #   v7: Erweiterte Profile-Vokabulare inkl. hair_length und
 #       body_height_impression; Body-Build ersetzt stocky durch broad_build.
-PROFILE_CACHE_SCHEMA_VERSION = "v12"
+PROFILE_CACHE_SCHEMA_VERSION = "v13"
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
@@ -3473,15 +3473,78 @@ def run_identity_consistency_check(
 # ============================================================
 
 def extract_response_text(response_json: Dict[str, Any]) -> str:
-    if response_json.get("NSFW_BLOCKED"):
-        return '{"NSFW_BLOCKED": True}'
+    """Collect the complete visible text from a Responses API result.
 
-    for item in response_json.get("output", []):
-        if item.get("type") == "message":
-            for part in item.get("content", []):
-                if part.get("type") == "output_text" and part.get("text"):
-                    return part["text"]
+    A response may contain more than one ``output_text`` content part.  The old
+    implementation returned only the first part, which could turn otherwise
+    valid structured JSON into an apparently truncated string.
+    """
+    if response_json.get("NSFW_BLOCKED"):
+        return '{"NSFW_BLOCKED": true}'
+
+    parts: List[str] = []
+    for item in response_json.get("output", []) or []:
+        if item.get("type") != "message":
+            continue
+        for part in item.get("content", []) or []:
+            if part.get("type") == "output_text" and part.get("text"):
+                parts.append(str(part["text"]))
+    if parts:
+        return "".join(parts).strip()
     raise ValueError("Kein output_text in Responses-Antwort gefunden.")
+
+
+def _parse_json_object_text(text: str) -> Dict[str, Any]:
+    """Parse one JSON object and tolerate harmless wrappers/trailing text.
+
+    Structured-output responses should already be JSON.  This helper only
+    repairs transport/presentation artefacts such as Markdown fences or a
+    short trailing explanation.  Incomplete JSON is *not* guessed locally; it
+    triggers a real model retry instead.
+    """
+    raw = str(text or "").strip().lstrip("\ufeff")
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+        raw = raw.strip()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as first_error:
+        start = raw.find("{")
+        if start < 0:
+            raise first_error
+        decoder = json.JSONDecoder()
+        try:
+            value, _end = decoder.raw_decode(raw[start:])
+        except json.JSONDecodeError:
+            raise first_error
+    if not isinstance(value, dict):
+        raise ValueError("Structured response is not a JSON object.")
+    return value
+
+
+def _responses_incomplete_reason(response_json: Dict[str, Any]) -> str:
+    status = str((response_json or {}).get("status", "") or "").strip().lower()
+    if status != "incomplete":
+        return ""
+    details = (response_json or {}).get("incomplete_details") or {}
+    if isinstance(details, dict):
+        reason = str(details.get("reason", "") or "").strip()
+        return reason or "response_status_incomplete"
+    return str(details or "response_status_incomplete")
+
+
+def _validate_subject_profile_core(profile: Dict[str, Any]) -> None:
+    required = ("subject_id", "stable_identity", "confidence", "identity_markers", "normalizer_notes")
+    missing = [key for key in required if key not in profile]
+    if missing:
+        raise ValueError("Subject profile missing required keys: " + ", ".join(missing))
+    if not isinstance(profile.get("stable_identity"), dict):
+        raise ValueError("Subject profile stable_identity must be an object.")
+    if not isinstance(profile.get("confidence"), dict):
+        raise ValueError("Subject profile confidence must be an object.")
+    if not isinstance(profile.get("identity_markers"), dict):
+        raise ValueError("Subject profile identity_markers must be an object.")
 
 
 def normalize_reasoning_effort_for_model(model: str, effort: Optional[str]) -> Optional[str]:
@@ -5974,17 +6037,66 @@ Return JSON only.
                 "strict": True,
             }
         },
-        "max_output_tokens": 2600,
+        # Reasoning tokens count against this budget. 2600 was too small for
+        # larger profiles and could truncate otherwise valid strict JSON.
+        "max_output_tokens": 7000,
         "store": False,
         "temperature": 0.1,
         "_reasoning_effort": PROFILE_REASONING_EFFORT,
     }
 
-    data = responses_api_call(PROFILE_NORMALIZER_MODEL, payload, phase_label="subject_profile_normalizer")
-    parsed = json.loads(extract_response_text(data))
+    primary_error = ""
+    parsed: Optional[Dict[str, Any]] = None
+
+    try:
+        data = responses_api_call(
+            PROFILE_NORMALIZER_MODEL, payload, phase_label="subject_profile_normalizer_primary"
+        )
+        incomplete_reason = _responses_incomplete_reason(data)
+        if incomplete_reason:
+            raise ValueError(f"Responses API returned incomplete output: {incomplete_reason}")
+        parsed = _parse_json_object_text(extract_response_text(data))
+        _validate_subject_profile_core(parsed)
+    except Exception as exc:
+        primary_error = str(exc)
+        safe_print(
+            "   ⚠️ Subject profile response was incomplete or invalid; "
+            f"retrying once with {PROFILE_NORMALIZER_MODEL}: {primary_error}"
+        )
+
+        repair_instructions = instructions + """
+
+RETRY REQUIREMENT:
+The previous structured response was incomplete or invalid. Rebuild the complete profile from the
+original input below. Do not quote or discuss the previous error. Return exactly one complete JSON
+object matching the supplied strict schema. Keep notes concise so the response cannot be truncated.
+"""
+        repair_payload = {
+            **payload,
+            "instructions": repair_instructions,
+            "max_output_tokens": 9000,
+        }
+        repair_data = responses_api_call(
+            PROFILE_NORMALIZER_MODEL, repair_payload, phase_label="subject_profile_normalizer_retry"
+        )
+        incomplete_reason = _responses_incomplete_reason(repair_data)
+        if incomplete_reason:
+            raise ValueError(
+                "Subject profile retry returned incomplete output: " + incomplete_reason
+            )
+        parsed = _parse_json_object_text(extract_response_text(repair_data))
+        _validate_subject_profile_core(parsed)
+        parsed.setdefault("normalizer_notes", []).append(
+            "Automatic profile-normalizer retry succeeded after an invalid primary response."
+        )
+
+    assert parsed is not None
     parsed["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
     parsed["input_hash"] = input_hash
     parsed["normalizer_model"] = PROFILE_NORMALIZER_MODEL
+    parsed["normalizer_source"] = "gpt_retry" if primary_error else "gpt_primary"
+    parsed["normalizer_retry_count"] = 1 if primary_error else 0
+    parsed["normalizer_primary_error"] = primary_error
     parsed["sample_size"] = len(rows)
     parsed["total_usable_images"] = total_count
     parsed["created_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -6060,6 +6172,9 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
         "profile_schema_version": PROFILE_CACHE_SCHEMA_VERSION,
         "input_hash": input_hash,
         "normalizer_model": "fallback_local",
+        "normalizer_source": "local_fallback",
+        "normalizer_retry_count": 1,
+        "normalizer_primary_error": str(reason or ""),
         "sample_size": len(rows),
         "total_usable_images": len(rows),
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -7174,6 +7289,7 @@ def load_subject_profile_cache(input_hash: str) -> Optional[Dict[str, Any]]:
         if (
             profile.get("profile_schema_version") == PROFILE_CACHE_SCHEMA_VERSION
             and profile.get("input_hash") == input_hash
+            and str(profile.get("normalizer_model", "")).strip().lower() != "fallback_local"
         ):
             return profile
     except Exception:
@@ -7596,6 +7712,9 @@ def subject_profile_report_summary(profile: Dict[str, Any]) -> Dict[str, Any]:
         "subject_id": profile.get("subject_id", ""),
         "profile_schema_version": profile.get("profile_schema_version", ""),
         "normalizer_model": profile.get("normalizer_model", ""),
+        "normalizer_source": profile.get("normalizer_source", ""),
+        "normalizer_retry_count": profile.get("normalizer_retry_count", 0),
+        "normalizer_primary_error": profile.get("normalizer_primary_error", ""),
         "sample_size": profile.get("sample_size", 0),
         "total_usable_images": profile.get("total_usable_images", 0),
         "force_only_when_visible": profile.get("force_only_when_visible", True),
@@ -8016,6 +8135,9 @@ def write_caption_stage_reports(
         "identity_check_n_hard_flagged_removed": identity_summary.get("n_hard", 0),
         "subject_profile_enabled": bool(subject_profile),
         "subject_profile_normalizer_model": (subject_profile or {}).get("normalizer_model", ""),
+        "subject_profile_normalizer_source": (subject_profile or {}).get("normalizer_source", ""),
+        "subject_profile_normalizer_retry_count": (subject_profile or {}).get("normalizer_retry_count", 0),
+        "subject_profile_normalizer_primary_error": (subject_profile or {}).get("normalizer_primary_error", ""),
         "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
         "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
         "variable_feature_mode": str(VARIABLE_FEATURE_CAPTION_MODE),
@@ -12042,6 +12164,9 @@ def main() -> None:
         "identity_check_n_hard_flagged_removed": identity_summary.get("n_hard", 0),
         "subject_profile_enabled": bool(subject_profile),
         "subject_profile_normalizer_model": (subject_profile or {}).get("normalizer_model", ""),
+        "subject_profile_normalizer_source": (subject_profile or {}).get("normalizer_source", ""),
+        "subject_profile_normalizer_retry_count": (subject_profile or {}).get("normalizer_retry_count", 0),
+        "subject_profile_normalizer_primary_error": (subject_profile or {}).get("normalizer_primary_error", ""),
         "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
         "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
         "training_target": normalize_training_target(TRAINING_TARGET),
