@@ -376,3 +376,10 @@ Cancellation no longer relies only on Gradio cancelling the active generator or 
 - Blocking OpenAI requests run in a daemon worker and are polled for cancellation, so the run does not have to wait for the HTTP timeout.
 - Windows still uses `taskkill /T /F`, with direct process and PowerShell fallbacks. The video processor uses the same cooperative marker.
 - Cancelled runs exit with code 130 and are shown as cancelled rather than failed or completed.
+
+## Fix 2026-08-01: Continue-from-Profile-Export
+
+- Behebt `TypeError: argument of type 'int' is not iterable` beim Captioning aus einem bestaetigten Subject Profile.
+- Die zentrale Row-Map wird nicht mehr durch den numerischen Export-Fortschrittsindex ueberschrieben.
+- Die Synchronisierung von `selected`, `output_bucket`, `new_basename` und `final_caption` ist zusaetzlich defensiv gegen falsche Argumenttypen abgesichert.
+

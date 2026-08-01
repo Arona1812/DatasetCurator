@@ -8426,11 +8426,19 @@ def clean_caption_output_dirs() -> None:
                     pass
 
 
-def _sync_row_update(row_index: Dict[str, Dict[str, Any]], row: Dict[str, Any]) -> None:
+def _sync_row_update(row_map: Dict[str, Dict[str, Any]], row: Dict[str, Any]) -> None:
+    """Synchronisiert Exportaenderungen zurueck in ``all_rows``.
+
+    Die defensive Typpruefung verhindert, dass ein versehentlich uebergebener
+    Schleifenindex den Continue-from-Profile-Export komplett abbricht.
+    """
+    if not isinstance(row_map, dict) or not isinstance(row, dict):
+        return
     key = row.get("original_filename")
-    if key and key in row_index:
-        row_index[key].update({
-            "selected": row.get("selected", row_index[key].get("selected")),
+    target = row_map.get(key) if key else None
+    if isinstance(target, dict):
+        target.update({
+            "selected": row.get("selected", target.get("selected")),
             "output_bucket": row.get("output_bucket", ""),
             "new_basename": row.get("new_basename", ""),
             "final_caption": row.get("final_caption", ""),
@@ -8881,15 +8889,15 @@ def continue_caption_from_profile() -> None:
         )
 
     clean_caption_output_dirs()
-    row_index = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
+    row_map = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
 
     # Auch die Non-Training-Buckets werden hier bewusst mit Captions aus dem
     # bestaetigten Subject Profile exportiert. So sind 03_caption_remove und
     # 04_review fuer spaetere manuelle Bearbeitung bereits captioned.
     counters = {"train_ready": 1, "keep_unused": 1, "caption_remove": 1, "review": 1}
 
-    for row_index, row in enumerate(selected_sorted, start=1):
-        raise_if_cancelled(f"train export {row_index}/{len(selected_sorted)}")
+    for export_index, row in enumerate(selected_sorted, start=1):
+        raise_if_cancelled(f"train export {export_index}/{len(selected_sorted)}")
         needs_text_cleanup = needs_caption_remove(row)
         if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
             bucket = "caption_remove"
@@ -8903,12 +8911,12 @@ def continue_caption_from_profile() -> None:
         row["output_bucket"] = bucket
         row["selected"] = True
         _write_captioned_image(row, out_dir, new_basename, global_rules, subject_profile)
-        _sync_row_update(row_index, row)
+        _sync_row_update(row_map, row)
 
     if EXPORT_REVIEW_IMAGES:
         review_export = sorted(review_items, key=lambda r: -int(r.get("quality_total", 0)))
-        for row_index, row in enumerate(review_export, start=1):
-            raise_if_cancelled(f"review export {row_index}/{len(review_export)}")
+        for export_index, row in enumerate(review_export, start=1):
+            raise_if_cancelled(f"review export {export_index}/{len(review_export)}")
             needs_text_cleanup = needs_caption_remove(row)
             if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
                 bucket = "caption_remove"
@@ -8922,21 +8930,21 @@ def continue_caption_from_profile() -> None:
             row["output_bucket"] = bucket
             try:
                 _write_captioned_image(row, out_dir, new_basename, global_rules, subject_profile)
-                _sync_row_update(row_index, row)
+                _sync_row_update(row_map, row)
             except RunCancelled:
                 raise
             except Exception as e:
                 safe_print(f"   ⚠️ Review export failed for {row.get('original_filename','')}: {e}")
 
     keep_unused_sorted = sorted(unselected_keep, key=lambda r: -int(r.get("quality_total", 0)))
-    for row_index, row in enumerate(keep_unused_sorted, start=1):
-        raise_if_cancelled(f"keep-unused export {row_index}/{len(keep_unused_sorted)}")
+    for export_index, row in enumerate(keep_unused_sorted, start=1):
+        raise_if_cancelled(f"keep-unused export {export_index}/{len(keep_unused_sorted)}")
         new_basename = f"{SAFE_TRIGGER}_unused_{counters['keep_unused']:03d}"
         counters["keep_unused"] += 1
         row["output_bucket"] = "keep_unused"
         try:
             _write_captioned_image(row, KEEP_UNUSED_DIR, new_basename, global_rules, subject_profile)
-            _sync_row_update(row_index, row)
+            _sync_row_update(row_map, row)
         except RunCancelled:
             raise
         except Exception as e:
@@ -8957,7 +8965,7 @@ def continue_caption_from_profile() -> None:
                     cropped.save(img_out, "JPEG", quality=100)
                 with open(txt_out, "w", encoding="utf-8") as ft:
                     ft.write(build_reject_export_text(row, global_rules, subject_profile))
-                _sync_row_update(row_index, row)
+                _sync_row_update(row_map, row)
             except RunCancelled:
                 raise
             except Exception as e:
