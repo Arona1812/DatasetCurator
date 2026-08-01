@@ -29,6 +29,17 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 import gradio as gr
 from PIL import Image
 
+# Make the UI process itself tolerant of characters that the active Windows
+# console code page cannot represent. Child-process log streaming has its own
+# explicit UTF-8 decoder below.
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    try:
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 # ============================================================
 # UI LANGUAGE / I18N
 # ============================================================
@@ -680,16 +691,20 @@ def _pid_is_running(pid: int) -> bool:
         return False
     if sys.platform == "win32":
         try:
+            # Keep tasklist output as bytes. Windows command-line tools may
+            # emit text in an OEM or legacy code page that differs from
+            # Python's current ANSI codec. Decoding it via text=True can make
+            # subprocess._readerthread crash with UnicodeDecodeError.  We only
+            # need the ASCII PID, so no text decoding is necessary here.
             result = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
                 timeout=2,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 check=False,
             )
-            return str(pid) in (result.stdout or "") and "No tasks" not in (result.stdout or "")
+            return str(pid).encode("ascii") in (result.stdout or b"")
         except Exception:
             return True  # do not discard a potentially valid registry entry
     try:
@@ -2774,11 +2789,12 @@ def _terminate_pid_tree(pid: int, proc: Optional[subprocess.Popen] = None, grace
     terminated = False
     if sys.platform == "win32":
         try:
+            # Do not decode taskkill output. Its return code is sufficient,
+            # and Windows may emit bytes that are invalid in cp1252/UTF-8.
             result = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
                 timeout=max(3.0, graceful_timeout + 1.0),
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
