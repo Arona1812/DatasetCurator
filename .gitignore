@@ -11,3 +11,4 @@ _ui_settings.json
 # Curator outputs / caches (often large)
 curated_*/
 */curated_*/
+_active_run_state.json
