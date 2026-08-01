@@ -182,7 +182,7 @@ Hair color/form, eye color, beard state/color and glasses are handled by a share
 
 When continuing from a confirmed Subject Profile, the final selector can softly promote images matching the user-confirmed canonical hair color. The default target is three canon images with a diminishing `+6 / +4 / +2` bonus. The bonus is only applied when the candidate is no more than five `quality_total` points behind the best alternative in the same selection step.
 
-This does not change the headshot/medium/full-body quotas, never promotes review or reject rows automatically, and never turns the target into a hard minimum. The report records the canonical color, selected count, eligible keep candidates and canon candidates still located in review or reject.
+This does not change the headshot/medium/full-body quotas, never promotes review or reject rows automatically through the canon bonus, and never turns the target into a hard minimum. An explicit user Priority override remains independent of this rule. The report records the canonical color, selected count, eligible keep candidates and canon candidates still located in review or reject.
 
 Black and dark brown remain distinct values. Only selected close blonde variants receive a reduced match strength for a blonde canon.
 
@@ -383,3 +383,47 @@ Cancellation no longer relies only on Gradio cancelling the active generator or 
 - Die zentrale Row-Map wird nicht mehr durch den numerischen Export-Fortschrittsindex ueberschrieben.
 - Die Synchronisierung von `selected`, `output_bucket`, `new_basename` und `final_caption` ist zusaetzlich defensiv gegen falsche Argumenttypen abgesichert.
 
+
+## Profile buckets, audited rejects, and Priority images
+
+The Subject Profile identity-clustering view supports image-level decisions:
+
+- Click an image in the selected bucket to enable individual actions.
+- **Detach image from bucket** moves only the exact selected source file into a new manual singleton bucket. Selection now uses filename/path plus a unique member key, so duplicate-content images in the large reject bucket can be detached safely. A normal image inherits its prior role; an image detached from the audited-reject bucket starts as `exclude` and can then be deliberately promoted.
+- Fully audited rejects and ArcFace hard flags appear in an always-last `audited_rejects` bucket with the fixed default role `exclude`. Early size rejects, script errors, NSFW blocks, and first-pass pHash duplicates are not shown because they did not receive a useful semantic audit.
+- The reject reason is visible below every thumbnail, in the selected-image details, and as an aggregate reason summary for the bucket.
+- A rejected image can be recovered by detaching it and assigning the new bucket a training role, or by marking the image as **Priority**.
+- **Priority** is an explicit user override. It forces the image into `01_train_ready` despite quality score, ArcFace result, bucket role, quota, duplicate, diversity, or caption-remove logic. Only a missing or unreadable source file can prevent export. If the number of Priority images exceeds the configured target, all Priority images are kept and the final dataset grows beyond the target.
+
+The profile persists the image-level overrides in:
+
+```json
+{
+  "priority_image_ids": ["..."],
+  "priority_image_filenames": ["..."]
+}
+```
+
+### Detach UI refresh fix (2026-08-01)
+
+After **Detach image from bucket**, the cluster panel is now rebuilt from the just-saved `_subject_profile.json`. The interactive cluster table and gallery receive explicit Gradio updates, the new singleton bucket becomes the active bucket immediately, and the previous image selection is cleared. This avoids a Gradio 6 behavior where the profile changed on disk but the visible Dataframe/Gallery could continue showing their previous values.
+
+
+### Audited-reject detach hardening and reason display (2026-08-01)
+
+- Reject-bucket members use a stable per-source member ID in addition to the content hash. Exact duplicate files no longer make Detach target the wrong row.
+- The persisted filename and source path are used as additional exact-match safeguards.
+- The audited-reject bucket is normalized to `exclude`; detached reject images also start as `exclude`.
+- `short_reason`, ArcFace hard flags, local override reasons and audit issues are surfaced in the gallery and selected-image panel.
+- Reject reasons are stored parallel to the reject bucket members so they remain visible even when the stage file is temporarily unavailable.
+
+### Large reject-bucket paging and stable selection (2026-08-01)
+
+The audited-reject gallery is now loaded in deterministic pages of 36 records.
+
+- A **Gallery page** selector appears above the preview when a bucket spans multiple pages.
+- The record list is paged before images are decoded, so large reject buckets no longer try to load hundreds of thumbnails in one callback.
+- Each visible tile retains the original absolute member index, member ID, filename and source path. Detach therefore resolves the exact source record even on later pages or when files have identical image content.
+- Missing or unreadable previews are represented by a neutral placeholder instead of being silently skipped. Such records remain selectable and can still be detached or marked Priority.
+- Changing page or cluster clears the previous image selection, preventing a stale selection from detaching a different record.
+- After Detach, the new singleton bucket opens on page 1 and the persisted profile is reloaded as before.

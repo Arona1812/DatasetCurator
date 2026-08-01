@@ -613,7 +613,10 @@ PROFILE_INPUT_BUCKETS = ["train_ready", "keep_unused"]   # rejects/reviews aus
 # Bilder bei Phase-3-Export in 01_train_ready kommen und wie stark sie im
 # Ranking bevorzugt werden.
 ENABLE_IDENTITY_APPEARANCE_CLUSTERING = True
-IDENTITY_CLUSTER_SCHEMA_VERSION = "v2"
+IDENTITY_CLUSTER_SCHEMA_VERSION = "v4"
+AUDITED_REJECT_CLUSTER_ID = "audited_rejects"
+PRIORITY_IMAGE_IDS_PROFILE_KEY = "priority_image_ids"
+PRIORITY_IMAGE_FILENAMES_PROFILE_KEY = "priority_image_filenames"
 IDENTITY_CLUSTER_CORE_SCORE_BOOST = 6.0
 IDENTITY_CLUSTER_VARIATION_SCORE_BOOST = 1.5
 IDENTITY_CLUSTER_BODY_SCORE_BOOST = 2.5
@@ -6163,12 +6166,30 @@ def output_caption_stage_path() -> str:
 
 
 def profile_image_id(row: Dict[str, Any]) -> str:
-    """Stabiler Bild-Key fuer Subject-Profile und per-image Tokens."""
+    """Stabiler Inhalts-Key fuer Subject-Profile und per-image Tokens."""
     h = str(row.get("file_hash") or "").strip()
     if h:
         return h
     src = str(row.get("original_path") or row.get("original_filename") or "")
     return hashlib.sha1(src.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def profile_member_id(row: Dict[str, Any]) -> str:
+    """Eindeutiger stabiler Key fuer genau eine Quelldatei im Profil-Board.
+
+    Zwei nachgelagert auditierte Dateien koennen denselben Inhalts-Hash besitzen.
+    Fuer UI-Aktionen wie Detach darf deshalb nicht allein der file_hash verwendet
+    werden. Der Pfad-/Dateinamens-Suffix haelt solche Eintraege getrennt, waehrend
+    ``profile_image_id`` weiterhin den inhaltlichen per-image Trait-Key liefert.
+    """
+    existing = str(row.get("profile_member_id") or "").strip()
+    if existing:
+        return existing
+    content_id = profile_image_id(row)
+    src = str(row.get("original_path") or row.get("original_filename") or "").strip()
+    normalized = os.path.normcase(os.path.abspath(src)) if src else str(row.get("original_filename") or content_id)
+    suffix = hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"{content_id}::{suffix}"
 
 
 def _profile_bool(value: Any) -> bool:
@@ -7661,6 +7682,280 @@ def build_identity_appearance_clusters(rows: List[Dict[str, Any]], profile: Dict
     }
 
 
+
+def post_audit_reject_reason(row: Dict[str, Any]) -> str:
+    """Compact, user-visible reason for the audited-reject profile bucket."""
+    if not isinstance(row, dict):
+        return "rejected after audit"
+    parts: List[str] = []
+
+    short_reason = str(row.get("short_reason", "") or "").strip()
+    if short_reason:
+        parts.append(short_reason)
+
+    if str(row.get("arcface_flag", "") or "").strip().lower() == "hard":
+        parts.append("ArcFace hard identity flag")
+
+    for field in ("local_override_reasons", "issues"):
+        value = row.get(field)
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                value = parsed
+            except Exception:
+                value = [x.strip() for x in re.split(r"[;,|]", value) if x.strip()]
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                text = str(item or "").strip()
+                if text and text not in parts:
+                    parts.append(text)
+
+    # Status notes often contain implementation details. Keep only clearly
+    # rejection-related entries so the gallery remains readable.
+    notes = row.get("status_notes") or []
+    if isinstance(notes, str):
+        notes = [notes]
+    if isinstance(notes, (list, tuple, set)):
+        for item in notes:
+            text = str(item or "").strip()
+            low = text.lower()
+            if text and any(token in low for token in ("reject", "hard_flag", "duplicate", "identity")) and text not in parts:
+                parts.append(text)
+
+    if not parts:
+        status = str(row.get("final_status") or row.get("base_status") or "reject").strip()
+        parts.append(f"{status} after semantic audit")
+    return " | ".join(parts[:4])
+
+
+def is_post_audit_reject(row: Dict[str, Any]) -> bool:
+    """True for rejected rows that reached the semantic image audit.
+
+    Early static rejects and the first pHash duplicate pass never received a
+    useful image description and therefore do not belong in the profile board.
+    Later rejects (including post-audit duplicate decisions) remain recoverable.
+    """
+    if not isinstance(row, dict):
+        return False
+    if row.get("base_status") != "reject" and row.get("arcface_flag") != "hard":
+        return False
+    reason = str(row.get("short_reason", "") or "").strip().lower()
+    if reason == "early_phash_duplicate":
+        return False
+    if reason.startswith(("hard_pass_too_small", "filesize_too_small", "script_error")):
+        return False
+    if row.get("NSFW_BLOCKED"):
+        return False
+    # The audit schema always supplies a shot type and several semantic fields.
+    # Requiring one of them avoids accidentally exposing pre-audit rows.
+    return bool(
+        str(row.get("shot_type", "") or "").strip()
+        and (
+            str(row.get("gender_class", "") or "").strip()
+            or str(row.get("clothing_description", "") or "").strip()
+            or str(row.get("background_description", "") or "").strip()
+            or float(row.get("quality_total", 0) or 0) > 0
+        )
+    )
+
+
+def _priority_id_set(profile: Optional[Dict[str, Any]]) -> set:
+    if not isinstance(profile, dict):
+        return set()
+    raw = profile.get(PRIORITY_IMAGE_IDS_PROFILE_KEY, []) or []
+    return {str(v).strip() for v in raw if str(v).strip()}
+
+
+def _priority_filename_set(profile: Optional[Dict[str, Any]]) -> set:
+    if not isinstance(profile, dict):
+        return set()
+    raw = profile.get(PRIORITY_IMAGE_FILENAMES_PROFILE_KEY, []) or []
+    return {str(v).strip() for v in raw if str(v).strip()}
+
+
+def is_priority_image(row: Dict[str, Any], profile: Optional[Dict[str, Any]]) -> bool:
+    if bool(row.get("priority_image")):
+        return True
+    image_id = str(row.get("profile_image_id") or profile_image_id(row) or "").strip()
+    filename = str(row.get("original_filename", "") or "").strip()
+    return image_id in _priority_id_set(profile) or filename in _priority_filename_set(profile)
+
+
+def apply_priority_image_flags(rows: List[Dict[str, Any]], profile: Optional[Dict[str, Any]]) -> None:
+    for row in rows:
+        priority = is_priority_image(row, profile)
+        row["priority_image"] = bool(priority)
+        if priority:
+            row.setdefault("status_notes", []).append("user_priority_image")
+
+
+def attach_audited_reject_cluster_to_profile(
+    profile: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Append a recoverable, always-last bucket for post-audit rejects.
+
+    The rejected rows do not influence stable identity aggregation. They are
+    exposed only after the profile has been built, so the user can detach an
+    individual image into a new manual bucket or mark it as Priority.
+    """
+    if not isinstance(profile, dict) or not profile:
+        return profile
+
+    clusters = [c for c in (profile.get("identity_clusters", []) or []) if isinstance(c, dict)]
+    existing_special = None
+    normal_clusters: List[Dict[str, Any]] = []
+    for c in clusters:
+        if str(c.get("cluster_id", "") or "") == AUDITED_REJECT_CLUSTER_ID or str(c.get("cluster_kind", "") or "") == "audited_rejects":
+            existing_special = c
+        else:
+            normal_clusters.append(c)
+
+    # A manually detached reject already belongs to another cluster and must not
+    # be silently pulled back into the special reject bucket on the next load.
+    occupied_member_ids = {
+        str(mid)
+        for c in normal_clusters
+        for mid in (c.get("members", []) or [])
+        if str(mid)
+    }
+    occupied_filenames = {
+        str(name)
+        for c in normal_clusters
+        for name in (c.get("filenames", []) or [])
+        if str(name)
+    }
+    occupied_paths = {
+        os.path.normcase(os.path.abspath(str(path)))
+        for c in normal_clusters
+        for path in (c.get("image_paths", []) or [])
+        if str(path)
+    }
+
+    audited_rows: List[Dict[str, Any]] = []
+    per_image = profile.setdefault("per_image_traits", {})
+    if not isinstance(per_image, dict):
+        per_image = {}
+        profile["per_image_traits"] = per_image
+    for row in rows:
+        if not is_post_audit_reject(row):
+            continue
+        image_id = profile_image_id(row)
+        member_id = profile_member_id(row)
+        row["profile_image_id"] = image_id
+        row["profile_member_id"] = member_id
+        filename = str(row.get("original_filename", "") or "")
+        source_path = str(row.get("original_path", "") or "")
+        normalized_path = os.path.normcase(os.path.abspath(source_path)) if source_path else ""
+        if member_id in occupied_member_ids or (filename and filename in occupied_filenames) or (normalized_path and normalized_path in occupied_paths):
+            continue
+        if image_id not in per_image:
+            per_image[image_id] = per_image_profile_traits(row, profile)
+        audited_rows.append(row)
+
+    if audited_rows:
+        member_ids = [profile_member_id(r) for r in audited_rows]
+        filenames = [str(r.get("original_filename", "") or "") for r in audited_rows]
+        image_paths = [str(r.get("original_path", "") or "") for r in audited_rows]
+        reject_reasons = [post_audit_reject_reason(r) for r in audited_rows]
+        shot_counts = Counter(normalize_text(r.get("shot_type")) or "unknown" for r in audited_rows)
+        style_counts = Counter(_appearance_visual_group(r) for r in audited_rows)
+        n = len(audited_rows)
+        quality_avg = sum(float(r.get("quality_total", 0) or 0) for r in audited_rows) / max(1, n)
+        identity_avg = sum(float(r.get("quality_identity_usefulness", 0) or 0) for r in audited_rows) / max(1, n)
+        special = dict(existing_special or {})
+        special.update({
+            "cluster_id": AUDITED_REJECT_CLUSTER_ID,
+            "cluster_kind": "audited_rejects",
+            "sort_last": True,
+            "role": "exclude",
+            "n": n,
+            "summary": "post-audit rejects / hard flags | manually recoverable",
+            "frame_group": "mixed",
+            "hair_family": "mixed",
+            "glasses_family": "mixed",
+            "visual_group": "mixed",
+            "avg_quality_total": round(quality_avg, 1),
+            "avg_identity_usefulness": round(identity_avg, 1),
+            "shot_counts": dict(shot_counts),
+            "style_counts": dict(style_counts),
+            "members": member_ids,
+            "filenames": filenames,
+            "image_paths": image_paths,
+            "reject_reasons": reject_reasons,
+        })
+        normal_clusters.append(special)
+    elif existing_special and existing_special.get("members"):
+        # Preserve a legacy/saved bucket when source files are temporarily absent.
+        normal_clusters.append(existing_special)
+
+    member_roles: Dict[str, str] = {}
+    member_clusters: Dict[str, str] = {}
+    for cluster in normal_clusters:
+        cid = str(cluster.get("cluster_id", "") or "")
+        role = str(cluster.get("role", "variation") or "variation")
+        for mid in cluster.get("members", []) or []:
+            member_roles[str(mid)] = role
+            member_clusters[str(mid)] = cid
+
+    profile["identity_clusters"] = normal_clusters
+    profile["identity_cluster_member_roles"] = member_roles
+    profile["identity_cluster_member_clusters"] = member_clusters
+    profile["identity_cluster_schema_version"] = IDENTITY_CLUSTER_SCHEMA_VERSION
+    return profile
+
+
+def merge_priority_images_into_selection(
+    selected: List[Dict[str, Any]],
+    all_rows: List[Dict[str, Any]],
+    profile: Optional[Dict[str, Any]],
+    target_size: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Guarantee every user-marked Priority image remains in train_ready.
+
+    Priority is an explicit user override. It bypasses quality, ArcFace, cluster
+    role, quota, duplicate and caption-remove decisions. Missing/unreadable files
+    are the only practical exception. If Priority count exceeds the target, the
+    dataset intentionally grows beyond the configured target.
+    """
+    target = int(target_size or TARGET_DATASET_SIZE)
+    priority_rows: List[Dict[str, Any]] = []
+    seen = set()
+    for row in all_rows:
+        if not is_priority_image(row, profile):
+            continue
+        key = str(row.get("original_filename", "") or profile_image_id(row))
+        if key in seen:
+            continue
+        path = str(row.get("original_path", "") or "")
+        if path and not os.path.exists(path):
+            safe_print(f"   ⚠️ Priority image missing and cannot be exported: {key}")
+            continue
+        seen.add(key)
+        row["priority_image"] = True
+        row["selected"] = True
+        row.setdefault("status_notes", []).append("forced_train_ready_by_user_priority")
+        priority_rows.append(row)
+
+    if not priority_rows:
+        return selected
+
+    priority_keys = {str(r.get("original_filename", "") or profile_image_id(r)) for r in priority_rows}
+    normal = [
+        r for r in selected
+        if str(r.get("original_filename", "") or profile_image_id(r)) not in priority_keys
+    ]
+    slots = max(0, target - len(priority_rows))
+    result = priority_rows + normal[:slots]
+    if len(priority_rows) > target:
+        safe_print(
+            f"   ⭐ Priority override contains {len(priority_rows)} images, exceeding target {target}; all are retained."
+        )
+    else:
+        safe_print(f"   ⭐ Priority override retained {len(priority_rows)} image(s) in train_ready.")
+    return result
+
+
 def attach_identity_clusters_to_profile(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     data = build_identity_appearance_clusters(rows, profile)
     profile["identity_cluster_schema_version"] = IDENTITY_CLUSTER_SCHEMA_VERSION
@@ -7679,18 +7974,31 @@ def identity_cluster_role_for_row(row: Dict[str, Any], profile: Optional[Dict[st
     if not profile:
         return ""
     roles = profile.get("identity_cluster_member_roles", {}) or {}
+    member_id = row.get("profile_member_id") or profile_member_id(row)
     image_id = row.get("profile_image_id") or profile_image_id(row)
-    role = str(roles.get(image_id, "") or "").strip().lower()
+    role = str(roles.get(member_id, roles.get(image_id, "")) or "").strip().lower()
     if role not in IDENTITY_CLUSTER_TRAIN_ROLES and role not in IDENTITY_CLUSTER_NONTRAIN_ROLES:
         return ""
     return role
 
 
+def identity_cluster_id_for_row(row: Dict[str, Any], profile: Optional[Dict[str, Any]]) -> str:
+    if not profile:
+        return ""
+    clusters = profile.get("identity_cluster_member_clusters", {}) or {}
+    member_id = row.get("profile_member_id") or profile_member_id(row)
+    image_id = row.get("profile_image_id") or profile_image_id(row)
+    return str(clusters.get(member_id, clusters.get(image_id, "")) or "").strip()
+
+
 def apply_identity_cluster_roles_to_rows(rows: List[Dict[str, Any]], profile: Optional[Dict[str, Any]]) -> None:
     for row in rows:
         role = identity_cluster_role_for_row(row, profile)
+        cluster_id = identity_cluster_id_for_row(row, profile)
         if role:
             row["identity_cluster_role"] = role
+        if cluster_id:
+            row["identity_cluster_id"] = cluster_id
 
 
 def identity_cluster_role_bonus(item: Dict[str, Any], selected: List[Dict[str, Any]]) -> float:
@@ -7717,31 +8025,44 @@ def rebuild_selection_from_identity_roles(
     all_rows: List[Dict[str, Any]],
     profile: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Phase-3 Re-Ranking nach UI-Clusterrollen.
+    """Phase-3 re-ranking after profile-bucket decisions.
 
-    Fuer AI Toolkit gibt es weiterhin nur 'rein' oder 'raus'. Die Rollen steuern hier:
-    - core / variation / body_reference -> Kandidaten fuer 01_train_ready
-    - review -> 04_review
-    - exclude -> 02_keep_unused
-    Core bekommt einen kleinen Score-Boost, wird aber durch MAX_CORE_SHARE begrenzt,
-    damit Variation nicht wegoptimiert wird.
+    Cluster roles control normal candidates. User Priority is stronger than all
+    automatic decisions and can recover an audited reject or ArcFace outlier.
     """
     apply_identity_cluster_roles_to_rows(all_rows, profile)
+    apply_priority_image_flags(all_rows, profile)
     has_roles = any(r.get("identity_cluster_role") for r in all_rows)
+    has_priority = any(bool(r.get("priority_image")) for r in all_rows)
     has_canon_selection = bool(
         ENABLE_CANON_REPRESENTATION_BONUS
         and normalize_text((profile.get("canonical_features", {}) or {}).get("hair_color", ""))
     )
-    if not has_roles and not has_canon_selection:
+    if not has_roles and not has_canon_selection and not has_priority:
         return [], [], []
 
     train_candidates: List[Dict[str, Any]] = []
     review_items: List[Dict[str, Any]] = []
     overflow_items: List[Dict[str, Any]] = []
+    priority_rows: List[Dict[str, Any]] = []
     for row in all_rows:
-        if row.get("arcface_flag") == "hard" or row.get("base_status") == "reject":
+        if row.get("priority_image"):
+            priority_rows.append(row)
             continue
         role = str(row.get("identity_cluster_role", "") or "").strip().lower()
+        cluster_id = str(row.get("identity_cluster_id", "") or "").strip()
+        if row.get("arcface_flag") == "hard":
+            continue
+        if row.get("base_status") == "reject":
+            # A rejected image is recoverable only after the user deliberately
+            # detached it from the always-last reject bucket and assigned a
+            # training role. Priority remains the stronger one-click override.
+            if cluster_id != AUDITED_REJECT_CLUSTER_ID and role in IDENTITY_CLUSTER_TRAIN_ROLES:
+                row.setdefault("status_notes", []).append("manual_recovery_from_audited_reject_bucket")
+                train_candidates.append(row)
+            else:
+                continue
+            continue
         if not has_roles:
             if row.get("base_status") == "keep":
                 train_candidates.append(row)
@@ -7755,17 +8076,24 @@ def rebuild_selection_from_identity_roles(
         elif role == "exclude":
             overflow_items.append(row)
         elif row.get("base_status") == "keep":
-            # Falls kein Cluster-Mapping fuer ein Bild existiert: nicht verlieren,
-            # aber nur als Overflow bereitstellen.
             overflow_items.append(row)
 
-    if not train_candidates:
+    if train_candidates:
+        selected = choose_final_dataset(train_candidates, profile)
+        selected = crop_dedup_selected(selected)
+        selected, _final_duplicate_rows = dedup_final_selected_scene_variants(selected)
+    else:
+        selected = []
+
+    selected = merge_priority_images_into_selection(
+        selected, priority_rows or all_rows, profile, TARGET_DATASET_SIZE
+    )
+    if not selected:
         return [], [], []
 
-    selected = choose_final_dataset(train_candidates, profile)
-    selected = crop_dedup_selected(selected)
-    selected, final_duplicate_rows = dedup_final_selected_scene_variants(selected)
     selected_names = {r.get("original_filename") for r in selected}
+    review_items = [r for r in review_items if r.get("original_filename") not in selected_names]
+    overflow_items = [r for r in overflow_items if r.get("original_filename") not in selected_names]
 
     unselected = [
         r for r in train_candidates
@@ -7777,6 +8105,7 @@ def rebuild_selection_from_identity_roles(
     selected_sorted = sorted(
         selected,
         key=lambda r: (
+            0 if r.get("priority_image") else 1,
             shot_order.get(r.get("shot_type"), 9),
             {"core": 0, "variation": 1, "body_reference": 2}.get(str(r.get("identity_cluster_role", "")), 9),
             -float(r.get("quality_total", 0) or 0),
@@ -7785,7 +8114,6 @@ def rebuild_selection_from_identity_roles(
     review_sorted = sorted(review_items, key=lambda r: -float(r.get("quality_total", 0) or 0))
     unselected_sorted = sorted(unselected, key=lambda r: -float(r.get("quality_total", 0) or 0))
     return selected_sorted, review_sorted, unselected_sorted
-
 
 def deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(base)
@@ -8414,7 +8742,7 @@ def clean_caption_output_dirs() -> None:
     """Entfernt alte Bild-/Caption-Exports vor dem Continue-Export.
     Cache, Profile und Audit-Zwischenstaende bleiben erhalten.
     """
-    for folder in [TRAIN_READY_DIR, KEEP_UNUSED_DIR, CAPTION_REMOVE_DIR, REVIEW_DIR]:
+    for folder in [TRAIN_READY_DIR, KEEP_UNUSED_DIR, CAPTION_REMOVE_DIR, REVIEW_DIR, REJECT_DIR]:
         os.makedirs(folder, exist_ok=True)
         for name in os.listdir(folder):
             if name.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".txt")):
@@ -8590,7 +8918,10 @@ def backfill_train_ready_selection(
     target = int(target_size or TARGET_DATASET_SIZE)
     out = list(selected)
     selected_names = {r.get("original_filename") for r in out}
-    clean_count = sum(1 for r in out if not needs_caption_remove(r) and r.get("arcface_flag") != "hard")
+    clean_count = sum(
+        1 for r in out
+        if bool(r.get("priority_image")) or (not needs_caption_remove(r) and r.get("arcface_flag") != "hard")
+    )
     if clean_count >= target:
         return out, []
 
@@ -8689,6 +9020,7 @@ def write_caption_stage_reports(
         "face_count_local", "width", "height",
         "file_size_mb", "arcface_distance_to_centroid", "arcface_flag",
         "canonical_hair_match_strength", "canon_representation_bonus_applied",
+        "identity_cluster_id", "identity_cluster_role", "priority_image",
         "caption_source", "caption_model", "caption_retry_count", "caption_validation_error", "final_caption",
     ]
 
@@ -8720,6 +9052,8 @@ def write_caption_stage_reports(
         "selected_headshots": sum(1 for r in selected_sorted if r.get("shot_type") == "headshot"),
         "selected_medium": sum(1 for r in selected_sorted if r.get("shot_type") == "medium"),
         "selected_full_body": sum(1 for r in selected_sorted if r.get("shot_type") == "full_body"),
+        "selected_priority_images": sum(1 for r in selected_sorted if bool(r.get("priority_image"))),
+        "audited_reject_profile_bucket": sum(1 for r in all_rows if is_post_audit_reject(r)),
         "smart_crop_pairs_evaluated": 0,
         "smart_crop_pairs_accepted": 0,
         "smart_crop_pairs_won": 0,
@@ -8858,6 +9192,10 @@ def continue_caption_from_profile() -> None:
             save_subject_profile(subject_profile)
             safe_print("   🧬 Migrated legacy profile to generalized feature-policy schema.")
 
+    subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
+    apply_priority_image_flags(all_rows, subject_profile)
+    save_subject_profile(subject_profile)
+
     reranked_selected, reranked_review, reranked_unused = rebuild_selection_from_identity_roles(all_rows, subject_profile)
     if reranked_selected:
         safe_print(
@@ -8876,6 +9214,15 @@ def continue_caption_from_profile() -> None:
         unselected_keep = [r for r in unselected_keep if r.get("original_filename") not in added_names]
         warnings.append(f"Backfilled {len(backfill_added)} image(s) so 01_train_ready can reach the requested target after caption-remove/review exclusions.")
 
+    priority_names = {
+        r.get("original_filename") for r in selected_sorted
+        if is_priority_image(r, subject_profile)
+    }
+    if priority_names:
+        review_items = [r for r in review_items if r.get("original_filename") not in priority_names]
+        unselected_keep = [r for r in unselected_keep if r.get("original_filename") not in priority_names]
+        reject_items = [r for r in reject_items if r.get("original_filename") not in priority_names]
+
     canon_summary = canon_representation_summary(all_rows, selected_sorted, subject_profile)
     if canon_summary.get("enabled") and canon_summary.get("selected", 0) < canon_summary.get("target", 0):
         warnings.append(
@@ -8885,7 +9232,7 @@ def continue_caption_from_profile() -> None:
             f"Eligible keep={canon_summary.get('eligible_keep_candidates', 0)}, "
             f"review={canon_summary.get('review_candidates', 0)}, "
             f"reject={canon_summary.get('reject_candidates', 0)}. "
-            "Review/reject candidates are never promoted automatically."
+            "Review/reject candidates are never promoted automatically by the canon bonus; explicit user Priority remains the only override."
         )
 
     clean_caption_output_dirs()
@@ -8899,7 +9246,9 @@ def continue_caption_from_profile() -> None:
     for export_index, row in enumerate(selected_sorted, start=1):
         raise_if_cancelled(f"train export {export_index}/{len(selected_sorted)}")
         needs_text_cleanup = needs_caption_remove(row)
-        if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE:
+        priority_override = is_priority_image(row, subject_profile)
+        row["priority_image"] = bool(priority_override)
+        if needs_text_cleanup and SEND_TEXT_IMAGES_TO_CAPTION_REMOVE and not priority_override:
             bucket = "caption_remove"
             out_dir = CAPTION_REMOVE_DIR
             new_basename = f"{SAFE_TRIGGER}-caption_remove_{counters[bucket]:03d}"
@@ -8954,6 +9303,8 @@ def continue_caption_from_profile() -> None:
         reject_export = sorted(reject_items, key=lambda r: -int(r.get("quality_total", 0)))
         for idx, row in enumerate(reject_export, start=1):
             raise_if_cancelled(f"reject export {idx}/{len(reject_export)}")
+            if is_priority_image(row, subject_profile):
+                continue
             new_basename = f"{SAFE_TRIGGER}_reject_{idx:03d}"
             img_out = os.path.join(REJECT_DIR, f"{new_basename}.jpg")
             txt_out = os.path.join(REJECT_DIR, f"{new_basename}.txt")
@@ -12419,6 +12770,9 @@ def main() -> None:
     # Audit-Werte enthalten, die wir herausfiltern wollen.
     profile_source_rows = list(selected) + list(unselected_keep)
     subject_profile = build_subject_profile(profile_source_rows)
+    subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
+    if subject_profile:
+        save_subject_profile(subject_profile)
 
     # PASS 5: Speichern
     shot_order = {"headshot": 0, "medium": 1, "full_body": 2}

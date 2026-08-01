@@ -14,6 +14,7 @@ import os
 import re
 import json
 import inspect
+import hashlib
 import subprocess
 import sys
 import threading
@@ -21,6 +22,7 @@ import signal
 import time
 import uuid
 from glob import glob
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
@@ -1058,6 +1060,7 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
             profile = json.load(f)
         if not isinstance(profile, dict):
             raise ValueError("profile is not a JSON object")
+        profile = _normalize_audited_reject_role_ui(profile)
     except Exception as e:
         return _empty_editor_payload(
             tr(f"❌ Profil-Lesefehler: {e}", f"❌ Profile read error: {e}"),
@@ -1579,42 +1582,269 @@ def _identity_clusters_gallery(
     return gallery
 
 
+AUDITED_REJECT_CLUSTER_ID = "audited_rejects"
+CLUSTER_GALLERY_PAGE_SIZE = 36
+
+
+def _parse_cluster_gallery_page(value: Any) -> int:
+    try:
+        return max(1, int(float(str(value or "1").strip())))
+    except Exception:
+        return 1
+
+
+def _cluster_gallery_page_count(cluster: Optional[Dict[str, Any]], page_size: int = CLUSTER_GALLERY_PAGE_SIZE) -> int:
+    total = len(_cluster_member_records(cluster or {}))
+    return max(1, (total + max(1, int(page_size)) - 1) // max(1, int(page_size)))
+
+
+def _cluster_gallery_page_update(profile: Dict[str, Any], cluster_id: str, page: Any = 1) -> Any:
+    cluster = _identity_cluster_by_id(profile or {}, cluster_id)
+    total_pages = _cluster_gallery_page_count(cluster)
+    current = min(_parse_cluster_gallery_page(page), total_pages)
+    choices = [(f"{i} / {total_pages}", str(i)) for i in range(1, total_pages + 1)]
+    return gr.update(choices=choices, value=str(current), interactive=total_pages > 1)
+
+
+def _profile_member_id_ui(row: Dict[str, Any]) -> str:
+    existing = str((row or {}).get("profile_member_id") or "").strip()
+    if existing:
+        return existing
+    content_id = str((row or {}).get("profile_image_id") or (row or {}).get("file_hash") or "").strip()
+    src = str((row or {}).get("original_path") or (row or {}).get("original_filename") or "").strip()
+    if not content_id:
+        content_id = hashlib.sha1(src.encode("utf-8", errors="ignore")).hexdigest()
+    normalized = os.path.normcase(os.path.abspath(src)) if src else str((row or {}).get("original_filename") or content_id)
+    suffix = hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return f"{content_id}::{suffix}"
+
+
+def _selection_ref_for_record(record: Dict[str, Any], record_index: int = -1) -> str:
+    return json.dumps({
+        "image_id": str(record.get("image_id", "") or ""),
+        "filename": str(record.get("filename", "") or ""),
+        "image_path": str(record.get("image_path", "") or ""),
+        "record_index": int(record_index),
+    }, ensure_ascii=False, separators=(",", ":"))
+
+
+def _parse_selection_ref(value: Any) -> Dict[str, Any]:
+    raw = str(value or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    # Backward compatibility with the earlier UI state, which stored only ID.
+    return {"image_id": raw}
+
+
+def _resolve_cluster_record(cluster: Dict[str, Any], selected_ref: Any) -> Tuple[int, Optional[Dict[str, str]]]:
+    records = _cluster_member_records(cluster or {})
+    ref = _parse_selection_ref(selected_ref)
+    if not ref:
+        return -1, None
+    try:
+        idx = int(ref.get("record_index", -1))
+    except Exception:
+        idx = -1
+    if 0 <= idx < len(records):
+        candidate = records[idx]
+        checks = [
+            ("image_path", str(ref.get("image_path", "") or "")),
+            ("filename", str(ref.get("filename", "") or "")),
+            ("image_id", str(ref.get("image_id", "") or "")),
+        ]
+        if all(not expected or str(candidate.get(field, "") or "") == expected for field, expected in checks):
+            return idx, candidate
+
+    image_path = str(ref.get("image_path", "") or "")
+    filename = str(ref.get("filename", "") or "")
+    image_id = str(ref.get("image_id", "") or "")
+    for i, record in enumerate(records):
+        if image_path and str(record.get("image_path", "") or "") == image_path:
+            return i, record
+    for i, record in enumerate(records):
+        if filename and image_id and str(record.get("filename", "") or "") == filename and str(record.get("image_id", "") or "") == image_id:
+            return i, record
+    for i, record in enumerate(records):
+        if filename and str(record.get("filename", "") or "") == filename:
+            return i, record
+    for i, record in enumerate(records):
+        if image_id and str(record.get("image_id", "") or "") == image_id:
+            return i, record
+    return -1, None
+
+
+def _normalize_audited_reject_role_ui(profile: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(profile, dict):
+        return profile
+    member_roles = profile.setdefault("identity_cluster_member_roles", {})
+    if not isinstance(member_roles, dict):
+        member_roles = {}
+        profile["identity_cluster_member_roles"] = member_roles
+    overrides = profile.setdefault("identity_cluster_role_overrides", {})
+    if not isinstance(overrides, dict):
+        overrides = {}
+        profile["identity_cluster_role_overrides"] = overrides
+    for cluster in profile.get("identity_clusters", []) or []:
+        if not isinstance(cluster, dict):
+            continue
+        cid = str(cluster.get("cluster_id", "") or "")
+        kind = str(cluster.get("cluster_kind", "") or "")
+        if cid == AUDITED_REJECT_CLUSTER_ID or kind == "audited_rejects":
+            cluster["role"] = "exclude"
+            overrides[cid or AUDITED_REJECT_CLUSTER_ID] = "exclude"
+            for mid in cluster.get("members", []) or []:
+                member_roles[str(mid)] = "exclude"
+    return profile
+
+
+def _sorted_identity_clusters(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    profile = _normalize_audited_reject_role_ui(profile or {})
+    clusters = [c for c in ((profile or {}).get("identity_clusters", []) or []) if isinstance(c, dict)]
+    return sorted(
+        clusters,
+        key=lambda c: (
+            1 if (
+                str(c.get("cluster_id", "") or "") == AUDITED_REJECT_CLUSTER_ID
+                or str(c.get("cluster_kind", "") or "") == "audited_rejects"
+                or bool(c.get("sort_last"))
+            ) else 0,
+        ),
+    )
+
+
+def _cluster_member_records(cluster: Dict[str, Any]) -> List[Dict[str, str]]:
+    members = list(cluster.get("members", []) or [])
+    filenames = list(cluster.get("filenames", []) or [])
+    paths = list(cluster.get("image_paths", []) or [])
+    reject_reasons = list(cluster.get("reject_reasons", []) or [])
+    total = max(len(members), len(filenames), len(paths), len(reject_reasons))
+    records: List[Dict[str, str]] = []
+    for idx in range(total):
+        records.append({
+            "image_id": str(members[idx] if idx < len(members) else ""),
+            "filename": str(filenames[idx] if idx < len(filenames) else ""),
+            "image_path": str(paths[idx] if idx < len(paths) else ""),
+            "reject_reason": str(reject_reasons[idx] if idx < len(reject_reasons) else ""),
+            "record_index": str(idx),
+        })
+    return records
+
+
+
+
+def _missing_cluster_preview_image() -> Image.Image:
+    """Return a neutral tile so every bucket member stays selectable."""
+    return Image.new("RGB", (384, 384), (72, 72, 72))
+
+def _identity_cluster_preview_entries(
+    profile: Dict[str, Any],
+    trigger_word: str,
+    input_folder: str,
+    cluster_id: Optional[str] = None,
+    page: Any = 1,
+    page_size: int = CLUSTER_GALLERY_PAGE_SIZE,
+) -> List[Dict[str, Any]]:
+    """Build one deterministic page of preview records.
+
+    Large reject buckets used to create hundreds of PIL thumbnails at once.
+    Apart from being slow, a transient image decode failure could shift gallery
+    indices between the select callback and the detach callback.  We now page
+    the *record list first* and return file paths to Gradio, so the browser/UI
+    loads only one small stable page and every selection keeps the original
+    member record index.
+    """
+    entries: List[Dict[str, Any]] = []
+    cluster = _identity_cluster_by_id(profile, cluster_id)
+    if not cluster:
+        return entries
+    role = str(cluster.get("role", "variation") or "variation")
+    summary = str(cluster.get("summary", "") or "")
+    priority_ids = {str(x) for x in ((profile or {}).get("priority_image_ids", []) or [])}
+    priority_names = {str(x) for x in ((profile or {}).get("priority_image_filenames", []) or [])}
+    row_lookup = _stage_rows_by_profile_id(trigger_word, input_folder)
+    is_reject_bucket = str(cluster.get("cluster_kind", "") or "") == "audited_rejects"
+
+    records = _cluster_member_records(cluster)
+    size = max(1, int(page_size))
+    total_pages = max(1, (len(records) + size - 1) // size)
+    current_page = min(_parse_cluster_gallery_page(page), total_pages)
+    start_index = (current_page - 1) * size
+    page_records = records[start_index:start_index + size]
+
+    for offset, record in enumerate(page_records):
+        record_index = start_index + offset
+        source = record.get("image_path") or record.get("filename")
+        path = _find_cluster_preview_image(trigger_word, input_folder, source)
+        filename = record.get("filename") or (os.path.basename(path) if path else str(source or "unknown"))
+        preview = load_gallery_image(path, max_size=(384, 384)) if path else None
+        preview_available = preview is not None
+        if preview is None:
+            preview = _missing_cluster_preview_image()
+        content_id = str(record.get("image_id", "") or "").split("::", 1)[0]
+        is_priority = record.get("image_id") in priority_ids or content_id in priority_ids or filename in priority_names
+        marker = "⭐ PRIORITY | " if is_priority else ""
+        if is_reject_bucket:
+            marker += "REJECTED/AUDITED | "
+        row = _row_for_cluster_record(row_lookup, record)
+        reject_reason = str(record.get("reject_reason", "") or "") or _reject_reason_from_row_ui(row)
+        caption = f"{marker}{role} | {summary}\n{filename}"
+        if not preview_available:
+            caption += "\n⚠ Preview unavailable – item remains selectable"
+        if reject_reason:
+            caption += f"\nReject: {reject_reason}"
+        entries.append({
+            **record,
+            "record_index": str(record_index),
+            "filename": filename,
+            "resolved_path": path,
+            # Only one small page is decoded at a time. Missing/unreadable files
+            # receive a placeholder so record positions never shift.
+            "image": preview,
+            "caption": caption,
+            "priority": is_priority,
+            "reject_reason": reject_reason,
+            "selection_ref": _selection_ref_for_record(record, record_index),
+            "page": current_page,
+            "total_pages": total_pages,
+            "preview_available": preview_available,
+        })
+    return entries
+
+
 def _identity_cluster_selector_choices(profile: Dict[str, Any]) -> List[Tuple[str, str]]:
     """Choices for selecting exactly one identity cluster in the UI preview."""
     choices: List[Tuple[str, str]] = []
-    clusters = profile.get("identity_clusters", []) or []
-    if not isinstance(clusters, list):
-        return choices
+    clusters = _sorted_identity_clusters(profile)
     for idx, c in enumerate(clusters, start=1):
-        if not isinstance(c, dict):
-            continue
         cid = str(c.get("cluster_id", "") or "").strip()
         if not cid:
             continue
         role = str(c.get("role", "variation") or "variation")
         n = int(c.get("n", 0) or 0)
         summary = str(c.get("summary", "") or cid)
-        label = f"{idx:02d}. {role} | n={n} | {summary}"
+        prefix = "⬇ REJECTED | " if str(c.get("cluster_kind", "") or "") == "audited_rejects" else ""
+        label = f"{idx:02d}. {prefix}{role} | n={n} | {summary}"
         choices.append((label, cid))
     return choices
 
-
 def _identity_cluster_by_id(profile: Dict[str, Any], cluster_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    clusters = profile.get("identity_clusters", []) or []
-    if not isinstance(clusters, list) or not clusters:
+    clusters = _sorted_identity_clusters(profile)
+    if not clusters:
         return None
     wanted = str(cluster_id or "").strip()
     if wanted:
         for c in clusters:
-            if isinstance(c, dict) and str(c.get("cluster_id", "") or "") == wanted:
+            if str(c.get("cluster_id", "") or "") == wanted:
                 return c
-    for c in clusters:
-        if isinstance(c, dict):
-            return c
-    return None
+    return clusters[0]
 
-
-def _identity_cluster_preview_markdown(profile: Dict[str, Any], cluster_id: Optional[str] = None) -> str:
+def _identity_cluster_preview_markdown(profile: Dict[str, Any], cluster_id: Optional[str] = None, page: Any = 1) -> str:
     c = _identity_cluster_by_id(profile, cluster_id)
     if not c:
         return tr("_Kein Cluster ausgewählt._", "_No cluster selected._")
@@ -1627,18 +1857,33 @@ def _identity_cluster_preview_markdown(profile: Dict[str, Any], cluster_id: Opti
     style_counts = c.get("style_counts", {}) or {}
     shot_counts = c.get("shot_counts", {}) or {}
     filenames = c.get("filenames", []) or []
+    cluster_kind = str(c.get("cluster_kind", "") or "")
+    page_count = _cluster_gallery_page_count(c)
+    current_page = min(_parse_cluster_gallery_page(page), page_count)
     lines = [
         f"### {tr('Vorschau', 'Preview')}: `{cid}`",
         f"**Role:** `{role}`  ",
         f"**N:** {n}  ",
         f"**Summary:** {summary}  ",
+        f"**" + tr("Galerieseite", "Gallery page") + f":** {current_page}/{page_count} · " + tr(f"bis zu {CLUSTER_GALLERY_PAGE_SIZE} Bilder je Seite", f"up to {CLUSTER_GALLERY_PAGE_SIZE} images per page") + "  ",
     ]
+    if cluster_kind == "audited_rejects":
+        lines.append("**" + tr("Sonder-Bucket", "Special bucket") + ":** " + tr(
+            "Vollständig auditierte Rejects; immer am Ende und standardmäßig `exclude`. Einzelbilder können gelöst oder als Priority markiert werden.  ",
+            "Fully audited rejects; always listed last and default to `exclude`. Individual images can be detached or marked Priority.  ",
+        ))
     if quality or identity:
         lines.append(f"**Quality / Identity:** {quality or '-'} / {identity or '-'}  ")
     if shot_counts:
         lines.append("**Shots:** " + ", ".join(f"`{k}`={v}" for k, v in sorted(shot_counts.items())))
     if style_counts:
         lines.append("**Style:** " + ", ".join(f"`{k}`={v}" for k, v in sorted(style_counts.items())))
+    reject_reasons = [str(x) for x in (c.get("reject_reasons", []) or []) if str(x)]
+    if reject_reasons:
+        reason_counts = Counter(reject_reasons)
+        lines.append("**" + tr("Häufigste Reject-Gründe", "Most common reject reasons") + ":** " + ", ".join(
+            f"`{reason}`={count}" for reason, count in reason_counts.most_common(8)
+        ))
     if filenames:
         lines.append("")
         lines.append("**" + tr("Dateien", "Files") + ":** " + ", ".join(str(x) for x in filenames[:10]) + (" …" if len(filenames) > 10 else ""))
@@ -1650,35 +1895,352 @@ def _identity_cluster_preview_gallery(
     trigger_word: str,
     input_folder: str,
     cluster_id: Optional[str] = None,
-    max_images: int = 18,
-) -> List[Tuple[Image.Image, str]]:
-    """Build thumbnails only for the currently selected identity cluster."""
-    gallery: List[Tuple[Image.Image, str]] = []
-    c = _identity_cluster_by_id(profile, cluster_id)
-    if not c:
-        return gallery
-    cid = str(c.get("cluster_id", "") or "")
-    role = str(c.get("role", "variation") or "variation")
-    summary = str(c.get("summary", "") or "")
-    filenames = c.get("filenames", []) or []
-    image_paths = c.get("image_paths", []) or []
-    preview_sources: List[str] = []
-    for src in list(image_paths) + list(filenames):
-        s = str(src or "").strip()
-        if s and s not in preview_sources:
-            preview_sources.append(s)
-    for src in preview_sources:
-        if len(gallery) >= max_images:
-            break
-        path = _find_cluster_preview_image(trigger_word, input_folder, src)
-        if not path:
+    page: Any = 1,
+) -> List[Tuple[Any, str]]:
+    """Build one stable, lazily loaded page for the selected cluster."""
+    return [
+        (entry["image"], entry["caption"])
+        for entry in _identity_cluster_preview_entries(
+            profile, trigger_word, input_folder, cluster_id, page=page
+        )
+    ]
+
+
+def select_identity_cluster_image_ui(
+    profile: Dict[str, Any],
+    trigger_word: str,
+    input_folder: str,
+    cluster_id: str,
+    gallery_page: Any,
+    evt: gr.SelectData,
+) -> Tuple[str, str]:
+    entries = _identity_cluster_preview_entries(profile or {}, trigger_word, input_folder, cluster_id, page=gallery_page)
+    idx = getattr(evt, "index", None)
+    try:
+        idx = idx[0] if isinstance(idx, (tuple, list)) else idx
+        selected_index = int(idx)
+    except Exception:
+        selected_index = -1
+    if selected_index < 0 or selected_index >= len(entries):
+        return "", tr("⚠️ Bildauswahl konnte nicht bestimmt werden.", "⚠️ Could not resolve selected image.")
+    entry = entries[selected_index]
+    image_id = str(entry.get("image_id", "") or "")
+    filename = str(entry.get("filename", "") or "")
+    priority = bool(entry.get("priority"))
+    reject_reason = str(entry.get("reject_reason", "") or "")
+    status = (
+        f"**{tr('Ausgewähltes Bild', 'Selected image')}:** `{filename}`  \n"
+        f"**Member ID:** `{image_id or '-'}`  \n"
+        f"**" + tr("Galerieseite", "Gallery page") + f":** {_parse_cluster_gallery_page(gallery_page)}  \n"
+        f"**Priority:** {'⭐ yes' if priority else 'no'}"
+    )
+    if reject_reason:
+        status += f"  \n**{tr('Reject-Grund', 'Reject reason')}:** `{reject_reason}`"
+    return str(entry.get("selection_ref", "") or ""), status
+
+
+def _load_profile_for_bucket_edit(trigger_word: str, input_folder: str, profile_state: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    path = subject_profile_path_for(input_folder, trigger_word)
+    profile: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                profile = _normalize_audited_reject_role_ui(loaded)
+        except Exception:
+            profile = {}
+    if not profile and isinstance(profile_state, dict):
+        profile = json.loads(json.dumps(profile_state))
+    return profile, path
+
+
+def _save_profile_bucket_edit(profile: Dict[str, Any], path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(profile, f, ensure_ascii=False, indent=2)
+
+
+def _stage_rows_by_profile_id(trigger_word: str, input_folder: str) -> Dict[str, Dict[str, Any]]:
+    path = caption_stage_path_for(input_folder, trigger_word)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            stage = json.load(f)
+        rows = stage.get("all_rows", []) if isinstance(stage, dict) else []
+    except Exception:
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
             continue
-        img = load_gallery_image(path, max_size=(768, 768))
-        if img is None:
-            continue
-        caption = f"{role} | {summary}\n{os.path.basename(path)}"
-        gallery.append((img, caption))
-    return gallery
+        image_id = str(row.get("profile_image_id", "") or row.get("file_hash", "") or "")
+        member_id = _profile_member_id_ui(row)
+        filename = str(row.get("original_filename", "") or "")
+        image_path = str(row.get("original_path", "") or "")
+        if member_id:
+            result[member_id] = row
+        if image_id and image_id not in result:
+            result[image_id] = row
+        if filename:
+            result[f"filename::{filename}"] = row
+        if image_path:
+            result[f"path::{image_path}"] = row
+    return result
+
+
+def _row_for_cluster_record(row_lookup: Dict[str, Dict[str, Any]], record: Dict[str, Any]) -> Dict[str, Any]:
+    for key in (
+        str(record.get("image_id", "") or ""),
+        f"path::{str(record.get('image_path', '') or '')}",
+        f"filename::{str(record.get('filename', '') or '')}",
+    ):
+        if key and key in row_lookup:
+            return row_lookup[key]
+    return {}
+
+
+def _reject_reason_from_row_ui(row: Dict[str, Any]) -> str:
+    if not isinstance(row, dict) or not row:
+        return ""
+    parts: List[str] = []
+    short_reason = str(row.get("short_reason", "") or "").strip()
+    if short_reason:
+        parts.append(short_reason)
+    if str(row.get("arcface_flag", "") or "").strip().lower() == "hard":
+        parts.append("ArcFace hard identity flag")
+    for field in ("local_override_reasons", "issues"):
+        value = row.get(field)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                value = [x.strip() for x in re.split(r"[;,|]", value) if x.strip()]
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                text = str(item or "").strip()
+                if text and text not in parts:
+                    parts.append(text)
+    return " | ".join(parts[:4])
+
+
+def _refresh_cluster_stats_ui(cluster: Dict[str, Any], row_lookup: Dict[str, Dict[str, Any]]) -> None:
+    members = [str(x) for x in (cluster.get("members", []) or [])]
+    rows = [row_lookup[mid] for mid in members if mid in row_lookup]
+    cluster["n"] = len(members)
+    if not rows:
+        return
+    qualities = [float(r.get("quality_total", 0) or 0) for r in rows]
+    identities = [float(r.get("quality_identity_usefulness", 0) or 0) for r in rows]
+    cluster["avg_quality_total"] = round(sum(qualities) / max(1, len(qualities)), 1)
+    cluster["avg_identity_usefulness"] = round(sum(identities) / max(1, len(identities)), 1)
+    shot_counts: Dict[str, int] = {}
+    style_counts: Dict[str, int] = {}
+    for row in rows:
+        shot = str(row.get("shot_type", "") or "unknown")
+        shot_counts[shot] = shot_counts.get(shot, 0) + 1
+        style = "bw" if bool(row.get("is_grayscale_filter")) else (str(row.get("color_tint_label", "") or "clean") or "clean")
+        style_counts[style] = style_counts.get(style, 0) + 1
+    cluster["shot_counts"] = shot_counts
+    cluster["style_counts"] = style_counts
+
+
+def _rebuild_cluster_member_maps_ui(profile: Dict[str, Any]) -> None:
+    roles: Dict[str, str] = {}
+    clusters_by_member: Dict[str, str] = {}
+    for cluster in _sorted_identity_clusters(profile):
+        cid = str(cluster.get("cluster_id", "") or "")
+        role = str(cluster.get("role", "variation") or "variation")
+        for mid in cluster.get("members", []) or []:
+            roles[str(mid)] = role
+            clusters_by_member[str(mid)] = cid
+    profile["identity_cluster_member_roles"] = roles
+    profile["identity_cluster_member_clusters"] = clusters_by_member
+
+
+def detach_selected_image_from_cluster_ui(
+    trigger_word: str,
+    input_folder: str,
+    profile_state: Dict[str, Any],
+    selected_cluster_id: str,
+    selected_image_id: str,
+    gallery_page: Any,
+) -> Tuple[Dict[str, Any], str, str, List[List[Any]], str, List[Tuple[Any, str]], str, Any, Any, str, str, str]:
+    profile, path = _load_profile_for_bucket_edit(trigger_word, input_folder, profile_state)
+    cid = str(selected_cluster_id or "").strip()
+    selected_ref = str(selected_image_id or "").strip()
+    if not profile or not cid or not selected_ref:
+        return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_clusters_markdown(profile), _identity_clusters_table(profile), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), cid, gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value=_identity_cluster_role_for_id(profile, cid)), _cluster_gallery_page_update(profile, cid, gallery_page), selected_ref, tr("_Kein Bild ausgewählt._", "_No image selected._"), tr("⚠️ Erst ein Bild in der Vorschau anklicken.", "⚠️ Select an image in the preview first.")
+
+    clusters = _sorted_identity_clusters(profile)
+    source = next((c for c in clusters if str(c.get("cluster_id", "") or "") == cid), None)
+    if not source:
+        return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_clusters_markdown(profile), _identity_clusters_table(profile), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), cid, gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value="variation"), _cluster_gallery_page_update(profile, cid, gallery_page), "", tr("_Kein Bild ausgewählt._", "_No image selected._"), tr("❌ Bucket nicht gefunden.", "❌ Bucket not found.")
+
+    selected_index, record = _resolve_cluster_record(source, selected_ref)
+    if selected_index < 0 or not record:
+        return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_clusters_markdown(profile), _identity_clusters_table(profile), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), cid, gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value=_identity_cluster_role_for_id(profile, cid)), _cluster_gallery_page_update(profile, cid, gallery_page), "", tr("_Kein Bild ausgewählt._", "_No image selected._"), tr("❌ Bild ist nicht mehr in diesem Bucket.", "❌ Image is no longer in this bucket.")
+
+    image_id = str(record.get("image_id", "") or "")
+    members = list(source.get("members", []) or [])
+    filenames = list(source.get("filenames", []) or [])
+    paths = list(source.get("image_paths", []) or [])
+    reject_reasons = list(source.get("reject_reasons", []) or [])
+    members.pop(selected_index)
+    filename = filenames.pop(selected_index) if selected_index < len(filenames) else record.get("filename", "")
+    image_path = paths.pop(selected_index) if selected_index < len(paths) else record.get("image_path", "")
+    reject_reason = reject_reasons.pop(selected_index) if selected_index < len(reject_reasons) else str(record.get("reject_reason", "") or "")
+    source["members"], source["filenames"], source["image_paths"] = members, filenames, paths
+    if reject_reasons or "reject_reasons" in source:
+        source["reject_reasons"] = reject_reasons
+
+    row_lookup = _stage_rows_by_profile_id(trigger_word, input_folder)
+    _refresh_cluster_stats_ui(source, row_lookup)
+    if not members:
+        clusters = [c for c in clusters if c is not source]
+
+    stem = re.sub(r"[^a-zA-Z0-9_\-]+", "_", os.path.splitext(os.path.basename(filename or image_id))[0]).strip("_").lower() or "image"
+    existing_ids = {str(c.get("cluster_id", "") or "") for c in clusters}
+    new_cid = f"manual_{stem}"
+    counter = 2
+    while new_cid in existing_ids:
+        new_cid = f"manual_{stem}_{counter}"
+        counter += 1
+    detached_from_reject = str(source.get("cluster_kind", "") or "") == "audited_rejects" or cid == AUDITED_REJECT_CLUSTER_ID
+    inherited_role = "exclude" if detached_from_reject else str(source.get("role", "variation") or "variation")
+    row = _row_for_cluster_record(row_lookup, record)
+    reject_reason = reject_reason or _reject_reason_from_row_ui(row)
+    new_cluster = {
+        "cluster_id": new_cid,
+        "cluster_kind": "manual_singleton",
+        "role": inherited_role,
+        "n": 1,
+        "summary": f"manually detached | {filename or image_id}",
+        "avg_quality_total": round(float(row.get("quality_total", 0) or 0), 1) if row else "",
+        "avg_identity_usefulness": round(float(row.get("quality_identity_usefulness", 0) or 0), 1) if row else "",
+        "shot_counts": {str(row.get("shot_type", "") or "unknown"): 1} if row else {},
+        "style_counts": {},
+        "members": [image_id],
+        "filenames": [filename],
+        "image_paths": [image_path],
+        "reject_reasons": [reject_reason] if reject_reason else [],
+        "origin_cluster_id": cid,
+        "detached_from_reject": bool(detached_from_reject),
+    }
+    # Keep audited rejects at the absolute bottom.
+    insert_at = next((i for i, c in enumerate(clusters) if str(c.get("cluster_kind", "") or "") == "audited_rejects"), len(clusters))
+    clusters.insert(insert_at, new_cluster)
+    profile["identity_clusters"] = clusters
+    _rebuild_cluster_member_maps_ui(profile)
+    notes = profile.setdefault("normalizer_notes", [])
+    if isinstance(notes, list):
+        notes.append(f"User detached image {filename or image_id} from {cid} into {new_cid} at {time.strftime('%Y-%m-%dT%H:%M:%S')}.")
+        profile["normalizer_notes"] = notes[-40:]
+    _save_profile_bucket_edit(profile, path)
+    role_update = gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value=inherited_role)
+    return (
+        profile,
+        json.dumps(profile, ensure_ascii=False, indent=2),
+        _identity_clusters_markdown(profile),
+        gr.update(value=_identity_clusters_table(profile)),
+        _identity_cluster_preview_markdown(profile, new_cid, page=1),
+        gr.update(value=_identity_cluster_preview_gallery(profile, trigger_word, input_folder, new_cid, page=1)),
+        new_cid,
+        role_update,
+        _cluster_gallery_page_update(profile, new_cid, 1),
+        "",
+        tr("_Kein Bild ausgewählt._", "_No image selected._"),
+        tr(f"✅ Bild aus `{cid}` gelöst und in neuen Bucket `{new_cid}` verschoben.", f"✅ Image detached from `{cid}` and moved into new bucket `{new_cid}`."),
+    )
+
+
+def refresh_identity_cluster_panel_ui(
+    trigger_word: str,
+    input_folder: str,
+    profile_state: Dict[str, Any],
+    preferred_cluster_id: str,
+) -> Tuple[Dict[str, Any], str, str, Any, str, Any, str, Any, Any, str, str]:
+    """Force-refresh all cluster UI components from the persisted profile.
+
+    Gradio 6 may keep an interactive Dataframe/Gallery visually unchanged when a
+    callback returns only a raw replacement value.  This helper reloads the
+    just-saved profile and returns explicit component updates.  It is chained
+    after detach so the new singleton bucket is visible immediately.
+    """
+    profile, _path = _load_profile_for_bucket_edit(trigger_word, input_folder, profile_state)
+    clusters = _sorted_identity_clusters(profile)
+    wanted = str(preferred_cluster_id or "").strip()
+    cluster_ids = {str(c.get("cluster_id", "") or "") for c in clusters}
+    if wanted not in cluster_ids:
+        wanted = str((clusters[0] if clusters else {}).get("cluster_id", "") or "")
+    role = _identity_cluster_role_for_id(profile, wanted) if wanted else "variation"
+    table_rows = _identity_clusters_table(profile)
+    gallery_rows = _identity_cluster_preview_gallery(profile, trigger_word, input_folder, wanted, page=1)
+    return (
+        profile,
+        json.dumps(profile, ensure_ascii=False, indent=2),
+        _identity_clusters_markdown(profile),
+        gr.update(value=table_rows),
+        _identity_cluster_preview_markdown(profile, wanted, page=1),
+        gr.update(value=gallery_rows),
+        wanted,
+        gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value=role),
+        _cluster_gallery_page_update(profile, wanted, 1),
+        "",
+        tr("_Kein Bild ausgewählt._", "_No image selected._"),
+    )
+
+
+def set_selected_image_priority_ui(
+    trigger_word: str,
+    input_folder: str,
+    profile_state: Dict[str, Any],
+    selected_cluster_id: str,
+    selected_image_id: str,
+    gallery_page: Any,
+    make_priority: bool,
+) -> Tuple[Dict[str, Any], str, str, List[Tuple[Any, str]], str, str]:
+    profile, path = _load_profile_for_bucket_edit(trigger_word, input_folder, profile_state)
+    cid = str(selected_cluster_id or "").strip()
+    selected_ref = str(selected_image_id or "").strip()
+    cluster = _identity_cluster_by_id(profile, cid)
+    _record_index, record = _resolve_cluster_record(cluster or {}, selected_ref)
+    if not record:
+        return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), tr("_Kein Bild ausgewählt._", "_No image selected._"), tr("⚠️ Erst ein Bild in der Vorschau anklicken.", "⚠️ Select an image in the preview first.")
+    image_id = str(record.get("image_id", "") or "")
+    content_image_id = image_id.split("::", 1)[0]
+    filename = str(record.get("filename", "") or "")
+    reject_reason = str(record.get("reject_reason", "") or "")
+    ids = [str(x) for x in (profile.get("priority_image_ids", []) or []) if str(x)]
+    names = [str(x) for x in (profile.get("priority_image_filenames", []) or []) if str(x)]
+    if make_priority:
+        if content_image_id and content_image_id not in ids:
+            ids.append(content_image_id)
+        if filename and filename not in names:
+            names.append(filename)
+    else:
+        ids = [x for x in ids if x not in {image_id, content_image_id}]
+        names = [x for x in names if x != filename]
+    profile["priority_image_ids"] = ids
+    profile["priority_image_filenames"] = names
+    notes = profile.setdefault("normalizer_notes", [])
+    if isinstance(notes, list):
+        notes.append(f"User {'marked' if make_priority else 'unmarked'} Priority image {filename or image_id} at {time.strftime('%Y-%m-%dT%H:%M:%S')}.")
+        profile["normalizer_notes"] = notes[-40:]
+    _save_profile_bucket_edit(profile, path)
+    selected_info = (
+        f"**{tr('Ausgewähltes Bild', 'Selected image')}:** `{filename}`  \n"
+        f"**Image ID:** `{image_id}`  \n"
+        f"**Priority:** {'⭐ yes' if make_priority else 'no'}"
+    )
+    if reject_reason:
+        selected_info += f"  \n**{tr('Reject-Grund', 'Reject reason')}:** `{reject_reason}`"
+    status = tr(
+        f"✅ `{filename}` ist jetzt {'Priority und wird zwingend in Train Ready übernommen' if make_priority else 'nicht mehr Priority'}.",
+        f"✅ `{filename}` is now {'Priority and will be forced into Train Ready' if make_priority else 'no longer Priority'}.",
+    )
+    return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), selected_info, status
 
 
 def _table_records_from_gradio(table_data: Any) -> List[Dict[str, Any]]:
@@ -1717,11 +2279,12 @@ def preview_identity_cluster_from_dropdown_ui(
     trigger_word: str,
     input_folder: str,
     cluster_id: str,
-) -> Tuple[str, List[Tuple[Image.Image, str]]]:
+) -> Tuple[str, List[Tuple[Any, str]], Any]:
     profile = profile or {}
     return (
-        _identity_cluster_preview_markdown(profile, cluster_id),
-        _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cluster_id),
+        _identity_cluster_preview_markdown(profile, cluster_id, page=1),
+        _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cluster_id, page=1),
+        _cluster_gallery_page_update(profile, cluster_id, 1),
     )
 
 
@@ -1742,7 +2305,7 @@ def _identity_cluster_id_from_table_select(
     back to the first cluster, so every click showed the same images.
     """
     profile = profile or {}
-    clusters = profile.get("identity_clusters", []) or []
+    clusters = _sorted_identity_clusters(profile)
     cluster_ids = [
         str(c.get("cluster_id", "") or "")
         for c in clusters
@@ -1821,16 +2384,35 @@ def preview_identity_cluster_from_table_ui(
     input_folder: str,
     table_data: Any,
     evt: gr.SelectData,
-) -> Tuple[str, List[Tuple[Image.Image, str]], str, Any]:
-    """Update the right-side preview and selected-row role editor from a table click."""
+) -> Tuple[str, List[Tuple[Any, str]], str, Any, Any]:
+    """Open the first stable gallery page for a selected cluster."""
     profile = profile or {}
     cluster_id = _identity_cluster_id_from_table_select(profile, table_data, evt)
     role = _identity_cluster_role_for_id(profile, cluster_id)
     return (
-        _identity_cluster_preview_markdown(profile, cluster_id),
-        _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cluster_id),
+        _identity_cluster_preview_markdown(profile, cluster_id, page=1),
+        _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cluster_id, page=1),
         cluster_id,
         gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value=role),
+        _cluster_gallery_page_update(profile, cluster_id, 1),
+    )
+
+
+def refresh_identity_cluster_gallery_page_ui(
+    profile: Dict[str, Any],
+    trigger_word: str,
+    input_folder: str,
+    cluster_id: str,
+    gallery_page: Any,
+) -> Tuple[str, List[Tuple[Any, str]], str, str]:
+    """Reload one gallery page and clear any stale image selection."""
+    profile = profile or {}
+    page = _parse_cluster_gallery_page(gallery_page)
+    return (
+        _identity_cluster_preview_markdown(profile, cluster_id, page=page),
+        _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cluster_id, page=page),
+        "",
+        tr("_Kein Bild ausgewählt._", "_No image selected._"),
     )
 
 
@@ -1918,6 +2500,16 @@ def apply_identity_cluster_role_selection_ui(
     """
     cid = str(selected_cluster_id or "").strip()
     role = str(selected_role or "").strip().lower()
+    if cid == AUDITED_REJECT_CLUSTER_ID and role != "exclude":
+        return (
+            profile if isinstance(profile, dict) else {},
+            _identity_clusters_table(profile if isinstance(profile, dict) else {}),
+            _identity_cluster_preview_markdown(profile if isinstance(profile, dict) else {}, cid),
+            tr(
+                "ℹ️ Der auditierte Reject-Bucket bleibt fest auf `exclude`. Löse ein Einzelbild in einen neuen Bucket oder markiere es als Priority.",
+                "ℹ️ The audited-reject bucket is fixed to `exclude`. Detach an individual image into a new bucket or mark it Priority.",
+            ),
+        )
     if not cid:
         return (
             profile if isinstance(profile, dict) else {},
@@ -1955,9 +2547,7 @@ def apply_identity_cluster_role_selection_ui(
 
 def _identity_clusters_table(profile: Dict[str, Any]) -> List[List[Any]]:
     rows: List[List[Any]] = []
-    for c in profile.get("identity_clusters", []) or []:
-        if not isinstance(c, dict):
-            continue
+    for c in _sorted_identity_clusters(profile):
         rows.append([
             str(c.get("cluster_id", "")),
             str(c.get("role", "variation") or "variation"),
@@ -1968,9 +2558,8 @@ def _identity_clusters_table(profile: Dict[str, Any]) -> List[List[Any]]:
         ])
     return rows
 
-
 def _identity_clusters_markdown(profile: Dict[str, Any]) -> str:
-    clusters = profile.get("identity_clusters", []) or []
+    clusters = _sorted_identity_clusters(profile)
     if not clusters:
         return tr(
             "_Keine Identity-Cluster im Profil. Starte den Curator mit aktualisierter Version neu oder baue das Profil neu._",
@@ -1981,6 +2570,12 @@ def _identity_clusters_markdown(profile: Dict[str, Any]) -> str:
         role = str(c.get("role", "variation") or "variation")
         role_counts[role] = role_counts.get(role, 0) + int(c.get("n", 0) or 0)
     warnings = [n for n in profile.get("normalizer_notes", []) or [] if "Identity clustering:" in str(n)]
+    priority_count = len({str(x) for x in (profile.get("priority_image_ids", []) or []) if str(x)})
+    audited_reject_count = sum(
+        int(c.get("n", 0) or 0)
+        for c in clusters
+        if str(c.get("cluster_kind", "") or "") == "audited_rejects"
+    )
     lines = [
         tr("### Identity-/Appearance-Cluster", "### Identity / appearance clusters"),
         "",
@@ -1990,6 +2585,8 @@ def _identity_clusters_markdown(profile: Dict[str, Any]) -> str:
         ),
         "",
         "**" + tr("Bildrollen", "Image roles") + ":** " + ", ".join(f"`{k}`={v}" for k, v in sorted(role_counts.items())),
+        f"**Priority:** {priority_count}  ",
+        f"**{tr('Auditierte Rejects im letzten Bucket', 'Audited rejects in the last bucket')}:** {audited_reject_count}",
     ]
     if warnings:
         lines.append("")
@@ -2045,7 +2642,7 @@ def save_identity_cluster_roles_ui(trigger_word: str, input_folder: str, table_d
         if role not in IDENTITY_CLUSTER_ROLE_CHOICES:
             invalid.append(f"{cid}: {role or '<empty>'}")
             continue
-        role_by_cluster[cid] = role
+        role_by_cluster[cid] = "exclude" if cid == AUDITED_REJECT_CLUSTER_ID else role
 
     # Merge roles from hidden profile state. This is more reliable than relying
     # only on the visible Dataframe value on all Gradio versions.
@@ -2056,14 +2653,14 @@ def save_identity_cluster_roles_ui(trigger_word: str, input_folder: str, table_d
             cid = str(c.get("cluster_id", "") or "").strip()
             role = str(c.get("role", "") or "").strip().lower()
             if cid and role in IDENTITY_CLUSTER_ROLE_CHOICES:
-                role_by_cluster[cid] = role
+                role_by_cluster[cid] = "exclude" if cid == AUDITED_REJECT_CLUSTER_ID else role
 
     # Final explicit override from the currently selected dropdown. This makes
     # Save work even if the user changed the dropdown and did not press Apply.
     selected_cid = str(selected_cluster_id or "").strip()
     selected_role_value = str(selected_role or "").strip().lower()
     if selected_cid and selected_role_value in IDENTITY_CLUSTER_ROLE_CHOICES:
-        role_by_cluster[selected_cid] = selected_role_value
+        role_by_cluster[selected_cid] = "exclude" if selected_cid == AUDITED_REJECT_CLUSTER_ID else selected_role_value
 
     if invalid:
         return tr(
@@ -4078,8 +4675,8 @@ def build_ui() -> gr.Blocks:
                     )
 
                     gr.Markdown(tr(
-                        "**Weiche Canon-Repräsentation:** Nach Bestätigung des Subject Profiles erhält die gewählte kanonische Haarfarbe einen abnehmenden Auswahlbonus. Die Headshot-/Medium-/Full-Body-Quoten bleiben unverändert. Review- und Reject-Bilder werden niemals automatisch hochgesetzt.",
-                        "**Soft canon representation:** After the Subject Profile is confirmed, the selected canonical hair color receives a diminishing selection bonus. Headshot/medium/full-body quotas remain unchanged. Review and reject images are never promoted automatically.",
+                        "**Weiche Canon-Repräsentation:** Nach Bestätigung des Subject Profiles erhält die gewählte kanonische Haarfarbe einen abnehmenden Auswahlbonus. Die Headshot-/Medium-/Full-Body-Quoten bleiben unverändert. Review- und Reject-Bilder werden durch den Canon-Bonus niemals automatisch hochgesetzt; eine ausdrückliche Priority-Markierung bleibt davon unberührt.",
+                        "**Soft canon representation:** After the Subject Profile is confirmed, the selected canonical hair color receives a diminishing selection bonus. Headshot/medium/full-body quotas remain unchanged. Review and reject images are never promoted automatically by the canon bonus; an explicit Priority override remains unaffected.",
                     ))
                     c_use_canon_representation = gr.Checkbox(
                         label=tr("Canon-Repräsentation bei der Auswahl fördern", "Promote canon representation during selection"),
@@ -5085,8 +5682,8 @@ def build_ui() -> gr.Blocks:
                     with gr.TabItem(tr("🧩 Identity Clustering", "🧩 Identity clustering")):
                         p_cluster_md = gr.Markdown("_kein Profil geladen_")
                         gr.Markdown(tr(
-                            "`core` gibt einen kleinen Ranking-Boost. `variation` und `body_reference` bleiben Trainingskandidaten. `review` und `exclude` gehen nicht in `01_train_ready`. Klicke links eine Cluster-Zeile an, um rechts die passenden Beispielbilder zu sehen.",
-                            "`core` gives a small ranking boost. `variation` and `body_reference` remain training candidates. `review` and `exclude` do not go to `01_train_ready`. Click a cluster row on the left to show the matching sample images on the right.",
+                            "`core` gibt einen kleinen Ranking-Boost. `variation` und `body_reference` bleiben Trainingskandidaten. `review` und `exclude` gehen nicht in `01_train_ready`. Vollständig auditierte Rejects stehen immer im letzten Bucket, beginnen als `exclude`, und zeigen den Reject-Grund direkt am Bild. Ein einzelnes Bild kann aus seinem Bucket gelöst oder als Priority zwingend in Train Ready übernommen werden.",
+                            "`core` gives a small ranking boost. `variation` and `body_reference` remain training candidates. `review` and `exclude` do not go to `01_train_ready`. Fully audited rejects always appear in the last bucket, start as `exclude`, and show the reject reason on each image. An individual image can be detached from its bucket or forced into Train Ready as Priority.",
                         ))
                         with gr.Row():
                             with gr.Column(scale=3):
@@ -5116,13 +5713,34 @@ def build_ui() -> gr.Blocks:
                                     p_save_clusters_btn = gr.Button(tr("💾 Cluster-Rollen speichern", "💾 Save cluster roles"), variant="secondary", scale=1)
                             with gr.Column(scale=2):
                                 p_cluster_preview_md = gr.Markdown(tr("_Kein Cluster ausgewählt._", "_No cluster selected._"))
+                                p_cluster_gallery_page = gr.Dropdown(
+                                    label=tr("Galerieseite", "Gallery page"),
+                                    choices=[("1 / 1", "1")],
+                                    value="1",
+                                    interactive=False,
+                                    allow_custom_value=False,
+                                    info=tr(
+                                        "Große Buckets werden seitenweise geladen, damit Auswahl und Detach stabil bleiben.",
+                                        "Large buckets are loaded page by page so selection and detach remain stable.",
+                                    ),
+                                )
                                 p_cluster_gallery = gr.Gallery(
-                                    label=tr("Cluster-Vorschau", "Cluster preview"),
+                                    label=tr("Cluster-Vorschau – Bild anklicken für Einzelaktionen", "Cluster preview – click an image for individual actions"),
                                     columns=3,
-                                    rows=3,
-                                    height=520,
+                                    rows=4,
+                                    height=620,
                                     object_fit="cover",
                                 )
+                                p_selected_cluster_image_id = gr.State("")
+                                p_selected_cluster_image_info = gr.Markdown(tr("_Kein Bild ausgewählt._", "_No image selected._"))
+                                with gr.Row():
+                                    p_detach_cluster_image_btn = gr.Button(tr("↗ Bild aus Bucket lösen", "↗ Detach image from bucket"), variant="secondary", scale=2)
+                                    p_priority_image_btn = gr.Button(tr("⭐ Als Priority markieren", "⭐ Mark as Priority"), variant="primary", scale=2)
+                                    p_unpriority_image_btn = gr.Button(tr("☆ Priority entfernen", "☆ Remove Priority"), variant="secondary", scale=2)
+                                gr.Markdown(tr(
+                                    "**Priority** überschreibt Qualitätswert, ArcFace, Bucket-Rolle, Quoten, Dubletten- und Caption-Remove-Entscheidungen. Nur eine fehlende oder unlesbare Quelldatei kann den Export verhindern.",
+                                    "**Priority** overrides quality, ArcFace, bucket role, quotas, duplicate and caption-remove decisions. Only a missing or unreadable source file can prevent export.",
+                                ))
 
                     # ----- Subtab: Diagnostics -----
                     with gr.TabItem(tr("🔬 Diagnostik & Raw JSON", "🔬 Diagnostics & raw JSON")):
@@ -5183,6 +5801,9 @@ def build_ui() -> gr.Blocks:
                     fn=load_profile_for_editor,
                     inputs=[p_trigger, p_input],
                     outputs=p_load_outputs,
+                ).then(
+                    fn=lambda: ("", tr("_Kein Bild ausgewählt._", "_No image selected._")),
+                    outputs=[p_selected_cluster_image_id, p_selected_cluster_image_info],
                 )
 
                 # Snapshot p_raw_json into the read-only diagnostics view
@@ -5195,7 +5816,53 @@ def build_ui() -> gr.Blocks:
                 p_cluster_table.select(
                     fn=preview_identity_cluster_from_table_ui,
                     inputs=[p_state, p_trigger, p_input, p_cluster_table],
-                    outputs=[p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_id, p_cluster_role_editor],
+                    outputs=[p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_id, p_cluster_role_editor, p_cluster_gallery_page],
+                ).then(
+                    fn=lambda: ("", tr("_Kein Bild ausgewählt._", "_No image selected._")),
+                    outputs=[p_selected_cluster_image_id, p_selected_cluster_image_info],
+                )
+
+                p_cluster_gallery.select(
+                    fn=select_identity_cluster_image_ui,
+                    inputs=[p_state, p_trigger, p_input, p_selected_cluster_id, p_cluster_gallery_page],
+                    outputs=[p_selected_cluster_image_id, p_selected_cluster_image_info],
+                )
+
+                p_cluster_gallery_page.input(
+                    fn=refresh_identity_cluster_gallery_page_ui,
+                    inputs=[p_state, p_trigger, p_input, p_selected_cluster_id, p_cluster_gallery_page],
+                    outputs=[p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_image_id, p_selected_cluster_image_info],
+                    show_progress="hidden",
+                )
+
+                p_detach_cluster_image_btn.click(
+                    fn=detach_selected_image_from_cluster_ui,
+                    inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_selected_cluster_image_id, p_cluster_gallery_page],
+                    outputs=[
+                        p_state, p_raw_json, p_cluster_md, p_cluster_table, p_cluster_preview_md, p_cluster_gallery,
+                        p_selected_cluster_id, p_cluster_role_editor, p_cluster_gallery_page, p_selected_cluster_image_id,
+                        p_selected_cluster_image_info, p_status,
+                    ],
+                ).then(
+                    fn=refresh_identity_cluster_panel_ui,
+                    inputs=[p_trigger, p_input, p_state, p_selected_cluster_id],
+                    outputs=[
+                        p_state, p_raw_json, p_cluster_md, p_cluster_table, p_cluster_preview_md, p_cluster_gallery,
+                        p_selected_cluster_id, p_cluster_role_editor, p_cluster_gallery_page, p_selected_cluster_image_id,
+                        p_selected_cluster_image_info,
+                    ],
+                    show_progress="hidden",
+                )
+
+                p_priority_image_btn.click(
+                    fn=lambda t, i, p, c, img, pg: set_selected_image_priority_ui(t, i, p, c, img, pg, True),
+                    inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_selected_cluster_image_id, p_cluster_gallery_page],
+                    outputs=[p_state, p_raw_json, p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_image_info, p_status],
+                )
+                p_unpriority_image_btn.click(
+                    fn=lambda t, i, p, c, img, pg: set_selected_image_priority_ui(t, i, p, c, img, pg, False),
+                    inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_selected_cluster_image_id, p_cluster_gallery_page],
+                    outputs=[p_state, p_raw_json, p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_image_info, p_status],
                 )
 
                 p_cluster_role_editor.change(
