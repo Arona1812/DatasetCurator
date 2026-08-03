@@ -427,3 +427,38 @@ The audited-reject gallery is now loaded in deterministic pages of 36 records.
 - Missing or unreadable previews are represented by a neutral placeholder instead of being silently skipped. Such records remain selectable and can still be detached or marked Priority.
 - Changing page or cluster clears the previous image selection, preventing a stale selection from detaching a different record.
 - After Detach, the new singleton bucket opens on page 1 and the persisted profile is reloaded as before.
+
+
+### Very large local images and Pillow safety (2026-08-02)
+
+The curator accepts trusted local high-resolution photographs and panoramas without emitting Pillow's default `DecompressionBombWarning` at roughly 89 megapixels.
+
+- A finite hard ceiling of 350 megapixels remains in place; files above it are treated as unreadable instead of being decoded without limit.
+- UI thumbnails use JPEG decoder-level draft scaling where supported and are then bounded to the requested preview size.
+- API input, pHash, exposure/color analysis, CLIP and ArcFace use bounded working copies; the original file is never resized in place.
+- Instagram-frame detection continues to analyze a small preview while taking any accepted crop from the original full-resolution source.
+- Final export and requested full-resolution crops still use the original image.
+
+This removes repeated warning spam for legitimate 108-megapixel images and substantially reduces memory use during preview and model analysis.
+
+## Smart Frame Cleanup / Rahmenprüfung
+
+The former IG-frame and secondary nav-bar workflows are unified in a local four-side detector.
+It analyses left, right, top and bottom independently on a bounded preview and never uses an LLM.
+
+- High-confidence candidates can be applied automatically before audit.
+- Medium-confidence candidates stay reversible and appear in the **Frame Review / Rahmenprüfung** tab.
+- The review tab shows original and proposed crop side by side and supports:
+  - accept suggestion,
+  - keep original,
+  - restore automatic behavior,
+  - enter and preview manual crop bounds.
+- Source and effective image paths are stored separately (`source_original_path`,
+  `effective_image_path`, `frame_crop_path`). Original files are never modified.
+- Detector cache can be recalculated independently without deleting audit, CLIP, ArcFace or profile caches.
+- Manual decisions are stored in `curated_<trigger>/_frame_cleanup_decisions.json`.
+- Early pHash duplicates are excluded from the audited-reject profile bucket.
+
+Default mode: automatically apply only high-confidence local crops and send medium-confidence
+cases to Frame Review. The optional aggressive mode can also apply medium-confidence candidates;
+`suggest_only` never crops automatically.

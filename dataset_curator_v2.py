@@ -17,7 +17,8 @@ import traceback
 import warnings
 import atexit
 from collections import Counter, defaultdict
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, List, Optional, Tuple, Iterator
 
 
 HF_HUB_UNAUTH_WARNING = "You are sending unauthenticated requests to the HF Hub"
@@ -38,6 +39,70 @@ logging.getLogger("huggingface_hub.utils._http").addFilter(_SuppressHfHubUnauthW
 import requests
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
+
+from frame_cleanup import (
+    DetectorSettings as SmartFrameDetectorSettings,
+    FRAME_DETECTOR_SCHEMA_VERSION,
+    analyze_frame_cleanup as analyze_smart_frame_cleanup,
+    resolve_frame_cleanup as resolve_smart_frame_cleanup,
+)
+
+# The default Pillow threshold warns for images above ~89 MP. High-resolution
+# local photographs and panoramas are valid curator inputs, so use an explicit
+# finite ceiling and suppress only Pillow's generic warning while we perform our
+# own size check. Originals are never resized in place.
+PIL_HARD_IMAGE_PIXEL_LIMIT = 350_000_000
+Image.MAX_IMAGE_PIXELS = PIL_HARD_IMAGE_PIXEL_LIMIT // 2
+PIL_SMALL_ANALYSIS_MAX_SIDE = 1024
+PIL_MODEL_ANALYSIS_MAX_SIDE = 2048
+
+
+@contextmanager
+def open_local_image(path: str) -> Iterator[Image.Image]:
+    """Open one trusted local image with a finite manual pixel ceiling."""
+    image: Optional[Image.Image] = None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            image = Image.open(path)
+        width, height = image.size
+        pixels = int(width) * int(height)
+        if pixels > PIL_HARD_IMAGE_PIXEL_LIMIT:
+            raise ValueError(
+                f"image_too_large_{width}x{height}_{pixels}px_"
+                f"limit_{PIL_HARD_IMAGE_PIXEL_LIMIT}px"
+            )
+        yield image
+    finally:
+        if image is not None:
+            try:
+                image.close()
+            except Exception:
+                pass
+
+
+def prepare_small_pil_image(
+    image: Image.Image,
+    max_size: Tuple[int, int],
+    mode: str = "RGB",
+    resampling: Optional[Any] = None,
+) -> Image.Image:
+    """Return an EXIF-correct bounded copy for analysis/API/model input.
+
+    For JPEG sources, ``draft`` requests a decoder-level downscale before the
+    image is expanded. The caller's original file and full-resolution crop
+    coordinates remain unchanged.
+    """
+    target = (max(1, int(max_size[0])), max(1, int(max_size[1])))
+    try:
+        image.draft(mode, (target[0] * 2, target[1] * 2))
+    except Exception:
+        pass
+    prepared = ImageOps.exif_transpose(image)
+    if resampling is None:
+        resampling = Image.Resampling.LANCZOS
+    prepared.thumbnail(target, resampling)
+    return prepared.convert(mode).copy()
 
 try:
     import cv2
@@ -675,26 +740,30 @@ MEDIUM_RESCUE_TRIGGER_COMPOSITION_MAX = 65.0
 MEDIUM_RESCUE_MIN_FACE_PX = 90
 MEDIUM_RESCUE_TARGET_ASPECT = 0.80  # 4:5 content crop; bucket normalization is later/optional
 
-# ── INSTAGRAM-FRAME AUTO-CROP ──────────────────────────────────────────────────
-# Erkennt und entfernt automatisch Instagram-Story-Rahmen (farbige Balken
-# links/rechts, ggf. oben/unten) BEVOR das Bild zur API geht.
-# Das gecropte Bild ersetzt das Original für alle weiteren Pipeline-Schritte.
-ENABLE_IG_FRAME_CROP = True                # IG-Frame-Erkennung aktivieren
-IG_FRAME_MIN_BORDER_PX = 30               # Mindestbreite eines Rahmens in Pixeln, um als Frame zu gelten
-IG_FRAME_MIN_CONTENT_PX = 400             # Mindestbreite/-höhe des verbleibenden Inhalts nach Frame-Crop
-# Zweistufige Bar-Detection (fuer Android-Nav-Bars, Drop-Shadow-Gradienten oben/unten):
-# Erkennt uniforme Bloecke am oberen/unteren Rand, tolerant gegenueber UI-Icons
-# (Nav-Buttons, Textfelder). Triggert nur wenn bereits Seitenframe gefunden wurde
-# (verhindert False-Positives bei normalen dunklen Bildelementen wie Kissen oder
-# dunklem Hintergrund). Ausschalten wenn unerwartete Crops auftreten.
+# ── LOCAL SMART-FRAME CLEANUP ──────────────────────────────────────────────────
+# Analysiert alle vier Bildseiten unabhängig und erkennt uniforme, asymmetrische
+# oder verlaufende Social-Media-/UI-Ränder vor dem Audit. Original und effektiver
+# Crop-Pfad bleiben getrennt; Quelldateien werden niemals überschrieben.
+ENABLE_IG_FRAME_CROP = True                # Lokale Smart-Frame-Erkennung aktivieren
+IG_FRAME_MIN_BORDER_PX = 24               # Mindestbreite eines künstlichen Randes in Originalpixeln
+IG_FRAME_MIN_CONTENT_PX = 400             # Mindestbreite/-höhe des verbleibenden Inhalts
+# Verhalten des lokalen Vier-Seiten-Detektors:
+# - auto_high_review_medium: hohe Sicherheit automatisch, mittlere Fälle nur vorschlagen
+# - auto_high_keep_medium: hohe und mittlere Sicherheit automatisch anwenden
+# - suggest_only: nichts automatisch beschneiden
+FRAME_CLEANUP_MODE = "auto_high_review_medium"
+FRAME_CLEANUP_HIGH_CONFIDENCE = 0.76
+FRAME_CLEANUP_MEDIUM_CONFIDENCE = 0.58
+# Erweiterte lokale Rahmentypen: asymmetrische Canvas-Ränder, Status-/Nav-Bars,
+# Polaroid-Unterkanten und weich verlaufende bzw. verschwommene Hintergründe.
+# Einzelne unsichere Seiten werden nur als Review-Vorschlag behandelt.
 IG_FRAME_TWO_STAGE_BAR_DETECT = True
-# Cache-Version fuer IG-Frame-Crops. Jede Aenderung an der Detection-Logik,
-# die andere Crop-Ergebnisse liefert, erfordert ein Increment dieser Version,
-# damit vorhandene Caches neu berechnet werden.
+# Legacy cache version retained for compatibility. The smart detector itself
+# uses a settings fingerprint plus FRAME_DETECTOR_SCHEMA_VERSION.
 # v1 = Original (nur Seiten + simple Top/Bottom-Gradienten)
 # v2 = + Zweistufige Bar-Detection (Android-Nav-Bars, Drop-Shadows)
 # v3 = negative decisions cached + detection on a <=1024px preview
-IG_FRAME_CACHE_VERSION = 3
+IG_FRAME_CACHE_VERSION = 4
 
 
 # ── SUBJECT-SANITY-CHECK (Gliedmassen-/Winkel-Filter) ──────────────────────────
@@ -744,6 +813,7 @@ _UI_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_
 # keine UI-Kontrolle haben soll.
 _UI_PROTECTED_KEYS = {
     "IG_FRAME_CACHE_VERSION",
+    "FRAME_DETECTOR_SCHEMA_VERSION",
     "PROFILE_CACHE_SCHEMA_VERSION",
     "AUDIT_CACHE_SCHEMA_VERSION",
     "LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION",
@@ -1670,24 +1740,47 @@ def iter_input_images(root: str) -> List[str]:
     return sorted(paths)
 
 
+def row_effective_image_path(row: Dict[str, Any]) -> str:
+    """Return the image actually used for audit/export while preserving source path."""
+    if not isinstance(row, dict):
+        return ""
+    return str(
+        row.get("effective_image_path")
+        or row.get("frame_crop_path")
+        or row.get("original_path")
+        or row.get("source_original_path")
+        or ""
+    )
+
+
 def resize_and_encode_for_api(image_path: str, max_side: int = API_MAX_IMAGE_SIDE) -> str:
-    with Image.open(image_path) as img:
-        img = ImageOps.exif_transpose(img)
-        img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    with open_local_image(image_path) as source:
+        img = prepare_small_pil_image(source, (max_side, max_side), mode="RGB")
         buffer = io.BytesIO()
-        img.convert("RGB").save(buffer, format="JPEG", quality=88)
+        img.save(buffer, format="JPEG", quality=88)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
 def image_dimensions(path: str) -> Tuple[int, int]:
-    with Image.open(path) as img:
-        img = ImageOps.exif_transpose(img)
-        return img.size
+    with open_local_image(path) as img:
+        # Reading dimensions must stay header-only. ImageOps.exif_transpose()
+        # may force a complete decode on very large JPEGs, so account for the
+        # EXIF orientation directly instead.
+        width, height = img.size
+        try:
+            orientation = int(img.getexif().get(274, 1) or 1)
+        except Exception:
+            orientation = 1
+        if orientation in (5, 6, 7, 8):
+            return int(height), int(width)
+        return int(width), int(height)
 
 
 def compute_phash(path: str) -> int:
-    with Image.open(path) as img:
-        img = ImageOps.exif_transpose(img).convert("L").resize((32, 32), Image.Resampling.LANCZOS)
+    with open_local_image(path) as source:
+        img = prepare_small_pil_image(source, (64, 64), mode="L").resize(
+            (32, 32), Image.Resampling.LANCZOS
+        )
         arr = np.asarray(img, dtype=np.float32)
 
     if HAVE_CV2:
@@ -1932,8 +2025,8 @@ def generate_headshot_crop(
         x2 = sq_x1 + size
         y2 = sq_y1 + size
 
-        with Image.open(image_path) as pil_img:
-            pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+        with open_local_image(image_path) as source:
+            pil_img = ImageOps.exif_transpose(source).convert("RGB")
             cropped = pil_img.crop((x1, y1, x2, y2))
             tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="headshot_crop_")
             os.close(tmp_fd)
@@ -1989,8 +2082,8 @@ def generate_medium_rescue_crop(
         y1 = max(0, min(top, img_h - crop_h))
         bbox = [x1, y1, crop_w, crop_h]
 
-        with Image.open(image_path) as pil_img:
-            pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+        with open_local_image(image_path) as source:
+            pil_img = ImageOps.exif_transpose(source).convert("RGB")
             cropped = pil_img.crop((x1, y1, x1 + crop_w, y1 + crop_h))
             tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="medium_rescue_")
             os.close(tmp_fd)
@@ -2134,8 +2227,13 @@ def local_exposure_median(image_path: str) -> float:
     Gibt 128.0 zurück bei Fehler (neutraler Wert, kein Filter).
     """
     try:
-        with Image.open(image_path) as img:
-            img = ImageOps.exif_transpose(img).convert("L")
+        with open_local_image(image_path) as source:
+            img = prepare_small_pil_image(
+                source,
+                (PIL_SMALL_ANALYSIS_MAX_SIDE, PIL_SMALL_ANALYSIS_MAX_SIDE),
+                mode="L",
+                resampling=Image.Resampling.BILINEAR,
+            )
             arr = np.asarray(img, dtype=np.uint8)
             return float(np.median(arr))
     except RunCancelled:
@@ -2239,11 +2337,12 @@ def local_colorfulness_metrics(image_path: str) -> Dict[str, Any]:
         "color_tint_strength": 0.0,
     }
     try:
-        img = Image.open(image_path)
-        img = ImageOps.exif_transpose(img).convert("RGB")
-        # Fuer die Statistik klein rechnen: schneller, aber stabil genug.
-        thumb = img.copy()
-        thumb.thumbnail((256, 256), Image.Resampling.BILINEAR)
+        with open_local_image(image_path) as source:
+            # Decode near analysis resolution instead of expanding a very large
+            # source before creating the 256 px statistics thumbnail.
+            thumb = prepare_small_pil_image(
+                source, (256, 256), mode="RGB", resampling=Image.Resampling.BILINEAR
+            )
         arr = np.asarray(thumb).astype(np.float32)
         if arr.size == 0:
             return result
@@ -2423,281 +2522,57 @@ def local_filesize_kb(image_path: str) -> float:
 # Instagram-Frame Auto-Crop
 # ============================================================
 
-def detect_and_crop_ig_frame(image_path: str, source_hash: Optional[str] = None) -> Optional[str]:
-    """Detect and remove Instagram-style frames with positive AND negative caching.
+def _smart_frame_settings() -> SmartFrameDetectorSettings:
+    return SmartFrameDetectorSettings(
+        analysis_max_side=int(IG_FRAME_ANALYSIS_MAX_SIDE),
+        min_border_px=int(IG_FRAME_MIN_BORDER_PX),
+        min_content_px=int(IG_FRAME_MIN_CONTENT_PX),
+        high_confidence=float(FRAME_CLEANUP_HIGH_CONFIDENCE),
+        medium_confidence=float(FRAME_CLEANUP_MEDIUM_CONFIDENCE),
+        advanced_types=bool(IG_FRAME_TWO_STAGE_BAR_DETECT),
+    )
 
-    Detection runs on a preview whose longest side is at most
-    IG_FRAME_ANALYSIS_MAX_SIDE. The final crop is always taken from the
-    full-resolution source image. A tiny JSON decision is persisted even when
-    no frame is found, making warm runs essentially a cache lookup.
-    """
+
+def frame_cleanup_for_pipeline(image_path: str, source_hash: Optional[str] = None) -> Dict[str, Any]:
+    """Resolve cached/manual/local frame cleanup without any LLM call."""
     if not ENABLE_IG_FRAME_CROP:
-        return None
-
+        return {
+            "source_original_path": os.path.abspath(image_path),
+            "effective_image_path": image_path,
+            "frame_crop_path": "",
+            "frame_cleanup_applied": False,
+            "frame_cleanup_applied_by": "disabled",
+            "frame_cleanup_bbox": None,
+            "frame_cleanup_analysis": {
+                "confidence": 0.0,
+                "confidence_level": "low",
+                "recommendation": "keep_original",
+                "signals": ["disabled"],
+            },
+        }
     started = time.perf_counter()
-    src_hash = source_hash or file_sha1(image_path)
-    cached_path = os.path.join(
-        IG_FRAME_CROP_DIR, f"{src_hash}_ig_cropped_v{IG_FRAME_CACHE_VERSION}.jpg"
+    source_hash = source_hash or file_sha1(image_path)
+    result = resolve_smart_frame_cleanup(
+        image_path=image_path,
+        source_hash=source_hash,
+        cache_dir=CACHE_DIR,
+        output_root=OUTPUT_ROOT,
+        mode=str(FRAME_CLEANUP_MODE or "auto_high_review_medium"),
+        settings=_smart_frame_settings(),
     )
-    decision_path = os.path.join(
-        IG_FRAME_CROP_DIR, f"{src_hash}_ig_decision_v{IG_FRAME_CACHE_VERSION}.json"
-    )
+    analysis = result.get("frame_cleanup_analysis", {}) or {}
+    if analysis.get("cache_hit"):
+        perf_count("ig_positive_hit" if analysis.get("detected") else "ig_negative_hit")
+    else:
+        perf_count("ig_positive_computed" if analysis.get("detected") else "ig_negative_computed")
+    perf_add_time("ig_frame", time.perf_counter() - started)
+    return result
 
-    def save_decision(frame_detected: bool, bbox: Optional[List[int]], reason: str) -> None:
-        if not ENABLE_CACHE:
-            return
-        try:
-            _atomic_write_json(decision_path, {
-                "schema_version": f"v{IG_FRAME_CACHE_VERSION}",
-                "source_hash": src_hash,
-                "frame_detected": bool(frame_detected),
-                "crop_bbox": bbox,
-                "reason": reason,
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            })
-        except RunCancelled:
-            raise
-        except Exception:
-            pass
 
-    if ENABLE_CACHE and os.path.isfile(decision_path):
-        try:
-            with open(decision_path, "r", encoding="utf-8") as f:
-                decision = json.load(f)
-            if (
-                decision.get("schema_version") == f"v{IG_FRAME_CACHE_VERSION}"
-                and decision.get("source_hash") == src_hash
-            ):
-                if not decision.get("frame_detected", False):
-                    perf_count("ig_negative_hit")
-                    perf_add_time("ig_frame", time.perf_counter() - started)
-                    return None
-                bbox = decision.get("crop_bbox")
-                if os.path.isfile(cached_path):
-                    perf_count("ig_positive_hit")
-                    perf_add_time("ig_frame", time.perf_counter() - started)
-                    return cached_path
-                if isinstance(bbox, list) and len(bbox) == 4:
-                    with Image.open(image_path) as source:
-                        source = ImageOps.exif_transpose(source).convert("RGB")
-                        source.crop(tuple(int(v) for v in bbox)).save(cached_path, "JPEG", quality=100)
-                    perf_count("ig_positive_hit")
-                    perf_add_time("ig_frame", time.perf_counter() - started)
-                    return cached_path
-        except RunCancelled:
-            raise
-        except Exception:
-            pass
-
-    try:
-        from scipy.ndimage import uniform_filter1d
-
-        with Image.open(image_path) as opened:
-            pil_img = ImageOps.exif_transpose(opened).convert("RGB")
-        orig_w, orig_h = pil_img.size
-        if orig_w < 400 or orig_h < 400:
-            save_decision(False, None, "source_too_small")
-            perf_count("ig_negative_computed")
-            perf_add_time("ig_frame", time.perf_counter() - started)
-            return None
-
-        analysis = pil_img.copy()
-        analysis.thumbnail(
-            (int(IG_FRAME_ANALYSIS_MAX_SIDE), int(IG_FRAME_ANALYSIS_MAX_SIDE)),
-            Image.Resampling.BILINEAR,
-        )
-        img = np.asarray(analysis, dtype=np.float32)
-        h, w = img.shape[:2]
-        scale_x = orig_w / float(w)
-        scale_y = orig_h / float(h)
-        min_border_px = max(4, int(round(IG_FRAME_MIN_BORDER_PX / scale_x)))
-        min_content_w = max(100, int(round(IG_FRAME_MIN_CONTENT_PX / scale_x)))
-        min_content_h = max(100, int(round(IG_FRAME_MIN_CONTENT_PX / scale_y)))
-
-        def is_frame_side(side: str) -> bool:
-            hits = 0
-            for divisor in [20, 14, 10, 7]:
-                pw = max(12, w // divisor)
-                strip = img[:, :pw, :] if side == "left" else img[:, w - pw:, :]
-                row_stds = strip.std(axis=1).mean(axis=1)
-                if float(np.median(row_stds)) < 15.0:
-                    hits += 1
-            return hits >= 3
-
-        left_is_frame = is_frame_side("left")
-        right_is_frame = is_frame_side("right")
-        if not left_is_frame and not right_is_frame:
-            save_decision(False, None, "no_frame_side")
-            perf_count("ig_negative_computed")
-            perf_add_time("ig_frame", time.perf_counter() - started)
-            return None
-
-        h_grad = np.abs(np.diff(img, axis=1)).mean(axis=2)
-        col_score_strict = uniform_filter1d((h_grad > 20).sum(axis=0) / h, size=3)
-        col_score_relaxed = uniform_filter1d((h_grad > 10).sum(axis=0) / h, size=3)
-
-        left_edge = 0
-        if left_is_frame:
-            left_zone = col_score_strict[: w // 3]
-            left_cands = np.where(left_zone > 0.15)[0]
-            if len(left_cands) > 0:
-                best = left_cands[np.argmax(left_zone[left_cands])]
-                left_edge = int(best) + 1
-            else:
-                for col in range(max(6, w // 20), w // 3):
-                    strip = img[:, col:col + 5, :]
-                    if float(np.median(strip.std(axis=1).mean(axis=1))) >= 15.0:
-                        left_edge = col
-                        break
-
-        right_edge = w
-        if right_is_frame:
-            r_off = 2 * w // 3
-            right_zone = col_score_strict[r_off:]
-            right_cands = np.where(right_zone > 0.15)[0]
-            if len(right_cands) > 0:
-                best = right_cands[np.argmax(right_zone[right_cands])]
-                right_edge = int(r_off + best)
-            else:
-                for col in range(w - max(6, w // 20), 2 * w // 3, -1):
-                    strip = img[:, col - 5:col, :]
-                    if float(np.median(strip.std(axis=1).mean(axis=1))) >= 15.0:
-                        right_edge = col
-                        break
-
-        left_border = left_edge
-        right_border = w - right_edge
-        if left_is_frame and not right_is_frame and left_border >= min_border_px:
-            sym = w - left_border
-            for col in range(max(0, sym - 25), min(len(col_score_relaxed), sym + 26)):
-                if col_score_relaxed[col] > 0.12:
-                    right_edge = col
-                    right_border = w - right_edge
-                    break
-        elif right_is_frame and not left_is_frame and right_border >= min_border_px:
-            sym = right_border
-            for col in range(max(0, sym - 25), min(w // 3, sym + 26)):
-                if col_score_relaxed[col] > 0.12:
-                    left_edge = col + 1
-                    left_border = left_edge
-                    break
-
-        if not (left_border >= min_border_px or right_border >= min_border_px):
-            save_decision(False, None, "border_below_minimum")
-            perf_count("ig_negative_computed")
-            perf_add_time("ig_frame", time.perf_counter() - started)
-            return None
-        if max(left_border, right_border) / float(w) > 0.30:
-            save_decision(False, None, "border_too_wide")
-            perf_count("ig_negative_computed")
-            perf_add_time("ig_frame", time.perf_counter() - started)
-            return None
-
-        v_grad = np.abs(np.diff(img, axis=0)).mean(axis=2)
-        row_score = uniform_filter1d((v_grad > 20).sum(axis=1) / w, size=3)
-        top_zone = row_score[: int(h * 0.4)]
-        top_cands = np.where(top_zone > 0.25)[0]
-        top_edge = int(top_cands[np.argmax(top_zone[top_cands])] + 1) if len(top_cands) > 0 else 0
-        bot_off = int(h * 0.7)
-        bot_zone = row_score[bot_off:]
-        bot_cands = np.where(bot_zone > 0.20)[0]
-        bottom_edge = int(bot_off + bot_cands[np.argmax(bot_zone[bot_cands])]) if len(bot_cands) > 0 else h
-
-        def detect_bar_two_stage(side: str) -> int:
-            max_rows = int(h * 0.5)
-            rows_region = img[h - max_rows:, :, :][::-1] if side == "bottom" else img[:max_rows, :, :]
-            row_stds_local = rows_region.std(axis=1).mean(axis=1)
-            stage_a = 0
-            gap_a = 0
-            for i, std_v in enumerate(row_stds_local):
-                if std_v < 15.0:
-                    stage_a = i + 1
-                    gap_a = 0
-                else:
-                    gap_a += 1
-                    if gap_a > 20:
-                        break
-            if stage_a == 0:
-                return 0
-            ref_mean = float(rows_region[:stage_a].mean())
-            is_dark_bar = ref_mean < 60.0
-            is_bright_bar = ref_mean > 200.0
-            if not (is_dark_bar or is_bright_bar):
-                return stage_a
-            stage_b = stage_a
-            gap_b = 0
-            for i in range(stage_a, len(row_stds_local)):
-                row_px = rows_region[i]
-                dominant_mask = (row_px < 40).all(axis=-1) if is_dark_bar else (row_px > 220).all(axis=-1)
-                dominant_ratio = float(dominant_mask.sum()) / float(row_px.shape[0])
-                if dominant_ratio > 0.55:
-                    stage_b = i + 1
-                    gap_b = 0
-                else:
-                    gap_b += 1
-                    if gap_b > 15:
-                        break
-            return stage_b
-
-        if IG_FRAME_TWO_STAGE_BAR_DETECT and (left_is_frame or right_is_frame):
-            bar_top = detect_bar_two_stage("top")
-            bar_bot = detect_bar_two_stage("bottom")
-            if bar_top > top_edge:
-                top_edge = bar_top
-            if bar_bot > 0 and (h - bar_bot) < bottom_edge:
-                bottom_edge = h - bar_bot
-
-        inner = img[top_edge:bottom_edge, left_edge:right_edge, :]
-        inner_h = inner.shape[0]
-        content_top = 0
-        for r in range(0, min(inner_h // 3, 300), 2):
-            if inner[r, :, :].var() > 300:
-                content_top = r
-                break
-        content_bottom = inner_h
-        for r in range(inner_h - 1, max(2 * inner_h // 3, inner_h - 300), -2):
-            if inner[r, :, :].var() > 300:
-                content_bottom = r + 1
-                break
-
-        final_top = top_edge + content_top
-        final_bottom = top_edge + content_bottom
-        if (right_edge - left_edge) < min_content_w or (final_bottom - final_top) < min_content_h:
-            save_decision(False, None, "content_too_small")
-            perf_count("ig_negative_computed")
-            perf_add_time("ig_frame", time.perf_counter() - started)
-            return None
-
-        x1 = max(0, int(round(left_edge * scale_x)))
-        y1 = max(0, int(round(final_top * scale_y)))
-        x2 = min(orig_w, int(round(right_edge * scale_x)))
-        y2 = min(orig_h, int(round(final_bottom * scale_y)))
-        if (x2 - x1) < IG_FRAME_MIN_CONTENT_PX or (y2 - y1) < IG_FRAME_MIN_CONTENT_PX:
-            save_decision(False, None, "full_resolution_content_too_small")
-            perf_count("ig_negative_computed")
-            perf_add_time("ig_frame", time.perf_counter() - started)
-            return None
-        total_removed = x1 + (orig_w - x2) + y1 + (orig_h - y2)
-        if total_removed < 40:
-            save_decision(False, None, "removed_area_too_small")
-            perf_count("ig_negative_computed")
-            perf_add_time("ig_frame", time.perf_counter() - started)
-            return None
-
-        bbox = [x1, y1, x2, y2]
-        pil_img.crop(tuple(bbox)).save(cached_path, "JPEG", quality=100)
-        save_decision(True, bbox, "frame_detected")
-        perf_count("ig_positive_computed")
-        perf_add_time("ig_frame", time.perf_counter() - started)
-        return cached_path
-
-    except RunCancelled:
-        raise
-    except Exception as exc:
-        perf_count("ig_error")
-        perf_add_time("ig_frame", time.perf_counter() - started)
-        safe_print(f"   ⚠️ IG frame detection failed: {exc}")
-        return None
+def detect_and_crop_ig_frame(image_path: str, source_hash: Optional[str] = None) -> Optional[str]:
+    """Backward-compatible wrapper returning only an applied crop path."""
+    result = frame_cleanup_for_pipeline(image_path, source_hash=source_hash)
+    return str(result.get("frame_crop_path") or "") or None
 
 
 def local_quick_reject(image_path: str, width: int, height: int) -> Optional[str]:
@@ -3674,8 +3549,12 @@ def compute_clip_embedding(image_path: str, file_hash: str) -> Optional[np.ndarr
         return None
 
     try:
-        with Image.open(image_path) as opened:
-            img = ImageOps.exif_transpose(opened).convert("RGB")
+        with open_local_image(image_path) as opened:
+            img = prepare_small_pil_image(
+                opened,
+                (PIL_MODEL_ANALYSIS_MAX_SIDE, PIL_MODEL_ANALYSIS_MAX_SIDE),
+                mode="RGB",
+            )
             tensor = CLIP_PREPROCESS(img).unsqueeze(0).to(CLIP_DEVICE)
         with torch.no_grad():
             features = CLIP_MODEL.encode_image(tensor)
@@ -3785,8 +3664,12 @@ def compute_arcface_embedding(image_path: str, file_hash: str) -> Optional[np.nd
     try:
         # InsightFace erwartet BGR (cv2-Konvention). Wir laden via PIL und
         # konvertieren, um konsistent mit dem Rest des Tools zu bleiben.
-        with Image.open(image_path) as pil_img:
-            pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+        with open_local_image(image_path) as source:
+            pil_img = prepare_small_pil_image(
+                source,
+                (PIL_MODEL_ANALYSIS_MAX_SIDE, PIL_MODEL_ANALYSIS_MAX_SIDE),
+                mode="RGB",
+            )
             rgb_np = np.array(pil_img)
         bgr_np = rgb_np[..., ::-1].copy()
 
@@ -3938,7 +3821,7 @@ def run_identity_consistency_check(
         # Originalpfad oder gecropter Pfad - body_aware_crop wird hier nicht
         # benutzt, weil ArcFace selber Face-Detection macht und das Original
         # mehr Kontext bietet (Hintergrund schadet ArcFace nicht).
-        path = row.get("original_path", "")
+        path = row_effective_image_path(row)
         file_hash = row.get("file_hash") or (file_sha1(path) if path and os.path.exists(path) else "")
         if not file_hash or not os.path.exists(path):
             row["arcface_flag"] = "no_face"
@@ -7639,7 +7522,7 @@ def build_identity_appearance_clusters(rows: List[Dict[str, Any]], profile: Dict
         identity_avg = sum(float(r.get("quality_identity_usefulness", 0) or 0) for r in members) / max(1, n)
         member_ids = [profile_image_id(r) for r in members]
         filenames = [r.get("original_filename", "") for r in members]
-        image_paths = [r.get("original_path", "") or r.get("source_path", "") or r.get("image_path", "") for r in members]
+        image_paths = [row_effective_image_path(r) or r.get("source_path", "") or r.get("image_path", "") for r in members]
         summary = f"{frame} | {hair} | {glasses} | {visual}"
         cluster = {
             "cluster_id": cid,
@@ -7740,7 +7623,16 @@ def is_post_audit_reject(row: Dict[str, Any]) -> bool:
     if row.get("base_status") != "reject" and row.get("arcface_flag") != "hard":
         return False
     reason = str(row.get("short_reason", "") or "").strip().lower()
-    if reason == "early_phash_duplicate":
+    notes_raw = row.get("status_notes") or []
+    if isinstance(notes_raw, str):
+        notes_raw = [notes_raw]
+    notes_lower = {str(v or "").strip().lower() for v in notes_raw if str(v or "").strip()}
+    duplicate_method = str(row.get("duplicate_method", "") or "").strip().lower()
+    if (
+        reason == "early_phash_duplicate"
+        or "early_phash_dedup" in notes_lower
+        or duplicate_method.startswith("early_phash")
+    ):
         return False
     if reason.startswith(("hard_pass_too_small", "filesize_too_small", "script_error")):
         return False
@@ -7856,7 +7748,7 @@ def attach_audited_reject_cluster_to_profile(
     if audited_rows:
         member_ids = [profile_member_id(r) for r in audited_rows]
         filenames = [str(r.get("original_filename", "") or "") for r in audited_rows]
-        image_paths = [str(r.get("original_path", "") or "") for r in audited_rows]
+        image_paths = [row_effective_image_path(r) for r in audited_rows]
         reject_reasons = [post_audit_reject_reason(r) for r in audited_rows]
         shot_counts = Counter(normalize_text(r.get("shot_type")) or "unknown" for r in audited_rows)
         style_counts = Counter(_appearance_visual_group(r) for r in audited_rows)
@@ -7886,8 +7778,9 @@ def attach_audited_reject_cluster_to_profile(
         })
         normal_clusters.append(special)
     elif existing_special and existing_special.get("members"):
-        # Preserve a legacy/saved bucket when source files are temporarily absent.
-        normal_clusters.append(existing_special)
+        # The audited-reject bucket is a derived view. Never preserve stale
+        # entries (especially early pHash duplicates) from an older profile.
+        pass
 
     member_roles: Dict[str, str] = {}
     member_clusters: Dict[str, str] = {}
@@ -8776,7 +8669,7 @@ def _sync_row_update(row_map: Dict[str, Dict[str, Any]], row: Dict[str, Any]) ->
 def _write_captioned_image(row: Dict[str, Any], out_dir: str, new_basename: str, global_rules: Dict[str, Any], subject_profile: Dict[str, Any]) -> None:
     row["new_basename"] = new_basename
     row["final_caption"] = build_caption(row, global_rules, subject_profile)
-    cropped = body_aware_crop(row["original_path"], row)
+    cropped = body_aware_crop(row_effective_image_path(row), row)
     img_out = os.path.join(out_dir, f"{new_basename}.jpg")
     txt_out = os.path.join(out_dir, f"{new_basename}.txt")
     cropped.save(img_out, "JPEG", quality=100)
@@ -9092,6 +8985,12 @@ def write_caption_stage_reports(
         "caption_local_fallback_count": sum(1 for r in selected_sorted if r.get("caption_source") == "local_fallback"),
         "controlled_buckets": bool(USE_CONTROLLED_BUCKETS),
         "medium_rescue_crop_enabled": bool(ENABLE_MEDIUM_RESCUE_CROP),
+        "frame_detector_schema": FRAME_DETECTOR_SCHEMA_VERSION,
+        "frame_cleanup_mode": str(FRAME_CLEANUP_MODE),
+        "frame_cleanup_high_candidates": sum(1 for r in all_rows if r.get("frame_cleanup_confidence_level") == "high"),
+        "frame_cleanup_medium_review_candidates": sum(1 for r in all_rows if r.get("frame_cleanup_confidence_level") == "medium"),
+        "frame_cleanup_applied": sum(1 for r in all_rows if r.get("frame_cleanup_applied")),
+        "frame_cleanup_manual_decisions": sum(1 for r in all_rows if str(r.get("frame_cleanup_user_decision", "auto")) != "auto"),
         "caption_stage_continued_from_profile": True,
     }
 
@@ -9310,9 +9209,9 @@ def continue_caption_from_profile() -> None:
             txt_out = os.path.join(REJECT_DIR, f"{new_basename}.txt")
             try:
                 if should_copy_reject_original(row):
-                    shutil.copy2(row["original_path"], img_out)
+                    shutil.copy2(row_effective_image_path(row), img_out)
                 else:
-                    cropped = body_aware_crop(row["original_path"], row)
+                    cropped = body_aware_crop(row_effective_image_path(row), row)
                     cropped.save(img_out, "JPEG", quality=100)
                 with open(txt_out, "w", encoding="utf-8") as ft:
                     ft.write(build_reject_export_text(row, global_rules, subject_profile))
@@ -9446,7 +9345,7 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     # Pipeline entfernst, muss diese Annahme neu geprueft werden.
     if USE_BLUR_FILTER and face_visible:
         face_bbox = item.get("main_face_bbox")
-        orig_path = item.get("original_path")
+        orig_path = row_effective_image_path(item)
         if face_bbox and orig_path and os.path.exists(orig_path):
             # Plausibilitaet: Bbox muss innerhalb der Bilddimensionen liegen.
             img_w = int(item.get("width", 0))
@@ -11000,7 +10899,7 @@ def _encode_pil_for_api(pil_img: Image.Image, max_side: int = API_MAX_IMAGE_SIDE
 def _krea_caption_cache_path(item: Dict[str, Any], subject_profile: Dict[str, Any]) -> str:
     source_key = str(item.get("file_hash") or "")
     if not source_key:
-        path = str(item.get("original_path") or "")
+        path = row_effective_image_path(item)
         source_key = file_sha1(path) if path and os.path.exists(path) else profile_image_id(item)
     profile_key = hashlib.sha1(
         json.dumps(subject_profile or {}, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -11198,7 +11097,7 @@ def build_krea_ai_caption(
     repair_errors: List[str] = []
 
     try:
-        exported_view = body_aware_crop(str(item.get("original_path") or ""), item)
+        exported_view = body_aware_crop(row_effective_image_path(item), item)
         image_b64 = _encode_pil_for_api(exported_view)
 
         visible_facts = {
@@ -11454,7 +11353,10 @@ def build_caption(
 # ============================================================
 
 def body_aware_crop(image_path: str, item: Dict[str, Any]) -> Image.Image:
-    pil_img = ImageOps.exif_transpose(Image.open(image_path)).convert("RGB")
+    # Final crop/export intentionally uses the full-resolution source. The safe
+    # opener suppresses Pillow's generic warning but retains a finite ceiling.
+    with open_local_image(image_path) as source:
+        pil_img = ImageOps.exif_transpose(source).convert("RGB")
     img = np.array(pil_img)
 
     h, w = img.shape[:2]
@@ -11901,6 +11803,7 @@ def main() -> None:
     )
     safe_print(f"  Audit cache schema: {AUDIT_CACHE_SCHEMA_VERSION}")
     safe_print(f"  Pipeline mode:      {PIPELINE_MODE}")
+    safe_print(f"  Frame detector:     {FRAME_DETECTOR_SCHEMA_VERSION} | {FRAME_CLEANUP_MODE}")
     safe_print("=" * 60)
 
     if CONTINUE_FROM_PROFILE:
@@ -12022,43 +11925,67 @@ def main() -> None:
 
         try:
             width, height = image_dimensions(image_path)
+            source_original_path = image_path
             row: Dict[str, Any] = {
                 "original_filename": original_filename,
-                "original_path": image_path,
+                "original_path": source_original_path,
+                "source_original_path": source_original_path,
+                "effective_image_path": source_original_path,
+                "frame_crop_path": "",
                 "status_notes": [],
                 "selected": False,
                 "output_bucket": "",
                 "new_basename": "",
             }
 
-            file_hash = file_sha1(image_path)
+            source_file_hash = file_sha1(source_original_path)
+            file_hash = source_file_hash
+            row["source_file_hash"] = source_file_hash
 
-            # ── Instagram-Frame Auto-Crop ──────────────────────────────────
-            # Erkennt IG-Story-Rahmen und ersetzt image_path durch das
-            # gecropte Bild, damit alle folgenden Schritte (Blur, Exposure,
-            # API, Metriken, Hashing) auf dem bereinigten Bild arbeiten.
+            # ── Local Smart-Frame cleanup ───────────────────────────────────
+            # All four sides are analysed independently. High-confidence crops
+            # can be applied automatically; medium-confidence candidates remain
+            # reversible suggestions until the user accepts them in the UI.
             if ENABLE_IG_FRAME_CROP:
-                ig_cropped_path = run_with_heartbeat(
-                    f"[{idx}/{len(image_paths)}] ig_frame_detect {original_filename}",
-                    detect_and_crop_ig_frame,
-                    image_path,
-                    source_hash=file_hash,
+                frame_result = run_with_heartbeat(
+                    f"[{idx}/{len(image_paths)}] smart_frame_detect {original_filename}",
+                    frame_cleanup_for_pipeline,
+                    source_original_path,
+                    source_hash=source_file_hash,
                 )
-                if ig_cropped_path:
-                    # Dimensionen und Hash des bereinigten Bildes übernehmen
-                    width, height = image_dimensions(ig_cropped_path)
-                    file_hash = file_sha1(ig_cropped_path)
+                frame_analysis = frame_result.get("frame_cleanup_analysis", {}) or {}
+                row.update({
+                    "source_original_path": frame_result.get("source_original_path", source_original_path),
+                    "effective_image_path": frame_result.get("effective_image_path", source_original_path),
+                    "frame_crop_path": frame_result.get("frame_crop_path", ""),
+                    "frame_cleanup_applied": bool(frame_result.get("frame_cleanup_applied")),
+                    "frame_cleanup_applied_by": frame_result.get("frame_cleanup_applied_by", "none"),
+                    "frame_cleanup_user_decision": frame_result.get("frame_cleanup_user_decision", "auto"),
+                    "frame_cleanup_bbox": frame_result.get("frame_cleanup_bbox"),
+                    "frame_cleanup_confidence": float(frame_analysis.get("confidence", 0) or 0),
+                    "frame_cleanup_confidence_level": frame_analysis.get("confidence_level", "low"),
+                    "frame_cleanup_recommendation": frame_analysis.get("recommendation", "keep_original"),
+                    "frame_cleanup_sides": frame_analysis.get("candidate_sides", []),
+                    "frame_cleanup_signals": frame_analysis.get("signals", []),
+                    "frame_cleanup_review_pending": (
+                        frame_analysis.get("confidence_level") == "medium"
+                        and str(frame_result.get("frame_cleanup_user_decision", "auto")) == "auto"
+                    ),
+                })
+                if row["frame_cleanup_review_pending"]:
+                    row.setdefault("status_notes", []).append("frame_cleanup_review_suggested")
+                if frame_result.get("frame_cleanup_applied"):
+                    image_path = str(frame_result.get("effective_image_path") or source_original_path)
+                    width, height = image_dimensions(image_path)
+                    file_hash = file_sha1(image_path)
                     row["ig_frame_cropped"] = True
-                    row.setdefault("status_notes", []).append("ig_frame_auto_cropped")
-                    safe_print(f"   🖼️  IG frame detected → cropped to {width}x{height}")
-                    # Für die weitere Pipeline das gecropte Bild verwenden
-                    image_path = ig_cropped_path
-                    row["original_path"] = ig_cropped_path
-
-                    # Nach dem Crop Groesse erneut pruefen: Wenn der Crop zu
-                    # klein geworden ist, jetzt erst verwerfen.
+                    row.setdefault("status_notes", []).append("smart_frame_cropped")
+                    safe_print(
+                        f"   🖼️  Frame cleanup applied ({row['frame_cleanup_applied_by']}, "
+                        f"confidence={row['frame_cleanup_confidence']:.2f}) → {width}x{height}"
+                    )
                     if min(width, height) < HARD_MIN_SIDE_PX:
-                        reason = f"hard_pass_too_small_after_ig_crop_{width}x{height}"
+                        reason = f"hard_pass_too_small_after_frame_crop_{width}x{height}"
                         row.update({
                             "width": width,
                             "height": height,
@@ -12071,6 +11998,10 @@ def main() -> None:
                         all_rows.append(row)
                         safe_print(f"   ❌ Reject: {reason}")
                         continue
+                else:
+                    image_path = source_original_path
+            else:
+                image_path = source_original_path
 
             # ── Vorfilter STUFE 2: Blur/Exposure auf gecroptem Bild ────────
             # A complete local-analysis cache also contains these quick metrics,
@@ -12594,7 +12525,9 @@ def main() -> None:
                                     r_base = "keep"
                                 rescue_row["base_status"] = r_base
                                 rescue_row["local_override_reasons"] = r_local_reasons
-                                rescue_row["original_path"] = image_path
+                                rescue_row["original_path"] = row.get("original_path", source_original_path)
+                                rescue_row["source_original_path"] = row.get("source_original_path", source_original_path)
+                                rescue_row["effective_image_path"] = image_path
                                 safe_print(
                                     f"   ✅ Medium rescue accepted: score={rescue_row.get('quality_total', 0):.1f} | status={r_base}"
                                 )
@@ -12621,7 +12554,9 @@ def main() -> None:
             safe_print(f"   ❌ Error: {e}")
             all_rows.append({
                 "original_filename": original_filename,
-                "original_path": image_path,
+                "original_path": locals().get("source_original_path", image_path),
+                "source_original_path": locals().get("source_original_path", image_path),
+                "effective_image_path": image_path,
                 "base_status": "reject",
                 "final_status": "reject",
                 "quality_total": 0,
@@ -12683,7 +12618,7 @@ def main() -> None:
         hard_flag_counter = 1
         for hf_row in hard_flagged_rows:
             try:
-                src_path = hf_row.get("original_path", "")
+                src_path = row_effective_image_path(hf_row)
                 if not src_path or not os.path.exists(src_path):
                     continue
                 src_name = hf_row.get("original_filename", os.path.basename(src_path))
@@ -12838,7 +12773,7 @@ def main() -> None:
         caption = build_caption(row, global_rules, subject_profile)
         row["final_caption"] = caption
 
-        cropped = body_aware_crop(row["original_path"], row)
+        cropped = body_aware_crop(row_effective_image_path(row), row)
         img_out = os.path.join(out_dir, f"{new_basename}.jpg")
         txt_out = os.path.join(out_dir, f"{new_basename}.txt")
 
@@ -12866,7 +12801,7 @@ def main() -> None:
             row["final_caption"] = build_caption(row, global_rules, subject_profile)
 
             try:
-                cropped = body_aware_crop(row["original_path"], row)
+                cropped = body_aware_crop(row_effective_image_path(row), row)
                 img_out = os.path.join(out_dir, f"{new_basename}.jpg")
                 txt_out = os.path.join(out_dir, f"{new_basename}.txt")
                 cropped.save(img_out, "JPEG", quality=100)
@@ -12890,7 +12825,7 @@ def main() -> None:
         row["final_caption"] = build_caption(row, global_rules, subject_profile)
 
         try:
-            cropped = body_aware_crop(row["original_path"], row)
+            cropped = body_aware_crop(row_effective_image_path(row), row)
             img_out = os.path.join(KEEP_UNUSED_DIR, f"{new_basename}.jpg")
             txt_out = os.path.join(KEEP_UNUSED_DIR, f"{new_basename}.txt")
             cropped.save(img_out, "JPEG", quality=100)
@@ -12912,9 +12847,9 @@ def main() -> None:
             # Keep/Review auf Exportgröße crop/resize.
             try:
                 if should_copy_reject_original(row):
-                    shutil.copy2(row["original_path"], img_out)
+                    shutil.copy2(row_effective_image_path(row), img_out)
                 else:
-                    cropped = body_aware_crop(row["original_path"], row)
+                    cropped = body_aware_crop(row_effective_image_path(row), row)
                     cropped.save(img_out, "JPEG", quality=100)
             except RunCancelled:
                 raise
@@ -12954,7 +12889,7 @@ def main() -> None:
                     img_out = os.path.join(SECOND_CHOICE_DIR, f"{new_basename}.jpg")
                     txt_out = os.path.join(SECOND_CHOICE_DIR, f"{new_basename}.txt")
 
-                    cropped = body_aware_crop(row["original_path"], row)
+                    cropped = body_aware_crop(row_effective_image_path(row), row)
                     cropped.save(img_out, "JPEG", quality=100)
 
                     caption_text = row.get("final_caption") or ""
@@ -13243,6 +13178,12 @@ def main() -> None:
         "caption_local_fallback_count": sum(1 for r in selected_sorted if r.get("caption_source") == "local_fallback"),
         "controlled_buckets": bool(USE_CONTROLLED_BUCKETS),
         "medium_rescue_crop_enabled": bool(ENABLE_MEDIUM_RESCUE_CROP),
+        "frame_detector_schema": FRAME_DETECTOR_SCHEMA_VERSION,
+        "frame_cleanup_mode": str(FRAME_CLEANUP_MODE),
+        "frame_cleanup_high_candidates": sum(1 for r in all_rows if r.get("frame_cleanup_confidence_level") == "high"),
+        "frame_cleanup_medium_review_candidates": sum(1 for r in all_rows if r.get("frame_cleanup_confidence_level") == "medium"),
+        "frame_cleanup_applied": sum(1 for r in all_rows if r.get("frame_cleanup_applied")),
+        "frame_cleanup_manual_decisions": sum(1 for r in all_rows if str(r.get("frame_cleanup_user_decision", "auto")) != "auto"),
         "performance_total_seconds": performance_summary.get("total_seconds", 0.0),
         "cache_audit_hits": performance_summary.get("cache_counts", {}).get("audit_hit", 0),
         "cache_audit_misses": performance_summary.get("cache_counts", {}).get("audit_miss", 0),

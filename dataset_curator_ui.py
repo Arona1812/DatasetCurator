@@ -21,13 +21,35 @@ import threading
 import signal
 import time
 import uuid
+import warnings
 from glob import glob
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import gradio as gr
-from PIL import Image
+from PIL import Image, ImageOps
+
+from frame_cleanup import (
+    DetectorSettings as SmartFrameDetectorSettings,
+    analyze_frame_cleanup,
+    build_review_preview,
+    decision_summary as frame_decision_summary,
+    file_sha1 as frame_file_sha1,
+    image_dimensions as frame_image_dimensions,
+    load_user_decisions as load_frame_user_decisions,
+    reset_detector_cache as reset_frame_detector_cache,
+    reset_user_decisions as reset_frame_user_decisions,
+    save_user_decision as save_frame_user_decision,
+    scan_source_images as scan_frame_source_images,
+)
+
+# Pillow warns above ~89 MP by default. The curator works with trusted local
+# source files and can legitimately encounter stitched panoramas or very
+# high-resolution photographs. Keep a finite safety ceiling, but avoid noisy
+# warnings for images that are still reasonable for local curation.
+PIL_HARD_IMAGE_PIXEL_LIMIT = 350_000_000
+Image.MAX_IMAGE_PIXELS = PIL_HARD_IMAGE_PIXEL_LIMIT // 2
 
 # Make the UI process itself tolerant of characters that the active Windows
 # console code page cannot represent. Child-process log streaming has its own
@@ -238,6 +260,7 @@ DEFAULTS: Dict[str, Any] = {
     # IG-Frame-Detection
     "c_ig_frame_crop": True,
     "c_ig_two_stage_bar": True,
+    "c_frame_cleanup_mode": "auto_high_review_medium",
     # Duplikate
     "c_use_clip": True,
     "c_use_phash": True,
@@ -556,7 +579,7 @@ def save_settings_fn(
     c_use_early_phash_loop1, c_early_phash_thresh_1, c_early_phash_keep_1,
     c_use_early_phash_loop2, c_early_phash_thresh_2, c_early_phash_keep_2,
     c_subject_sanity, c_subject_min_torso,
-    c_ig_frame_crop, c_ig_two_stage_bar,
+    c_ig_frame_crop, c_ig_two_stage_bar, c_frame_cleanup_mode,
     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
     c_smart_crop, c_crop_gain, c_crop_pad,
     c_medium_rescue_crop, c_medium_rescue_gain,
@@ -613,6 +636,7 @@ def save_settings_fn(
         "c_subject_min_torso": c_subject_min_torso,
         "c_ig_frame_crop": c_ig_frame_crop,
         "c_ig_two_stage_bar": c_ig_two_stage_bar,
+        "c_frame_cleanup_mode": str(c_frame_cleanup_mode or "auto_high_review_medium"),
         "c_use_clip": c_use_clip, "c_use_phash": c_use_phash,
         "c_phash_thresh": c_phash_thresh, "c_clip_thresh": c_clip_thresh,
         "c_smart_crop": c_smart_crop, "c_crop_gain": c_crop_gain, "c_crop_pad": c_crop_pad,
@@ -787,13 +811,35 @@ def scan_images(folder: str, limit: int = 60) -> List[str]:
 
 
 def load_gallery_image(path: str, max_size: Tuple[int, int] = (1600, 1600)) -> Optional[Image.Image]:
-    """Load an image into memory so Gradio does not need direct filesystem access."""
+    """Load a bounded preview while preserving the original source file.
+
+    ``Image.draft`` lets Pillow decode large JPEGs close to preview resolution
+    instead of expanding (for example) a 108 MP source completely in memory.
+    PNG and other formats still use Pillow's normal decoder, but remain guarded
+    by a finite manual pixel ceiling.
+    """
+    if not path or not os.path.isfile(path):
+        return None
     try:
-        with Image.open(path) as img:
-            preview = img.convert("RGB")
-            resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
-            preview.thumbnail(max_size, resampling)
-            return preview
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(path) as img:
+                width, height = img.size
+                if int(width) * int(height) > PIL_HARD_IMAGE_PIXEL_LIMIT:
+                    return None
+
+                # JPEG draft decoding is substantially cheaper for large local
+                # originals. A 2x margin keeps enough detail for LANCZOS downscale.
+                draft_size = (max(64, int(max_size[0]) * 2), max(64, int(max_size[1]) * 2))
+                try:
+                    img.draft("RGB", draft_size)
+                except Exception:
+                    pass
+
+                preview = ImageOps.exif_transpose(img)
+                resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+                preview.thumbnail(max_size, resampling)
+                return preview.convert("RGB").copy()
     except Exception:
         return None
 
@@ -1062,6 +1108,79 @@ def _empty_editor_payload(status_msg: str) -> Tuple:
     )
 
 
+def _remove_early_duplicates_from_profile_reject_bucket_ui(
+    profile: Dict[str, Any], trigger_word: str, input_folder: str
+) -> Dict[str, Any]:
+    """Filter stale early-pHash duplicates from legacy saved reject buckets."""
+    if not isinstance(profile, dict):
+        return profile
+    stage_path = caption_stage_path_for(input_folder, trigger_word)
+    try:
+        with open(stage_path, "r", encoding="utf-8") as handle:
+            stage = json.load(handle)
+    except Exception:
+        return profile
+    excluded_filenames = set()
+    excluded_paths = set()
+    for row in (stage.get("all_rows", []) or []) if isinstance(stage, dict) else []:
+        if not isinstance(row, dict):
+            continue
+        reason = str(row.get("short_reason", "") or "").strip().lower()
+        notes = row.get("status_notes") or []
+        if isinstance(notes, str):
+            notes = [notes]
+        notes_lower = {str(v or "").strip().lower() for v in notes}
+        duplicate_method = str(row.get("duplicate_method", "") or "").strip().lower()
+        if not (
+            reason == "early_phash_duplicate"
+            or "early_phash_dedup" in notes_lower
+            or duplicate_method.startswith("early_phash")
+        ):
+            continue
+        filename = str(row.get("original_filename", "") or "")
+        path = str(row.get("original_path", "") or row.get("source_original_path", "") or "")
+        if filename:
+            excluded_filenames.add(filename)
+        if path:
+            excluded_paths.add(os.path.normcase(os.path.abspath(path)))
+    if not excluded_filenames and not excluded_paths:
+        return profile
+
+    new_clusters = []
+    removed_member_ids = set()
+    for cluster in profile.get("identity_clusters", []) or []:
+        if not isinstance(cluster, dict):
+            continue
+        if str(cluster.get("cluster_id", "") or "") != AUDITED_REJECT_CLUSTER_ID and str(cluster.get("cluster_kind", "") or "") != "audited_rejects":
+            new_clusters.append(cluster)
+            continue
+        records = _cluster_member_records(cluster)
+        kept = []
+        for record in records:
+            filename = str(record.get("filename", "") or "")
+            path = str(record.get("image_path", "") or "")
+            normalized_path = os.path.normcase(os.path.abspath(path)) if path else ""
+            if filename in excluded_filenames or (normalized_path and normalized_path in excluded_paths):
+                removed_member_ids.add(str(record.get("image_id", "") or ""))
+                continue
+            kept.append(record)
+        if kept:
+            updated = dict(cluster)
+            updated["members"] = [r.get("image_id", "") for r in kept]
+            updated["filenames"] = [r.get("filename", "") for r in kept]
+            updated["image_paths"] = [r.get("image_path", "") for r in kept]
+            updated["reject_reasons"] = [r.get("reject_reason", "") for r in kept]
+            updated["n"] = len(kept)
+            new_clusters.append(updated)
+    profile["identity_clusters"] = new_clusters
+    for field in ("identity_cluster_member_roles", "identity_cluster_member_clusters"):
+        mapping = profile.get(field)
+        if isinstance(mapping, dict):
+            for member_id in removed_member_ids:
+                mapping.pop(member_id, None)
+    return profile
+
+
 def load_profile_for_editor(trigger_word: str, input_folder: str):
     """Laedt ein Profil und fuellt alle UI-Komponenten."""
     path = subject_profile_path_for(input_folder, trigger_word)
@@ -1075,6 +1194,7 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
             profile = json.load(f)
         if not isinstance(profile, dict):
             raise ValueError("profile is not a JSON object")
+        profile = _remove_early_duplicates_from_profile_reject_bucket_ui(profile, trigger_word, input_folder)
         profile = _normalize_audited_reject_role_ui(profile)
     except Exception as e:
         return _empty_editor_payload(
@@ -3165,7 +3285,7 @@ def start_curator(
     use_early_phash_loop1, early_phash_threshold_1, early_phash_keep_per_group_1,
     use_early_phash_loop2, early_phash_threshold_2, early_phash_keep_per_group_2,
     subject_sanity, subject_min_torso,
-    ig_frame_crop, ig_two_stage_bar,
+    ig_frame_crop, ig_two_stage_bar, frame_cleanup_mode,
     use_clip, use_phash, phash_threshold, clip_threshold,
     enable_smart_crop, crop_min_gain, crop_padding,
     enable_medium_rescue_crop, medium_rescue_min_gain,
@@ -3236,6 +3356,7 @@ def start_curator(
         "SUBJECT_MIN_TORSO_LANDMARKS": int(subject_min_torso),
         "ENABLE_IG_FRAME_CROP": ig_frame_crop,
         "IG_FRAME_TWO_STAGE_BAR_DETECT": ig_two_stage_bar,
+        "FRAME_CLEANUP_MODE": str(frame_cleanup_mode or "auto_high_review_medium"),
         "USE_EARLY_PHASH_DEDUP": use_early_phash,
         "USE_EARLY_PHASH_LOOP1": bool(use_early_phash_loop1),
         "EARLY_PHASH_HAMMING_THRESHOLD_1": int(early_phash_threshold_1),
@@ -3313,7 +3434,7 @@ def start_caption_from_profile(
     use_early_phash_loop1, early_phash_threshold_1, early_phash_keep_per_group_1,
     use_early_phash_loop2, early_phash_threshold_2, early_phash_keep_per_group_2,
     subject_sanity, subject_min_torso,
-    ig_frame_crop, ig_two_stage_bar,
+    ig_frame_crop, ig_two_stage_bar, frame_cleanup_mode,
     use_clip, use_phash, phash_threshold, clip_threshold,
     enable_smart_crop, crop_min_gain, crop_padding,
     enable_medium_rescue_crop, medium_rescue_min_gain,
@@ -3497,6 +3618,326 @@ def load_results(input_folder, trigger_word, subfolder):
         f"📁 {target}\n📷 {len(image_paths)} images found",
     )
     return gallery_data, report, info
+
+
+
+# ============================================================
+# LOCAL FRAME REVIEW MODULE
+# ============================================================
+
+FRAME_REVIEW_PAGE_SIZE = 18
+FRAME_REVIEW_FILTER_CHOICES = [
+    ("review", "Mittlere Sicherheit / zu prüfen", "Medium confidence / review"),
+    ("high", "Hohe Sicherheit", "High confidence"),
+    ("detected", "Alle erkannten Rahmen", "All detected frames"),
+    ("decided", "Manuell entschieden", "Manually decided"),
+    ("all", "Alle Bilder", "All images"),
+]
+
+
+def _frame_ui_paths(input_folder: str, trigger_word: str) -> Tuple[str, str]:
+    output_root = output_root_for(input_folder, trigger_word)
+    cache_dir = os.path.join(output_root, "_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return output_root, cache_dir
+
+
+def _load_frame_hash_index_ui(cache_dir: str) -> Dict[str, Any]:
+    path = os.path.join(cache_dir, "file_hash_index.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if payload.get("schema_version") == "v1" and isinstance(payload.get("entries"), dict):
+            return payload
+    except Exception:
+        pass
+    return {"schema_version": "v1", "entries": {}, "updated_at": ""}
+
+
+def _frame_hash_with_index_ui(path: str, payload: Dict[str, Any]) -> Tuple[str, bool]:
+    entries = payload.setdefault("entries", {})
+    key = os.path.normcase(os.path.abspath(path))
+    stat = os.stat(path)
+    signature = {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+    existing = entries.get(key)
+    if (
+        isinstance(existing, dict)
+        and existing.get("size") == signature["size"]
+        and existing.get("mtime_ns") == signature["mtime_ns"]
+        and isinstance(existing.get("sha1"), str)
+    ):
+        return str(existing["sha1"]), False
+    digest = frame_file_sha1(path)
+    entries[key] = {**signature, "sha1": digest}
+    return digest, True
+
+
+def _save_frame_hash_index_ui(cache_dir: str, payload: Dict[str, Any]) -> None:
+    payload["schema_version"] = "v1"
+    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _atomic_write_json(os.path.join(cache_dir, "file_hash_index.json"), payload)
+
+
+def _frame_filter_records(state: Any, filter_value: str) -> List[Dict[str, Any]]:
+    records = list((state or {}).get("records", []) or []) if isinstance(state, dict) else []
+    value = str(filter_value or "review")
+    if value == "review":
+        return [r for r in records if r.get("confidence_level") == "medium"]
+    if value == "high":
+        return [r for r in records if r.get("confidence_level") == "high"]
+    if value == "detected":
+        return [r for r in records if r.get("confidence_level") in {"high", "medium"}]
+    if value == "decided":
+        return [r for r in records if r.get("user_decision", "auto") != "auto"]
+    return records
+
+
+def _frame_page_choices(count: int) -> List[str]:
+    pages = max(1, (max(0, int(count)) + FRAME_REVIEW_PAGE_SIZE - 1) // FRAME_REVIEW_PAGE_SIZE)
+    return [str(i) for i in range(1, pages + 1)]
+
+
+def _frame_review_caption(record: Dict[str, Any]) -> str:
+    level = str(record.get("confidence_level", "low")).upper()
+    confidence = float(record.get("confidence", 0) or 0)
+    decision = str(record.get("user_decision", "auto") or "auto")
+    sides = ", ".join(record.get("candidate_sides", []) or []) or "-"
+    return f"{record.get('filename', '')}\n{level} {confidence:.0%} | {sides} | {decision}"
+
+
+def _frame_review_gallery(state: Any, filter_value: str, page_value: Any) -> List[Tuple[str, str]]:
+    records = _frame_filter_records(state, filter_value)
+    try:
+        page = max(1, int(page_value or 1))
+    except Exception:
+        page = 1
+    start = (page - 1) * FRAME_REVIEW_PAGE_SIZE
+    selected = records[start:start + FRAME_REVIEW_PAGE_SIZE]
+    gallery: List[Tuple[str, str]] = []
+    cache_dir = str((state or {}).get("cache_dir", "")) if isinstance(state, dict) else ""
+    for record in selected:
+        try:
+            bbox = record.get("display_bbox") or record.get("candidate_bbox")
+            preview = build_review_preview(
+                record["source_path"], bbox, cache_dir, source_hash=record["source_hash"]
+            )
+            gallery.append((preview, _frame_review_caption(record)))
+        except Exception as exc:
+            gallery.append((record.get("source_path", ""), f"{record.get('filename','')}\nPreview error: {exc}"))
+    return gallery
+
+
+def _frame_review_summary_md(state: Any) -> str:
+    if not isinstance(state, dict) or not state.get("records"):
+        return tr("Noch keine Rahmenanalyse geladen.", "No frame analysis loaded yet.")
+    summary = frame_decision_summary(state.get("records", []))
+    decisions = Counter(str(r.get("user_decision", "auto")) for r in state.get("records", []))
+    return tr(
+        f"**{summary['total']} Bilder lokal geprüft:** {summary['high']} hohe Sicherheit, "
+        f"{summary['medium']} mittlere Sicherheit, {summary['low']} ohne belastbaren Rahmenfund.  "
+        f"Manuell: {decisions.get('accept',0)} übernommen, {decisions.get('manual',0)} manuell, "
+        f"{decisions.get('keep_original',0)} Original behalten. **Keine LLM-Aufrufe.**",
+        f"**{summary['total']} images checked locally:** {summary['high']} high confidence, "
+        f"{summary['medium']} medium confidence, {summary['low']} without a reliable frame.  "
+        f"Manual: {decisions.get('accept',0)} accepted, {decisions.get('manual',0)} manual, "
+        f"{decisions.get('keep_original',0)} original kept. **No LLM calls.**",
+    )
+
+
+def scan_frame_review_ui(
+    trigger_word: str,
+    input_folder: str,
+    advanced_types: bool,
+    progress=gr.Progress(track_tqdm=False),
+):
+    if not trigger_word or not str(trigger_word).strip():
+        return {}, tr("Bitte zuerst ein Triggerwort eingeben.", "Please enter a trigger word first."), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), 0, 0, 0, 0, tr("❌ Triggerwort fehlt", "❌ Trigger word missing")
+    if not input_folder or not os.path.isdir(input_folder):
+        return {}, tr("Input-Ordner nicht gefunden.", "Input folder not found."), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), 0, 0, 0, 0, tr("❌ Input fehlt", "❌ Input missing")
+
+    output_root, cache_dir = _frame_ui_paths(input_folder, trigger_word)
+    paths = scan_frame_source_images(input_folder, output_root)
+    user_payload = load_frame_user_decisions(output_root)
+    user_map = user_payload.get("decisions", {}) or {}
+    hash_index = _load_frame_hash_index_ui(cache_dir)
+    hash_index_dirty = False
+    settings = SmartFrameDetectorSettings(advanced_types=bool(advanced_types))
+    records: List[Dict[str, Any]] = []
+    total = max(1, len(paths))
+    for index, path in enumerate(paths, start=1):
+        progress((index - 1) / total, desc=tr(f"Rahmenanalyse {index}/{len(paths)}", f"Frame analysis {index}/{len(paths)}"))
+        try:
+            source_hash, hash_changed = _frame_hash_with_index_ui(path, hash_index)
+            hash_index_dirty = hash_index_dirty or hash_changed
+            analysis = analyze_frame_cleanup(path, cache_dir, source_hash=source_hash, settings=settings, use_cache=True)
+            user = user_map.get(source_hash, {}) or {}
+            display_bbox = user.get("bbox") if user.get("decision") == "manual" else analysis.get("candidate_bbox")
+            records.append({
+                "source_hash": source_hash,
+                "source_path": path,
+                "filename": os.path.basename(path),
+                "original_size": analysis.get("original_size", []),
+                "confidence": float(analysis.get("confidence", 0) or 0),
+                "confidence_level": analysis.get("confidence_level", "low"),
+                "candidate_bbox": analysis.get("candidate_bbox"),
+                "candidate_sides": analysis.get("candidate_sides", []),
+                "signals": analysis.get("signals", []),
+                "recommendation": analysis.get("recommendation", "keep_original"),
+                "user_decision": user.get("decision", "auto"),
+                "display_bbox": display_bbox,
+                "cache_hit": bool(analysis.get("cache_hit")),
+            })
+        except Exception as exc:
+            records.append({
+                "source_hash": "",
+                "source_path": path,
+                "filename": os.path.basename(path),
+                "original_size": [],
+                "confidence": 0.0,
+                "confidence_level": "low",
+                "candidate_bbox": None,
+                "candidate_sides": [],
+                "signals": [f"error:{exc}"],
+                "recommendation": "keep_original",
+                "user_decision": "auto",
+                "display_bbox": None,
+                "cache_hit": False,
+            })
+    if hash_index_dirty:
+        try:
+            _save_frame_hash_index_ui(cache_dir, hash_index)
+        except Exception:
+            pass
+    progress(1.0, desc=tr("Rahmenanalyse abgeschlossen", "Frame analysis complete"))
+    state = {"records": records, "output_root": output_root, "cache_dir": cache_dir, "advanced_types": bool(advanced_types)}
+    filtered = _frame_filter_records(state, "review")
+    pages = _frame_page_choices(len(filtered))
+    gallery = _frame_review_gallery(state, "review", "1")
+    return (
+        state,
+        _frame_review_summary_md(state),
+        gr.update(choices=pages, value="1"),
+        gallery,
+        "",
+        tr("_Kein Bild ausgewählt._", "_No image selected._"),
+        0, 0, 0, 0,
+        tr(f"✅ {len(records)} Bilder lokal geprüft", f"✅ {len(records)} images checked locally"),
+    )
+
+
+def refresh_frame_review_page_ui(state: Any, filter_value: str, page_value: Any):
+    records = _frame_filter_records(state, filter_value)
+    choices = _frame_page_choices(len(records))
+    try:
+        page = str(min(max(1, int(page_value or 1)), len(choices)))
+    except Exception:
+        page = "1"
+    return gr.update(choices=choices, value=page), _frame_review_gallery(state, filter_value, page), "", tr("_Kein Bild ausgewählt._", "_No image selected._"), 0, 0, 0, 0
+
+
+def select_frame_review_image_ui(state: Any, filter_value: str, page_value: Any, evt: gr.SelectData):
+    records = _frame_filter_records(state, filter_value)
+    try:
+        page = max(1, int(page_value or 1))
+        index = (page - 1) * FRAME_REVIEW_PAGE_SIZE + int(evt.index)
+        record = records[index]
+    except Exception:
+        return "", tr("Auswahl konnte nicht aufgelöst werden.", "Could not resolve selection."), 0, 0, 0, 0
+    bbox = record.get("display_bbox") or record.get("candidate_bbox") or [0, 0, *(record.get("original_size") or [0, 0])]
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        bbox = [0, 0, 0, 0]
+    detail = tr(
+        f"**{record.get('filename','')}**  \n"
+        f"Sicherheit: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%})  \n"
+        f"Seiten: `{', '.join(record.get('candidate_sides',[]) or []) or '-'}`  \n"
+        f"Empfehlung: `{record.get('recommendation')}` | Nutzerentscheidung: `{record.get('user_decision')}`  \n"
+        f"Signale: `{'; '.join(record.get('signals',[]) or []) or '-'}`",
+        f"**{record.get('filename','')}**  \n"
+        f"Confidence: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%})  \n"
+        f"Sides: `{', '.join(record.get('candidate_sides',[]) or []) or '-'}`  \n"
+        f"Recommendation: `{record.get('recommendation')}` | User decision: `{record.get('user_decision')}`  \n"
+        f"Signals: `{'; '.join(record.get('signals',[]) or []) or '-'}`",
+    )
+    return record.get("source_hash", ""), detail, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+
+
+def _find_frame_record(state: Any, source_hash: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(state, dict):
+        return None
+    for record in state.get("records", []) or []:
+        if str(record.get("source_hash", "")) == str(source_hash or ""):
+            return record
+    return None
+
+
+def set_frame_review_decision_ui(
+    state: Any,
+    filter_value: str,
+    page_value: Any,
+    source_hash: str,
+    decision: str,
+    x1: Any, y1: Any, x2: Any, y2: Any,
+):
+    if isinstance(state, dict):
+        state = dict(state)
+        state["records"] = [dict(r) for r in (state.get("records", []) or [])]
+    record = _find_frame_record(state, source_hash)
+    if not record:
+        return state, _frame_review_summary_md(state), _frame_review_gallery(state, filter_value, page_value), tr("Kein Bild ausgewählt.", "No image selected."), tr("❌ Keine Auswahl", "❌ No selection")
+    bbox = None
+    if decision == "manual":
+        bbox = [int(x1), int(y1), int(x2), int(y2)]
+        width, height = record.get("original_size") or frame_image_dimensions(record["source_path"])
+        if not (0 <= bbox[0] < bbox[2] <= int(width) and 0 <= bbox[1] < bbox[3] <= int(height)):
+            return state, _frame_review_summary_md(state), _frame_review_gallery(state, filter_value, page_value), tr("Ungültige Crop-Koordinaten.", "Invalid crop coordinates."), tr("❌ Ungültiger Crop", "❌ Invalid crop")
+    elif decision == "accept":
+        bbox = record.get("candidate_bbox")
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return state, _frame_review_summary_md(state), _frame_review_gallery(state, filter_value, page_value), tr("Kein Crop-Vorschlag vorhanden.", "No crop suggestion available."), tr("❌ Kein Vorschlag", "❌ No suggestion")
+
+    save_frame_user_decision(
+        state["output_root"], record["source_hash"], record["source_path"], decision, bbox=bbox
+    )
+    record["user_decision"] = decision
+    record["display_bbox"] = bbox if decision in {"manual", "accept"} else record.get("candidate_bbox")
+    message = {
+        "accept": tr("Crop-Vorschlag übernommen.", "Crop suggestion accepted."),
+        "manual": tr("Manueller Crop gespeichert.", "Manual crop saved."),
+        "keep_original": tr("Original wird beibehalten.", "Original will be kept."),
+        "auto": tr("Manuelle Entscheidung entfernt; Automatik gilt wieder.", "Manual decision removed; automatic behavior restored."),
+    }.get(decision, decision)
+    return state, _frame_review_summary_md(state), _frame_review_gallery(state, filter_value, page_value), message, f"✅ {message}"
+
+
+def preview_manual_frame_crop_ui(state: Any, source_hash: str, x1: Any, y1: Any, x2: Any, y2: Any):
+    record = _find_frame_record(state, source_hash)
+    if not record:
+        return None, tr("Kein Bild ausgewählt.", "No image selected.")
+    try:
+        bbox = [int(x1), int(y1), int(x2), int(y2)]
+        width, height = record.get("original_size") or frame_image_dimensions(record["source_path"])
+        if not (0 <= bbox[0] < bbox[2] <= int(width) and 0 <= bbox[1] < bbox[3] <= int(height)):
+            raise ValueError("bbox outside image")
+        preview = build_review_preview(record["source_path"], bbox, state["cache_dir"], source_hash=record["source_hash"])
+        return preview, tr("Manuelle Vorschau aktualisiert.", "Manual preview updated.")
+    except Exception as exc:
+        return None, tr(f"Ungültige Vorschau: {exc}", f"Invalid preview: {exc}")
+
+
+def reset_frame_detector_cache_ui(trigger_word: str, input_folder: str):
+    if not trigger_word or not os.path.isdir(input_folder):
+        return {}, tr("Triggerwort/Input fehlen.", "Trigger word/input missing."), gr.update(choices=["1"], value="1"), [], tr("❌ Eingaben fehlen", "❌ Missing input")
+    _, cache_dir = _frame_ui_paths(input_folder, trigger_word)
+    count = reset_frame_detector_cache(cache_dir)
+    return {}, tr("Erkennungscache geleert. Manuelle Entscheidungen bleiben erhalten.", "Detection cache cleared. Manual decisions were preserved."), gr.update(choices=["1"], value="1"), [], tr(f"🧹 {count} Rahmen-Cachedateien entfernt", f"🧹 Removed {count} frame-cache files")
+
+
+def reset_frame_manual_decisions_ui(trigger_word: str, input_folder: str):
+    if not trigger_word or not os.path.isdir(input_folder):
+        return tr("❌ Eingaben fehlen", "❌ Missing input")
+    output_root, _ = _frame_ui_paths(input_folder, trigger_word)
+    count = reset_frame_user_decisions(output_root)
+    return tr(f"🧹 {count} manuelle Rahmenentscheidungen entfernt", f"🧹 Removed {count} manual frame decisions")
 
 
 # ============================================================
@@ -4286,7 +4727,7 @@ def build_ui() -> gr.Blocks:
                             ),
                         )
 
-                with gr.Accordion(tr("🖼️ Instagram-Frame / UI-Rand-Entfernung", "🖼️ Instagram frame / UI border removal"), open=False):
+                with gr.Accordion(tr("🖼️ Smart-Rahmenbereinigung", "🖼️ Smart frame cleanup"), open=False):
                     gr.Markdown(tr(
                         "<details>"
                         "<summary><b>ℹ️ Was wird hier entfernt?</b></summary>"
@@ -4334,7 +4775,7 @@ def build_ui() -> gr.Blocks:
                     ))
                     with gr.Row():
                         c_ig_frame_crop = gr.Checkbox(
-                            label=tr("IG-Frame-/UI-Rand-Entfernung aktivieren", "Enable IG frame / UI border removal"),
+                            label=tr("Lokale Rahmenbereinigung aktivieren", "Enable local frame cleanup"),
                             value=S["c_ig_frame_crop"],
                             info=tr(
                                 "Hauptschalter für die Rand-Erkennung und das Wegschneiden. Empfohlen: an, sobald deine Bilder aus Social Media stammen. Bei reinen DSLR-/Studio-Fotos kannst du es ausschalten.",
@@ -4342,13 +4783,27 @@ def build_ui() -> gr.Blocks:
                             ),
                         )
                         c_ig_two_stage_bar = gr.Checkbox(
-                            label=tr("Zusätzlich Nav-Bars und Schatten erkennen", "Also detect nav bars and shadows"),
+                            label=tr("Erweiterte Rahmentypen erkennen", "Detect advanced frame types"),
                             value=S["c_ig_two_stage_bar"],
                             info=tr(
-                                "Zusätzliche Erkennung für Android-Nav-Bars (schwarz + UI-Icons) und Drop-Shadow-Gradienten. Triggert nur, wenn bereits ein Seitenrand gefunden wurde – das verhindert, dass dunkle Kissen oder Haare als Nav-Bar erkannt werden. Empfohlen: an.",
-                                "Additional detection for Android nav bars (black + UI icons) and drop-shadow gradients. Only triggers when a side border was already detected – prevents dark pillows or hair from being misidentified as nav bars. Recommended: on.",
+                                "Erkennt zusätzlich asymmetrische Canvas-Ränder, Status-/Navigationsleisten, Polaroid-Unterkanten und verlaufende Social-Media-Flächen. Die vier Seiten werden unabhängig geprüft.",
+                                "Also detects asymmetric canvas borders, status/navigation bars, Polaroid-style bottom borders and gradient social-media canvases. All four sides are analysed independently.",
                             ),
                         )
+                    c_frame_cleanup_mode = gr.Dropdown(
+                        label=tr("Verhalten bei Rahmenfunden", "Frame-cleanup behavior"),
+                        choices=[
+                            (tr("Hohe Sicherheit automatisch; mittlere Fälle prüfen", "Auto-apply high confidence; review medium cases"), "auto_high_review_medium"),
+                            (tr("Hohe und mittlere Sicherheit automatisch anwenden", "Auto-apply high and medium confidence"), "auto_high_keep_medium"),
+                            (tr("Nur Vorschläge; nichts automatisch beschneiden", "Suggestions only; never auto-crop"), "suggest_only"),
+                        ],
+                        value=S.get("c_frame_cleanup_mode", "auto_high_review_medium"),
+                        allow_custom_value=False,
+                        info=tr(
+                            "Standard: Nur hochsichere lokale Crops automatisch anwenden. Mittlere Fälle werden im Tab Rahmenprüfung als Original/Crop-Paar angezeigt. Es entstehen keine LLM-Aufrufe.",
+                            "Default: only high-confidence local crops are auto-applied. Medium cases are shown as original/crop pairs in the Frame Review tab. No LLM calls are made.",
+                        ),
+                    )
 
                 with gr.Accordion(tr("🧍 Subject-Sanity-Check (Gliedmaßen-Filter)", "🧍 Subject sanity check (limb filter)"), open=False):
                     gr.Markdown(tr(
@@ -5391,7 +5846,7 @@ def build_ui() -> gr.Blocks:
                     c_use_early_phash_loop1, c_early_phash_thresh_1, c_early_phash_keep_1,
                     c_use_early_phash_loop2, c_early_phash_thresh_2, c_early_phash_keep_2,
                     c_subject_sanity, c_subject_min_torso,
-                    c_ig_frame_crop, c_ig_two_stage_bar,
+                    c_ig_frame_crop, c_ig_two_stage_bar, c_frame_cleanup_mode,
                     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
                     c_smart_crop, c_crop_gain, c_crop_pad,
                     c_medium_rescue_crop, c_medium_rescue_gain,
@@ -5425,6 +5880,116 @@ def build_ui() -> gr.Blocks:
             # ==============================================================
             # TAB 2: SUBJECT PROFILE (Phase 3 UI gate)
             # ==============================================================
+            with gr.TabItem(tr("🖼️ Rahmenprüfung", "🖼️ Frame Review")):
+                gr.Markdown(tr(
+                    "## Lokale Rahmenprüfung vor dem Audit\n"
+                    "Der neue Vier-Seiten-Detektor arbeitet vollständig lokal. Er prüft links, rechts, oben und unten unabhängig, "
+                    "erzeugt reversible Crop-Vorschläge und verwendet **keine LLM-Aufrufe**. Hochsichere Fälle können im normalen Lauf "
+                    "automatisch angewendet werden; mittlere Fälle lassen sich hier als Original/Crop-Paar prüfen.",
+                    "## Local frame review before audit\n"
+                    "The new four-side detector runs entirely locally. It analyses left, right, top and bottom independently, creates "
+                    "reversible crop suggestions and uses **no LLM calls**. High-confidence cases can be auto-applied during the normal "
+                    "run; medium cases can be reviewed here as original/crop pairs.",
+                ))
+                with gr.Row():
+                    fr_scan_btn = gr.Button(tr("🔎 Rahmen lokal analysieren", "🔎 Analyze frames locally"), variant="primary", scale=2)
+                    fr_reset_cache_btn = gr.Button(tr("♻ Erkennung neu berechnen", "♻ Recompute detection"), variant="secondary", scale=1)
+                    fr_reset_manual_btn = gr.Button(tr("↩ Manuelle Entscheidungen löschen", "↩ Clear manual decisions"), variant="secondary", scale=1)
+                fr_status = gr.Textbox(label=tr("Status", "Status"), interactive=False, max_lines=1)
+                fr_summary = gr.Markdown(tr("Noch keine Rahmenanalyse geladen.", "No frame analysis loaded yet."))
+                fr_state = gr.State({})
+                fr_selected_hash = gr.State("")
+                with gr.Row():
+                    fr_filter = gr.Dropdown(
+                        label=tr("Anzeige", "View"),
+                        choices=[(tr(de, en), value) for value, de, en in FRAME_REVIEW_FILTER_CHOICES],
+                        value="review",
+                        allow_custom_value=False,
+                    )
+                    fr_page = gr.Dropdown(label=tr("Seite", "Page"), choices=["1"], value="1", allow_custom_value=False)
+                fr_gallery = gr.Gallery(
+                    label=tr("Original links – vorgeschlagener Crop rechts", "Original left – suggested crop right"),
+                    columns=2,
+                    rows=3,
+                    height=720,
+                    object_fit="contain",
+                )
+                fr_selected_info = gr.Markdown(tr("_Kein Bild ausgewählt._", "_No image selected._"))
+                with gr.Row():
+                    fr_accept_btn = gr.Button(tr("✓ Vorschlag übernehmen", "✓ Accept suggestion"), variant="primary")
+                    fr_keep_btn = gr.Button(tr("Original behalten", "Keep original"), variant="secondary")
+                    fr_auto_btn = gr.Button(tr("Automatik wiederherstellen", "Restore automatic"), variant="secondary")
+                with gr.Accordion(tr("Manuelle Crop-Grenzen", "Manual crop bounds"), open=False):
+                    with gr.Row():
+                        fr_x1 = gr.Number(label="X1 / links", value=0, precision=0)
+                        fr_y1 = gr.Number(label="Y1 / oben", value=0, precision=0)
+                        fr_x2 = gr.Number(label="X2 / rechts", value=0, precision=0)
+                        fr_y2 = gr.Number(label="Y2 / unten", value=0, precision=0)
+                    with gr.Row():
+                        fr_preview_manual_btn = gr.Button(tr("Vorschau aktualisieren", "Update preview"), variant="secondary")
+                        fr_accept_manual_btn = gr.Button(tr("Manuellen Crop übernehmen", "Accept manual crop"), variant="primary")
+                    fr_manual_preview = gr.Image(label=tr("Manuelle Original/Crop-Vorschau", "Manual original/crop preview"), interactive=False, height=480)
+                    fr_manual_status = gr.Markdown("")
+
+                fr_scan_btn.click(
+                    fn=scan_frame_review_ui,
+                    inputs=[c_trigger, c_input, c_ig_two_stage_bar],
+                    outputs=[fr_state, fr_summary, fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
+                    concurrency_id="frame_review_local",
+                )
+                fr_filter.change(
+                    fn=refresh_frame_review_page_ui,
+                    inputs=[fr_state, fr_filter, fr_page],
+                    outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_x1, fr_y1, fr_x2, fr_y2],
+                    show_progress="hidden",
+                )
+                fr_page.input(
+                    fn=refresh_frame_review_page_ui,
+                    inputs=[fr_state, fr_filter, fr_page],
+                    outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_x1, fr_y1, fr_x2, fr_y2],
+                    show_progress="hidden",
+                )
+                fr_gallery.select(
+                    fn=select_frame_review_image_ui,
+                    inputs=[fr_state, fr_filter, fr_page],
+                    outputs=[fr_selected_hash, fr_selected_info, fr_x1, fr_y1, fr_x2, fr_y2],
+                )
+                fr_accept_btn.click(
+                    fn=lambda st, flt, pg, sid, a, b, c, d: set_frame_review_decision_ui(st, flt, pg, sid, "accept", a, b, c, d),
+                    inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2],
+                    outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_status],
+                )
+                fr_keep_btn.click(
+                    fn=lambda st, flt, pg, sid, a, b, c, d: set_frame_review_decision_ui(st, flt, pg, sid, "keep_original", a, b, c, d),
+                    inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2],
+                    outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_status],
+                )
+                fr_auto_btn.click(
+                    fn=lambda st, flt, pg, sid, a, b, c, d: set_frame_review_decision_ui(st, flt, pg, sid, "auto", a, b, c, d),
+                    inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2],
+                    outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_status],
+                )
+                fr_preview_manual_btn.click(
+                    fn=preview_manual_frame_crop_ui,
+                    inputs=[fr_state, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2],
+                    outputs=[fr_manual_preview, fr_manual_status],
+                )
+                fr_accept_manual_btn.click(
+                    fn=lambda st, flt, pg, sid, a, b, c, d: set_frame_review_decision_ui(st, flt, pg, sid, "manual", a, b, c, d),
+                    inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2],
+                    outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_status],
+                )
+                fr_reset_cache_btn.click(
+                    fn=reset_frame_detector_cache_ui,
+                    inputs=[c_trigger, c_input],
+                    outputs=[fr_state, fr_summary, fr_page, fr_gallery, fr_status],
+                )
+                fr_reset_manual_btn.click(
+                    fn=reset_frame_manual_decisions_ui,
+                    inputs=[c_trigger, c_input],
+                    outputs=[fr_status],
+                )
+
             with gr.TabItem(tr("🧬 Subject Profile", "🧬 Subject Profile")):
                 gr.Markdown(tr(
                     "### Profil bearbeiten und Captioning starten\n\n"
