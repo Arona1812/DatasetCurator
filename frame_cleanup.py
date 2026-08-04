@@ -40,7 +40,7 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None
 
-FRAME_DETECTOR_SCHEMA_VERSION = "smart-frame-v1"
+FRAME_DETECTOR_SCHEMA_VERSION = "smart-frame-v4-nested-options"
 FRAME_USER_DECISION_SCHEMA_VERSION = "v1"
 FRAME_DECISION_FILENAME = "_frame_cleanup_decisions.json"
 FRAME_CACHE_SUBDIR = "frame_cleanup"
@@ -64,6 +64,7 @@ class DetectorSettings:
     high_confidence: float = DEFAULT_HIGH_CONFIDENCE
     medium_confidence: float = DEFAULT_MEDIUM_CONFIDENCE
     advanced_types: bool = True
+    auto_accept_types: Tuple[str, ...] = ("uniform_canvas", "story_bars")
 
     def fingerprint(self) -> str:
         payload = {
@@ -74,6 +75,7 @@ class DetectorSettings:
             "high_confidence": round(float(self.high_confidence), 4),
             "medium_confidence": round(float(self.medium_confidence), 4),
             "advanced_types": bool(self.advanced_types),
+            "auto_accept_types": sorted(str(v) for v in self.auto_accept_types),
         }
         return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -328,6 +330,9 @@ def _candidate_side_metrics(
             score *= 0.88
         if not advanced and kind != "solid_bar":
             score *= 0.30
+        outer_mean_value = float(np.mean(line_mean[outer_slice]))
+        outer_dark_value = float(np.mean(dark_share[outer_slice]))
+        outer_bright_value = float(np.mean(bright_share[outer_slice]))
         record = {
             "side": side,
             "distance": int(distance),
@@ -339,6 +344,9 @@ def _candidate_side_metrics(
             "texture_gain": round(texture_gain, 4),
             "outer_edge": round(outer_edge, 4),
             "inner_edge": round(inner_edge, 4),
+            "outer_mean": round(outer_mean_value, 4),
+            "outer_dark_share": round(outer_dark_value, 4),
+            "outer_bright_share": round(outer_bright_value, 4),
         }
         if best is None or float(record["score"]) > float(best["score"]):
             best = record
@@ -416,13 +424,21 @@ def _build_candidate(
     single_side = len(accepted) == 1
     if single_side:
         only = next(iter(accepted.values()))
+        only_side = str(only.get("side"))
         if only.get("kind") != "solid_bar":
             confidence -= 0.20
-        if str(only.get("side")) in {"left", "right"}:
+        if only_side in {"left", "right"}:
             confidence -= 0.04
-        # A lone edge can be a wall, sky line, dark curtain or subject edge.
-        # Keep it reviewable but never auto-apply without a user decision.
-        confidence = min(confidence, 0.735)
+            # A lone vertical edge can be a wall, door, curtain or subject edge.
+            # It may be proposed for review, but is never auto-applied.
+            confidence = min(confidence, 0.735)
+        else:
+            # Strong horizontal UI/status/navigation bars are common and can be
+            # safely auto-cropped when the full-width boundary is coherent.
+            continuity = float(only.get("continuity", 0) or 0)
+            seam = float(only.get("seam", 0) or 0)
+            if continuity >= 0.72 and seam >= 10.0 and float(only.get("score", 0)) >= 0.82:
+                confidence = max(confidence, 0.80)
     confidence = float(np.clip(confidence, 0.0, 1.0))
     signals = []
     for side, values in accepted.items():
@@ -440,6 +456,384 @@ def _build_candidate(
     }
 
 
+
+def _corner_layout_metrics(img: np.ndarray) -> Dict[str, Any]:
+    """Cheap layout signals for social-media canvases and app screenshots.
+
+    Story canvases normally use the same background color on the left and
+    right at a given height, while that color may change vertically as a
+    gradient. Natural scenes such as a dark wall on one side show the opposite
+    pattern (top and bottom of the same side match instead).
+    """
+    h, w = img.shape[:2]
+    py = max(6, int(round(h * 0.06)))
+    px = max(6, int(round(w * 0.06)))
+    corners = {
+        "tl": np.mean(img[:py, :px], axis=(0, 1)),
+        "tr": np.mean(img[:py, w - px:], axis=(0, 1)),
+        "bl": np.mean(img[h - py:, :px], axis=(0, 1)),
+        "br": np.mean(img[h - py:, w - px:], axis=(0, 1)),
+    }
+    def dist(a: str, b: str) -> float:
+        return float(np.linalg.norm(corners[a] - corners[b]))
+    horizontal_symmetry = 0.5 * (dist("tl", "tr") + dist("bl", "br"))
+    vertical_symmetry = 0.5 * (dist("tl", "bl") + dist("tr", "br"))
+    gray = np.mean(img, axis=2)
+    band = max(4, int(round(h * 0.08)))
+    top_dark = float(np.mean(gray[:band] < 35))
+    bottom_dark = float(np.mean(gray[h - band:] < 35))
+    aspect = h / float(max(1, w))
+    app_screenshot = bool(aspect >= 2.0 and top_dark >= 0.70 and bottom_dark >= 0.65)
+    vertical_story_canvas = bool(
+        aspect >= 1.45
+        and horizontal_symmetry <= 22.0
+        and vertical_symmetry >= horizontal_symmetry + 28.0
+    )
+    uniform_canvas = bool(horizontal_symmetry <= 12.0 and vertical_symmetry <= 12.0)
+    return {
+        "aspect_ratio": round(aspect, 4),
+        "horizontal_corner_symmetry": round(horizontal_symmetry, 4),
+        "vertical_corner_symmetry": round(vertical_symmetry, 4),
+        "top_dark_share": round(top_dark, 4),
+        "bottom_dark_share": round(bottom_dark, 4),
+        "app_screenshot": app_screenshot,
+        "vertical_story_canvas": vertical_story_canvas,
+        "uniform_canvas": uniform_canvas,
+    }
+
+
+
+def _app_viewport_sides(img: np.ndarray) -> Dict[str, Dict[str, Any]]:
+    """Estimate the photo viewport inside a tall app screenshot.
+
+    This deliberately returns an additional candidate, not a forced decision.
+    The UI can present it beside the generic border candidate.
+    """
+    h, w = img.shape[:2]
+    if h / float(max(1, w)) < 1.65:
+        return {}
+    gray = np.mean(img, axis=2)
+    dark_share = np.mean(gray < 48, axis=1)
+    edge_profile = np.mean(np.abs(np.diff(gray, axis=0)), axis=1)
+    top_limit = max(8, int(h * 0.42))
+    bottom_start = min(h - 8, int(h * 0.58))
+
+    top = 0
+    for y in range(8, top_limit):
+        before_dark = float(np.mean(dark_share[max(0, y - 8):y]))
+        after_dark = float(np.mean(dark_share[y:min(h, y + 8)]))
+        seam = float(edge_profile[min(y, len(edge_profile) - 1)])
+        if before_dark >= 0.48 and after_dark <= 0.34 and seam >= 4.0:
+            top = y
+            break
+
+    bottom = 0
+    for y in range(h - 9, bottom_start, -1):
+        after_dark = float(np.mean(dark_share[y:min(h, y + 8)]))
+        before_dark = float(np.mean(dark_share[max(0, y - 8):y]))
+        seam = float(edge_profile[max(0, min(y - 1, len(edge_profile) - 1))])
+        if after_dark >= 0.48 and before_dark <= 0.34 and seam >= 4.0:
+            bottom = h - y
+            break
+
+    result: Dict[str, Dict[str, Any]] = {}
+    if top >= max(10, int(h * 0.035)):
+        result["top"] = {
+            "side": "top", "distance": int(top), "score": 0.72,
+            "kind": "app_viewport", "seam": 6.0, "continuity": 0.7,
+            "flatness": 0.65, "texture_gain": 0.3, "outer_edge": 0.1,
+            "outer_dark_share": float(np.mean(dark_share[:top])),
+            "outer_bright_share": 0.0,
+        }
+    if bottom >= max(10, int(h * 0.035)):
+        result["bottom"] = {
+            "side": "bottom", "distance": int(bottom), "score": 0.72,
+            "kind": "app_viewport", "seam": 6.0, "continuity": 0.7,
+            "flatness": 0.65, "texture_gain": 0.3, "outer_edge": 0.1,
+            "outer_dark_share": float(np.mean(dark_share[h-bottom:])),
+            "outer_bright_share": 0.0,
+        }
+    return result if len(result) >= 1 else {}
+
+
+
+def _scale_preview_bbox_to_original(
+    preview_bbox: Iterable[int],
+    preview_size: Tuple[int, int],
+    original_size: Tuple[int, int],
+) -> List[int]:
+    """Scale an analysis-preview bbox back to source-image coordinates."""
+    x1, y1, x2, y2 = [int(v) for v in preview_bbox]
+    pw, ph = preview_size
+    ow, oh = original_size
+    sx = ow / float(max(1, pw))
+    sy = oh / float(max(1, ph))
+    return [
+        max(0, int(round(x1 * sx))),
+        max(0, int(round(y1 * sy))),
+        min(ow, int(round(x2 * sx))),
+        min(oh, int(round(y2 * sy))),
+    ]
+
+
+def _nested_inner_image_candidates(
+    img: np.ndarray,
+    original_size: Tuple[int, int],
+    faces: List[Tuple[int, int, int, int]],
+    min_content_px: int,
+    allow_without_app_shell: bool = False,
+) -> List[Dict[str, Any]]:
+    """Find rectangular photos embedded inside another photo or app screenshot.
+
+    The most important real-world case is a coloured portrait pasted over a
+    larger monochrome/blurred version of the same photo and then captured as a
+    story screenshot.  A normal side-border detector cannot reach the innermost
+    photo.  This helper searches for closed rectangular seams and scores the
+    interior against a narrow ring around the rectangle.  Results are always
+    review candidates; they are never auto-applied.
+    """
+    if cv2 is None:
+        return []
+    h, w = img.shape[:2]
+    if min(h, w) < 240:
+        return []
+    rgb = np.clip(img, 0, 255).astype(np.uint8)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    saturation = hsv[:, :, 1].astype(np.float32)
+    edges = cv2.Canny(gray, 48, 138)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    image_area = float(max(1, w * h))
+    candidates: List[Dict[str, Any]] = []
+    seen: List[Tuple[int, int, int, int]] = []
+
+    for contour in contours:
+        x, y, bw, bh = [int(v) for v in cv2.boundingRect(contour)]
+        if bw < int(w * 0.18) or bh < int(h * 0.16):
+            continue
+        area_ratio = (bw * bh) / image_area
+        if not (0.075 <= area_ratio <= 0.72):
+            continue
+        # The nested photo must be inset; full-screen app viewports are handled
+        # by the dedicated viewport candidates.
+        if min(x, y, w - (x + bw), h - (y + bh)) < max(4, int(min(w, h) * 0.012)):
+            continue
+        aspect = bw / float(max(1, bh))
+        if not (0.34 <= aspect <= 2.8):
+            continue
+        contour_area = float(abs(cv2.contourArea(contour)))
+        rectangularity = contour_area / float(max(1, bw * bh))
+        if rectangularity < 0.30:
+            continue
+
+        ring = max(5, int(round(min(bw, bh) * 0.035)))
+        ox1, oy1 = max(0, x - ring), max(0, y - ring)
+        ox2, oy2 = min(w, x + bw + ring), min(h, y + bh + ring)
+        inside_sat = float(np.mean(saturation[y:y + bh, x:x + bw]))
+        outer_patch = saturation[oy1:oy2, ox1:ox2].copy()
+        mask = np.ones(outer_patch.shape, dtype=bool)
+        ix1, iy1 = x - ox1, y - oy1
+        mask[iy1:iy1 + bh, ix1:ix1 + bw] = False
+        ring_sat = float(np.mean(outer_patch[mask])) if np.any(mask) else inside_sat
+        sat_gain = inside_sat - ring_sat
+
+        # Boundary support: sample the four edges of the proposed rectangle.
+        top_edge = float(np.mean(edges[max(0, y - 2):min(h, y + 3), x:x + bw] > 0))
+        bottom_edge = float(np.mean(edges[max(0, y + bh - 3):min(h, y + bh + 2), x:x + bw] > 0))
+        left_edge = float(np.mean(edges[y:y + bh, max(0, x - 2):min(w, x + 3)] > 0))
+        right_edge = float(np.mean(edges[y:y + bh, max(0, x + bw - 3):min(w, x + bw + 2)] > 0))
+        edge_support = float(np.mean([top_edge, bottom_edge, left_edge, right_edge]))
+
+        cx = x + bw / 2.0
+        cy = y + bh / 2.0
+        centre_distance = math.sqrt(((cx - w / 2.0) / max(1.0, w / 2.0)) ** 2 + ((cy - h / 2.0) / max(1.0, h / 2.0)) ** 2)
+        centre_score = max(0.0, 1.0 - centre_distance)
+
+        contained_faces = 0
+        for fx, fy, fw, fh in faces:
+            fcx, fcy = fx + fw / 2.0, fy + fh / 2.0
+            if x <= fcx <= x + bw and y <= fcy <= y + bh:
+                contained_faces += 1
+
+        evidence = (
+            0.34 * min(1.0, max(0.0, sat_gain) / 55.0)
+            + 0.30 * min(1.0, edge_support / 0.30)
+            + 0.18 * centre_score
+            + 0.10 * min(1.0, rectangularity)
+            + (0.08 if contained_faces else 0.0)
+        )
+        # A nested-photo proposal needs either a strong colour-domain change
+        # (typical colour photo over a monochrome/blurred duplicate) or a
+        # clearly closed rectangular seam. This avoids treating ordinary story
+        # viewports and furniture/background rectangles as inner photos.
+        if sat_gain < 55.0 and edge_support < 0.16:
+            continue
+        if evidence < 0.43:
+            continue
+
+        preview_bbox = [x, y, x + bw, y + bh]
+        # Suppress near-identical contour duplicates.
+        duplicate = False
+        for px1, py1, px2, py2 in seen:
+            inter = max(0, min(px2, x + bw) - max(px1, x)) * max(0, min(py2, y + bh) - max(py1, y))
+            union = (px2 - px1) * (py2 - py1) + bw * bh - inter
+            if union > 0 and inter / float(union) >= 0.88:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        seen.append(tuple(preview_bbox))
+        bbox = _scale_preview_bbox_to_original(preview_bbox, (w, h), original_size)
+        if bbox[2] - bbox[0] < min_content_px or bbox[3] - bbox[1] < min_content_px:
+            continue
+        candidates.append({
+            "bbox": bbox,
+            "preview_bbox": preview_bbox,
+            "sides": ["nested"],
+            "side_details": {},
+            "confidence": round(min(0.79, 0.54 + evidence * 0.30), 5),
+            "retained_area_ratio": round(area_ratio, 5),
+            "signals": [
+                "nested_rectangular_photo",
+                f"nested_saturation_gain:{sat_gain:.1f}",
+                f"nested_edge_support:{edge_support:.2f}",
+                f"nested_faces:{contained_faces}",
+            ],
+            "face_safe": True,
+            "crop_type": "nested_inner_image",
+        })
+
+    candidates.sort(key=lambda item: (
+        float(item.get("confidence", 0)),
+        1 if any(str(v).startswith("nested_faces:") and not str(v).endswith(":0") for v in item.get("signals", [])) else 0,
+        -abs(float(item.get("retained_area_ratio", 0.5)) - 0.30),
+    ), reverse=True)
+    return candidates[:3]
+
+
+def _app_viewport_candidate_sets(img: np.ndarray) -> List[Dict[str, Dict[str, Any]]]:
+    """Return conservative and tighter app-viewport variants.
+
+    Social-media screenshots often contain two stacked lower UI regions: the
+    message/action bar and the Android navigation bar.  A single reverse scan
+    may stop at the lower bar and leave the message bar in the crop.  Returning
+    both plausible boundaries lets the review UI show the safer and tighter
+    alternatives side by side.
+    """
+    base = _app_viewport_sides(img)
+    if not base:
+        return []
+    variants = [base]
+    h, w = img.shape[:2]
+    gray = np.mean(img, axis=2)
+    dark_share = uniform_filter1d(np.mean(gray < 62, axis=1).astype(np.float32), max(5, int(h * 0.012)), mode="nearest")
+    edge_profile = uniform_filter1d(np.mean(np.abs(np.diff(gray, axis=0)), axis=1).astype(np.float32), 5, mode="nearest")
+    window = max(8, int(h * 0.025))
+    candidates: List[Tuple[float, int]] = []
+    for y in range(max(window, int(h * 0.48)), h - window - 1):
+        above = float(np.mean(dark_share[max(0, y - window):y]))
+        below = float(np.mean(dark_share[y:min(h, y + window)]))
+        seam = float(edge_profile[min(y, len(edge_profile) - 1)])
+        trailing_dark = float(np.mean(dark_share[y:]))
+        if below >= 0.30 and below - above >= 0.08 and seam >= 2.4 and trailing_dark >= 0.30:
+            score = (below - above) + min(0.25, seam / 40.0) + min(0.20, trailing_dark * 0.25)
+            candidates.append((score, y))
+    if candidates:
+        # Prefer the earliest credible top edge of the complete bottom UI.
+        credible = [item for item in candidates if item[0] >= max(v[0] for v in candidates) * 0.58]
+        aggressive_y = min(y for _score, y in credible)
+        aggressive_bottom = h - aggressive_y
+        current_bottom = int((base.get("bottom") or {}).get("distance", 0))
+        if aggressive_bottom > current_bottom + max(6, int(h * 0.018)):
+            tighter = {key: dict(value) for key, value in base.items()}
+            tighter["bottom"] = {
+                "side": "bottom", "distance": int(aggressive_bottom), "score": 0.70,
+                "kind": "app_viewport", "seam": 5.0, "continuity": 0.68,
+                "flatness": 0.62, "texture_gain": 0.28, "outer_edge": 0.10,
+                "outer_dark_share": float(np.mean(dark_share[aggressive_y:])),
+                "outer_bright_share": 0.0,
+            }
+            variants.append(tighter)
+    return variants
+
+
+def _dark_overlay_crosses_bbox(img: np.ndarray, bbox: List[int], faces: List[Tuple[int, int, int, int]]) -> bool:
+    """Detect a large dark sticker/banner crossing a proposed photo boundary."""
+    if cv2 is None:
+        return False
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    gray = np.mean(img, axis=2)
+    mask = (gray < 42).astype(np.uint8)
+    try:
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    except Exception:
+        return False
+    min_area = max(80, int(round(h * w * 0.0025)))
+    for idx in range(1, count):
+        x, y, width, height, area = [int(v) for v in stats[idx]]
+        if area < min_area:
+            continue
+        rx2, ry2 = x + width, y + height
+        crosses_vertical = (
+            (x < x1 - 3 and rx2 > x1 + 6)
+            or (x < x2 - 6 and rx2 > x2 + 3)
+        ) and height >= int(h * 0.055)
+        crosses_horizontal = (
+            (y < y1 - 3 and ry2 > y1 + 6)
+            or (y < y2 - 6 and ry2 > y2 + 3)
+        ) and width >= int(w * 0.08)
+        if crosses_vertical or crosses_horizontal:
+            # Crossing graphics only force review when they materially overlap
+            # the subject's face. Text banners elsewhere may remain in the
+            # cropped photo and are handled by the normal overlay/text audit.
+            for fx, fy, fw, fh in faces:
+                face_area = max(1, fw * fh)
+                overlap = max(0, min(rx2, fx + fw) - max(x, fx)) * max(0, min(ry2, fy + fh) - max(y, fy))
+                if overlap / float(face_area) >= 0.05:
+                    return True
+    return False
+
+
+def classify_crop_type(candidate: Optional[Dict[str, Any]], layout_class: str, layout_flags: Iterable[str]) -> str:
+    """Return a stable UI/policy type for a crop candidate."""
+    if not candidate:
+        return "none"
+    explicit = str(candidate.get("crop_type", "") or "").strip()
+    if explicit:
+        return explicit
+    sides = set(str(v) for v in (candidate.get("sides", []) or []))
+    flags = set(str(v) for v in (layout_flags or []))
+    kinds = {
+        str(v.get("kind", ""))
+        for v in ((candidate.get("side_details", {}) or {}).values())
+        if isinstance(v, dict)
+    }
+    if kinds == {"app_viewport"} or "app_viewport" in kinds:
+        return "app_viewport"
+    if "nested_app_screenshot" in flags or layout_class == "nested_app_screenshot":
+        return "nested_screenshot"
+    if "overlay_crosses_frame_boundary" in flags:
+        return "overlay_intrudes_content"
+    if layout_class == "vertical_story_canvas" or kinds & {"story_canvas", "blurred_canvas", "blurred_side_fill"}:
+        return "story_canvas"
+    if layout_class == "uniform_canvas":
+        return "uniform_canvas"
+    if sides == {"top", "bottom"}:
+        return "story_bars"
+    if sides == {"left", "right"}:
+        return "side_canvas"
+    if len(sides) >= 3:
+        return "uniform_canvas"
+    if len(sides) == 1:
+        return "single_side_border"
+    if sides:
+        return "multi_side_border"
+    return "unknown"
+
+
 def _analyse_preview(
     preview: Image.Image,
     original_size: Tuple[int, int],
@@ -447,6 +841,7 @@ def _analyse_preview(
 ) -> Dict[str, Any]:
     img = np.asarray(preview.convert("RGB"), dtype=np.float32)
     h, w = img.shape[:2]
+    layout_metrics = _corner_layout_metrics(img)
     scale_x = original_size[0] / float(w)
     scale_y = original_size[1] / float(h)
     min_border_x = max(4, int(round(settings.min_border_px / max(scale_x, 1e-6))))
@@ -472,12 +867,15 @@ def _analyse_preview(
         if kind == "solid_bar" and score >= threshold:
             accepted[side] = dict(candidate)
 
-    # Pair evidence makes weaker but coherent canvas borders usable.
+    # Pair evidence makes weaker but coherent canvas borders usable. Vertical
+    # pairs are deliberately stricter: a wall/door on one side plus an internal
+    # edge on the other must not become an automatic crop.
     for first, second in (("left", "right"), ("top", "bottom")):
         a, b = side_candidates.get(first), side_candidates.get(second)
         if not a or not b:
             continue
-        if float(a.get("score", 0)) < 0.47 or float(b.get("score", 0)) < 0.47:
+        pair_floor = 0.70 if first == "left" else 0.52
+        if float(a.get("score", 0)) < pair_floor or float(b.get("score", 0)) < pair_floor:
             continue
         def _pair_usable(value: Dict[str, Any]) -> bool:
             if value.get("kind") == "solid_bar":
@@ -509,6 +907,45 @@ def _analyse_preview(
             promoted["score"] = min(1.0, float(promoted["score"]) + 0.08)
             accepted[side] = promoted
 
+    # Vertical story canvases often use a gradient/blurred outer background.
+    # Their left/right corner colors match at each height even when the top and
+    # bottom colors differ considerably. Promote the four locally estimated
+    # boundaries together; a later overlay/layout guard may still cap the
+    # result to review.
+    if settings.advanced_types and bool(layout_metrics.get("vertical_story_canvas")):
+        usable_story_sides: Dict[str, Dict[str, Any]] = {}
+        boundary_evidence = 0
+        for side, value in side_candidates.items():
+            if not value:
+                continue
+            if float(value.get("outer_edge", 1)) > 0.14:
+                continue
+            if int(value.get("distance", 0)) <= 0:
+                continue
+            if float(value.get("seam", 0)) >= 5.0 or float(value.get("continuity", 0)) >= 0.14 or float(value.get("texture_gain", 0)) >= 0.20:
+                boundary_evidence += 1
+            promoted = dict(value)
+            promoted["kind"] = "story_canvas"
+            promoted["score"] = max(float(promoted.get("score", 0)), 0.72 if value.get("kind") == "solid_bar" else 0.68)
+            usable_story_sides[side] = promoted
+        if len(usable_story_sides) >= 3 and boundary_evidence >= 2:
+            accepted.update(usable_story_sides)
+
+    # Uniform blurred side fills can have almost no hard seam. Keep them as a
+    # conservative review proposal, never as an automatic crop from this rule.
+    if settings.advanced_types and bool(layout_metrics.get("uniform_canvas")):
+        left_c, right_c = side_candidates.get("left"), side_candidates.get("right")
+        if left_c and right_c:
+            left_d, right_d = int(left_c.get("distance", 0)), int(right_c.get("distance", 0))
+            side_ratio = min(left_d, right_d) / float(max(1, max(left_d, right_d)))
+            weak_hard_edges = max(float(left_c.get("continuity", 0)), float(right_c.get("continuity", 0))) < 0.12
+            if side_ratio >= 0.70 and weak_hard_edges and min(left_d, right_d) >= int(w * 0.12):
+                for side, value in (("left", left_c), ("right", right_c)):
+                    promoted = dict(value)
+                    promoted["kind"] = "blurred_side_fill"
+                    promoted["score"] = 0.60
+                    accepted[side] = promoted
+
     # A blurred social-media canvas can have four geometrically coherent
     # boundaries with only a weak seam. Promote this pattern to review rather
     # than missing it completely; it still cannot become a high-confidence
@@ -526,13 +963,19 @@ def _analyse_preview(
             and all(float(v.get("outer_edge", 1)) <= 0.08 for v in (left_c, right_c, top_c, bottom_c))
             and all(float(v.get("continuity", 0)) >= 0.28 for v in (left_c, right_c, top_c, bottom_c))
             and all(float(v.get("seam", 0)) >= 4.8 for v in (left_c, right_c, top_c, bottom_c))
+            # Do not demote a genuine crisp four-sided solid frame to the
+            # lower-confidence blurred-canvas class.
+            and sum(1 for v in (left_c, right_c, top_c, bottom_c)
+                    if v.get("kind") == "solid_bar" and float(v.get("score", 0)) >= 0.72) <= 1
         )
         if coherent_blurred_canvas:
             for side, value in side_candidates.items():
                 promoted = dict(value)
                 promoted["kind"] = "blurred_canvas"
                 promoted["score"] = max(0.56, min(0.64, float(promoted.get("score", 0)) + 0.10))
-                accepted[side] = promoted
+                previous = accepted.get(side)
+                if previous is None or float(previous.get("score", 0)) < float(promoted.get("score", 0)):
+                    accepted[side] = promoted
 
     # Textured/gradient top and bottom bars can stand alone if the seam is strong.
     if settings.advanced_types:
@@ -554,8 +997,18 @@ def _analyse_preview(
             if opposite not in accepted and not ({"top", "bottom"} & set(accepted.keys())):
                 del accepted[side]
 
+    # A single dark vertical band is frequently a real wall/curtain or a
+    # naturally dark image edge. Without supporting frame geometry it is safer
+    # to keep the original. Bright one-sided canvases remain reviewable.
+    if len(accepted) == 1:
+        only_side, only_value = next(iter(accepted.items()))
+        if only_side in {"left", "right"} and float(only_value.get("outer_dark_share", 0)) >= 0.82:
+            accepted.clear()
+
     faces = _detect_face_boxes(preview)
     candidate_sets: List[Dict[str, Dict[str, Any]]] = []
+    app_viewport_variants = _app_viewport_candidate_sets(img) if bool(layout_metrics.get("app_screenshot")) else []
+    candidate_sets.extend(app_viewport_variants)
     if accepted:
         candidate_sets.append(dict(accepted))
     if "left" in accepted and "right" in accepted:
@@ -577,13 +1030,64 @@ def _analyse_preview(
             continue
         seen.add(key)
         candidates.append(built)
-    candidates.sort(key=lambda item: float(item.get("confidence", 0)), reverse=True)
+    nested_candidates: List[Dict[str, Any]] = []
+    nested_context = bool(
+        layout_metrics.get("app_screenshot")
+        or layout_metrics.get("vertical_story_canvas")
+        or layout_metrics.get("uniform_canvas")
+    )
+    if settings.advanced_types and nested_context:
+        nested_candidates = _nested_inner_image_candidates(
+            img, original_size, faces, settings.min_content_px, allow_without_app_shell=True
+        )
+        for nested in nested_candidates:
+            key = tuple(nested.get("bbox", []))
+            if len(key) == 4 and key not in seen:
+                seen.add(key)
+                candidates.append(nested)
+
+    def _candidate_rank(item: Dict[str, Any]) -> Tuple[float, int, float]:
+        side_count = len(item.get("sides", []) or [])
+        completeness_bonus = 0.035 * max(0, side_count - 1)
+        retained = float(item.get("retained_area_ratio", 1.0) or 1.0)
+        return (float(item.get("confidence", 0)) + completeness_bonus, side_count, retained)
+
+    candidates.sort(key=_candidate_rank, reverse=True)
 
     best = candidates[0] if candidates else None
     confidence = float(best.get("confidence", 0)) if best else 0.0
+    layout_flags: List[str] = []
+    if any(str(c.get("crop_type", "")) == "nested_inner_image" for c in candidates):
+        layout_flags.append("nested_inner_image_detected")
+    if bool(layout_metrics.get("app_screenshot")):
+        layout_flags.append("nested_app_screenshot")
+    best_kinds = {
+        str(v.get("kind", ""))
+        for v in ((best or {}).get("side_details", {}) or {}).values()
+        if isinstance(v, dict)
+    }
+    if (
+        best
+        and bool(layout_metrics.get("vertical_story_canvas"))
+        and "story_canvas" in best_kinds
+        and _dark_overlay_crosses_bbox(img, list(best.get("preview_bbox", [])), faces)
+    ):
+        layout_flags.append("overlay_crosses_frame_boundary")
+
     if not best:
         level = "low"
         recommendation = "keep_original"
+    elif (
+        "nested_app_screenshot" in layout_flags
+        or "overlay_crosses_frame_boundary" in layout_flags
+        or "nested_inner_image_detected" in layout_flags
+        or str((best or {}).get("crop_type", "")) == "nested_inner_image"
+    ):
+        # Cropping may still be useful, but nested app chrome, collages and
+        # crossing stickers require an explicit user decision.
+        confidence = max(confidence, settings.medium_confidence)
+        level = "medium"
+        recommendation = "review"
     elif confidence >= settings.high_confidence and bool(best.get("face_safe", True)):
         level = "high"
         recommendation = "auto_accept"
@@ -594,6 +1098,40 @@ def _analyse_preview(
         level = "low"
         recommendation = "keep_original"
 
+    layout_class = (
+        "nested_app_screenshot" if layout_metrics.get("app_screenshot")
+        else "vertical_story_canvas" if layout_metrics.get("vertical_story_canvas")
+        else "uniform_canvas" if layout_metrics.get("uniform_canvas")
+        else "natural_or_unknown"
+    )
+    for candidate in candidates:
+        candidate["crop_type"] = classify_crop_type(candidate, layout_class, layout_flags)
+    crop_type = classify_crop_type(best, layout_class, layout_flags)
+
+    visible_candidates = list(candidates[:5])
+    # Keep up to two distinct innermost-photo proposals visible even when
+    # higher-confidence outer-canvas candidates occupy the top ranks. The
+    # review UI is deliberately user-driven for nested layouts.
+    visible_nested_bboxes = {
+        tuple(c.get("bbox", [])) for c in visible_candidates
+        if str(c.get("crop_type", "")) == "nested_inner_image"
+    }
+    for nested_choice in nested_candidates[:2]:
+        key = tuple(nested_choice.get("bbox", []))
+        if key in visible_nested_bboxes:
+            continue
+        if len(visible_candidates) >= 5:
+            # Replace the last non-nested option first.
+            replace_at = next(
+                (i for i in range(len(visible_candidates) - 1, -1, -1)
+                 if str(visible_candidates[i].get("crop_type", "")) != "nested_inner_image"),
+                len(visible_candidates) - 1,
+            )
+            visible_candidates[replace_at] = nested_choice
+        else:
+            visible_candidates.append(nested_choice)
+        visible_nested_bboxes.add(key)
+
     return {
         "detected": bool(best and confidence >= settings.medium_confidence),
         "confidence": round(confidence, 5),
@@ -602,10 +1140,14 @@ def _analyse_preview(
         "candidate_bbox": list(best["bbox"]) if best else None,
         "candidate_sides": list(best.get("sides", [])) if best else [],
         "signals": list(best.get("signals", [])) if best else [],
-        "candidates": candidates[:5],
+        "candidates": visible_candidates,
         "side_candidates": side_candidates,
         "preview_size": [w, h],
         "face_boxes_detected": len(faces),
+        "layout_class": layout_class,
+        "crop_type": crop_type,
+        "layout_flags": layout_flags,
+        "layout_metrics": layout_metrics,
     }
 
 
@@ -650,6 +1192,9 @@ def analyze_frame_cleanup(
                 "side_candidates": {},
                 "preview_size": list(original_size),
                 "face_boxes_detected": 0,
+                "layout_class": "source_too_small",
+                "layout_flags": [],
+                "layout_metrics": {},
             }
         else:
             preview = load_bounded_rgb(image_path, settings.analysis_max_side)
@@ -667,6 +1212,9 @@ def analyze_frame_cleanup(
             "side_candidates": {},
             "preview_size": [],
             "face_boxes_detected": 0,
+            "layout_class": "detector_error",
+            "layout_flags": [],
+            "layout_metrics": {},
         }
 
     result.update({
@@ -733,12 +1281,17 @@ def resolve_frame_cleanup(
         applied_by = "user_keep_original"
     else:
         mode = str(mode or "auto_high_review_medium")
-        if mode == "auto_high_review_medium" and analysis.get("confidence_level") == "high":
+        crop_type = str(analysis.get("crop_type", "unknown") or "unknown")
+        allowed_types = {str(v) for v in (settings.auto_accept_types if settings else ())}
+        type_allowed = crop_type in allowed_types
+        if mode == "auto_high_review_medium" and analysis.get("confidence_level") == "high" and type_allowed:
             bbox = analysis.get("candidate_bbox")
-            applied_by = "auto_high"
-        elif mode == "auto_high_keep_medium" and analysis.get("confidence_level") in {"high", "medium"}:
+            applied_by = f"auto_high:{crop_type}"
+        elif mode == "auto_high_keep_medium" and analysis.get("confidence_level") in {"high", "medium"} and type_allowed:
             bbox = analysis.get("candidate_bbox")
-            applied_by = "auto_high_or_medium"
+            applied_by = f"auto_high_or_medium:{crop_type}"
+        elif mode in {"auto_high_review_medium", "auto_high_keep_medium"} and analysis.get("confidence_level") in {"high", "medium"} and not type_allowed:
+            applied_by = f"policy_review:{crop_type}"
         elif mode == "suggest_only":
             applied_by = "suggest_only"
 

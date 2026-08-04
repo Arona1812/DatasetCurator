@@ -16,6 +16,8 @@ import threading
 import traceback
 import warnings
 import atexit
+import platform
+from importlib import metadata as importlib_metadata
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, List, Optional, Tuple, Iterator
@@ -45,6 +47,22 @@ from frame_cleanup import (
     FRAME_DETECTOR_SCHEMA_VERSION,
     analyze_frame_cleanup as analyze_smart_frame_cleanup,
     resolve_frame_cleanup as resolve_smart_frame_cleanup,
+)
+
+from curator_core import (
+    APP_VERSION,
+    OutputTransaction,
+    atomic_write_json as core_atomic_write_json,
+    atomic_write_text as core_atomic_write_text,
+    build_caption_fingerprint,
+    normalize_run_config_payload,
+    normalized_caption_policy,
+    stable_hash,
+)
+from pose_rules import (
+    apply_structured_pose,
+    edit_suitability_decision,
+    pose_suitability_decision,
 )
 
 # The default Pillow threshold warns for images above ~89 MP. High-resolution
@@ -604,7 +622,7 @@ KREA_CAPTION_MODEL = "gpt-5.6-luna"
 USE_KREA_CAPTION_REPAIR = True
 KREA_CAPTION_REPAIR_MODEL = "gpt-5.6-terra"
 KREA_CAPTION_IMAGE_DETAIL = "high"
-KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v5-canon-selection-tattoo-policy"
+KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v6-active-policy-fingerprint"
 CAPTION_POLICY = {
     "include_gender_class": True,
     "include_skin_tone": True, 
@@ -654,10 +672,10 @@ CONTINUE_FROM_PROFILE = False
 # Dateiname fuer den pausierten Zustand zwischen Profile-Build und Caption-Export.
 CAPTION_STAGE_FILENAME = "_caption_stage.json"
 
-# Subject-Profile-Cache (zentral, pro Trigger-Word)
-SUBJECT_PROFILE_CACHE_DIR = os.path.join(
-    os.path.expanduser("~"), ".dataset_curator", "profiles"
-)
+# Subject-Profile-Cache: bewusst datensatzlokal. Alle Profile und Caches
+# bleiben im jeweiligen curated_<Trigger>/_cache-Ordner; es wird nichts im
+# Benutzerprofil abgelegt.
+SUBJECT_PROFILE_CACHE_DIR = os.path.join(CACHE_DIR, "subject_profiles")
 
 # Stratified Sampling fuer Profile-Normalizer:
 # Wenn die Anzahl gueltiger Audits > PROFILE_SAMPLE_THRESHOLD ist, wird ein
@@ -665,10 +683,6 @@ SUBJECT_PROFILE_CACHE_DIR = os.path.join(
 # Normalizer-Context-Window nicht zu sprengen. Sonst gehen alle rein.
 PROFILE_SAMPLE_THRESHOLD = 100   # ueberschreibbar via UI / _ui_config.json
 PROFILE_SAMPLE_SIZE = 80         # ueberschreibbar via UI / _ui_config.json
-
-# UI-Modus-Schwelle: bei N <= dieser Schwelle zeigt die UI Per-Bild-Dropdowns,
-# sonst die aggregierte Spot-Check-Sicht.
-PROFILE_UI_PER_IMAGE_THRESHOLD = 30   # ueberschreibbar via UI
 
 # Profile-Builder verwendet welche Buckets als Input:
 PROFILE_INPUT_BUCKETS = ["train_ready", "keep_unused"]   # rejects/reviews aus
@@ -718,7 +732,7 @@ PROFILE_NORMALIZER_MODEL = "gpt-5.6-terra"
 #       kanonische Profil-Brille ueberschrieben werden.
 #   v7: Erweiterte Profile-Vokabulare inkl. hair_length und
 #       body_height_impression; Body-Build ersetzt stocky durch broad_build.
-PROFILE_CACHE_SCHEMA_VERSION = "v13"
+PROFILE_CACHE_SCHEMA_VERSION = "v14"
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
@@ -751,7 +765,12 @@ IG_FRAME_MIN_CONTENT_PX = 400             # Mindestbreite/-höhe des verbleibend
 # - auto_high_review_medium: hohe Sicherheit automatisch, mittlere Fälle nur vorschlagen
 # - auto_high_keep_medium: hohe und mittlere Sicherheit automatisch anwenden
 # - suggest_only: nichts automatisch beschneiden
-FRAME_CLEANUP_MODE = "auto_high_review_medium"
+FRAME_CLEANUP_MODE = "suggest_only"
+# Optional preflight gate. When enabled, unresolved medium-confidence frame
+# candidates stop the run before any paid audit call.
+FRAME_PAUSE_ON_MEDIUM_REVIEW = False
+FRAME_AUTO_ACCEPT_TYPES = ["uniform_canvas", "story_bars"]
+POST_FRAME_DUPLICATE_REFRESH = True
 FRAME_CLEANUP_HIGH_CONFIDENCE = 0.76
 FRAME_CLEANUP_MEDIUM_CONFIDENCE = 0.58
 # Erweiterte lokale Rahmentypen: asymmetrische Canvas-Ränder, Status-/Nav-Bars,
@@ -822,7 +841,7 @@ _UI_PROTECTED_KEYS = {
 if os.path.exists(_UI_CONFIG_PATH):
     try:
         with open(_UI_CONFIG_PATH, "r", encoding="utf-8") as _f:
-            _ui_cfg = json.load(_f)
+            _ui_cfg = normalize_run_config_payload(json.load(_f))
         for _k, _v in _ui_cfg.items():
             # CAPTION_POLICY separat mergen, nicht komplett ersetzen
             if _k == "CAPTION_POLICY":
@@ -851,6 +870,7 @@ if os.path.exists(_UI_CONFIG_PATH):
     ARCFACE_CACHE_DIR = os.path.join(CACHE_DIR, "arcface")
     TRIGGER_CACHE_DIR = os.path.join(CACHE_DIR, "trigger")
     LOCAL_ANALYSIS_CACHE_DIR = os.path.join(CACHE_DIR, "local_analysis")
+    SUBJECT_PROFILE_CACHE_DIR = os.path.join(CACHE_DIR, "subject_profiles")
     FILE_HASH_INDEX_PATH = os.path.join(CACHE_DIR, "file_hash_index.json")
     SMART_CROP_COMPARISON_DIR = os.path.join(OUTPUT_ROOT, "08_smart_crop_pairs")
     IG_FRAME_CROP_DIR = os.path.join(CACHE_DIR, "ig_frame_crops")
@@ -897,6 +917,7 @@ for folder in [
     ARCFACE_CACHE_DIR,
     TRIGGER_CACHE_DIR,
     LOCAL_ANALYSIS_CACHE_DIR,
+    SUBJECT_PROFILE_CACHE_DIR,
 ]:
     os.makedirs(folder, exist_ok=True)
 
@@ -1116,11 +1137,49 @@ _FILE_HASH_INDEX: Dict[str, Dict[str, Any]] = {}
 
 
 def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    core_atomic_write_json(path, payload)
+
+
+_ACTIVE_OUTPUT_TRANSACTION: Optional[OutputTransaction] = None
+
+def begin_output_transaction(run_kind: str) -> OutputTransaction:
+    """Redirect export buckets to a staging area until the run is complete."""
+    global _ACTIVE_OUTPUT_TRANSACTION
+    if _ACTIVE_OUTPUT_TRANSACTION is not None:
+        return _ACTIVE_OUTPUT_TRANSACTION
+    final_dirs = {
+        "TRAIN_READY_DIR": os.path.join(OUTPUT_ROOT, "01_train_ready"),
+        "KEEP_UNUSED_DIR": os.path.join(OUTPUT_ROOT, "02_keep_unused"),
+        "CAPTION_REMOVE_DIR": os.path.join(OUTPUT_ROOT, "03_caption_remove"),
+        "REVIEW_DIR": os.path.join(OUTPUT_ROOT, "04_review"),
+        "REJECT_DIR": os.path.join(OUTPUT_ROOT, "05_reject"),
+        "SMART_CROP_COMPARISON_DIR": os.path.join(OUTPUT_ROOT, "08_smart_crop_pairs"),
+    }
+    tx = OutputTransaction(OUTPUT_ROOT, final_dirs, run_kind=run_kind)
+    tx.begin(globals())
+    _ACTIVE_OUTPUT_TRANSACTION = tx
+    safe_print(f"   🛡️ Transactional export staging: {tx.staging_root}")
+    return tx
+
+def commit_output_transaction() -> Dict[str, int]:
+    global _ACTIVE_OUTPUT_TRANSACTION
+    tx = _ACTIVE_OUTPUT_TRANSACTION
+    if tx is None:
+        return {}
+    counts = tx.commit(globals())
+    _ACTIVE_OUTPUT_TRANSACTION = None
+    safe_print("   ✅ Transactional export committed; previous complete dataset replaced atomically.")
+    return counts
+
+def cancel_output_transaction(reason: str = "cancelled") -> None:
+    global _ACTIVE_OUTPUT_TRANSACTION
+    tx = _ACTIVE_OUTPUT_TRANSACTION
+    if tx is None:
+        return
+    try:
+        tx.cancel(globals(), reason)
+    finally:
+        _ACTIVE_OUTPUT_TRANSACTION = None
 
 
 def _load_file_hash_index() -> None:
@@ -2522,7 +2581,22 @@ def local_filesize_kb(image_path: str) -> float:
 # Instagram-Frame Auto-Crop
 # ============================================================
 
+def _workspace_frame_settings() -> Dict[str, Any]:
+    path = os.path.join(OUTPUT_ROOT, "_project_workspace.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        frame = payload.get("frame", {}) if isinstance(payload, dict) else {}
+        return frame if isinstance(frame, dict) else {}
+    except Exception:
+        return {}
+
+
 def _smart_frame_settings() -> SmartFrameDetectorSettings:
+    workspace_frame = _workspace_frame_settings()
+    auto_types = workspace_frame.get("auto_accept_types")
+    if not isinstance(auto_types, list):
+        auto_types = globals().get("FRAME_AUTO_ACCEPT_TYPES", []) or []
     return SmartFrameDetectorSettings(
         analysis_max_side=int(IG_FRAME_ANALYSIS_MAX_SIDE),
         min_border_px=int(IG_FRAME_MIN_BORDER_PX),
@@ -2530,6 +2604,7 @@ def _smart_frame_settings() -> SmartFrameDetectorSettings:
         high_confidence=float(FRAME_CLEANUP_HIGH_CONFIDENCE),
         medium_confidence=float(FRAME_CLEANUP_MEDIUM_CONFIDENCE),
         advanced_types=bool(IG_FRAME_TWO_STAGE_BAR_DETECT),
+        auto_accept_types=tuple(str(v) for v in auto_types),
     )
 
 
@@ -2573,6 +2648,54 @@ def detect_and_crop_ig_frame(image_path: str, source_hash: Optional[str] = None)
     """Backward-compatible wrapper returning only an applied crop path."""
     result = frame_cleanup_for_pipeline(image_path, source_hash=source_hash)
     return str(result.get("frame_crop_path") or "") or None
+
+
+
+def post_frame_duplicate_refresh(image_paths: List[str], threshold: int = 2) -> Tuple[List[str], List[str]]:
+    """Re-check near-identical content after confirmed frame crops.
+
+    The first pHash pass intentionally runs on source files. A story screenshot
+    and the same clean photo can therefore differ before frame cleanup but
+    become identical afterwards. This lightweight second pass uses resolved
+    effective paths and never calls OpenAI.
+    """
+    if not ENABLE_IG_FRAME_CROP or len(image_paths) < 2:
+        return image_paths, []
+    items: List[Tuple[str, str, int]] = []
+    for path in image_paths:
+        raise_if_cancelled("post-frame duplicate refresh")
+        try:
+            source_hash = file_sha1(path)
+            result = frame_cleanup_for_pipeline(path, source_hash=source_hash)
+            effective = str(result.get("effective_image_path") or path)
+            items.append((path, effective, compute_phash(effective)))
+        except RunCancelled:
+            raise
+        except Exception:
+            continue
+    groups: List[List[Tuple[str, str, int]]] = []
+    for item in items:
+        for group in groups:
+            if hamming_distance(item[2], group[0][2]) <= int(threshold):
+                group.append(item)
+                break
+        else:
+            groups.append([item])
+    removed: List[str] = []
+    for group in groups:
+        if len(group) <= 1:
+            continue
+        ranked = sorted(
+            group,
+            key=lambda item: early_duplicate_pick_score_resolution_strict(item[1], item[2])[0],
+            reverse=True,
+        )
+        removed.extend(item[0] for item in ranked[1:])
+    removed_set = set(removed)
+    survivors = [path for path in image_paths if path not in removed_set]
+    if removed:
+        safe_print(f"   ↳ Post-frame pHash refresh: removed {len(removed)} duplicate(s) after crop resolution")
+    return survivors, removed
 
 
 def local_quick_reject(image_path: str, width: int, height: int) -> Optional[str]:
@@ -3220,7 +3343,8 @@ def cache_path_for_file(file_hash: str) -> str:
 #   v12: Cosplay-/High-Variation-Felder ohne Herkunftserkennung:
 #        eye_appearance, look_context, makeup_style, costume_accessories
 #        plus datasetweite Hair-/Eye-Variability-Policies fuer Stable Profile.
-AUDIT_CACHE_SCHEMA_VERSION = "v15"
+AUDIT_CACHE_SCHEMA_VERSION = "v16"
+AUDIT_PROMPT_VERSION = "audit-v16-structured-pose-edit-provenance"
 EARLY_RESULT_CACHE_SCHEMA_VERSION = "v1"
 
 
@@ -3238,6 +3362,7 @@ def audit_cache_key(
         )
     raw = "|".join([
         AUDIT_CACHE_SCHEMA_VERSION,
+        AUDIT_PROMPT_VERSION,
         str(variant),
         str(base_hash),
         (model or "").strip().lower(),
@@ -3329,8 +3454,7 @@ def save_cached_early_results(payload: Dict[str, Any]) -> None:
     if not ENABLE_CACHE:
         return
     path = early_result_cache_path()
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    core_atomic_write_json(path, payload)
 
 
 def apply_early_static_rejects(image_paths: List[str]) -> Tuple[List[str], List[Dict[str, Any]]]:
@@ -3423,8 +3547,7 @@ def save_cached_audit(file_hash: str, payload: Dict[str, Any]) -> None:
     if not ENABLE_CACHE:
         return
     path = cache_path_for_file(file_hash)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    core_atomic_write_json(path, payload)
 
 
 def audit_cache_payload(audit: Dict[str, Any], model: str, variant: str) -> Dict[str, Any]:
@@ -3464,16 +3587,22 @@ def save_cached_trigger_check(trigger_word: str, payload: Dict[str, Any]) -> Non
     if not ENABLE_CACHE:
         return
     path = trigger_cache_path(trigger_word)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    core_atomic_write_json(path, payload)
 
 
 # ============================================================
 # 5) CLIP
 # ============================================================
 
+def clip_cache_fingerprint() -> str:
+    return stable_hash({
+        "model": CLIP_MODEL_NAME,
+        "pretrained": CLIP_PRETRAINED,
+        "schema": "clip-embedding-v2",
+    })[:14]
+
 def get_clip_cache_path(file_hash: str) -> str:
-    return os.path.join(CLIP_CACHE_DIR, f"{file_hash}.npy")
+    return os.path.join(CLIP_CACHE_DIR, f"{file_hash}_{clip_cache_fingerprint()}.npy")
 
 
 def load_clip_embedding_cached(file_hash: str) -> Optional[np.ndarray]:
@@ -3493,7 +3622,9 @@ def save_clip_embedding_cached(file_hash: str, vec: np.ndarray) -> None:
     if not ENABLE_CACHE:
         return
     path = get_clip_cache_path(file_hash)
-    np.save(path, vec.astype(np.float32))
+    tmp = path + ".tmp.npy"
+    np.save(tmp, vec.astype(np.float32))
+    os.replace(tmp, path)
 
 
 def _init_clip_model() -> bool:
@@ -3615,8 +3746,15 @@ def _init_arcface_app():
     return ARCFACE_APP
 
 
+def arcface_cache_fingerprint() -> str:
+    return stable_hash({
+        "model_pack": ARCFACE_MODEL_PACK,
+        "det_size": int(ARCFACE_DET_SIZE),
+        "schema": "arcface-embedding-v2",
+    })[:14]
+
 def get_arcface_cache_path(file_hash: str) -> str:
-    return os.path.join(ARCFACE_CACHE_DIR, f"{file_hash}.npy")
+    return os.path.join(ARCFACE_CACHE_DIR, f"{file_hash}_{arcface_cache_fingerprint()}.npy")
 
 
 def load_arcface_embedding_cached(file_hash: str) -> Optional[np.ndarray]:
@@ -3636,7 +3774,9 @@ def save_arcface_embedding_cached(file_hash: str, vec: np.ndarray) -> None:
     if not ENABLE_CACHE:
         return
     path = get_arcface_cache_path(file_hash)
-    np.save(path, vec.astype(np.float32))
+    tmp = path + ".tmp.npy"
+    np.save(tmp, vec.astype(np.float32))
+    os.replace(tmp, path)
 
 
 def compute_arcface_embedding(image_path: str, file_hash: str) -> Optional[np.ndarray]:
@@ -3917,8 +4057,11 @@ def extract_response_text(response_json: Dict[str, Any]) -> str:
     implementation returned only the first part, which could turn otherwise
     valid structured JSON into an apparently truncated string.
     """
+    # Legacy providers may expose a blocked/empty audit flag. This is treated
+    # as a technical inability to obtain audit data, never as a suitability or
+    # youth-protection decision by the curator.
     if response_json.get("NSFW_BLOCKED"):
-        return '{"NSFW_BLOCKED": true}'
+        return '{"AUDIT_PROVIDER_REFUSAL": true}'
 
     parts: List[str] = []
     for item in response_json.get("output", []) or []:
@@ -4252,6 +4395,41 @@ def build_api_schema() -> Dict[str, Any]:
             "tattoos_description": {"type": "string"},
             "clothing_description": {"type": "string"},
             "pose_description": {"type": "string"},
+            "posture": {
+                "type": "string",
+                "enum": ["standing", "seated_upright", "seated_leaning", "crouching", "kneeling", "reclining", "lying_side", "lying_back", "lying_front", "acrobatic", "ambiguous"],
+                "description": "Structured real-world posture. Natural light leaning while standing remains standing; use reclining/lying only when the body is actually supported horizontally."
+            },
+            "body_axis": {
+                "type": "string",
+                "enum": ["upright", "diagonal", "horizontal"],
+                "description": "Main body axis in the real scene, independent of image rotation."
+            },
+            "pose_naturalness": {
+                "type": "string",
+                "enum": ["natural", "stylized", "contorted"],
+                "description": "Whether the posture is ordinary, deliberately stylized, or anatomically/visually contorted."
+            },
+            "perspective_strength": {
+                "type": "string",
+                "enum": ["normal", "strong", "extreme"],
+                "description": "Strength of perspective/foreshortening. Extreme means proportions are dominated by camera proximity or a very unusual angle."
+            },
+            "image_rotation": {
+                "type": "string",
+                "enum": ["normal", "rotated_90", "rotated_180"],
+                "description": "Whether the file itself should be rotated for normal upright viewing."
+            },
+            "edit_status": {
+                "type": "string",
+                "enum": ["unknown", "unedited", "background_or_bystanders_edited", "target_retouched", "target_reconstructed", "fully_synthetic"],
+                "description": "Provenance estimate. Removing background people is background_or_bystanders_edited and is only a warning, not a reject."
+            },
+            "edit_evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Short factual evidence for edit_status. Use [] when unknown."
+            },
             "expression": {"type": "string"},
             "gaze_direction": {"type": "string"},
             "head_pose_bucket": {
@@ -4484,6 +4662,13 @@ def build_api_schema() -> Dict[str, Any]:
             "tattoos_description",
             "clothing_description",
             "pose_description",
+            "posture",
+            "body_axis",
+            "pose_naturalness",
+            "perspective_strength",
+            "image_rotation",
+            "edit_status",
+            "edit_evidence",
             "expression",
             "gaze_direction",
             "head_pose_bucket",
@@ -4605,12 +4790,9 @@ Important:
   if it is small. A huge shirt slogan is prominent_readable_text=True even
   if it is not an overlay. They can both be True simultaneously.
 
-- IMAGE MEDIUM CLASSIFICATION (critical, hard filter):
-  Determine what TYPE of image this is. The training pipeline can only use
-  real photographs of real people - anything else teaches the model wrong
-  visual statistics. Use exactly one value:
-    * "photograph": a real camera photo of a real human being. This is the
-      ONLY value that allows the image into the training set. Includes
+- IMAGE MEDIUM CLASSIFICATION (provenance and review aid):
+  Determine what TYPE of image this is. This field informs warnings/review; it is not by itself a blanket hard reject. Use exactly one value:
+    * "photograph": a real camera photo of a real human being. Includes
       selfies, portraits, candid shots, professional photography, photos
       with light filters/grading, scanned analog photos.
     * "illustration": drawings, line art, anime/manga style, cartoon,
@@ -4637,9 +4819,10 @@ Important:
   pore detail, realistic hair strands, natural lighting falloff. If those
   are absent and replaced by stylized smooth shading or line art, it is
   'illustration' regardless of how realistic the proportions are.
-  Be strict. False classification of an illustration as 'photograph'
-  poisons the training set. False classification of a photograph as
-  'illustration' is a low-cost false positive (the image goes to review).
+  Be accurate and conservative. Screenshots containing a usable photograph,
+  edited backgrounds, or removed bystanders are review/warning signals rather
+  than automatic rejection. Fully synthetic target people should be identified
+  for review.
 
 - Flag multiple prominent people.
 - Ignore brand names and exact text content. Just flag the presence.
@@ -4700,6 +4883,22 @@ Important:
       fully occluded by an object).
   This classification is critical for LoRA training: 'sideways' and
   'inverted' images teach the model wrong anatomy unless rotated first.
+- STRUCTURED POSE SUITABILITY (required):
+  Fill posture, body_axis, pose_naturalness, perspective_strength, and image_rotation.
+  Natural standing, upright sitting, and light leaning remain eligible. Use reclining/
+  lying_* only when the body is genuinely supported horizontally. Use acrobatic or
+  contorted only for clearly unusual body arrangements. Strong or extreme perspective
+  concerns geometry/foreshortening, never clothing or presentation.
+- EDIT PROVENANCE (required):
+  Set edit_status to background_or_bystanders_edited when other people or only the
+  background appear removed/changed while the target person remains photographic.
+  This is a warning only. Use fully_synthetic only when the target person itself is
+  generated. Use target_reconstructed when the target face/body has been substantially
+  regenerated. Provide short edit_evidence facts or [].
+- There is no youth-protection/NSFW suitability filter. Do not reject or downgrade based
+  on clothing, nudity, sexualized styling, or costume. Judge only technical quality,
+  identity, pose, image structure, and usefulness for the selected training goal.
+
 - ISSUES TAGGING (critical for training data quality):
   Be aggressive about tagging the following issues - missing them
   pollutes the training set. The 'issues' array should contain ALL
@@ -4944,7 +5143,7 @@ If no piercings are visible: piercing_inventory_now = [].
         phase_label=phase_label or f"audit:{os.path.basename(image_path)}",
     )
     if data.get("NSFW_BLOCKED"):
-        return {"NSFW_BLOCKED": True}
+        return {"AUDIT_PROVIDER_REFUSAL": True}
     text = extract_response_text(data)
     return json.loads(text)
 
@@ -6036,6 +6235,17 @@ def subject_profile_cache_path(trigger_word: Optional[str] = None) -> str:
     return os.path.join(SUBJECT_PROFILE_CACHE_DIR, f"{safe}.profile.json")
 
 
+def subject_profile_settings_fingerprint() -> str:
+    return stable_hash({
+        "schema": PROFILE_CACHE_SCHEMA_VERSION,
+        "normalizer_model": PROFILE_NORMALIZER_MODEL,
+        "reasoning_effort": PROFILE_REASONING_EFFORT,
+        "sample_threshold": int(PROFILE_SAMPLE_THRESHOLD),
+        "sample_size": int(PROFILE_SAMPLE_SIZE),
+        "training_target": normalize_training_target(TRAINING_TARGET),
+    })
+
+
 def output_subject_profile_path() -> str:
     return os.path.join(OUTPUT_ROOT, "_subject_profile.json")
 
@@ -6083,6 +6293,42 @@ def _profile_bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "ja", "y"}
 
 
+def profile_role_weight(row: Dict[str, Any]) -> float:
+    """Importance used only while consolidating the identity profile.
+
+    Explicit user Priority is strongest, followed by user-selected core.
+    Export ranking remains separate; this weight must never turn a review or
+    reject into train_ready on its own.
+    """
+    if bool(row.get("priority_image")):
+        return 3.0
+    role = normalize_text(row.get("identity_cluster_role"))
+    if role == "core":
+        return 2.0
+    if role == "body_reference":
+        return 1.35
+    if role in {"review", "exclude"}:
+        return 0.0
+    return 1.0
+
+
+def apply_profile_role_metadata(rows: List[Dict[str, Any]], profile: Optional[Dict[str, Any]]) -> None:
+    """Attach current Priority/cluster role information to audit rows."""
+    apply_priority_image_flags(rows, profile)
+    apply_identity_cluster_roles_to_rows(rows, profile)
+    for row in rows:
+        row["profile_weight"] = profile_role_weight(row)
+
+
+def _weighted_mode_clean(rows: List[Dict[str, Any]], field: str) -> str:
+    scores: Dict[str, float] = defaultdict(float)
+    for row in rows:
+        value = compact_trait(row.get(field))
+        if value:
+            scores[value] += max(0.0, float(row.get("profile_weight", profile_role_weight(row)) or 0.0))
+    return max(scores, key=lambda value: (scores[value], len(value))) if scores else ""
+
+
 def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
     """Hash ueber die relevanten Audit-Felder, nicht ueber Captions/Outputnamen."""
     relevant: List[Dict[str, Any]] = []
@@ -6120,6 +6366,9 @@ def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
             "background_description": row.get("background_description", ""),
             "background_type": row.get("background_type", ""),
             "head_pose_bucket": row.get("head_pose_bucket", ""),
+            "priority_image": bool(row.get("priority_image")),
+            "identity_cluster_role": row.get("identity_cluster_role", ""),
+            "profile_weight": round(float(row.get("profile_weight", profile_role_weight(row)) or 0.0), 3),
         })
     relevant.sort(key=lambda x: (str(x.get("image_id", "")), str(x.get("original_filename", ""))))
     payload = {
@@ -6167,6 +6416,30 @@ def stratified_sample_for_profile(rows: List[Dict[str, Any]]) -> List[Dict[str, 
     def _sid(row: Dict[str, Any]) -> str:
         return profile_image_id(row)
 
+    # 0) Manual decisions are authoritative for profile consolidation.
+    # Keep every Priority image, then the strongest Core references. Priority
+    # may intentionally expand the normal sample target.
+    priority_rows = sorted(
+        [r for r in rows if bool(r.get("priority_image"))],
+        key=lambda r: (-float(r.get("quality_total", 0) or 0), _sid(r)),
+    )
+    for row in priority_rows:
+        sid = _sid(row)
+        if sid not in selected_ids:
+            selected.append(row)
+            selected_ids.add(sid)
+    core_rows = sorted(
+        [r for r in rows if normalize_text(r.get("identity_cluster_role")) == "core"],
+        key=lambda r: (-float(r.get("quality_total", 0) or 0), _sid(r)),
+    )
+    for row in core_rows:
+        if len(selected) >= max(target, len(priority_rows)):
+            break
+        sid = _sid(row)
+        if sid not in selected_ids:
+            selected.append(row)
+            selected_ids.add(sid)
+
     # 1) Body-relevante Bilder zuerst, aber begrenzt, damit Face-Identity nicht
     #    ueberrollt wird. Score-Sortierung sorgt fuer gute Body-Referenzen.
     body_rows = [
@@ -6174,7 +6447,8 @@ def stratified_sample_for_profile(rows: List[Dict[str, Any]]) -> List[Dict[str, 
         if normalize_text(r.get("shot_type")) in {"medium", "full_body"}
     ]
     body_rows.sort(key=lambda r: (normalize_text(r.get("shot_type")) != "full_body", -float(r.get("quality_total", 0)), _sid(r)))
-    for row in body_rows[: min(len(body_rows), int(PROFILE_BODY_PRIORITY_SAMPLE_MAX), target)]:
+    body_slots = max(0, max(target, len(priority_rows)) - len(selected))
+    for row in body_rows[: min(len(body_rows), int(PROFILE_BODY_PRIORITY_SAMPLE_MAX), body_slots)]:
         sid = _sid(row)
         if sid not in selected_ids:
             selected.append(row)
@@ -6375,6 +6649,9 @@ def _profile_sample_payload(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "image_id": profile_image_id(row),
             "filename": row.get("original_filename", ""),
             "quality_total": row.get("quality_total", 0),
+            "profile_weight": round(float(row.get("profile_weight", profile_role_weight(row)) or 0.0), 3),
+            "priority_image": bool(row.get("priority_image")),
+            "identity_cluster_role": row.get("identity_cluster_role", ""),
             "shot_type": row.get("shot_type", ""),
             "head_pose_bucket": row.get("head_pose_bucket", ""),
             "lighting_type": row.get("lighting_type", ""),
@@ -6424,6 +6701,7 @@ All input images are intended to show the same subject. Some outliers may exist.
 
 Important:
 - Stable identity traits must be canonical and consistent across captions.
+- Each sampled image includes profile_weight. Treat explicit Priority images (3.0) as the strongest identity evidence, Core images (2.0) next, body_reference (1.35) as extra body evidence, and ordinary variation (1.0) normally. Do not turn a styling attribute into stable identity solely because one weighted image shows it; use the weights to resolve genuine conflicts.
 - Use single, clean tokens or short phrases. No hedge words, no 'or'-phrases, no 'none visible'.
 - For skin tone, account for studio-lighting bias: studio or ring-light images can make darker skin read lighter.
 - For eye color, treat mirror selfies, filters, and extreme lighting as possible outliers.
@@ -6582,11 +6860,16 @@ object matching the supplied strict schema. Keep notes concise so the response c
 
 
 def _mode_clean(rows: List[Dict[str, Any]], field: str) -> str:
-    vals = [compact_trait(r.get(field)) for r in rows]
-    vals = [v for v in vals if v]
-    if not vals:
-        return ""
-    return Counter(vals).most_common(1)[0][0]
+    return _weighted_mode_clean(rows, field)
+
+
+def _weighted_canonical_mode(rows: List[Dict[str, Any]], getter) -> str:
+    scores: Dict[str, float] = defaultdict(float)
+    for row in rows:
+        value = compact_trait(getter(row))
+        if value:
+            scores[value] += max(0.0, float(row.get("profile_weight", profile_role_weight(row)) or 0.0))
+    return max(scores, key=lambda value: (scores[value], len(value))) if scores else ""
 
 
 def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason: str = "") -> Dict[str, Any]:
@@ -6665,8 +6948,8 @@ def fallback_subject_profile(rows: List[Dict[str, Any]], input_hash: str, reason
             "body_height_impression": _mode_clean(rows, "body_height_impression"),
         },
         "canonical_features": {
-            "hair_color": Counter([canonical_hair_color(r) for r in rows if canonical_hair_color(r)]).most_common(1)[0][0] if any(canonical_hair_color(r) for r in rows) else "",
-            "hair_form": Counter([canonical_hair_form(r) for r in rows if canonical_hair_form(r)]).most_common(1)[0][0] if any(canonical_hair_form(r) for r in rows) else "",
+            "hair_color": _weighted_canonical_mode(rows, canonical_hair_color),
+            "hair_form": _weighted_canonical_mode(rows, canonical_hair_form),
             "eye_color": canonical_eye_color({"eye_color": _mode_clean(rows, "eye_color")}),
             "beard_pattern": "",
             "beard_color": "",
@@ -7344,6 +7627,9 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
             piercings_visible.append(loc)
 
     return {
+        "profile_weight": round(float(row.get("profile_weight", profile_role_weight(row)) or 0.0), 3),
+        "priority_image": bool(row.get("priority_image")),
+        "identity_cluster_role": row.get("identity_cluster_role", ""),
         "hair_color_base": canonical_hair_color(row),
         "hair_color_modifier": canonical_hair_color_modifier(row),
         "hair_form": canonical_hair_form(row),
@@ -7636,7 +7922,7 @@ def is_post_audit_reject(row: Dict[str, Any]) -> bool:
         return False
     if reason.startswith(("hard_pass_too_small", "filesize_too_small", "script_error")):
         return False
-    if row.get("NSFW_BLOCKED"):
+    if row.get("AUDIT_PROVIDER_REFUSAL") or row.get("NSFW_BLOCKED"):
         return False
     # The audit schema always supplies a shot type and several semantic fields.
     # Requiring one of them avoids accidentally exposing pre-audit rows.
@@ -8034,14 +8320,17 @@ def load_profile_override() -> Dict[str, Any]:
 
 
 def save_subject_profile(profile: Dict[str, Any]) -> None:
+    profile = dict(profile or {})
+    # Backend saves represent a freshly built/reconsolidated profile. UI frame
+    # changes write dependency markers directly and intentionally bypass this
+    # helper until the targeted re-audit has completed.
+    profile.pop("audit_stale_images", None)
+    profile.pop("preserve_audit_stale_markers", None)
     os.makedirs(SUBJECT_PROFILE_CACHE_DIR, exist_ok=True)
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-    with open(subject_profile_cache_path(), "w", encoding="utf-8") as f:
-        json.dump(profile, f, ensure_ascii=False, indent=2)
-
-    with open(output_subject_profile_path(), "w", encoding="utf-8") as f:
-        json.dump(profile, f, ensure_ascii=False, indent=2)
+    core_atomic_write_json(subject_profile_cache_path(), profile)
+    core_atomic_write_json(output_subject_profile_path(), profile)
 
     example_path = os.path.join(OUTPUT_ROOT, "_profile_override.example.json")
     if not os.path.exists(example_path):
@@ -8072,8 +8361,7 @@ def save_subject_profile(profile: Dict[str, Any]) -> None:
             },
             "per_image_traits": {}
         }
-        with open(example_path, "w", encoding="utf-8") as f:
-            json.dump(example, f, ensure_ascii=False, indent=2)
+        core_atomic_write_json(example_path, example)
 
 
 def load_subject_profile_cache(input_hash: str) -> Optional[Dict[str, Any]]:
@@ -8086,6 +8374,7 @@ def load_subject_profile_cache(input_hash: str) -> Optional[Dict[str, Any]]:
         if (
             profile.get("profile_schema_version") == PROFILE_CACHE_SCHEMA_VERSION
             and profile.get("input_hash") == input_hash
+            and profile.get("normalizer_settings_fingerprint") == subject_profile_settings_fingerprint()
             and str(profile.get("normalizer_model", "")).strip().lower() != "fallback_local"
         ):
             return profile
@@ -8142,6 +8431,18 @@ def _state_stats(values: List[str]) -> Dict[str, Any]:
         "variation_detected": len(counts) >= 2 and minority_count >= 2,
         "counts": dict(counts.most_common(12)),
     }
+
+def _weighted_trait_mode(traits: List[Dict[str, Any]], field: str, reliable_field: str = "") -> str:
+    scores: Dict[str, float] = defaultdict(float)
+    for trait in traits:
+        if reliable_field and not bool(trait.get(reliable_field)):
+            continue
+        value = normalize_text(trait.get(field, ""))
+        if not value or value in {"none", "unknown", "unclear", "not_visible", "n_a"}:
+            continue
+        scores[value] += max(0.0, float(trait.get("profile_weight", 1.0) or 0.0))
+    return max(scores, key=lambda value: (scores[value], len(value))) if scores else ""
+
 
 def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Attach canonical baselines and measurable per-feature variation.
@@ -8221,15 +8522,15 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
 
     canonical = profile.setdefault("canonical_features", {})
     if not normalize_text(canonical.get("hair_color", "")):
-        canonical["hair_color"] = hair_color_stats.get("mode", "")
+        canonical["hair_color"] = _weighted_trait_mode(trait_rows, "hair_color_base") or hair_color_stats.get("mode", "")
     if not normalize_text(canonical.get("hair_form", "")):
-        canonical["hair_form"] = hair_form_stats.get("mode", "")
+        canonical["hair_form"] = _weighted_trait_mode(trait_rows, "hair_form") or hair_form_stats.get("mode", "")
     if not normalize_text(canonical.get("eye_color", "")):
-        canonical["eye_color"] = normalize_text((profile.get("stable_identity", {}) or {}).get("eye_color", "")) or eye_color_stats.get("mode", "")
+        canonical["eye_color"] = normalize_text((profile.get("stable_identity", {}) or {}).get("eye_color", "")) or _weighted_trait_mode(trait_rows, "eye_color_base", "eye_color_reliable") or eye_color_stats.get("mode", "")
     if not normalize_text(canonical.get("beard_pattern", "")):
-        canonical["beard_pattern"] = beard_pattern_stats.get("mode", "")
+        canonical["beard_pattern"] = _weighted_trait_mode(trait_rows, "beard_pattern") or beard_pattern_stats.get("mode", "")
     if not normalize_text(canonical.get("beard_color", "")):
-        canonical["beard_color"] = beard_color_stats.get("mode", "")
+        canonical["beard_color"] = _weighted_trait_mode(trait_rows, "beard_color") or beard_color_stats.get("mode", "")
     if not normalize_text(canonical.get("glasses_frame_shape", "")):
         canonical["glasses_frame_shape"] = glasses_shape_stats.get("mode", "")
     if not normalize_text(canonical.get("glasses_frame_material", "")):
@@ -8406,6 +8707,8 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         safe_print("   ⚠️ Subject profile skipped: no usable keep rows.")
         return {}
 
+    for row in rows:
+        row.setdefault("profile_weight", profile_role_weight(row))
     input_hash = profile_input_hash(rows)
     cached = load_subject_profile_cache(input_hash)
     if cached:
@@ -8478,6 +8781,7 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     profile = attach_profile_variability_policies(profile, rows)
     profile["input_hash"] = input_hash
     profile["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
+    profile["normalizer_settings_fingerprint"] = subject_profile_settings_fingerprint()
     profile["subject_id"] = profile.get("subject_id") or SAFE_TRIGGER
     profile["force_only_when_visible"] = True
 
@@ -8503,6 +8807,97 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         f"height={stable.get('body_height_impression','') or '-'} | "
         f"mode={profile.get('profile_appearance_mode','') or '-'}"
     )
+    return profile
+
+
+def refresh_subject_profile_from_existing_audits(
+    existing_profile: Dict[str, Any],
+    all_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Re-consolidate identity after Priority/Core edits without re-auditing images.
+
+    This performs one profile-normalizer call (plus its built-in repair retry if
+    needed), then overlays explicitly confirmed UI identity values. Existing
+    cluster membership, detached buckets and Priority IDs remain intact.
+    """
+    profile = json.loads(json.dumps(existing_profile or {}))
+    apply_profile_role_metadata(all_rows, profile)
+    eligible: List[Dict[str, Any]] = []
+    for row in all_rows:
+        role = normalize_text(row.get("identity_cluster_role"))
+        priority = bool(row.get("priority_image"))
+        normal_usable = row.get("base_status") == "keep" and row.get("arcface_flag") != "hard" and role not in {"review", "exclude"}
+        if priority or normal_usable:
+            row["profile_weight"] = profile_role_weight(row)
+            eligible.append(row)
+    if not eligible:
+        profile["profile_rebuild_required"] = False
+        profile["profile_rebuild_reason"] = ""
+        return profile
+
+    input_hash = profile_input_hash(eligible)
+    sample = stratified_sample_for_profile(eligible)
+    safe_print(
+        f"   🧬 Re-consolidating profile from existing audits: {len(sample)}/{len(eligible)} "
+        "sampled | Priority > Core > automatic evidence"
+    )
+    try:
+        normalized = call_subject_profile_normalizer(sample, input_hash, total_count=len(eligible))
+    except RunCancelled:
+        raise
+    except Exception as exc:
+        safe_print(f"   ⚠️ Weighted profile normalizer failed; using local weighted fallback: {exc}")
+        normalized = fallback_subject_profile(sample or eligible, input_hash, reason=str(exc))
+        normalized["total_usable_images"] = len(eligible)
+
+    # Replace only the automatically consolidated identity layer. Preserve UI
+    # cluster buckets, priority overlays and diagnostic history.
+    profile["stable_identity"] = normalized.get("stable_identity", {}) or {}
+    profile["confidence"] = normalized.get("confidence", {}) or {}
+    profile["identity_markers"] = normalized.get("identity_markers", {}) or {}
+    profile["normalizer_model"] = normalized.get("normalizer_model", "")
+    profile["normalizer_source"] = normalized.get("normalizer_source", "")
+    profile["normalizer_retry_count"] = normalized.get("normalizer_retry_count", 0)
+    profile["normalizer_primary_error"] = normalized.get("normalizer_primary_error", "")
+    profile["sample_size"] = len(sample)
+    profile["total_usable_images"] = len(eligible)
+    profile["input_hash"] = input_hash
+    profile["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
+    profile["normalizer_settings_fingerprint"] = subject_profile_settings_fingerprint()
+
+    # Recalculate automatic canonical features from the weighted evidence.
+    profile["canonical_features"] = {}
+    per_image: Dict[str, Any] = {}
+    for row in eligible:
+        image_id = profile_image_id(row)
+        row["profile_image_id"] = image_id
+        per_image[image_id] = per_image_profile_traits(row, profile)
+    profile["per_image_traits"] = per_image
+    profile = attach_piercing_inventory(profile, eligible)
+    profile = attach_profile_variability_policies(profile, eligible)
+
+    explicit = existing_profile.get("user_confirmed_identity_overrides", {}) or {}
+    if isinstance(explicit, dict) and explicit:
+        profile = deep_merge_dict(profile, explicit)
+        profile["user_confirmed_identity_overrides"] = explicit
+        profile.setdefault("normalizer_notes", []).append(
+            "Explicit user-confirmed identity values re-applied after Priority/Core weighted profile rebuild."
+        )
+
+    profile["profile_rebuild_required"] = False
+    profile["profile_rebuild_reason"] = ""
+    profile["profile_weighting"] = {
+        "priority": 3.0,
+        "core": 2.0,
+        "body_reference": 1.35,
+        "variation": 1.0,
+        "refreshed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    profile.setdefault("normalizer_notes", []).append(
+        "Profile re-consolidated from existing audits after manual Priority/Core changes; no image audit was repeated."
+    )
+    profile["normalizer_notes"] = (profile.get("normalizer_notes", []) or [])[-40:]
+    save_subject_profile(profile)
     return profile
 
 
@@ -8594,8 +8989,7 @@ def save_caption_stage(
         "warnings": warnings,
         "valid_candidate_count": valid_candidate_count,
     }
-    with open(output_caption_stage_path(), "w", encoding="utf-8") as f:
-        json.dump(make_json_safe(stage), f, ensure_ascii=False, indent=2)
+    core_atomic_write_json(output_caption_stage_path(), make_json_safe(stage))
 
 
 def load_caption_stage() -> Dict[str, Any]:
@@ -8721,7 +9115,7 @@ def build_reject_reason_string(row: Dict[str, Any]) -> str:
     Reihenfolge der Quellen:
       1. local_override_reasons (Liste oder String aus CSV-Roundtrip)
       2. status_notes (Duplikat-Marker, Smart-Crop-Marker etc.)
-      3. short_reason (hart vergebener Grund: too_small, NSFW, script_error,
+      3. short_reason (technischer Grund: too_small, provider_refusal, script_error,
          oder bei API-Reject die Audit-Beschreibung)
       4. duplicate_method/duplicate_of explizit
       5. API suggested_status=reject mit short_reason als api_reject:
@@ -8903,6 +9297,8 @@ def write_caption_stage_reports(
         "body_skin_visibility",
         "face_orientation_in_frame",
         "tattoos_visible", "tattoos_description", "clothing_description", "pose_description",
+        "posture", "body_axis", "pose_naturalness", "perspective_strength", "image_rotation",
+        "edit_status", "edit_evidence",
         "expression", "expression_category", "gaze_direction", "gaze_category",
         "head_pose_bucket", "occlusion_type", "background_description",
         "lighting_description", "lighting_type", "background_type", "hair_texture",
@@ -8914,19 +9310,12 @@ def write_caption_stage_reports(
         "file_size_mb", "arcface_distance_to_centroid", "arcface_flag",
         "canonical_hair_match_strength", "canon_representation_bonus_applied",
         "identity_cluster_id", "identity_cluster_role", "priority_image",
-        "caption_source", "caption_model", "caption_retry_count", "caption_validation_error", "final_caption",
+        "caption_source", "caption_model", "caption_retry_count",
+        "primary_caption_error", "final_caption_valid", "caption_validation_error", "final_caption",
     ]
 
     csv_path = os.path.join(OUTPUT_ROOT, f"dataset_audit_{SAFE_TRIGGER}.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_fields, extrasaction="ignore")
-        writer.writeheader()
-        for row in all_rows:
-            row_copy = dict(row)
-            row_copy["issues"] = ", ".join(row_copy.get("issues", [])) if isinstance(row_copy.get("issues"), list) else row_copy.get("issues", "")
-            row_copy["costume_accessories"] = ", ".join(row_copy.get("costume_accessories", [])) if isinstance(row_copy.get("costume_accessories"), list) else row_copy.get("costume_accessories", "")
-            row_copy["local_override_reasons"] = ", ".join(row_copy.get("local_override_reasons", [])) if isinstance(row_copy.get("local_override_reasons"), list) else row_copy.get("local_override_reasons", "")
-            writer.writerow(row_copy)
+    write_csv_atomic(csv_path, csv_fields, all_rows)
 
     jsonl_path = os.path.join(OUTPUT_ROOT, f"dataset_audit_{SAFE_TRIGGER}.jsonl")
     write_jsonl(jsonl_path, make_json_safe(all_rows))
@@ -8974,7 +9363,12 @@ def write_caption_stage_reports(
         "canon_representation_reject_candidates": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("reject_candidates", 0),
         "canon_representation_max_quality_gap": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("max_quality_gap", 0),
         "training_target": normalize_training_target(TRAINING_TARGET),
+        "pipeline_mode": str(PIPELINE_MODE),
         "caption_profile": caption_profile_for_training_target(TRAINING_TARGET),
+        "variable_feature_mode": str(VARIABLE_FEATURE_CAPTION_MODE),
+        "active_caption_policy": normalized_caption_policy(CAPTION_POLICY),
+        "run_config_schema_version": str((_ui_cfg or {}).get("RUN_CONFIG_SCHEMA_VERSION", "")) if isinstance(globals().get("_ui_cfg"), dict) else "",
+        "run_config_fingerprint": str((_ui_cfg or {}).get("RUN_CONFIG_FINGERPRINT", "")) if isinstance(globals().get("_ui_cfg"), dict) else "",
         "audit_model": AI_MODEL,
         "krea_ai_captioning": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_AI_CAPTIONING),
         "krea_caption_model": KREA_CAPTION_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" else "",
@@ -8987,6 +9381,8 @@ def write_caption_stage_reports(
         "medium_rescue_crop_enabled": bool(ENABLE_MEDIUM_RESCUE_CROP),
         "frame_detector_schema": FRAME_DETECTOR_SCHEMA_VERSION,
         "frame_cleanup_mode": str(FRAME_CLEANUP_MODE),
+        "frame_auto_accept_types": list(FRAME_AUTO_ACCEPT_TYPES or []),
+        "post_frame_duplicate_refresh": bool(POST_FRAME_DUPLICATE_REFRESH),
         "frame_cleanup_high_candidates": sum(1 for r in all_rows if r.get("frame_cleanup_confidence_level") == "high"),
         "frame_cleanup_medium_review_candidates": sum(1 for r in all_rows if r.get("frame_cleanup_confidence_level") == "medium"),
         "frame_cleanup_applied": sum(1 for r in all_rows if r.get("frame_cleanup_applied")),
@@ -9000,11 +9396,14 @@ def write_caption_stage_reports(
         "global_rules": global_rules,
         "identity_check": identity_summary,
         "subject_profile": subject_profile_report_summary(subject_profile),
+        "active_caption_policy": normalized_caption_policy(CAPTION_POLICY),
+        "variable_feature_mode": str(VARIABLE_FEATURE_CAPTION_MODE),
         "performance": performance_summary,
     }
 
     md_path = os.path.join(OUTPUT_ROOT, f"dataset_report_{SAFE_TRIGGER}.md")
     save_report_md(md_path, report)
+    commit_output_transaction()
     perf_add_time("report_write", time.perf_counter() - _report_started)
 
     safe_print("")
@@ -9031,6 +9430,26 @@ def write_caption_stage_reports(
     safe_print("=" * 70)
 
 
+
+def _frame_audit_stale_entries(stage: Dict[str, Any], subject_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return unique frame-change dependencies that require a targeted re-audit.
+
+    A normal Curator run is sufficient: unchanged images reuse their audit cache,
+    while only the changed effective image variant gets a new audit.
+    """
+    combined: List[Dict[str, Any]] = []
+    for source in (stage, subject_profile):
+        value = source.get("audit_stale_images", []) if isinstance(source, dict) else []
+        if isinstance(value, list):
+            combined.extend(item for item in value if isinstance(item, dict))
+    unique: Dict[str, Dict[str, Any]] = {}
+    for item in combined:
+        key = str(item.get("source_hash") or item.get("source_path") or item.get("filename") or "")
+        if key:
+            unique[key] = item
+    return list(unique.values())
+
+
 def continue_caption_from_profile() -> None:
     """Phase 3 Continue-Pfad: exportiert Captions/Bilder aus _caption_stage.json.
     Kein Audit, kein Dedup, kein ArcFace-Neulauf.
@@ -9047,6 +9466,19 @@ def continue_caption_from_profile() -> None:
     subject_profile = load_confirmed_subject_profile(stage)
     if not subject_profile:
         raise RuntimeError("No subject profile available. Load/edit _subject_profile.json first.")
+
+    stale_frame_audits = _frame_audit_stale_entries(stage, subject_profile)
+    if stale_frame_audits:
+        examples = ", ".join(
+            str(item.get("filename") or Path(str(item.get("source_path") or "")).name)
+            for item in stale_frame_audits[:5]
+        )
+        more = "" if len(stale_frame_audits) <= 5 else f" (+{len(stale_frame_audits) - 5} weitere)"
+        raise RuntimeError(
+            "Frame decision changed after the audit. Run the normal Curator once so only the "
+            f"affected image variant(s) are re-audited from cache: {examples}{more}. "
+            "Continue-from-profile is intentionally blocked to prevent captions based on stale image data."
+        )
 
     all_rows = stage.get("all_rows", []) or []
     selected_sorted = stage.get("selected_sorted", []) or []
@@ -9092,7 +9524,13 @@ def continue_caption_from_profile() -> None:
             safe_print("   🧬 Migrated legacy profile to generalized feature-policy schema.")
 
     subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
-    apply_priority_image_flags(all_rows, subject_profile)
+    apply_profile_role_metadata(all_rows, subject_profile)
+    if bool(subject_profile.get("profile_rebuild_required")):
+        subject_profile = refresh_subject_profile_from_existing_audits(subject_profile, all_rows)
+        # Reattach the derived audited-reject view and current manual roles,
+        # which are intentionally outside the normalizer response.
+        subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
+        apply_profile_role_metadata(all_rows, subject_profile)
     save_subject_profile(subject_profile)
 
     reranked_selected, reranked_review, reranked_unused = rebuild_selection_from_identity_roles(all_rows, subject_profile)
@@ -9134,6 +9572,7 @@ def continue_caption_from_profile() -> None:
             "Review/reject candidates are never promoted automatically by the canon bonus; explicit user Priority remains the only override."
         )
 
+    begin_output_transaction("continue_from_profile")
     clean_caption_output_dirs()
     row_map = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
 
@@ -9233,6 +9672,7 @@ def continue_caption_from_profile() -> None:
         warnings=warnings,
         valid_candidate_count=valid_candidate_count,
     )
+    commit_output_transaction()
 
 def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     reasons = []
@@ -9247,19 +9687,25 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     main_subject_clear = bool(item.get("main_subject_clear", True))
     issues = set(item.get("issues", []))
 
-    # ── Image-Medium-Check (hard reject, hoechste Prioritaet) ──
-    # Nicht-photographische Bilder (Anime, Illustrationen, 3D-Renders,
-    # Screenshots, AI-Generiert) vergiften das LoRA-Training. Selbst wenn
-    # die Person erkannt wird, bringt das Modell falsche Visualstatistiken
-    # bei (anatomische Vereinfachungen, Anime-Augen-Proportionen, etc.).
-    # Strenger Filter, hoechste Prioritaet vor allen anderen Checks.
+    # ── EDIT / MEDIUM PROVENANCE ───────────────────────────────────────
+    # Background edits or removed bystanders are warning-only. A fully
+    # synthetic target or non-photographic depiction goes to review instead
+    # of being silently hard-rejected.
+    edit_decision, edit_reasons = edit_suitability_decision(item)
+    reasons.extend(edit_reasons)
+    if edit_decision == "review":
+        item.setdefault("status_notes", []).append("edit_provenance_review")
+        return "review", reasons
+
     image_medium = str(item.get("image_medium", "")).strip().lower()
-    if image_medium and image_medium != "photograph":
-        reasons.append(f"non_photographic_medium({image_medium})")
-        item.setdefault("status_notes", []).append(
-            f"image_medium_{image_medium}_hard_reject"
-        )
-        return "reject", reasons
+    if image_medium in {"illustration", "painting", "3d_render", "mixed"}:
+        reasons.append(f"non_photographic_medium_review({image_medium})")
+        item.setdefault("status_notes", []).append(f"image_medium_{image_medium}_review")
+        return "review", reasons
+    if image_medium == "screenshot" and not item.get("frame_cleanup_applied"):
+        reasons.append("screenshot_requires_frame_review")
+        item.setdefault("status_notes", []).append("image_medium_screenshot_review")
+        return "review", reasons
 
     if multiple_people:
         sec_ratio = float(item.get("secondary_face_area_ratio", 0.0))
@@ -9293,21 +9739,14 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
         # in Brille, Hintergrund-Statist, Spiegelbild). Dann statt hard reject
         # -> review. Sonst -> reject.
   
-    # ── POSE-FILTER ────────────────────────────────────────────────────
-    # Filtere unvorteilhafte Posen (kniend nach vorn, liegend, auf allen Vieren)
-    # direkt auf "reject", da das LoRA-Modell diese Haltungen ueberlernt.
-    pose_desc = str(item.get("pose_description", "")).lower()
-    bad_pose_keywords = [
-        "crouched on hands and knees", "on hands and knees", "all fours",
-        "lying on a bed", "lying on", "reclining", 
-        "kneeling forward", "leaning forward", 
-        "crouching forward", "crouched forward"
-    ]
-    for bad_kw in bad_pose_keywords:
-        if bad_kw in pose_desc:
-            reasons.append(f"bad_lora_pose: {bad_kw}")
-            item.setdefault("status_notes", []).append(f"pose_override: {pose_desc}")
-            return "reject", reasons
+    # ── STRUCTURED POSE SUITABILITY ────────────────────────────────────
+    # Lying/reclining/horizontal/contorted/extreme-perspective images are
+    # review cases. Natural light leaning is explicitly not a hidden reject.
+    pose_decision, pose_reasons = pose_suitability_decision(item)
+    if pose_decision == "review":
+        reasons.extend([f"pose_review:{r}" for r in pose_reasons])
+        item.setdefault("status_notes", []).append("structured_pose_review")
+        return "review", reasons
 
     # ── SUBJECT-SANITY-CHECK (nach Gesichts-Erkennung) ─────────────────────
     # Bilder ohne sichtbares Gesicht UND ohne erkennbaren Torso sind
@@ -10897,27 +11336,27 @@ def _encode_pil_for_api(pil_img: Image.Image, max_side: int = API_MAX_IMAGE_SIDE
 
 
 def _krea_caption_cache_path(item: Dict[str, Any], subject_profile: Dict[str, Any]) -> str:
-    source_key = str(item.get("file_hash") or "")
+    source_key = str(item.get("effective_file_hash") or item.get("file_hash") or "")
     if not source_key:
         path = row_effective_image_path(item)
         source_key = file_sha1(path) if path and os.path.exists(path) else profile_image_id(item)
-    profile_key = hashlib.sha1(
-        json.dumps(subject_profile or {}, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
-    raw = "|".join([
-        KREA_CAPTION_PROMPT_VERSION,
-        str(KREA_CAPTION_MODEL),
-        str(KREA_CAPTION_REASONING_EFFORT),
-        str(bool(USE_KREA_CAPTION_REPAIR)),
-        str(KREA_CAPTION_REPAIR_MODEL),
-        str(KREA_CAPTION_REPAIR_REASONING_EFFORT),
-        str(VARIABLE_FEATURE_CAPTION_MODE),
-        str(source_key),
-        profile_key,
-        str(item.get("crop_variant") or "original"),
-        str(TRIGGER_WORD),
-    ])
-    key = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    image_id = profile_image_id(item)
+    key = build_caption_fingerprint(
+        source_key=source_key,
+        image_id=image_id,
+        training_target=TRAINING_TARGET,
+        trigger_word=TRIGGER_WORD,
+        prompt_version=KREA_CAPTION_PROMPT_VERSION,
+        primary_model=KREA_CAPTION_MODEL,
+        primary_reasoning=KREA_CAPTION_REASONING_EFFORT,
+        repair_enabled=bool(USE_KREA_CAPTION_REPAIR),
+        repair_model=KREA_CAPTION_REPAIR_MODEL,
+        repair_reasoning=KREA_CAPTION_REPAIR_REASONING_EFFORT,
+        variable_feature_mode=VARIABLE_FEATURE_CAPTION_MODE,
+        caption_policy=normalized_caption_policy(CAPTION_POLICY),
+        subject_profile=subject_profile,
+        crop_variant=str(item.get("crop_variant") or "original"),
+    )
     folder = os.path.join(CACHE_DIR, "krea_captions")
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, f"{key}.json")
@@ -10944,6 +11383,10 @@ def _set_caption_metadata(
     item["caption_source"] = str(source or "")
     item["caption_model"] = str(model or "")
     item["caption_retry_count"] = int(retry_count or 0)
+    item["primary_caption_error"] = str(validation_error or "")
+    item["final_caption_valid"] = str(source or "") != "local_fallback"
+    # Backward-compatible diagnostic field. It records the primary failure,
+    # not a defect in the final repaired caption.
     item["caption_validation_error"] = str(validation_error or "")
 
 
@@ -11003,23 +11446,23 @@ def _save_krea_caption_cache(
 ) -> None:
     if not ENABLE_CACHE:
         return
-    with open(cache_path, "w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "caption": caption,
-                "caption_source": source,
-                "model": model,
-                "retry_count": int(retry_count or 0),
-                "validation_error": validation_error,
-                "primary_model": KREA_CAPTION_MODEL,
-                "repair_enabled": bool(USE_KREA_CAPTION_REPAIR),
-                "repair_model": KREA_CAPTION_REPAIR_MODEL,
-                "prompt_version": KREA_CAPTION_PROMPT_VERSION,
-            },
-            f,
-            ensure_ascii=False,
-            indent=2,
-        )
+    core_atomic_write_json(
+        cache_path,
+        {
+            "caption": caption,
+            "caption_source": source,
+            "model": model,
+            "retry_count": int(retry_count or 0),
+            "primary_caption_error": validation_error,
+            "final_caption_valid": str(source or "") != "local_fallback",
+            "validation_error": validation_error,
+            "primary_model": KREA_CAPTION_MODEL,
+            "repair_enabled": bool(USE_KREA_CAPTION_REPAIR),
+            "repair_model": KREA_CAPTION_REPAIR_MODEL,
+            "prompt_version": KREA_CAPTION_PROMPT_VERSION,
+            "active_caption_policy": normalized_caption_policy(CAPTION_POLICY),
+        },
+    )
 
 
 def build_krea_ai_caption(
@@ -11583,9 +12026,32 @@ def should_copy_reject_original(row: Dict[str, Any]) -> bool:
 # ============================================================
 
 def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    text = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+    core_atomic_write_text(path, text)
+
+
+def write_csv_atomic(path: str, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
+    tmp = f"{path}.tmp.{os.getpid()}"
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    try:
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for source_row in rows:
+                row_copy = dict(source_row)
+                for key in ("issues", "costume_accessories", "local_override_reasons", "edit_evidence"):
+                    if isinstance(row_copy.get(key), list):
+                        row_copy[key] = ", ".join(str(x) for x in row_copy.get(key, []))
+                if isinstance(row_copy.get("clip_embedding"), np.ndarray):
+                    row_copy["clip_embedding"] = ""
+                writer.writerow(row_copy)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 
 def save_report_md(path: str, report: Dict[str, Any]) -> None:
@@ -11704,8 +12170,76 @@ def save_report_md(path: str, report: Dict[str, Any]) -> None:
                     lines.append(f"- `{fn}`")
         lines.append("")
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    core_atomic_write_text(path, "\n".join(lines) + "\n")
+
+
+
+def _dependency_versions_for_manifest() -> Dict[str, str]:
+    result = {"python": platform.python_version()}
+    for package in ("gradio", "Pillow", "numpy", "opencv-python", "mediapipe", "open_clip_torch", "insightface", "onnxruntime"):
+        try:
+            result[package] = importlib_metadata.version(package)
+        except Exception:
+            continue
+    return result
+
+
+def _effective_config_for_manifest() -> Dict[str, Any]:
+    keys = (
+        "TRAINING_TARGET", "PIPELINE_MODE", "TARGET_DATASET_SIZE",
+        "AI_MODEL", "AUDIT_REASONING_EFFORT", "PROFILE_NORMALIZER_MODEL", "PROFILE_REASONING_EFFORT",
+        "KREA_CAPTION_MODEL", "KREA_CAPTION_REASONING_EFFORT", "USE_KREA_CAPTION_REPAIR",
+        "KREA_CAPTION_REPAIR_MODEL", "KREA_CAPTION_REPAIR_REASONING_EFFORT",
+        "VARIABLE_FEATURE_CAPTION_MODE", "CAPTION_POLICY",
+        "RATIO_HEADSHOT", "RATIO_MEDIUM", "RATIO_FULL_BODY",
+        "FRAME_CLEANUP_MODE", "FRAME_PAUSE_ON_MEDIUM_REVIEW", "FRAME_AUTO_ACCEPT_TYPES", "POST_FRAME_DUPLICATE_REFRESH",
+        "ENABLE_IG_FRAME_CROP", "IG_FRAME_TWO_STAGE_BAR_DETECT",
+        "USE_ARCFACE_IDENTITY_CHECK", "ARCFACE_MODEL_PACK", "ARCFACE_DET_SIZE",
+        "USE_CLIP_DUPLICATE_SCORING", "CLIP_MODEL_NAME", "CLIP_PRETRAINED",
+        "ENABLE_IDENTITY_APPEARANCE_CLUSTERING", "ENABLE_CANON_REPRESENTATION_BONUS",
+        "USE_CONTROLLED_BUCKETS",
+    )
+    snapshot: Dict[str, Any] = {}
+    for key in keys:
+        if key in globals():
+            value = globals().get(key)
+            if isinstance(value, (str, int, float, bool, list, dict)) or value is None:
+                snapshot[key] = value
+    return snapshot
+
+
+def update_run_manifest(status: str, **extra: Any) -> None:
+    path = os.path.join(OUTPUT_ROOT, "_run_manifest.json")
+    payload: Dict[str, Any] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if isinstance(existing, dict):
+            payload.update(existing)
+    except Exception:
+        pass
+    payload.update({
+        "schema_version": "run-manifest-v1",
+        "app_version": APP_VERSION,
+        "run_id": str(globals().get("RUN_ID", "") or ""),
+        "status": str(status),
+        "training_target": normalize_training_target(TRAINING_TARGET),
+        "pipeline_mode": str(PIPELINE_MODE),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "effective_config": _effective_config_for_manifest(),
+        "schemas": {
+            "audit_cache": AUDIT_CACHE_SCHEMA_VERSION,
+            "audit_prompt": AUDIT_PROMPT_VERSION,
+            "profile": PROFILE_CACHE_SCHEMA_VERSION,
+            "frame": FRAME_DETECTOR_SCHEMA_VERSION,
+            "caption_prompt": KREA_CAPTION_PROMPT_VERSION,
+        },
+        "dependencies": _dependency_versions_for_manifest(),
+    })
+    if "started_at" not in payload:
+        payload["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    payload.update(extra)
+    core_atomic_write_json(path, payload)
 
 
 # ============================================================
@@ -11795,16 +12329,18 @@ def main() -> None:
     # Schema-Bumps wirklich gegriffen haben (alte Caches bei v6 vs v7
     # haben in der Vergangenheit zu Verwirrung gefuehrt).
     safe_print("=" * 60)
+    safe_print(f"  App version:        {APP_VERSION}")
     safe_print(f"  Audit model:        {AI_MODEL}")
     safe_print(f"  Trigger model:      {TRIGGER_CHECK_MODEL}")
     safe_print(f"  Escalation:         {'ON (' + REVIEW_ESCALATION_MODEL + ')' if USE_REVIEW_ESCALATION and REVIEW_ESCALATION_MODEL else 'OFF'}")
     safe_print(
         f"  Token limit:        {f'{int(OPENAI_TOKEN_LIMIT_TOTAL):,}' if openai_token_limit_enabled() else 'OFF'}"
     )
-    safe_print(f"  Audit cache schema: {AUDIT_CACHE_SCHEMA_VERSION}")
+    safe_print(f"  Audit cache schema: {AUDIT_CACHE_SCHEMA_VERSION} | {AUDIT_PROMPT_VERSION}")
     safe_print(f"  Pipeline mode:      {PIPELINE_MODE}")
     safe_print(f"  Frame detector:     {FRAME_DETECTOR_SCHEMA_VERSION} | {FRAME_CLEANUP_MODE}")
     safe_print("=" * 60)
+    update_run_manifest("running", run_kind="continue_from_profile" if CONTINUE_FROM_PROFILE else "full_run")
 
     if CONTINUE_FROM_PROFILE:
         continue_caption_from_profile()
@@ -11844,6 +12380,7 @@ def main() -> None:
 
     _early_started = time.perf_counter()
     dataset_fp = dataset_fingerprint(image_paths)
+    update_run_manifest("running", input_dataset_fingerprint=dataset_fp, input_image_count=len(image_paths))
     settings_fp = early_result_settings_fingerprint()
     cached_early = load_cached_early_results(dataset_fp, settings_fp)
 
@@ -11894,6 +12431,57 @@ def main() -> None:
         )
 
     perf_add_time("early_filter_dedupe", time.perf_counter() - _early_started)
+
+    # Optional local preflight gate: no LLM/API calls. The second start is fast
+    # because frame decisions and negative detections are already cached.
+    if ENABLE_IG_FRAME_CROP and bool(FRAME_PAUSE_ON_MEDIUM_REVIEW):
+        unresolved: List[Dict[str, Any]] = []
+        for pf_index, pf_path in enumerate(image_paths, start=1):
+            raise_if_cancelled(f"frame preflight {pf_index}/{len(image_paths)}")
+            pf_hash = file_sha1(pf_path)
+            pf_result = frame_cleanup_for_pipeline(pf_path, source_hash=pf_hash)
+            pf_analysis = pf_result.get("frame_cleanup_analysis", {}) or {}
+            if (
+                str(pf_analysis.get("confidence_level", "low")) == "medium"
+                and str(pf_result.get("frame_cleanup_user_decision", "auto")) == "auto"
+            ):
+                unresolved.append({
+                    "source_hash": pf_hash,
+                    "source_path": os.path.abspath(pf_path),
+                    "filename": os.path.basename(pf_path),
+                    "confidence": float(pf_analysis.get("confidence", 0) or 0),
+                    "candidate_bbox": pf_analysis.get("candidate_bbox"),
+                    "signals": pf_analysis.get("signals", []),
+                })
+        if unresolved:
+            core_atomic_write_json(os.path.join(OUTPUT_ROOT, "_frame_preflight_pending.json"), {
+                "schema_version": "v1",
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "count": len(unresolved),
+                "items": unresolved,
+            })
+            safe_print("")
+            safe_print("=" * 70)
+            safe_print("FRAME REVIEW REQUIRED - AUDIT NOT STARTED")
+            safe_print("=" * 70)
+            safe_print(f"{len(unresolved)} medium-confidence frame case(s) are still undecided.")
+            safe_print("Open the Frame Review tab, accept a crop or keep the original, then start again.")
+            safe_print("No paid image audit was started; local frame results are cached.")
+            safe_print("=" * 70)
+            update_run_manifest("frame_review_required", pending_frame_count=len(unresolved))
+            return
+        try:
+            os.remove(os.path.join(OUTPUT_ROOT, "_frame_preflight_pending.json"))
+        except FileNotFoundError:
+            pass
+
+    workspace_frame = _workspace_frame_settings()
+    if bool(workspace_frame.get("post_frame_duplicate_refresh", False)) and ENABLE_IG_FRAME_CROP:
+        image_paths, post_frame_duplicates = post_frame_duplicate_refresh(image_paths)
+        for duplicate_path in post_frame_duplicates:
+            if duplicate_path not in early_dup_paths:
+                early_dup_paths.append(duplicate_path)
+
     safe_print(f"Starting audit for trigger word: {TRIGGER_WORD}")
     safe_print("")
 
@@ -11967,6 +12555,8 @@ def main() -> None:
                     "frame_cleanup_recommendation": frame_analysis.get("recommendation", "keep_original"),
                     "frame_cleanup_sides": frame_analysis.get("candidate_sides", []),
                     "frame_cleanup_signals": frame_analysis.get("signals", []),
+                    "frame_cleanup_layout_class": frame_analysis.get("layout_class", "plain_photo"),
+                    "frame_cleanup_layout_flags": frame_analysis.get("layout_flags", []),
                     "frame_cleanup_review_pending": (
                         frame_analysis.get("confidence_level") == "medium"
                         and str(frame_result.get("frame_cleanup_user_decision", "auto")) == "auto"
@@ -12069,17 +12659,18 @@ def main() -> None:
                     phase_label=f"[{idx}/{len(image_paths)}] primary_audit {original_filename}",
                 )
 
-            if audit.get("NSFW_BLOCKED"):
-                safe_print(f"      🔞 NSFW BLOCKED: {original_filename} -> needs manual review.")
-                review_path = os.path.join(MANUAL_REVIEW_DIR, f"NSFW_{original_filename}")
+            if audit.get("AUDIT_PROVIDER_REFUSAL") or audit.get("NSFW_BLOCKED"):
+                safe_print(f"      ⚠️ Provider returned no usable audit output: {original_filename} -> technical manual review.")
+                review_path = os.path.join(MANUAL_REVIEW_DIR, f"AUDITTECH_{original_filename}")
                 shutil.copy2(image_path, review_path)
                 all_rows.append({
                     "original_filename": original_filename,
                     "original_path": image_path,
-                    "base_status": "reject",
-                    "final_status": "reject",
+                    "base_status": "review",
+                    "final_status": "review",
                     "quality_total": 0,
-                    "short_reason": "NSFW_BLOCKED_NEEDS_MANUAL_REVIEW"
+                    "AUDIT_PROVIDER_REFUSAL": True,
+                    "short_reason": "AUDIT_PROVIDER_REFUSAL_TECHNICAL_REVIEW"
                 })
                 continue
 
@@ -12170,14 +12761,14 @@ def main() -> None:
                         phase_label=f"[{idx}/{len(image_paths)}] escalation_audit {original_filename}",
                         reasoning_effort=REVIEW_ESCALATION_REASONING_EFFORT,
                     )
-                    if not escalated_audit.get("NSFW_BLOCKED"):
+                    if not (escalated_audit.get("AUDIT_PROVIDER_REFUSAL") or escalated_audit.get("NSFW_BLOCKED")):
                         escalated_audit = normalize_audit_scores(escalated_audit)
                         save_cached_audit(
                             escalation_cache_key,
                             audit_cache_payload(escalated_audit, REVIEW_ESCALATION_MODEL, "escalation_audit"),
                         )
 
-                if not escalated_audit.get("NSFW_BLOCKED"):
+                if not (escalated_audit.get("AUDIT_PROVIDER_REFUSAL") or escalated_audit.get("NSFW_BLOCKED")):
                     row.update(escalated_audit)
                     row["score_nach_eskalation"] = row.get("quality_total", "")
                     row.setdefault("status_notes", []).append("review_escalation_applied")
@@ -12261,7 +12852,7 @@ def main() -> None:
                                     phase_label=f"[{idx}/{len(image_paths)}] primary_crop_audit {original_filename}",
                                 )
 
-                            if not crop_audit.get("NSFW_BLOCKED"):
+                            if not (crop_audit.get("AUDIT_PROVIDER_REFUSAL") or crop_audit.get("NSFW_BLOCKED")):
                                 crop_audit = normalize_audit_scores(crop_audit)
 
                                 if not cached_crop:
@@ -12295,7 +12886,7 @@ def main() -> None:
                                             phase_label=f"[{idx}/{len(image_paths)}] escalation_crop_audit {original_filename}",
                                             reasoning_effort=REVIEW_ESCALATION_REASONING_EFFORT,
                                         )
-                                        if not escalated_crop_audit.get("NSFW_BLOCKED"):
+                                        if not (escalated_crop_audit.get("AUDIT_PROVIDER_REFUSAL") or escalated_crop_audit.get("NSFW_BLOCKED")):
                                             crop_audit = normalize_audit_scores(escalated_crop_audit)
                                             save_cached_audit(
                                                 crop_escalation_cache_key,
@@ -12459,7 +13050,7 @@ def main() -> None:
                                 model=AI_MODEL,
                                 phase_label=f"[{idx}/{len(image_paths)}] primary_medium_rescue_audit {original_filename}",
                             )
-                        if not rescue_audit.get("NSFW_BLOCKED"):
+                        if not (rescue_audit.get("AUDIT_PROVIDER_REFUSAL") or rescue_audit.get("NSFW_BLOCKED")):
                             rescue_audit = normalize_audit_scores(rescue_audit)
                             if not cached_rescue:
                                 save_cached_audit(
@@ -12622,7 +13213,7 @@ def main() -> None:
                 if not src_path or not os.path.exists(src_path):
                     continue
                 src_name = hf_row.get("original_filename", os.path.basename(src_path))
-                # Naming-Schema analog zu NSFW_<filename>: IDCHECK_<filename>
+                # Naming-Schema für technische/Identitäts-Review-Dateien: IDCHECK_<filename>
                 # Praefix-Counter zusaetzlich, damit auch mehrere Hard-Flags
                 # eindeutig sortiert sind.
                 idcheck_name = f"IDCHECK_{hard_flag_counter:03d}_{src_name}"
@@ -12738,7 +13329,10 @@ def main() -> None:
         safe_print("Review or edit the profile in the UI, then click 'Start captioning from profile'.")
         safe_print("No train-ready captions were exported yet.")
         safe_print("=" * 70)
+        update_run_manifest("profile_ready", subject_profile_path=output_subject_profile_path(), caption_stage_path=output_caption_stage_path())
         return
+
+    begin_output_transaction("single_pass_export")
 
     counters = {
         "train_ready": 1,
@@ -13115,16 +13709,7 @@ def main() -> None:
     ]
 
     csv_path = os.path.join(OUTPUT_ROOT, f"dataset_audit_{SAFE_TRIGGER}.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=csv_fields, extrasaction="ignore")
-        writer.writeheader()
-        for row in all_rows:
-            row_copy = dict(row)
-            row_copy["issues"] = ", ".join(row_copy.get("issues", [])) if isinstance(row_copy.get("issues"), list) else row_copy.get("issues", "")
-            row_copy["local_override_reasons"] = ", ".join(row_copy.get("local_override_reasons", []))
-            if isinstance(row_copy.get("clip_embedding"), np.ndarray):
-                row_copy["clip_embedding"] = ""
-            writer.writerow(row_copy)
+    write_csv_atomic(csv_path, csv_fields, all_rows)
 
     jsonl_path = os.path.join(OUTPUT_ROOT, f"dataset_audit_{SAFE_TRIGGER}.jsonl")
     json_rows = []
@@ -13167,7 +13752,12 @@ def main() -> None:
         "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
         "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
         "training_target": normalize_training_target(TRAINING_TARGET),
+        "pipeline_mode": str(PIPELINE_MODE),
         "caption_profile": caption_profile_for_training_target(TRAINING_TARGET),
+        "variable_feature_mode": str(VARIABLE_FEATURE_CAPTION_MODE),
+        "active_caption_policy": normalized_caption_policy(CAPTION_POLICY),
+        "run_config_schema_version": str((_ui_cfg or {}).get("RUN_CONFIG_SCHEMA_VERSION", "")) if isinstance(globals().get("_ui_cfg"), dict) else "",
+        "run_config_fingerprint": str((_ui_cfg or {}).get("RUN_CONFIG_FINGERPRINT", "")) if isinstance(globals().get("_ui_cfg"), dict) else "",
         "audit_model": AI_MODEL,
         "krea_ai_captioning": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_AI_CAPTIONING),
         "krea_caption_model": KREA_CAPTION_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" else "",
@@ -13180,6 +13770,8 @@ def main() -> None:
         "medium_rescue_crop_enabled": bool(ENABLE_MEDIUM_RESCUE_CROP),
         "frame_detector_schema": FRAME_DETECTOR_SCHEMA_VERSION,
         "frame_cleanup_mode": str(FRAME_CLEANUP_MODE),
+        "frame_auto_accept_types": list(FRAME_AUTO_ACCEPT_TYPES or []),
+        "post_frame_duplicate_refresh": bool(POST_FRAME_DUPLICATE_REFRESH),
         "frame_cleanup_high_candidates": sum(1 for r in all_rows if r.get("frame_cleanup_confidence_level") == "high"),
         "frame_cleanup_medium_review_candidates": sum(1 for r in all_rows if r.get("frame_cleanup_confidence_level") == "medium"),
         "frame_cleanup_applied": sum(1 for r in all_rows if r.get("frame_cleanup_applied")),
@@ -13246,6 +13838,8 @@ def main() -> None:
         "global_rules": global_rules,
         "identity_check": identity_summary,
         "subject_profile": subject_profile_report_summary(subject_profile),
+        "active_caption_policy": normalized_caption_policy(CAPTION_POLICY),
+        "variable_feature_mode": str(VARIABLE_FEATURE_CAPTION_MODE),
         "performance": performance_summary,
     }
 
@@ -13284,10 +13878,22 @@ if __name__ == "__main__":
         main()
     except RunCancelled:
         try:
+            update_run_manifest("cancelled")
+        except Exception:
+            pass
+        cancel_output_transaction("cancelled")
+        try:
             flush_file_hash_index()
         except RunCancelled:
-            raise
+            pass
         except Exception:
             pass
         safe_print("⏹ RUN_CANCELLED")
         raise SystemExit(130)
+    except Exception as exc:
+        try:
+            update_run_manifest("failed", error=f"{type(exc).__name__}: {exc}")
+        except Exception:
+            pass
+        cancel_output_transaction(f"{type(exc).__name__}: {exc}")
+        raise

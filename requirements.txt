@@ -1,0 +1,17 @@
+# Core dependencies for the portable, CPU-friendly manual installation.
+# For NVIDIA/CUDA, install PyTorch and ONNX Runtime builds matching your system.
+requests
+pillow
+numpy
+scipy
+mediapipe==0.10.33
+torch
+torchvision
+open_clip_torch
+opencv-python
+onnxruntime
+scikit-learn
+gradio
+
+# Optional: required for Video Processor face matching and ArcFace identity checks.
+# insightface
