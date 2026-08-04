@@ -46,6 +46,15 @@ CAPTION_POLICY_SCHEMA_VERSION = "caption-policy-v2"
 RUN_MANIFEST_SCHEMA_VERSION = "run-manifest-v1"
 
 
+def natural_sort_key(value: Any) -> tuple:
+    """Case-insensitive human ordering for names containing numbers.
+
+    Example: Bild 2 sorts before Bild 10 instead of after it.
+    """
+    text = os.path.basename(str(value or "")).casefold()
+    return tuple(int(part) if part.isdigit() else part for part in re.split(r"(\d+)", text))
+
+
 def normalize_training_target(value: Any) -> str:
     v = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     if v in {"z_image_base", "zimage", "z_image"}:

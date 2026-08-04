@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import time
 import warnings
@@ -54,6 +55,11 @@ DEFAULT_MIN_BORDER_PX = 24
 DEFAULT_MIN_CONTENT_PX = 400
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+
+def _natural_sort_key(value: Any) -> tuple:
+    text = os.path.basename(str(value or "")).casefold()
+    return tuple(int(part) if part.isdigit() else part for part in re.split(r"(\d+)", text))
 
 
 @dataclass(frozen=True)
@@ -1376,7 +1382,7 @@ def scan_source_images(input_folder: str, output_root: Optional[str] = None) -> 
         if output_abs and os.path.normcase(os.path.abspath(path)).startswith(output_abs + os.sep):
             continue
         paths.append(path)
-    return sorted(paths, key=lambda p: os.path.basename(p).lower())
+    return sorted(paths, key=_natural_sort_key)
 
 
 def decision_summary(records: Iterable[Dict[str, Any]]) -> Dict[str, int]:

@@ -57,6 +57,7 @@ from curator_core import (
     build_caption_fingerprint,
     normalize_run_config_payload,
     normalized_caption_policy,
+    natural_sort_key,
     stable_hash,
 )
 from pose_rules import (
@@ -1796,7 +1797,7 @@ def iter_input_images(root: str) -> List[str]:
         p = os.path.join(root, name)
         if os.path.isfile(p) and is_image_file(name):
             paths.append(p)
-    return sorted(paths)
+    return sorted(paths, key=natural_sort_key)
 
 
 def row_effective_image_path(row: Dict[str, Any]) -> str:

@@ -19,6 +19,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from curator_core import natural_sort_key
+
 try:
     import cv2  # type: ignore
 except Exception:  # pragma: no cover
@@ -84,7 +86,7 @@ def cache_dir_for(input_folder: str, trigger_word: str) -> str:
 def scan_images(input_folder: str, output_root: Optional[str] = None) -> List[str]:
     output_root_abs = os.path.normcase(os.path.abspath(output_root)) if output_root else ""
     result: List[str] = []
-    for name in sorted(os.listdir(input_folder), key=str.lower):
+    for name in sorted(os.listdir(input_folder), key=natural_sort_key):
         path = os.path.abspath(os.path.join(input_folder, name))
         if not os.path.isfile(path) or not name.lower().endswith(IMAGE_EXTENSIONS):
             continue
