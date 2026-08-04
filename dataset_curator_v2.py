@@ -17,6 +17,7 @@ import traceback
 import warnings
 import atexit
 import platform
+from pathlib import Path
 from importlib import metadata as importlib_metadata
 from collections import Counter, defaultdict
 from contextlib import contextmanager
