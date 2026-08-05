@@ -4534,11 +4534,17 @@ FRAME_AUTO_ACCEPT_TYPE_CHOICES = [
 ]
 
 
-def _workspace_is_ready(trigger_word: str, input_folder: str, api_key: str) -> bool:
+def _workspace_is_ready(trigger_word: str, input_folder: str, api_key: str = "") -> bool:
+    """Return whether a local project context can be loaded.
+
+    Preflight and frame review are fully local and must remain resumable even
+    when no API key is stored. The API key is validated only when an OpenAI
+    stage is actually started.
+    """
+    del api_key  # Kept in the signature for compatibility with older callers.
     return bool(
         str(trigger_word or "").strip()
         and os.path.isdir(str(input_folder or "").strip())
-        and (str(api_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip())
     )
 
 
@@ -4600,8 +4606,6 @@ def initialize_workspace_ui(
         return tr("❌ Triggerwort fehlt", "❌ Trigger word missing"), "", False
     if not os.path.isdir(input_folder):
         return tr(f"❌ Input-Ordner nicht gefunden: {input_folder}", f"❌ Input folder not found: {input_folder}"), "", False
-    if not (str(api_key or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip()):
-        return tr("❌ API-Key fehlt", "❌ API key missing"), "", False
     output_root = output_root_for(input_folder, trigger_word)
     os.makedirs(os.path.join(output_root, "_cache"), exist_ok=True)
     workspace = load_project_workspace(input_folder, trigger_word)
@@ -4720,7 +4724,10 @@ def _workspace_sync_payload(
     frame_mode: str,
     frame_pause: bool,
 ):
-    tab_update = gr.update(interactive=bool(ready))
+    # Return independent update objects. Reusing the same component-update
+    # dictionary for several tabs can lead to unstable client reconciliation
+    # in some Gradio versions.
+    tab_updates = [gr.update(interactive=bool(ready)) for _ in range(4)]
     return (
         status, summary, bool(ready),
         trigger_word, input_folder, api_key,
@@ -4730,7 +4737,7 @@ def _workspace_sync_payload(
         frame_enabled, frame_advanced, frame_mode, frame_pause,
         trigger_word, input_folder,
         trigger_word, input_folder,
-        tab_update, tab_update, tab_update, tab_update,
+        *tab_updates,
     )
 
 
@@ -4742,14 +4749,22 @@ def initialize_workspace_and_sync_ui(
     frame_enabled: bool, frame_advanced: bool, frame_mode: str,
     frame_auto_accept_types: List[str], frame_pause: bool, post_frame_refresh: bool,
 ):
-    status, summary, _ = initialize_workspace_ui(
+    status, summary, initialized = initialize_workspace_ui(
         trigger_word, input_folder, api_key, frame_enabled, frame_mode,
         frame_auto_accept_types, frame_pause, post_frame_refresh,
     )
-    # Initialization alone does not unlock modules. The local preflight is the
-    # explicit project gate requested by the workflow.
+    # A current saved preflight is a valid resumable project state. Initializing
+    # the same folder/trigger must not lock the later modules again.
+    workspace = load_project_workspace(input_folder, trigger_word) if initialized else {}
+    ready = bool(initialized and _workspace_preflight_is_current(input_folder, trigger_word, workspace))
+    if ready:
+        status = tr(
+            "✅ Bestehender Projektstand geladen. Die Vorprüfung ist aktuell; du kannst fortfahren.",
+            "✅ Existing project state loaded. Preflight is current; you can continue.",
+        )
+        summary = _workspace_summary_md(input_folder, trigger_word, workspace)
     return _workspace_sync_payload(
-        status, summary, False,
+        status, summary, ready,
         trigger_word, input_folder, api_key,
         use_early_phash, use_loop1, threshold1, keep1,
         use_loop2, threshold2, keep2,
@@ -4864,7 +4879,17 @@ def build_ui() -> gr.Blocks:
             )
         )
 
-        with gr.Tabs(selected="workspace") as main_tabs:
+        main_tabs_kwargs: Dict[str, Any] = {"selected": "workspace"}
+        try:
+            tabs_signature = inspect.signature(gr.Tabs.__init__)
+            if "key" in tabs_signature.parameters:
+                main_tabs_kwargs["key"] = "dataset-curator-main-tabs"
+            if "preserved_by_key" in tabs_signature.parameters:
+                main_tabs_kwargs["preserved_by_key"] = "selected"
+        except Exception:
+            pass
+
+        with gr.Tabs(**main_tabs_kwargs) as main_tabs:
 
             # ==============================================================
             # TAB 0: PROJECT WORKSPACE / LOCAL PREFLIGHT
