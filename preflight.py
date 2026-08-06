@@ -32,6 +32,7 @@ PROJECT_STATE_FILENAME = "_project_workspace.json"
 PREFLIGHT_STATE_FILENAME = "_preflight_state.json"
 EARLY_RESULT_FILENAME = "early_results.json"
 EARLY_RESULT_SCHEMA = "v1"
+ASSET_REGISTRY_SCHEMA = "asset-registry-v1"
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,128 @@ def scan_images(input_folder: str, output_root: Optional[str] = None) -> List[st
             continue
         result.append(path)
     return result
+
+
+def _asset_relative_key(input_folder: str, path: str) -> str:
+    """Stable project-local key used to preserve integer asset IDs."""
+    try:
+        relative = os.path.relpath(os.path.abspath(path), os.path.abspath(input_folder))
+    except Exception:
+        relative = os.path.basename(str(path or ""))
+    return os.path.normcase(relative.replace("\\", "/"))
+
+
+def _load_json_dict(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def build_asset_registry(
+    input_folder: str,
+    image_paths: Iterable[str],
+    existing_workspace: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Assign persistent, never-reused integer IDs to project images.
+
+    IDs are preserved by project-relative path across repeated preflight runs.
+    Removed files stay in the registry as inactive entries so their IDs are not
+    accidentally reused. Paths and hashes remain metadata/cache keys; UI and
+    workflow selection use ``asset_id`` as the authoritative identity.
+    """
+    workspace = dict(existing_workspace or {})
+    previous = workspace.get("asset_registry") or {}
+    previous_items = previous.get("items") if isinstance(previous, dict) else []
+    if not isinstance(previous_items, list):
+        previous_items = []
+
+    by_key: Dict[str, Dict[str, Any]] = {}
+    highest = 0
+    for raw in previous_items:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            asset_id = int(raw.get("asset_id"))
+        except Exception:
+            continue
+        if asset_id <= 0:
+            continue
+        key = str(raw.get("relative_key") or "")
+        if not key:
+            source_path = str(raw.get("source_path") or "")
+            if source_path:
+                key = _asset_relative_key(input_folder, source_path)
+        if not key:
+            continue
+        item = dict(raw)
+        item["asset_id"] = asset_id
+        item["relative_key"] = key
+        by_key[key] = item
+        highest = max(highest, asset_id)
+
+    try:
+        next_asset_id = max(highest + 1, int(previous.get("next_asset_id", 1) or 1))
+    except Exception:
+        next_asset_id = highest + 1
+
+    active_keys = set()
+    active_map: Dict[str, int] = {}
+    for path in image_paths:
+        absolute = os.path.abspath(str(path))
+        key = _asset_relative_key(input_folder, absolute)
+        active_keys.add(key)
+        item = by_key.get(key)
+        if item is None:
+            item = {
+                "asset_id": next_asset_id,
+                "relative_key": key,
+            }
+            by_key[key] = item
+            next_asset_id += 1
+        item.update({
+            "source_path": absolute,
+            "filename": os.path.basename(absolute),
+            "active": True,
+        })
+        active_map[os.path.normcase(absolute)] = int(item["asset_id"])
+
+    for key, item in by_key.items():
+        if key not in active_keys:
+            item["active"] = False
+
+    items = sorted(by_key.values(), key=lambda item: int(item.get("asset_id", 0) or 0))
+    registry = {
+        "schema_version": ASSET_REGISTRY_SCHEMA,
+        "next_asset_id": int(next_asset_id),
+        "items": items,
+    }
+    return registry, active_map
+
+
+def ensure_asset_registry(
+    input_folder: str,
+    trigger_word: str,
+    image_paths: Optional[Iterable[str]] = None,
+    workspace: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Load/migrate and persist the integer asset registry for a project."""
+    output_root = output_root_for(input_folder, trigger_word)
+    workspace_path = os.path.join(output_root, PROJECT_STATE_FILENAME)
+    current = dict(workspace or _load_json_dict(workspace_path))
+    paths = list(image_paths) if image_paths is not None else scan_images(input_folder, output_root)
+    registry, active_map = build_asset_registry(input_folder, paths, current)
+    if current.get("asset_registry") != registry:
+        current["asset_registry"] = registry
+        current["schema_version"] = "workspace-v2-asset-ids"
+        current["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        current.setdefault("input_folder", os.path.abspath(input_folder))
+        current.setdefault("trigger_word", str(trigger_word).strip())
+        current.setdefault("output_root", output_root)
+        atomic_write_json(workspace_path, current)
+    return current, active_map
 
 
 def image_dimensions(path: str) -> Tuple[int, int]:
@@ -230,7 +353,12 @@ def run_preflight(
     cache_dir = os.path.join(output_root, "_cache")
     os.makedirs(cache_dir, exist_ok=True)
     images = scan_images(input_folder, output_root)
+    existing_workspace = _load_json_dict(os.path.join(output_root, PROJECT_STATE_FILENAME))
+    asset_registry, asset_id_by_path = build_asset_registry(input_folder, images, existing_workspace)
     dataset_fp = dataset_fingerprint(images, input_folder)
+
+    def asset_id_for(path: str) -> int:
+        return int(asset_id_by_path.get(os.path.normcase(os.path.abspath(path)), 0) or 0)
 
     early_reject_rows: List[Dict[str, Any]] = []
     survivors: List[str] = []
@@ -246,6 +374,9 @@ def run_preflight(
                 reason = f"filesize_too_small_{size_kb:.0f}kb"
             if reason:
                 early_reject_rows.append({
+                    "asset_id": asset_id_for(path),
+                    "asset_id": asset_id_for(path),
+                "source_asset_id": asset_id_for(path),
                     "original_filename": name,
                     "original_path": path,
                     "width": width,
@@ -264,6 +395,8 @@ def run_preflight(
                 survivors.append(path)
         except (OSError, UnidentifiedImageError, ValueError) as exc:
             early_reject_rows.append({
+                "asset_id": asset_id_for(path),
+                "source_asset_id": asset_id_for(path),
                 "original_filename": name,
                 "original_path": path,
                 "width": 0,
@@ -310,7 +443,14 @@ def run_preflight(
         "settings_fingerprint": settings_fingerprint(settings),
         "settings": settings.as_cache_settings(),
         "survivor_paths": survivors,
+        "survivor_asset_ids": [asset_id_for(path) for path in survivors],
         "early_duplicate_paths": duplicate_paths,
+        "early_duplicate_asset_ids": [asset_id_for(path) for path in duplicate_paths],
+        "asset_ids_by_path": {
+            os.path.abspath(path): asset_id_for(path)
+            for path in images
+        },
+        "asset_registry": asset_registry,
         "phash_cache": {p: hashes[p] for p in hashes if os.path.exists(p)},
         "early_reject_rows": early_reject_rows,
         "created_by": "workspace_preflight",
@@ -318,7 +458,8 @@ def run_preflight(
     atomic_write_json(os.path.join(cache_dir, EARLY_RESULT_FILENAME), early_cache)
 
     workspace = {
-        "schema_version": "workspace-v1",
+        "schema_version": "workspace-v2-asset-ids",
+        "asset_registry": asset_registry,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "input_folder": os.path.abspath(input_folder),
         "trigger_word": str(trigger_word).strip(),

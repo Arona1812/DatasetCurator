@@ -48,6 +48,7 @@ from frame_cleanup import (
     analyze_frame_cleanup as analyze_smart_frame_cleanup,
     resolve_frame_cleanup as resolve_smart_frame_cleanup,
 )
+from preflight import ensure_asset_registry as ensure_project_asset_registry
 
 from curator_core import (
     APP_VERSION,
@@ -58,6 +59,11 @@ from curator_core import (
     normalize_run_config_payload,
     normalized_caption_policy,
     natural_sort_key,
+    normalize_asset_id,
+    asset_id_for_row,
+    assign_asset_id,
+    asset_id_key,
+    row_identity_key,
     replace_file_with_retry,
     stable_hash,
 )
@@ -694,7 +700,7 @@ PROFILE_INPUT_BUCKETS = ["train_ready", "keep_unused"]   # rejects/reviews aus
 # Bilder bei Phase-3-Export in 01_train_ready kommen und wie stark sie im
 # Ranking bevorzugt werden.
 ENABLE_IDENTITY_APPEARANCE_CLUSTERING = True
-IDENTITY_CLUSTER_SCHEMA_VERSION = "v4"
+IDENTITY_CLUSTER_SCHEMA_VERSION = "v5-asset-id"
 AUDITED_REJECT_CLUSTER_ID = "audited_rejects"
 PRIORITY_IMAGE_IDS_PROFILE_KEY = "priority_image_ids"
 PRIORITY_IMAGE_FILENAMES_PROFILE_KEY = "priority_image_filenames"
@@ -2610,7 +2616,7 @@ def _smart_frame_settings() -> SmartFrameDetectorSettings:
     )
 
 
-def frame_cleanup_for_pipeline(image_path: str, source_hash: Optional[str] = None) -> Dict[str, Any]:
+def frame_cleanup_for_pipeline(image_path: str, source_hash: Optional[str] = None, asset_id: Optional[int] = None) -> Dict[str, Any]:
     """Resolve cached/manual/local frame cleanup without any LLM call."""
     if not ENABLE_IG_FRAME_CROP:
         return {
@@ -2636,6 +2642,7 @@ def frame_cleanup_for_pipeline(image_path: str, source_hash: Optional[str] = Non
         output_root=OUTPUT_ROOT,
         mode=str(FRAME_CLEANUP_MODE or "auto_high_review_medium"),
         settings=_smart_frame_settings(),
+        asset_id=asset_id,
     )
     analysis = result.get("frame_cleanup_analysis", {}) or {}
     if analysis.get("cache_hit"):
@@ -2646,9 +2653,9 @@ def frame_cleanup_for_pipeline(image_path: str, source_hash: Optional[str] = Non
     return result
 
 
-def detect_and_crop_ig_frame(image_path: str, source_hash: Optional[str] = None) -> Optional[str]:
+def detect_and_crop_ig_frame(image_path: str, source_hash: Optional[str] = None, asset_id: Optional[int] = None) -> Optional[str]:
     """Backward-compatible wrapper returning only an applied crop path."""
-    result = frame_cleanup_for_pipeline(image_path, source_hash=source_hash)
+    result = frame_cleanup_for_pipeline(image_path, source_hash=source_hash, asset_id=asset_id)
     return str(result.get("frame_crop_path") or "") or None
 
 
@@ -2664,11 +2671,18 @@ def post_frame_duplicate_refresh(image_paths: List[str], threshold: int = 2) -> 
     if not ENABLE_IG_FRAME_CROP or len(image_paths) < 2:
         return image_paths, []
     items: List[Tuple[str, str, int]] = []
+    try:
+        _workspace, asset_id_by_path = ensure_project_asset_registry(INPUT_FOLDER, TRIGGER_WORD, image_paths=image_paths)
+    except Exception:
+        asset_id_by_path = {}
     for path in image_paths:
         raise_if_cancelled("post-frame duplicate refresh")
         try:
             source_hash = file_sha1(path)
-            result = frame_cleanup_for_pipeline(path, source_hash=source_hash)
+            result = frame_cleanup_for_pipeline(
+                path, source_hash=source_hash,
+                asset_id=int(asset_id_by_path.get(os.path.normcase(os.path.abspath(path)), 0) or 0),
+            )
             effective = str(result.get("effective_image_path") or path)
             items.append((path, effective, compute_phash(effective)))
         except RunCancelled:
@@ -6261,7 +6275,17 @@ def output_caption_stage_path() -> str:
 
 
 def profile_image_id(row: Dict[str, Any]) -> str:
-    """Stabiler Inhalts-Key fuer Subject-Profile und per-image Tokens."""
+    """Authoritative per-image key: the persistent project ``asset_id``.
+
+    Hash/path fallbacks are retained only to migrate old paused stages. Every
+    new run receives an integer asset ID during project initialization.
+    """
+    asset_key = asset_id_key(row)
+    if asset_key:
+        return asset_key
+    existing = str(row.get("profile_image_id") or "").strip()
+    if existing:
+        return existing.split("::", 1)[0]
     h = str(row.get("file_hash") or "").strip()
     if h:
         return h
@@ -6270,21 +6294,151 @@ def profile_image_id(row: Dict[str, Any]) -> str:
 
 
 def profile_member_id(row: Dict[str, Any]) -> str:
-    """Eindeutiger stabiler Key fuer genau eine Quelldatei im Profil-Board.
-
-    Zwei nachgelagert auditierte Dateien koennen denselben Inhalts-Hash besitzen.
-    Fuer UI-Aktionen wie Detach darf deshalb nicht allein der file_hash verwendet
-    werden. Der Pfad-/Dateinamens-Suffix haelt solche Eintraege getrennt, waehrend
-    ``profile_image_id`` weiterhin den inhaltlichen per-image Trait-Key liefert.
-    """
+    """Unique cluster-member key; identical to ``asset_id`` for current runs."""
+    asset_key = asset_id_key(row)
+    if asset_key:
+        return asset_key
     existing = str(row.get("profile_member_id") or "").strip()
     if existing:
         return existing
+    # Legacy migration fallback only.
     content_id = profile_image_id(row)
     src = str(row.get("original_path") or row.get("original_filename") or "").strip()
     normalized = os.path.normcase(os.path.abspath(src)) if src else str(row.get("original_filename") or content_id)
     suffix = hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[:12]
     return f"{content_id}::{suffix}"
+
+
+ASSET_IDENTITY_SCHEMA_VERSION = "asset-id-v1"
+FAVORITE_ASSET_IDS_PROFILE_KEY = "favorite_asset_ids"
+
+
+def ensure_rows_have_asset_ids(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Attach the project registry ID to every pipeline row in place.
+
+    The integer is the only current image identity. Legacy hashes, filenames
+    and paths remain descriptive/cache metadata and are used only to migrate
+    old paused stages.
+    """
+    if not rows:
+        return rows
+    try:
+        _workspace, by_path = ensure_project_asset_registry(INPUT_FOLDER, TRIGGER_WORD)
+    except Exception:
+        by_path = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        asset_id = asset_id_for_row(row)
+        if asset_id <= 0:
+            source = str(row.get("original_path") or row.get("source_original_path") or row.get("source_path") or "")
+            if source:
+                asset_id = int(by_path.get(os.path.normcase(os.path.abspath(source)), 0) or 0)
+        if asset_id > 0:
+            assign_asset_id(row, asset_id)
+            row["profile_image_id"] = str(asset_id)
+            row["profile_member_id"] = str(asset_id)
+    return rows
+
+
+def migrate_profile_to_asset_ids(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Migrate profile, clustering, buckets and favorites to integer asset IDs."""
+    if not isinstance(profile, dict):
+        return profile
+    ensure_rows_have_asset_ids(rows)
+    lookup: Dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        aid = asset_id_for_row(row)
+        if aid <= 0:
+            continue
+        for value in (
+            aid, str(aid), row.get("source_asset_id"), row.get("profile_image_id"),
+            row.get("profile_member_id"), row.get("file_hash"), row.get("original_filename"),
+            row.get("original_path"), row.get("source_original_path"), row.get("effective_image_path"),
+        ):
+            text = str(value or "").strip()
+            if text:
+                lookup[text] = aid
+                lookup[text.split("::", 1)[0]] = aid
+                if os.path.isabs(text):
+                    lookup[os.path.normcase(os.path.abspath(text))] = aid
+
+    def resolve(value: Any, filename: Any = "", image_path: Any = "") -> int:
+        direct = normalize_asset_id(value)
+        if direct > 0:
+            return direct
+        for candidate in (value, str(value or "").split("::", 1)[0], filename, image_path):
+            text = str(candidate or "").strip()
+            if not text:
+                continue
+            if text in lookup:
+                return lookup[text]
+            if os.path.isabs(text):
+                normalized = os.path.normcase(os.path.abspath(text))
+                if normalized in lookup:
+                    return lookup[normalized]
+        return 0
+
+    old_traits = profile.get("per_image_traits", {}) or {}
+    if isinstance(old_traits, dict):
+        new_traits: Dict[str, Any] = {}
+        for old_key, value in old_traits.items():
+            aid = resolve(old_key)
+            new_traits[str(aid) if aid > 0 else str(old_key)] = value
+        profile["per_image_traits"] = new_traits
+
+    clusters = [c for c in (profile.get("identity_clusters", []) or []) if isinstance(c, dict)]
+    for cluster in clusters:
+        members = list(cluster.get("asset_ids") or cluster.get("members") or [])
+        filenames = list(cluster.get("filenames") or [])
+        paths = list(cluster.get("image_paths") or [])
+        total = max(len(members), len(filenames), len(paths))
+        migrated: List[Any] = []
+        for index in range(total):
+            member = members[index] if index < len(members) else ""
+            filename = filenames[index] if index < len(filenames) else ""
+            image_path = paths[index] if index < len(paths) else ""
+            aid = resolve(member, filename, image_path)
+            migrated.append(aid if aid > 0 else member)
+        cluster["members"] = migrated
+        cluster["asset_ids"] = [int(v) for v in migrated if normalize_asset_id(v) > 0]
+        cluster["n"] = len(migrated)
+    profile["identity_clusters"] = clusters
+
+    member_roles: Dict[str, str] = {}
+    member_clusters: Dict[str, str] = {}
+    for cluster in clusters:
+        cid = str(cluster.get("cluster_id", "") or "")
+        role = str(cluster.get("role", "variation") or "variation")
+        for member in cluster.get("members", []) or []:
+            key = asset_id_key(member) or str(member)
+            member_roles[key] = role
+            member_clusters[key] = cid
+    profile["identity_cluster_member_roles"] = member_roles
+    profile["identity_cluster_member_clusters"] = member_clusters
+
+    favorite_ids = set()
+    for raw in profile.get(FAVORITE_ASSET_IDS_PROFILE_KEY, []) or []:
+        aid = resolve(raw)
+        if aid > 0:
+            favorite_ids.add(aid)
+    for raw in profile.get(PRIORITY_IMAGE_IDS_PROFILE_KEY, []) or []:
+        aid = resolve(raw)
+        if aid > 0:
+            favorite_ids.add(aid)
+    for filename in profile.get(PRIORITY_IMAGE_FILENAMES_PROFILE_KEY, []) or []:
+        aid = resolve("", filename, "")
+        if aid > 0:
+            favorite_ids.add(aid)
+    ordered_favorites = sorted(favorite_ids)
+    profile[FAVORITE_ASSET_IDS_PROFILE_KEY] = ordered_favorites
+    # Compatibility alias for older code/releases; values are now asset IDs.
+    profile[PRIORITY_IMAGE_IDS_PROFILE_KEY] = ordered_favorites
+    profile[PRIORITY_IMAGE_FILENAMES_PROFILE_KEY] = []
+    profile["asset_identity_schema_version"] = ASSET_IDENTITY_SCHEMA_VERSION
+    return profile
 
 
 def _profile_bool(value: Any) -> bool:
@@ -7808,7 +7962,7 @@ def build_identity_appearance_clusters(rows: List[Dict[str, Any]], profile: Dict
         style_counts = Counter(_appearance_visual_group(r) for r in members)
         quality_avg = sum(float(r.get("quality_total", 0) or 0) for r in members) / max(1, n)
         identity_avg = sum(float(r.get("quality_identity_usefulness", 0) or 0) for r in members) / max(1, n)
-        member_ids = [profile_image_id(r) for r in members]
+        member_ids = [asset_id_for_row(r) or profile_image_id(r) for r in members]
         filenames = [r.get("original_filename", "") for r in members]
         image_paths = [row_effective_image_path(r) or r.get("source_path", "") or r.get("image_path", "") for r in members]
         summary = f"{frame} | {hair} | {glasses} | {visual}"
@@ -7826,6 +7980,7 @@ def build_identity_appearance_clusters(rows: List[Dict[str, Any]], profile: Dict
             "shot_counts": dict(shot_counts),
             "style_counts": dict(style_counts),
             "members": member_ids,
+            "asset_ids": [int(v) for v in member_ids if normalize_asset_id(v) > 0],
             "filenames": filenames,
             "image_paths": image_paths,
         }
@@ -7942,11 +8097,13 @@ def is_post_audit_reject(row: Dict[str, Any]) -> bool:
 def _priority_id_set(profile: Optional[Dict[str, Any]]) -> set:
     if not isinstance(profile, dict):
         return set()
-    raw = profile.get(PRIORITY_IMAGE_IDS_PROFILE_KEY, []) or []
-    return {str(v).strip() for v in raw if str(v).strip()}
+    raw = list(profile.get(FAVORITE_ASSET_IDS_PROFILE_KEY, []) or [])
+    raw.extend(profile.get(PRIORITY_IMAGE_IDS_PROFILE_KEY, []) or [])
+    return {asset_id_key(v) or str(v).strip() for v in raw if asset_id_key(v) or str(v).strip()}
 
 
 def _priority_filename_set(profile: Optional[Dict[str, Any]]) -> set:
+    """Legacy migration aid only; new favorite operations never store filenames."""
     if not isinstance(profile, dict):
         return set()
     raw = profile.get(PRIORITY_IMAGE_FILENAMES_PROFILE_KEY, []) or []
@@ -7956,9 +8113,13 @@ def _priority_filename_set(profile: Optional[Dict[str, Any]]) -> set:
 def is_priority_image(row: Dict[str, Any], profile: Optional[Dict[str, Any]]) -> bool:
     if bool(row.get("priority_image")):
         return True
-    image_id = str(row.get("profile_image_id") or profile_image_id(row) or "").strip()
+    key = asset_id_key(row) or profile_image_id(row)
+    if key in _priority_id_set(profile):
+        return True
+    # Old profiles are migrated on load. Keep this fallback for a partially
+    # written legacy profile so the user's previous choice is not lost.
     filename = str(row.get("original_filename", "") or "").strip()
-    return image_id in _priority_id_set(profile) or filename in _priority_filename_set(profile)
+    return bool(filename and filename in _priority_filename_set(profile))
 
 
 def apply_priority_image_flags(rows: List[Dict[str, Any]], profile: Optional[Dict[str, Any]]) -> None:
@@ -8034,7 +8195,7 @@ def attach_audited_reject_cluster_to_profile(
         audited_rows.append(row)
 
     if audited_rows:
-        member_ids = [profile_member_id(r) for r in audited_rows]
+        member_ids = [asset_id_for_row(r) or profile_member_id(r) for r in audited_rows]
         filenames = [str(r.get("original_filename", "") or "") for r in audited_rows]
         image_paths = [row_effective_image_path(r) for r in audited_rows]
         reject_reasons = [post_audit_reject_reason(r) for r in audited_rows]
@@ -8060,6 +8221,7 @@ def attach_audited_reject_cluster_to_profile(
             "shot_counts": dict(shot_counts),
             "style_counts": dict(style_counts),
             "members": member_ids,
+            "asset_ids": [int(v) for v in member_ids if normalize_asset_id(v) > 0],
             "filenames": filenames,
             "image_paths": image_paths,
             "reject_reasons": reject_reasons,
@@ -8105,7 +8267,7 @@ def merge_priority_images_into_selection(
     for row in all_rows:
         if not is_priority_image(row, profile):
             continue
-        key = str(row.get("original_filename", "") or profile_image_id(row))
+        key = row_identity_key(row) or profile_image_id(row)
         if key in seen:
             continue
         path = str(row.get("original_path", "") or "")
@@ -8121,10 +8283,10 @@ def merge_priority_images_into_selection(
     if not priority_rows:
         return selected
 
-    priority_keys = {str(r.get("original_filename", "") or profile_image_id(r)) for r in priority_rows}
+    priority_keys = {row_identity_key(r) or profile_image_id(r) for r in priority_rows}
     normal = [
         r for r in selected
-        if str(r.get("original_filename", "") or profile_image_id(r)) not in priority_keys
+        if (row_identity_key(r) or profile_image_id(r)) not in priority_keys
     ]
     slots = max(0, target - len(priority_rows))
     result = priority_rows + normal[:slots]
@@ -8272,13 +8434,13 @@ def rebuild_selection_from_identity_roles(
     if not selected:
         return [], [], []
 
-    selected_names = {r.get("original_filename") for r in selected}
-    review_items = [r for r in review_items if r.get("original_filename") not in selected_names]
-    overflow_items = [r for r in overflow_items if r.get("original_filename") not in selected_names]
+    selected_keys = {row_identity_key(r) for r in selected}
+    review_items = [r for r in review_items if row_identity_key(r) not in selected_keys]
+    overflow_items = [r for r in overflow_items if row_identity_key(r) not in selected_keys]
 
     unselected = [
         r for r in train_candidates
-        if r.get("original_filename") not in selected_names
+        if row_identity_key(r) not in selected_keys
         and r.get("base_status") != "reject"
     ] + overflow_items
 
@@ -8704,6 +8866,7 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Baut/lädt das zentrale Subject-Profile und erzeugt per-image Tokens.
     Reject- und Review-Bilder sollen upstream ausgeschlossen werden.
     """
+    ensure_rows_have_asset_ids(profile_rows)
     rows = [r for r in profile_rows if r.get("base_status") == "keep" and r.get("arcface_flag") != "hard"]
     if not rows:
         safe_print("   ⚠️ Subject profile skipped: no usable keep rows.")
@@ -8714,7 +8877,7 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     input_hash = profile_input_hash(rows)
     cached = load_subject_profile_cache(input_hash)
     if cached:
-        profile = cached
+        profile = migrate_profile_to_asset_ids(cached, rows)
         safe_print(
             f"   🧬 Subject profile cache used: {SAFE_TRIGGER} "
             f"({len(rows)} usable images)"
@@ -8791,6 +8954,7 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Wird nach per_image_traits gebaut, damit die Cluster dieselben normalisierten
     # Merkmale nutzen wie die Captions.
     profile = attach_identity_clusters_to_profile(profile, rows)
+    profile = migrate_profile_to_asset_ids(profile, rows)
 
     override = load_profile_override()
     if override:
@@ -8822,7 +8986,8 @@ def refresh_subject_profile_from_existing_audits(
     needed), then overlays explicitly confirmed UI identity values. Existing
     cluster membership, detached buckets and Priority IDs remain intact.
     """
-    profile = json.loads(json.dumps(existing_profile or {}))
+    ensure_rows_have_asset_ids(all_rows)
+    profile = migrate_profile_to_asset_ids(json.loads(json.dumps(existing_profile or {})), all_rows)
     apply_profile_role_metadata(all_rows, profile)
     eligible: List[Dict[str, Any]] = []
     for row in all_rows:
@@ -8899,6 +9064,7 @@ def refresh_subject_profile_from_existing_audits(
         "Profile re-consolidated from existing audits after manual Priority/Core changes; no image audit was repeated."
     )
     profile["normalizer_notes"] = (profile.get("normalizer_notes", []) or [])[-40:]
+    profile = migrate_profile_to_asset_ids(profile, all_rows)
     save_subject_profile(profile)
     return profile
 
@@ -8975,6 +9141,9 @@ def save_caption_stage(
     kann und danach nur der Caption-/Bildexport laeuft, ohne neues Audit.
     """
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    for rows in (all_rows, selected_sorted, review_items, unselected_keep, reject_items):
+        ensure_rows_have_asset_ids(rows)
+    subject_profile = migrate_profile_to_asset_ids(subject_profile, all_rows)
     stage = {
         "stage_schema_version": "v1",
         "trigger_word": TRIGGER_WORD,
@@ -9051,7 +9220,7 @@ def _sync_row_update(row_map: Dict[str, Dict[str, Any]], row: Dict[str, Any]) ->
     """
     if not isinstance(row_map, dict) or not isinstance(row, dict):
         return
-    key = row.get("original_filename")
+    key = row_identity_key(row)
     target = row_map.get(key) if key else None
     if isinstance(target, dict):
         target.update({
@@ -9206,7 +9375,7 @@ def backfill_train_ready_selection(
     """
     target = int(target_size or TARGET_DATASET_SIZE)
     out = list(selected)
-    selected_names = {r.get("original_filename") for r in out}
+    selected_keys = {row_identity_key(r) for r in out}
     clean_count = sum(
         1 for r in out
         if bool(r.get("priority_image")) or (not needs_caption_remove(r) and r.get("arcface_flag") != "hard")
@@ -9223,7 +9392,7 @@ def backfill_train_ready_selection(
 
     candidates = []
     for row in candidate_pool:
-        if row.get("original_filename") in selected_names:
+        if row_identity_key(row) in selected_keys:
             continue
         if row.get("base_status") != "keep" or row.get("arcface_flag") == "hard":
             continue
@@ -9255,7 +9424,7 @@ def backfill_train_ready_selection(
         best["selected"] = True
         out.append(best)
         added.append(best)
-        selected_names.add(best.get("original_filename"))
+        selected_keys.add(row_identity_key(best))
         shot_counts[best.get("shot_type", "headshot")] += 1
         clean_count += 1
 
@@ -9278,7 +9447,7 @@ def write_caption_stage_reports(
 ) -> None:
     _report_started = time.perf_counter()
     csv_fields = [
-        "original_filename", "base_status", "selected", "output_bucket", "new_basename",
+        "asset_id", "original_filename", "base_status", "selected", "output_bucket", "new_basename",
         "quality_total", "quality_total_before_local_penalties", "grundscore", "score_nach_eskalation", "quality_sharpness",
         "quality_lighting", "quality_composition", "quality_identity_usefulness", "shot_type",
         "body_orientation", "camera_angle", "depth_of_field", "action_description",
@@ -9446,7 +9615,7 @@ def _frame_audit_stale_entries(stage: Dict[str, Any], subject_profile: Dict[str,
             combined.extend(item for item in value if isinstance(item, dict))
     unique: Dict[str, Dict[str, Any]] = {}
     for item in combined:
-        key = str(item.get("source_hash") or item.get("source_path") or item.get("filename") or "")
+        key = str(item.get("source_asset_id") or item.get("asset_id") or item.get("source_hash") or item.get("source_path") or item.get("filename") or "")
         if key:
             unique[key] = item
     return list(unique.values())
@@ -9483,10 +9652,16 @@ def continue_caption_from_profile() -> None:
         )
 
     all_rows = stage.get("all_rows", []) or []
+    ensure_rows_have_asset_ids(all_rows)
+    subject_profile = migrate_profile_to_asset_ids(subject_profile, all_rows)
     selected_sorted = stage.get("selected_sorted", []) or []
+    ensure_rows_have_asset_ids(selected_sorted)
     review_items = stage.get("review_items", []) or []
     unselected_keep = stage.get("unselected_keep", []) or []
     reject_items = stage.get("reject_items", []) or []
+    ensure_rows_have_asset_ids(review_items)
+    ensure_rows_have_asset_ids(unselected_keep)
+    ensure_rows_have_asset_ids(reject_items)
     global_rules = stage.get("global_rules", {}) or {}
     identity_summary = stage.get("identity_summary", {}) or {}
     warnings = stage.get("warnings", []) or []
@@ -9533,6 +9708,7 @@ def continue_caption_from_profile() -> None:
         # which are intentionally outside the normalizer response.
         subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
         apply_profile_role_metadata(all_rows, subject_profile)
+    subject_profile = migrate_profile_to_asset_ids(subject_profile, all_rows)
     save_subject_profile(subject_profile)
 
     reranked_selected, reranked_review, reranked_unused = rebuild_selection_from_identity_roles(all_rows, subject_profile)
@@ -9549,18 +9725,18 @@ def continue_caption_from_profile() -> None:
         selected_sorted, list(unselected_keep) + list(all_rows), TARGET_DATASET_SIZE, subject_profile
     )
     if backfill_added:
-        added_names = {r.get("original_filename") for r in backfill_added}
-        unselected_keep = [r for r in unselected_keep if r.get("original_filename") not in added_names]
+        added_keys = {row_identity_key(r) for r in backfill_added}
+        unselected_keep = [r for r in unselected_keep if row_identity_key(r) not in added_keys]
         warnings.append(f"Backfilled {len(backfill_added)} image(s) so 01_train_ready can reach the requested target after caption-remove/review exclusions.")
 
-    priority_names = {
-        r.get("original_filename") for r in selected_sorted
+    priority_keys = {
+        row_identity_key(r) for r in selected_sorted
         if is_priority_image(r, subject_profile)
     }
-    if priority_names:
-        review_items = [r for r in review_items if r.get("original_filename") not in priority_names]
-        unselected_keep = [r for r in unselected_keep if r.get("original_filename") not in priority_names]
-        reject_items = [r for r in reject_items if r.get("original_filename") not in priority_names]
+    if priority_keys:
+        review_items = [r for r in review_items if row_identity_key(r) not in priority_keys]
+        unselected_keep = [r for r in unselected_keep if row_identity_key(r) not in priority_keys]
+        reject_items = [r for r in reject_items if row_identity_key(r) not in priority_keys]
 
     canon_summary = canon_representation_summary(all_rows, selected_sorted, subject_profile)
     if canon_summary.get("enabled") and canon_summary.get("selected", 0) < canon_summary.get("target", 0):
@@ -9576,7 +9752,7 @@ def continue_caption_from_profile() -> None:
 
     begin_output_transaction("continue_from_profile")
     clean_caption_output_dirs()
-    row_map = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
+    row_map = {row_identity_key(r): r for r in all_rows if row_identity_key(r)}
 
     # Auch die Non-Training-Buckets werden hier bewusst mit Captions aus dem
     # bestaetigten Subject Profile exportiert. So sind 03_caption_remove und
@@ -10645,9 +10821,9 @@ def choose_final_dataset(clean_keep_items: List[Dict[str, Any]], subject_profile
         nonlocal selected, selected_ids
         picked = 0
         while picked < count:
-            remaining = [p for p in pool if p["original_filename"] not in selected_ids and cluster_caps_allow(p, selected)]
+            remaining = [p for p in pool if row_identity_key(p) not in selected_ids and cluster_caps_allow(p, selected)]
             if not remaining:
-                fallback = [p for p in pool if p["original_filename"] not in selected_ids]
+                fallback = [p for p in pool if row_identity_key(p) not in selected_ids]
                 if not fallback:
                     break
                 scoring_pool = fallback
@@ -10664,7 +10840,7 @@ def choose_final_dataset(clean_keep_items: List[Dict[str, Any]], subject_profile
                 best["canonical_hair_match_strength"] = round(canonical_hair_match_strength(best, subject_profile), 3)
                 best.setdefault("status_notes", []).append("selected_with_soft_canon_representation_bonus")
             selected.append(best)
-            selected_ids.add(best["original_filename"])
+            selected_ids.add(row_identity_key(best))
             picked += 1
 
     for shot_type in ["headshot", "medium", "full_body"]:
@@ -10672,7 +10848,7 @@ def choose_final_dataset(clean_keep_items: List[Dict[str, Any]], subject_profile
 
     remaining_slots = TARGET_DATASET_SIZE - len(selected)
     if remaining_slots > 0:
-        leftovers = [i for i in clean_keep_items if i["original_filename"] not in selected_ids]
+        leftovers = [i for i in clean_keep_items if row_identity_key(i) not in selected_ids]
         leftovers.sort(key=lambda x: x.get("quality_total", 0), reverse=True)
         greedy_pick(leftovers, remaining_slots)
 
@@ -12380,6 +12556,15 @@ def main() -> None:
 
     safe_print(f"Images found: {len(image_paths)}")
 
+    _workspace_with_ids, source_asset_id_by_path = ensure_project_asset_registry(
+        INPUT_FOLDER,
+        TRIGGER_WORD,
+        image_paths=image_paths,
+    )
+
+    def source_asset_id_for(path: str) -> int:
+        return int(source_asset_id_by_path.get(os.path.normcase(os.path.abspath(str(path))), 0) or 0)
+
     _early_started = time.perf_counter()
     dataset_fp = dataset_fingerprint(image_paths)
     update_run_manifest("running", input_dataset_fingerprint=dataset_fp, input_image_count=len(image_paths))
@@ -12391,6 +12576,13 @@ def main() -> None:
     phash_cache: Dict[str, int] = {}
 
     if cached_early:
+        cached_asset_ids = cached_early.get("asset_ids_by_path", {}) or {}
+        if isinstance(cached_asset_ids, dict):
+            for path, value in cached_asset_ids.items():
+                try:
+                    source_asset_id_by_path[os.path.normcase(os.path.abspath(str(path)))] = int(value)
+                except Exception:
+                    pass
         image_paths = [
             p for p in cached_early.get("survivor_paths", [])
             if isinstance(p, str) and os.path.exists(p)
@@ -12423,7 +12615,13 @@ def main() -> None:
             "settings_fingerprint": settings_fp,
             "settings": early_result_cache_settings(),
             "survivor_paths": list(image_paths),
+            "survivor_asset_ids": [source_asset_id_for(path) for path in image_paths],
             "early_duplicate_paths": list(early_dup_paths),
+            "early_duplicate_asset_ids": [source_asset_id_for(path) for path in early_dup_paths],
+            "asset_ids_by_path": {
+                os.path.abspath(path): source_asset_id_for(path)
+                for path in iter_input_images(INPUT_FOLDER)
+            },
             "phash_cache": phash_cache,
             "early_reject_rows": early_reject_rows,
         })
@@ -12431,6 +12629,10 @@ def main() -> None:
             f"   ↳ Early result cache saved: {len(image_paths)} survivors, "
             f"{len(early_reject_rows)} early rejects, {len(early_dup_paths)} early duplicates"
         )
+
+    for row in early_reject_rows:
+        if isinstance(row, dict):
+            assign_asset_id(row, asset_id_for_row(row) or source_asset_id_for(str(row.get("original_path") or "")))
 
     perf_add_time("early_filter_dedupe", time.perf_counter() - _early_started)
 
@@ -12441,13 +12643,15 @@ def main() -> None:
         for pf_index, pf_path in enumerate(image_paths, start=1):
             raise_if_cancelled(f"frame preflight {pf_index}/{len(image_paths)}")
             pf_hash = file_sha1(pf_path)
-            pf_result = frame_cleanup_for_pipeline(pf_path, source_hash=pf_hash)
+            pf_result = frame_cleanup_for_pipeline(pf_path, source_hash=pf_hash, asset_id=source_asset_id_for(pf_path))
             pf_analysis = pf_result.get("frame_cleanup_analysis", {}) or {}
             if (
                 str(pf_analysis.get("confidence_level", "low")) == "medium"
                 and str(pf_result.get("frame_cleanup_user_decision", "auto")) == "auto"
             ):
                 unresolved.append({
+                    "asset_id": source_asset_id_for(pf_path),
+                    "source_asset_id": source_asset_id_for(pf_path),
                     "source_hash": pf_hash,
                     "source_path": os.path.abspath(pf_path),
                     "filename": os.path.basename(pf_path),
@@ -12494,6 +12698,8 @@ def main() -> None:
     # Early-Duplikate als Reject-Rows eintragen (fuer vollständigen CSV-Export)
     for dup_path in early_dup_paths:
         all_rows.append({
+            "asset_id": source_asset_id_for(dup_path),
+            "source_asset_id": source_asset_id_for(dup_path),
             "original_filename": os.path.basename(dup_path),
             "original_path": dup_path,
             "base_status": "reject",
@@ -12517,6 +12723,8 @@ def main() -> None:
             width, height = image_dimensions(image_path)
             source_original_path = image_path
             row: Dict[str, Any] = {
+                "asset_id": source_asset_id_for(source_original_path),
+                "source_asset_id": source_asset_id_for(source_original_path),
                 "original_filename": original_filename,
                 "original_path": source_original_path,
                 "source_original_path": source_original_path,
@@ -12542,6 +12750,7 @@ def main() -> None:
                     frame_cleanup_for_pipeline,
                     source_original_path,
                     source_hash=source_file_hash,
+                    asset_id=source_asset_id_for(source_original_path),
                 )
                 frame_analysis = frame_result.get("frame_cleanup_analysis", {}) or {}
                 row.update({
@@ -13146,6 +13355,8 @@ def main() -> None:
             tb = traceback.format_exc()
             safe_print(f"   ❌ Error: {e}")
             all_rows.append({
+                "asset_id": source_asset_id_for(locals().get("source_original_path", image_path)),
+                "source_asset_id": source_asset_id_for(locals().get("source_original_path", image_path)),
                 "original_filename": original_filename,
                 "original_path": locals().get("source_original_path", image_path),
                 "source_original_path": locals().get("source_original_path", image_path),
@@ -13166,6 +13377,7 @@ def main() -> None:
             break
 
     perf_add_time("audit_loop_total", time.perf_counter() - _audit_loop_started)
+    ensure_rows_have_asset_ids(all_rows)
 
     # PASS 2: Duplicate-Filter
     _selection_started = time.perf_counter()
@@ -13262,8 +13474,8 @@ def main() -> None:
 
         # Aus dem selected-Set entfernen, damit der Train-Ready-Export
         # diese Bilder nicht mehr exportiert.
-        hard_names = {r.get("original_filename") for r in hard_flagged_rows}
-        selected = [r for r in selected if r.get("original_filename") not in hard_names]
+        hard_keys = {row_identity_key(r) for r in hard_flagged_rows}
+        selected = [r for r in selected if row_identity_key(r) not in hard_keys]
         safe_print(
             f"   🛂 Removed {len(hard_flagged_rows)} hard-flagged image(s) from train_ready; "
             f"copies in 06_needs_manual_review."
@@ -13273,9 +13485,9 @@ def main() -> None:
     if backfill_added:
         warnings.append(f"Backfilled {len(backfill_added)} image(s) after hard/caption-remove exclusions to preserve the train-ready target.")
 
-    selected_names = {r["original_filename"] for r in selected}
+    selected_keys = {row_identity_key(r) for r in selected}
     for row in all_rows:
-        if row["original_filename"] in selected_names:
+        if row_identity_key(row) in selected_keys:
             row["selected"] = True
 
     # Keep-Bilder, die qualitativ ok sind, aber durch Cluster-/Diversity-Selection
@@ -13286,7 +13498,7 @@ def main() -> None:
     unselected_keep = [
         r for r in all_rows
         if r.get("base_status") == "keep"
-        and r["original_filename"] not in selected_names
+        and row_identity_key(r) not in selected_keys
         and r.get("arcface_flag") != "hard"
     ]
     for r in unselected_keep:
@@ -13299,6 +13511,7 @@ def main() -> None:
     profile_source_rows = list(selected) + list(unselected_keep)
     subject_profile = build_subject_profile(profile_source_rows)
     subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
+    subject_profile = migrate_profile_to_asset_ids(subject_profile, all_rows)
     if subject_profile:
         save_subject_profile(subject_profile)
 

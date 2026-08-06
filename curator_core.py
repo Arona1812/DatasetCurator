@@ -56,6 +56,56 @@ def natural_sort_key(value: Any) -> tuple:
     return tuple(int(part) if part.isdigit() else part for part in re.split(r"(\d+)", text))
 
 
+def normalize_asset_id(value: Any) -> int:
+    """Return one positive integer asset ID or ``0`` for legacy/invalid data."""
+    if isinstance(value, Mapping):
+        for key in ("asset_id", "source_asset_id"):
+            normalized = normalize_asset_id(value.get(key))
+            if normalized > 0:
+                return normalized
+        return 0
+    try:
+        normalized = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return 0
+    return normalized if normalized > 0 else 0
+
+
+def asset_id_for_row(row: Optional[Mapping[str, Any]]) -> int:
+    """Read the authoritative project image ID from a pipeline row."""
+    return normalize_asset_id(row or {})
+
+
+def assign_asset_id(row: MutableMapping[str, Any], asset_id: Any) -> int:
+    """Write the canonical ID and its legacy alias to one mutable row."""
+    normalized = normalize_asset_id(asset_id)
+    if normalized > 0:
+        row["asset_id"] = normalized
+        # Retained while old caches/stages are migrated. New logic never uses
+        # this alias as a separate identity.
+        row["source_asset_id"] = normalized
+    return normalized
+
+
+def asset_id_key(value: Any) -> str:
+    """Stable JSON/dictionary key for one project asset."""
+    normalized = normalize_asset_id(value)
+    return str(normalized) if normalized > 0 else ""
+
+
+def row_identity_key(row: Optional[Mapping[str, Any]]) -> str:
+    """Authoritative row key; asset ID first, legacy fallback only for migration."""
+    asset_key = asset_id_key(row or {})
+    if asset_key:
+        return asset_key
+    legacy = row or {}
+    for key in ("profile_image_id", "file_hash", "original_path", "original_filename"):
+        value = str(legacy.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def normalize_training_target(value: Any) -> str:
     v = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     if v in {"z_image_base", "zimage", "z_image"}:

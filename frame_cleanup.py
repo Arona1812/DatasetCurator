@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover
     cv2 = None
 
 FRAME_DETECTOR_SCHEMA_VERSION = "smart-frame-v4-nested-options"
-FRAME_USER_DECISION_SCHEMA_VERSION = "v1"
+FRAME_USER_DECISION_SCHEMA_VERSION = "v2-asset-id"
 FRAME_DECISION_FILENAME = "_frame_cleanup_decisions.json"
 FRAME_CACHE_SUBDIR = "frame_cleanup"
 FRAME_CROP_SUBDIR = "crops"
@@ -208,12 +208,17 @@ def save_user_decision(
     source_path: str,
     decision: str,
     bbox: Optional[Iterable[int]] = None,
+    asset_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     payload = load_user_decisions(output_root)
     normalized = str(decision or "auto").strip().lower()
     if normalized not in {"auto", "accept", "keep_original", "manual"}:
         raise ValueError(f"unsupported frame decision: {decision}")
+    normalized_asset_id = int(asset_id) if asset_id not in (None, "") and int(asset_id) > 0 else None
+    decision_key = f"asset:{normalized_asset_id}" if normalized_asset_id is not None else source_hash
     record = {
+        "asset_id": normalized_asset_id,
+        "source_asset_id": normalized_asset_id,
         "source_hash": source_hash,
         "source_path": os.path.abspath(source_path),
         "decision": normalized,
@@ -221,9 +226,13 @@ def save_user_decision(
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     if normalized == "auto":
+        payload["decisions"].pop(decision_key, None)
+        # Remove the legacy hash-keyed decision for this exact source as well.
         payload["decisions"].pop(source_hash, None)
     else:
-        payload["decisions"][source_hash] = record
+        payload["decisions"][decision_key] = record
+        if decision_key != source_hash:
+            payload["decisions"].pop(source_hash, None)
     payload["schema_version"] = FRAME_USER_DECISION_SCHEMA_VERSION
     payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     atomic_write_json(user_decision_path(output_root), payload)
@@ -1298,10 +1307,14 @@ def resolve_frame_cleanup(
     output_root: str,
     mode: str = "auto_high_review_medium",
     settings: Optional[DetectorSettings] = None,
+    asset_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     analysis = analyze_frame_cleanup(image_path, cache_dir, source_hash, settings=settings, use_cache=True)
     user_payload = load_user_decisions(output_root)
-    user = (user_payload.get("decisions", {}) or {}).get(source_hash) or {}
+    decisions = user_payload.get("decisions", {}) or {}
+    normalized_asset_id = int(asset_id) if asset_id not in (None, "") and int(asset_id) > 0 else None
+    user = decisions.get(f"asset:{normalized_asset_id}") if normalized_asset_id is not None else None
+    user = user or decisions.get(source_hash) or {}
     user_decision = str(user.get("decision", "auto") or "auto")
     bbox = None
     applied_by = "none"
@@ -1332,6 +1345,8 @@ def resolve_frame_cleanup(
         effective_path = materialize_crop(image_path, bbox, cache_dir, source_hash)
 
     return {
+        "asset_id": normalized_asset_id,
+        "source_asset_id": normalized_asset_id,
         "source_original_path": os.path.abspath(image_path),
         "effective_image_path": effective_path,
         "frame_crop_path": effective_path if effective_path != image_path else "",

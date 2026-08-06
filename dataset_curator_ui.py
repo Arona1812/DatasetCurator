@@ -34,6 +34,11 @@ from curator_core import (
     APP_VERSION,
     atomic_write_json as core_atomic_write_json,
     normalize_run_config_payload,
+    normalize_asset_id as core_normalize_asset_id,
+    asset_id_for_row,
+    assign_asset_id,
+    asset_id_key,
+    row_identity_key,
 )
 
 from preflight import (
@@ -43,6 +48,7 @@ from preflight import (
     output_root_for as preflight_output_root_for,
     run_preflight as run_project_preflight,
     scan_images as scan_preflight_images,
+    ensure_asset_registry as ensure_project_asset_registry,
 )
 
 from frame_cleanup import (
@@ -1243,7 +1249,8 @@ def _remove_early_duplicates_from_profile_reject_bucket_ui(
             kept.append(record)
         if kept:
             updated = dict(cluster)
-            updated["members"] = [r.get("image_id", "") for r in kept]
+            updated["members"] = [core_normalize_asset_id(r.get("asset_id") or r.get("image_id")) or r.get("image_id", "") for r in kept]
+            updated["asset_ids"] = [core_normalize_asset_id(r.get("asset_id") or r.get("image_id")) for r in kept if core_normalize_asset_id(r.get("asset_id") or r.get("image_id")) > 0]
             updated["filenames"] = [r.get("filename", "") for r in kept]
             updated["image_paths"] = [r.get("image_path", "") for r in kept]
             updated["reject_reasons"] = [r.get("reject_reason", "") for r in kept]
@@ -1273,6 +1280,8 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
             raise ValueError("profile is not a JSON object")
         profile = _remove_early_duplicates_from_profile_reject_bucket_ui(profile, trigger_word, input_folder)
         profile = _normalize_audited_reject_role_ui(profile)
+        profile = _migrate_profile_asset_ids_ui(profile, trigger_word, input_folder)
+        core_atomic_write_json(path, profile)
     except Exception as e:
         return _empty_editor_payload(
             tr(f"❌ Profil-Lesefehler: {e}", f"❌ Profile read error: {e}"),
@@ -1827,6 +1836,9 @@ def _cluster_gallery_page_update(profile: Dict[str, Any], cluster_id: str, page:
 
 
 def _profile_member_id_ui(row: Dict[str, Any]) -> str:
+    asset_key = asset_id_key(row or {})
+    if asset_key:
+        return asset_key
     existing = str((row or {}).get("profile_member_id") or "").strip()
     if existing:
         return existing
@@ -1841,9 +1853,7 @@ def _profile_member_id_ui(row: Dict[str, Any]) -> str:
 
 def _selection_ref_for_record(record: Dict[str, Any], record_index: int = -1) -> str:
     return json.dumps({
-        "image_id": str(record.get("image_id", "") or ""),
-        "filename": str(record.get("filename", "") or ""),
-        "image_path": str(record.get("image_path", "") or ""),
+        "asset_id": core_normalize_asset_id(record.get("asset_id") or record.get("image_id")),
         "record_index": int(record_index),
     }, ensure_ascii=False, separators=(",", ":"))
 
@@ -1867,35 +1877,30 @@ def _resolve_cluster_record(cluster: Dict[str, Any], selected_ref: Any) -> Tuple
     ref = _parse_selection_ref(selected_ref)
     if not ref:
         return -1, None
+    wanted_asset_id = core_normalize_asset_id(ref.get("asset_id") or ref.get("image_id"))
+    if wanted_asset_id > 0:
+        for index, record in enumerate(records):
+            if core_normalize_asset_id(record.get("asset_id") or record.get("image_id")) == wanted_asset_id:
+                return index, record
+        return -1, None
+
+    # Legacy paused UI state only. New selections contain asset_id exclusively.
     try:
         idx = int(ref.get("record_index", -1))
     except Exception:
         idx = -1
     if 0 <= idx < len(records):
-        candidate = records[idx]
-        checks = [
-            ("image_path", str(ref.get("image_path", "") or "")),
-            ("filename", str(ref.get("filename", "") or "")),
-            ("image_id", str(ref.get("image_id", "") or "")),
-        ]
-        if all(not expected or str(candidate.get(field, "") or "") == expected for field, expected in checks):
-            return idx, candidate
-
-    image_path = str(ref.get("image_path", "") or "")
+        return idx, records[idx]
+    legacy_id = str(ref.get("image_id", "") or "")
     filename = str(ref.get("filename", "") or "")
-    image_id = str(ref.get("image_id", "") or "")
-    for i, record in enumerate(records):
+    image_path = str(ref.get("image_path", "") or "")
+    for index, record in enumerate(records):
+        if legacy_id and str(record.get("image_id", "") or "") == legacy_id:
+            return index, record
         if image_path and str(record.get("image_path", "") or "") == image_path:
-            return i, record
-    for i, record in enumerate(records):
-        if filename and image_id and str(record.get("filename", "") or "") == filename and str(record.get("image_id", "") or "") == image_id:
-            return i, record
-    for i, record in enumerate(records):
+            return index, record
         if filename and str(record.get("filename", "") or "") == filename:
-            return i, record
-    for i, record in enumerate(records):
-        if image_id and str(record.get("image_id", "") or "") == image_id:
-            return i, record
+            return index, record
     return -1, None
 
 
@@ -1939,15 +1944,18 @@ def _sorted_identity_clusters(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _cluster_member_records(cluster: Dict[str, Any]) -> List[Dict[str, str]]:
-    members = list(cluster.get("members", []) or [])
+    members = list(cluster.get("asset_ids") or cluster.get("members") or [])
     filenames = list(cluster.get("filenames", []) or [])
     paths = list(cluster.get("image_paths", []) or [])
     reject_reasons = list(cluster.get("reject_reasons", []) or [])
     total = max(len(members), len(filenames), len(paths), len(reject_reasons))
     records: List[Dict[str, str]] = []
     for idx in range(total):
+        raw_member = members[idx] if idx < len(members) else ""
+        asset_id = core_normalize_asset_id(raw_member)
         records.append({
-            "image_id": str(members[idx] if idx < len(members) else ""),
+            "asset_id": str(asset_id) if asset_id > 0 else "",
+            "image_id": str(asset_id) if asset_id > 0 else str(raw_member or ""),
             "filename": str(filenames[idx] if idx < len(filenames) else ""),
             "image_path": str(paths[idx] if idx < len(paths) else ""),
             "reject_reason": str(reject_reasons[idx] if idx < len(reject_reasons) else ""),
@@ -1961,6 +1969,29 @@ def _cluster_member_records(cluster: Dict[str, Any]) -> List[Dict[str, str]]:
 def _missing_cluster_preview_image() -> Image.Image:
     """Return a neutral tile so every bucket member stays selectable."""
     return Image.new("RGB", (384, 384), (72, 72, 72))
+
+def _decorate_favorite_preview(image: Image.Image) -> Image.Image:
+    """Draw an unmistakable gold frame and star without external fonts."""
+    decorated = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(decorated)
+    width, height = decorated.size
+    border = max(5, min(width, height) // 45)
+    gold = (218, 165, 32)
+    dark = (70, 48, 0)
+    for offset in range(border):
+        draw.rectangle((offset, offset, width - 1 - offset, height - 1 - offset), outline=gold)
+    radius = max(22, min(width, height) // 11)
+    cx, cy = width - radius - border * 2, radius + border * 2
+    draw.ellipse((cx-radius, cy-radius, cx+radius, cy+radius), fill=(28, 28, 28), outline=gold, width=max(2, border//2))
+    points = []
+    import math as _math
+    for i in range(10):
+        angle = -_math.pi / 2 + i * _math.pi / 5
+        r = radius * (0.72 if i % 2 == 0 else 0.32)
+        points.append((cx + r * _math.cos(angle), cy + r * _math.sin(angle)))
+    draw.polygon(points, fill=gold, outline=dark)
+    return decorated
+
 
 def _identity_cluster_preview_entries(
     profile: Dict[str, Any],
@@ -1985,7 +2016,12 @@ def _identity_cluster_preview_entries(
         return entries
     role = str(cluster.get("role", "variation") or "variation")
     summary = str(cluster.get("summary", "") or "")
-    priority_ids = {str(x) for x in ((profile or {}).get("priority_image_ids", []) or [])}
+    priority_ids = {
+        asset_id_key(x) or str(x)
+        for x in list((profile or {}).get("favorite_asset_ids", []) or [])
+        + list((profile or {}).get("priority_image_ids", []) or [])
+        if asset_id_key(x) or str(x)
+    }
     priority_names = {str(x) for x in ((profile or {}).get("priority_image_filenames", []) or [])}
     row_lookup = _stage_rows_by_profile_id(trigger_word, input_folder)
     is_reject_bucket = str(cluster.get("cluster_kind", "") or "") == "audited_rejects"
@@ -2006,9 +2042,12 @@ def _identity_cluster_preview_entries(
         preview_available = preview is not None
         if preview is None:
             preview = _missing_cluster_preview_image()
+        asset_key = asset_id_key(record.get("asset_id") or record.get("image_id"))
         content_id = str(record.get("image_id", "") or "").split("::", 1)[0]
-        is_priority = record.get("image_id") in priority_ids or content_id in priority_ids or filename in priority_names
-        marker = "⭐ PRIORITY | " if is_priority else ""
+        is_priority = asset_key in priority_ids or content_id in priority_ids or filename in priority_names
+        marker = "⭐ FAVORITE | " if is_priority else ""
+        if is_priority:
+            preview = _decorate_favorite_preview(preview)
         if is_reject_bucket:
             marker += "REJECTED/AUDITED | "
         row = _row_for_cluster_record(row_lookup, record)
@@ -2089,8 +2128,8 @@ def _identity_cluster_preview_markdown(profile: Dict[str, Any], cluster_id: Opti
     ]
     if cluster_kind == "audited_rejects":
         lines.append("**" + tr("Sonder-Bucket", "Special bucket") + ":** " + tr(
-            "Vollständig auditierte Rejects; immer am Ende und standardmäßig `exclude`. Einzelbilder können gelöst oder als Priority markiert werden.  ",
-            "Fully audited rejects; always listed last and default to `exclude`. Individual images can be detached or marked Priority.  ",
+            "Vollständig auditierte Rejects; immer am Ende und standardmäßig `exclude`. Einzelbilder können gelöst oder als Favorit markiert werden.  ",
+            "Fully audited rejects; always listed last and default to `exclude`. Individual images can be detached or marked as favorites.  ",
         ))
     if quality or identity:
         lines.append(f"**Quality / Identity:** {quality or '-'} / {identity or '-'}  ")
@@ -2145,18 +2184,97 @@ def select_identity_cluster_image_ui(
         return "", tr("⚠️ Bildauswahl konnte nicht bestimmt werden.", "⚠️ Could not resolve selected image.")
     entry = entries[selected_index]
     image_id = str(entry.get("image_id", "") or "")
+    selected_asset_id = core_normalize_asset_id(entry.get("asset_id") or image_id)
     filename = str(entry.get("filename", "") or "")
     priority = bool(entry.get("priority"))
     reject_reason = str(entry.get("reject_reason", "") or "")
     status = (
         f"**{tr('Ausgewähltes Bild', 'Selected image')}:** `{filename}`  \n"
-        f"**Member ID:** `{image_id or '-'}`  \n"
+        f"**Asset ID:** `{selected_asset_id or image_id or '-'}`  \n"
         f"**" + tr("Galerieseite", "Gallery page") + f":** {_parse_cluster_gallery_page(gallery_page)}  \n"
-        f"**Priority:** {'⭐ yes' if priority else 'no'}"
+        f"**Favorite:** {'⭐ yes' if priority else 'no'}"
     )
     if reject_reason:
         status += f"  \n**{tr('Reject-Grund', 'Reject reason')}:** `{reject_reason}`"
     return str(entry.get("selection_ref", "") or ""), status
+
+
+def _migrate_profile_asset_ids_ui(profile: Dict[str, Any], trigger_word: str, input_folder: str) -> Dict[str, Any]:
+    """Normalize profile board, buckets and favorites to persistent asset IDs."""
+    if not isinstance(profile, dict):
+        return profile
+    row_lookup = _stage_rows_by_profile_id(trigger_word, input_folder)
+
+    def resolve(value: Any = "", filename: Any = "", image_path: Any = "") -> int:
+        direct = core_normalize_asset_id(value)
+        if direct > 0:
+            return direct
+        candidates = [str(value or "").strip(), str(value or "").split("::", 1)[0],
+                      f"filename::{str(filename or '')}", f"path::{str(image_path or '')}"]
+        if image_path:
+            candidates.append(f"path::{os.path.normcase(os.path.abspath(str(image_path)))}")
+        for key in candidates:
+            row = row_lookup.get(key)
+            aid = asset_id_for_row(row or {})
+            if aid > 0:
+                return aid
+        return 0
+
+    traits = profile.get("per_image_traits", {}) or {}
+    if isinstance(traits, dict):
+        migrated_traits: Dict[str, Any] = {}
+        for key, value in traits.items():
+            aid = resolve(key)
+            migrated_traits[str(aid) if aid > 0 else str(key)] = value
+        profile["per_image_traits"] = migrated_traits
+
+    clusters = [c for c in (profile.get("identity_clusters", []) or []) if isinstance(c, dict)]
+    roles: Dict[str, str] = {}
+    cluster_map: Dict[str, str] = {}
+    for cluster in clusters:
+        members = list(cluster.get("asset_ids") or cluster.get("members") or [])
+        filenames = list(cluster.get("filenames") or [])
+        paths = list(cluster.get("image_paths") or [])
+        total = max(len(members), len(filenames), len(paths))
+        migrated: List[Any] = []
+        for index in range(total):
+            member = members[index] if index < len(members) else ""
+            filename = filenames[index] if index < len(filenames) else ""
+            image_path = paths[index] if index < len(paths) else ""
+            aid = resolve(member, filename, image_path)
+            migrated.append(aid if aid > 0 else member)
+        cluster["members"] = migrated
+        cluster["asset_ids"] = [int(v) for v in migrated if core_normalize_asset_id(v) > 0]
+        cluster["n"] = len(migrated)
+        cid = str(cluster.get("cluster_id", "") or "")
+        role = str(cluster.get("role", "variation") or "variation")
+        for member in migrated:
+            key = asset_id_key(member) or str(member)
+            roles[key] = role
+            cluster_map[key] = cid
+    profile["identity_clusters"] = clusters
+    profile["identity_cluster_member_roles"] = roles
+    profile["identity_cluster_member_clusters"] = cluster_map
+
+    favorites = set()
+    for raw in profile.get("favorite_asset_ids", []) or []:
+        aid = resolve(raw)
+        if aid > 0:
+            favorites.add(aid)
+    for raw in profile.get("priority_image_ids", []) or []:
+        aid = resolve(raw)
+        if aid > 0:
+            favorites.add(aid)
+    for filename in profile.get("priority_image_filenames", []) or []:
+        aid = resolve("", filename, "")
+        if aid > 0:
+            favorites.add(aid)
+    ordered = sorted(favorites)
+    profile["favorite_asset_ids"] = ordered
+    profile["priority_image_ids"] = ordered
+    profile["priority_image_filenames"] = []
+    profile["asset_identity_schema_version"] = "asset-id-v1"
+    return profile
 
 
 def _load_profile_for_bucket_edit(trigger_word: str, input_folder: str, profile_state: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
@@ -2168,6 +2286,7 @@ def _load_profile_for_bucket_edit(trigger_word: str, input_folder: str, profile_
                 loaded = json.load(f)
             if isinstance(loaded, dict):
                 profile = _normalize_audited_reject_role_ui(loaded)
+                profile = _migrate_profile_asset_ids_ui(profile, trigger_word, input_folder)
         except Exception:
             profile = {}
     if not profile and isinstance(profile_state, dict):
@@ -2194,25 +2313,40 @@ def _stage_rows_by_profile_id(trigger_word: str, input_folder: str) -> Dict[str,
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        image_id = str(row.get("profile_image_id", "") or row.get("file_hash", "") or "")
-        member_id = _profile_member_id_ui(row)
+        legacy_member_id = str(row.get("profile_member_id", "") or "")
+        legacy_image_id = str(row.get("profile_image_id", "") or "")
+        legacy_file_hash = str(row.get("file_hash", "") or "")
+        asset_id = asset_id_for_row(row)
+        if asset_id > 0:
+            assign_asset_id(row, asset_id)
+            row["profile_image_id"] = str(asset_id)
+            row["profile_member_id"] = str(asset_id)
+            result[str(asset_id)] = row
+            result[f"asset::{asset_id}"] = row
+        # Legacy aliases are read-only migration aids.
+        for key in (legacy_member_id, legacy_image_id, legacy_file_hash):
+            if key and key not in result:
+                result[key] = row
         filename = str(row.get("original_filename", "") or "")
         image_path = str(row.get("original_path", "") or "")
-        if member_id:
-            result[member_id] = row
-        if image_id and image_id not in result:
-            result[image_id] = row
         if filename:
             result[f"filename::{filename}"] = row
         if image_path:
             result[f"path::{image_path}"] = row
+            result[f"path::{os.path.normcase(os.path.abspath(image_path))}"] = row
     return result
 
 
 def _row_for_cluster_record(row_lookup: Dict[str, Dict[str, Any]], record: Dict[str, Any]) -> Dict[str, Any]:
+    asset_id = core_normalize_asset_id(record.get("asset_id") or record.get("image_id"))
+    if asset_id > 0:
+        for key in (str(asset_id), f"asset::{asset_id}"):
+            if key in row_lookup:
+                return row_lookup[key]
     for key in (
         str(record.get("image_id", "") or ""),
         f"path::{str(record.get('image_path', '') or '')}",
+        f"path::{os.path.normcase(os.path.abspath(str(record.get('image_path', '') or '')))}" if record.get("image_path") else "",
         f"filename::{str(record.get('filename', '') or '')}",
     ):
         if key and key in row_lookup:
@@ -2301,8 +2435,9 @@ def detach_selected_image_from_cluster_ui(
     if selected_index < 0 or not record:
         return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_clusters_markdown(profile), _identity_clusters_table(profile), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), cid, gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value=_identity_cluster_role_for_id(profile, cid)), _cluster_gallery_page_update(profile, cid, gallery_page), "", tr("_Kein Bild ausgewählt._", "_No image selected._"), tr("❌ Bild ist nicht mehr in diesem Bucket.", "❌ Image is no longer in this bucket.")
 
-    image_id = str(record.get("image_id", "") or "")
-    members = list(source.get("members", []) or [])
+    asset_id = core_normalize_asset_id(record.get("asset_id") or record.get("image_id"))
+    image_id = str(asset_id) if asset_id > 0 else str(record.get("image_id", "") or "")
+    members = list(source.get("asset_ids") or source.get("members", []) or [])
     filenames = list(source.get("filenames", []) or [])
     paths = list(source.get("image_paths", []) or [])
     reject_reasons = list(source.get("reject_reasons", []) or [])
@@ -2311,6 +2446,7 @@ def detach_selected_image_from_cluster_ui(
     image_path = paths.pop(selected_index) if selected_index < len(paths) else record.get("image_path", "")
     reject_reason = reject_reasons.pop(selected_index) if selected_index < len(reject_reasons) else str(record.get("reject_reason", "") or "")
     source["members"], source["filenames"], source["image_paths"] = members, filenames, paths
+    source["asset_ids"] = [int(v) for v in members if core_normalize_asset_id(v) > 0]
     if reject_reasons or "reject_reasons" in source:
         source["reject_reasons"] = reject_reasons
 
@@ -2340,7 +2476,8 @@ def detach_selected_image_from_cluster_ui(
         "avg_identity_usefulness": round(float(row.get("quality_identity_usefulness", 0) or 0), 1) if row else "",
         "shot_counts": {str(row.get("shot_type", "") or "unknown"): 1} if row else {},
         "style_counts": {},
-        "members": [image_id],
+        "members": [asset_id if asset_id > 0 else image_id],
+        "asset_ids": [asset_id] if asset_id > 0 else [],
         "filenames": [filename],
         "image_paths": [image_path],
         "reject_reasons": [reject_reason] if reject_reason else [],
@@ -2419,8 +2556,8 @@ def set_selected_image_priority_ui(
     selected_image_id: str,
     gallery_page: Any,
     make_priority: bool,
-    confirm_hazards: bool = False,
 ) -> Tuple[Dict[str, Any], str, str, List[Tuple[Any, str]], str, str]:
+    """Add/remove one asset as a visible Favorite and train-ready override."""
     profile, path = _load_profile_for_bucket_edit(trigger_word, input_folder, profile_state)
     cid = str(selected_cluster_id or "").strip()
     selected_ref = str(selected_image_id or "").strip()
@@ -2428,77 +2565,51 @@ def set_selected_image_priority_ui(
     _record_index, record = _resolve_cluster_record(cluster or {}, selected_ref)
     if not record:
         return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), tr("_Kein Bild ausgewählt._", "_No image selected._"), tr("⚠️ Erst ein Bild in der Vorschau anklicken.", "⚠️ Select an image in the preview first.")
-    image_id = str(record.get("image_id", "") or "")
-    content_image_id = image_id.split("::", 1)[0]
+
+    asset_id = core_normalize_asset_id(record.get("asset_id") or record.get("image_id"))
     filename = str(record.get("filename", "") or "")
     reject_reason = str(record.get("reject_reason", "") or "")
+    if asset_id <= 0:
+        status = tr("❌ Für dieses alte Profil konnte keine Asset-ID aufgelöst werden. Profil bitte neu laden.", "❌ No asset ID could be resolved for this legacy profile. Reload the profile.")
+        return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), status, status
 
-    hazards: List[str] = []
+    favorites = {
+        core_normalize_asset_id(value)
+        for value in list(profile.get("favorite_asset_ids", []) or [])
+        + list(profile.get("priority_image_ids", []) or [])
+        if core_normalize_asset_id(value) > 0
+    }
     if make_priority:
-        stage = _load_caption_stage_for_profile_ui(trigger_word, input_folder)
-        matching = None
-        for candidate in (stage.get("all_rows", []) or []):
-            if not isinstance(candidate, dict):
-                continue
-            candidate_name = str(candidate.get("original_filename", "") or "")
-            candidate_member = str(candidate.get("profile_member_id", "") or "")
-            candidate_image = str(candidate.get("profile_image_id", "") or "")
-            matches_filename = bool(filename and candidate_name == filename)
-            matches_full_id = bool(image_id and image_id in {candidate_member, candidate_image})
-            matches_content_id = bool(content_image_id and content_image_id in {candidate_member, candidate_image})
-            if matches_filename or matches_full_id or matches_content_id:
-                matching = candidate
-                break
-        if matching:
-            source = str(matching.get("original_path", "") or "")
-            if source and not os.path.isfile(source):
-                hazards.append("Quelldatei fehlt")
-            if bool(matching.get("multiple_people")):
-                hazards.append("mehrere Personen erkannt")
-            if str(matching.get("arcface_flag", "") or "").lower() == "hard":
-                hazards.append("ArcFace Hard-Flag")
-            reason = str(matching.get("short_reason", "") or "").lower()
-            duplicate_method = str(matching.get("duplicate_method", "") or "").lower()
-            if "duplicate" in reason or duplicate_method or matching.get("duplicate_of"):
-                hazards.append("Duplikat-/Near-Duplicate-Hinweis")
-            if reason.startswith(("hard_pass_too_small", "filesize_too_small", "script_error")):
-                hazards.append(f"technischer Ausschluss: {reason}")
-        if hazards and not bool(confirm_hazards):
-            warning = tr(
-                "⚠️ Priority-Warnung für `" + (filename or image_id) + "`: " + ", ".join(hazards) + ". Aktiviere die Bestätigung unter den Buttons und klicke erneut, wenn das Bild trotzdem zwingend ins Training soll.",
-                "⚠️ Priority warning for `" + (filename or image_id) + "`: " + ", ".join(hazards) + ". Enable the confirmation below the buttons and click again to force it into training anyway.",
-            )
-            return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), warning, warning
-
-    ids = [str(x) for x in (profile.get("priority_image_ids", []) or []) if str(x)]
-    names = [str(x) for x in (profile.get("priority_image_filenames", []) or []) if str(x)]
-    if make_priority:
-        if content_image_id and content_image_id not in ids:
-            ids.append(content_image_id)
-        if filename and filename not in names:
-            names.append(filename)
+        favorites.add(asset_id)
     else:
-        ids = [x for x in ids if x not in {image_id, content_image_id}]
-        names = [x for x in names if x != filename]
-    profile["priority_image_ids"] = ids
-    profile["priority_image_filenames"] = names
+        favorites.discard(asset_id)
+    ordered = sorted(favorites)
+    profile["favorite_asset_ids"] = ordered
+    # Compatibility alias: the values are asset IDs, never filenames/hashes.
+    profile["priority_image_ids"] = ordered
+    profile["priority_image_filenames"] = []
+    profile["asset_identity_schema_version"] = "asset-id-v1"
     profile["profile_rebuild_required"] = True
-    profile["profile_rebuild_reason"] = "Priority image selection changed"
+    profile["profile_rebuild_reason"] = "Favorite image selection changed"
     notes = profile.setdefault("normalizer_notes", [])
     if isinstance(notes, list):
-        notes.append(f"User {'marked' if make_priority else 'unmarked'} Priority image {filename or image_id} at {time.strftime('%Y-%m-%dT%H:%M:%S')}.")
+        notes.append(
+            f"User {'added' if make_priority else 'removed'} Favorite asset_id={asset_id} "
+            f"({filename}) at {time.strftime('%Y-%m-%dT%H:%M:%S')}."
+        )
         profile["normalizer_notes"] = notes[-40:]
     _save_profile_bucket_edit(profile, path)
+
     selected_info = (
         f"**{tr('Ausgewähltes Bild', 'Selected image')}:** `{filename}`  \n"
-        f"**Image ID:** `{image_id}`  \n"
-        f"**Priority:** {'⭐ yes' if make_priority else 'no'}"
+        f"**Asset ID:** `{asset_id}`  \n"
+        f"**Favorite:** {'⭐ yes' if make_priority else 'no'}"
     )
     if reject_reason:
         selected_info += f"  \n**{tr('Reject-Grund', 'Reject reason')}:** `{reject_reason}`"
     status = tr(
-        f"✅ `{filename}` ist jetzt {'Priority und wird zwingend in Train Ready übernommen' if make_priority else 'nicht mehr Priority'}.",
-        f"✅ `{filename}` is now {'Priority and will be forced into Train Ready' if make_priority else 'no longer Priority'}.",
+        f"✅ Asset ID `{asset_id}` (`{filename}`) ist jetzt {'Favorit und wird zwingend in Train Ready übernommen' if make_priority else 'kein Favorit mehr'}.",
+        f"✅ Asset ID `{asset_id}` (`{filename}`) is now {'a favorite and will be forced into Train Ready' if make_priority else 'no longer a favorite'}.",
     )
     return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), selected_info, status
 
@@ -2766,8 +2877,8 @@ def apply_identity_cluster_role_selection_ui(
             _identity_clusters_table(profile if isinstance(profile, dict) else {}),
             _identity_cluster_preview_markdown(profile if isinstance(profile, dict) else {}, cid),
             tr(
-                "ℹ️ Der auditierte Reject-Bucket bleibt fest auf `exclude`. Löse ein Einzelbild in einen neuen Bucket oder markiere es als Priority.",
-                "ℹ️ The audited-reject bucket is fixed to `exclude`. Detach an individual image into a new bucket or mark it Priority.",
+                "ℹ️ Der auditierte Reject-Bucket bleibt fest auf `exclude`. Löse ein Einzelbild in einen neuen Bucket oder markiere es als Favorit.",
+                "ℹ️ The audited-reject bucket is fixed to `exclude`. Detach an individual image into a new bucket or mark it as a favorite.",
             ),
         )
     if not cid:
@@ -2830,7 +2941,11 @@ def _identity_clusters_markdown(profile: Dict[str, Any]) -> str:
         role = str(c.get("role", "variation") or "variation")
         role_counts[role] = role_counts.get(role, 0) + int(c.get("n", 0) or 0)
     warnings = [n for n in profile.get("normalizer_notes", []) or [] if "Identity clustering:" in str(n)]
-    priority_count = len({str(x) for x in (profile.get("priority_image_ids", []) or []) if str(x)})
+    priority_count = len({
+        core_normalize_asset_id(x)
+        for x in list(profile.get("favorite_asset_ids", []) or []) + list(profile.get("priority_image_ids", []) or [])
+        if core_normalize_asset_id(x) > 0
+    })
     audited_reject_count = sum(
         int(c.get("n", 0) or 0)
         for c in clusters
@@ -2845,7 +2960,7 @@ def _identity_clusters_markdown(profile: Dict[str, Any]) -> str:
         ),
         "",
         "**" + tr("Bildrollen", "Image roles") + ":** " + ", ".join(f"`{k}`={v}" for k, v in sorted(role_counts.items())),
-        f"**Priority:** {priority_count}  ",
+        f"**{tr('Favoriten', 'Favorites')}:** {priority_count}  ",
         f"**{tr('Auditierte Rejects im letzten Bucket', 'Audited rejects in the last bucket')}:** {audited_reject_count}",
     ]
     if warnings:
@@ -2958,7 +3073,7 @@ def save_identity_cluster_roles_ui(trigger_word: str, input_folder: str, table_d
     try:
         core_atomic_write_json(path, profile)
         return tr(
-            f"✅ Cluster-Rollen gespeichert ({changed} geändert). Das Identitätsprofil wird vor Phase 3 aus den vorhandenen Audits mit Priority > Core neu konsolidiert.",
+            f"✅ Cluster-Rollen gespeichert ({changed} geändert). Das Identitätsprofil wird vor Phase 3 aus den vorhandenen Audits mit Favorit > Core neu konsolidiert.",
             f"✅ Cluster roles saved ({changed} changed). Phase-3 export uses these roles for ranking and in/out selection.",
         )
     except Exception as e:
@@ -3750,6 +3865,7 @@ def _save_frame_hash_index_ui(cache_dir: str, payload: Dict[str, Any]) -> None:
 
 def _frame_filter_records(state: Any, filter_value: str) -> List[Dict[str, Any]]:
     records = list((state or {}).get("records", []) or []) if isinstance(state, dict) else []
+    records.sort(key=lambda record: _normalize_asset_id(record.get("asset_id")))
     value = str(filter_value or "review")
     if value == "review":
         return [r for r in records if r.get("confidence_level") == "medium"]
@@ -3767,26 +3883,41 @@ def _frame_page_choices(count: int) -> List[str]:
     return [str(i) for i in range(1, pages + 1)]
 
 
+def _normalize_asset_id(value: Any) -> int:
+    try:
+        result = int(value)
+    except Exception:
+        return 0
+    return result if result > 0 else 0
+
+
 def _frame_selection_location(
     state: Any,
     filter_value: str,
-    source_hash: str,
+    asset_id: Any,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Return filtered records and the selected record's global index."""
+    """Return filtered records and the selected asset's global index."""
     records = _frame_filter_records(state, filter_value)
-    selected = str(source_hash or "")
-    for index, record in enumerate(records):
-        if str(record.get("source_hash", "")) == selected:
-            return records, index
+    selected = _normalize_asset_id(asset_id)
+    if selected > 0:
+        for index, record in enumerate(records):
+            if _normalize_asset_id(record.get("asset_id")) == selected:
+                return records, index
+    # Legacy fallback for an in-memory state created before asset IDs existed.
+    legacy_hash = str(asset_id or "")
+    if legacy_hash:
+        for index, record in enumerate(records):
+            if str(record.get("source_hash", "")) == legacy_hash:
+                return records, index
     return records, -1
 
 
 def _frame_viewer_navigation_updates(
     state: Any,
     filter_value: str,
-    source_hash: str,
+    asset_id: Any,
 ):
-    records, index = _frame_selection_location(state, filter_value, source_hash)
+    records, index = _frame_selection_location(state, filter_value, asset_id)
     total = len(records)
     if index < 0 or total == 0:
         return (
@@ -3794,8 +3925,12 @@ def _frame_viewer_navigation_updates(
             gr.update(interactive=False),
             gr.update(interactive=False),
         )
+    selected_id = _normalize_asset_id(records[index].get("asset_id"))
     return (
-        tr(f"**Bild {index + 1} von {total}**", f"**Image {index + 1} of {total}**"),
+        tr(
+            f"**Bild {index + 1} von {total} · ID {selected_id}**",
+            f"**Image {index + 1} of {total} · ID {selected_id}**",
+        ),
         gr.update(interactive=index > 0),
         gr.update(interactive=index < total - 1),
     )
@@ -3805,18 +3940,15 @@ def _frame_review_gallery_update(
     state: Any,
     filter_value: str,
     page_value: Any,
-    source_hash: str = "",
+    asset_id: Any = 0,
 ):
-    """Refresh the overview while preserving the active image highlight."""
-    gallery = _frame_review_gallery(state, filter_value, page_value)
-    records, index = _frame_selection_location(state, filter_value, source_hash)
-    try:
-        page = max(1, int(page_value or 1))
-    except Exception:
-        page = 1
-    page_start = (page - 1) * FRAME_REVIEW_PAGE_SIZE
-    selected_index = index - page_start if page_start <= index < page_start + len(gallery) else None
-    return gr.update(value=gallery, selected_index=selected_index)
+    """Refresh the overview while preserving the active asset highlight."""
+    gallery = _frame_review_gallery(state, filter_value, page_value, selected_asset_id=asset_id)
+    # Do not set Gallery.selected_index programmatically. Gradio emits a select
+    # event for that update; around a page boundary it can arrive before the new
+    # page value and resolve the same thumbnail index against the previous page.
+    # The selected asset is marked directly in the rendered card instead.
+    return gr.update(value=gallery, selected_index=None)
 
 
 def _frame_candidate_choices(record: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -3962,32 +4094,39 @@ def _frame_option_gallery_update(record: Optional[Dict[str, Any]], state: Any = 
 
 
 def _frame_option_detail(record: Dict[str, Any], option_key: str) -> Tuple[str, List[int]]:
+    asset_id = _normalize_asset_id(record.get("asset_id"))
     if option_key == "original":
         width, height = record.get("original_size") or [0, 0]
         return tr(
-            f"**{record.get('filename','')}** – Original wird beibehalten. Die Entscheidung wurde sofort gespeichert.",
-            f"**{record.get('filename','')}** – Original is kept. The decision was saved immediately.",
+            f"**ID {asset_id} · {record.get('filename','')}** – Original wird beibehalten. Die Entscheidung wurde sofort gespeichert.",
+            f"**ID {asset_id} · {record.get('filename','')}** – Original is kept. The decision was saved immediately.",
         ), [0, 0, int(width), int(height)]
     for entry in _frame_option_entries(record):
         if entry["key"] == option_key:
             bbox = entry.get("bbox") or [0, 0, *(record.get("original_size") or [0, 0])]
             return tr(
-                f"**{record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Sofort gespeichert.",
-                f"**{record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Saved immediately.",
+                f"**ID {asset_id} · {record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Sofort gespeichert.",
+                f"**ID {asset_id} · {record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Saved immediately.",
             ), [int(v) for v in bbox]
     width, height = record.get("original_size") or [0, 0]
     return tr("Unbekannte Auswahl.", "Unknown selection."), [0, 0, int(width), int(height)]
 
 
 def _frame_review_caption(record: Dict[str, Any]) -> str:
+    asset_id = _normalize_asset_id(record.get("asset_id"))
     level = str(record.get("confidence_level", "low")).upper()
     confidence = float(record.get("confidence", 0) or 0)
     decision = str(record.get("user_decision", "auto") or "auto")
     sides = ", ".join(record.get("candidate_sides", []) or []) or "-"
-    return f"{record.get('filename', '')}\n{level} {confidence:.0%} | {sides} | {decision}"
+    return f"ID {asset_id} · {record.get('filename', '')}\n{level} {confidence:.0%} | {sides} | {decision}"
 
 
-def _frame_review_gallery(state: Any, filter_value: str, page_value: Any) -> List[Tuple[Image.Image, str]]:
+def _frame_review_gallery(
+    state: Any,
+    filter_value: str,
+    page_value: Any,
+    selected_asset_id: Any = 0,
+) -> List[Tuple[Image.Image, str]]:
     """Build the frame-review gallery without exposing external file paths.
 
     Gradio 5/6 rejects file paths outside the application directory or the
@@ -4004,9 +4143,13 @@ def _frame_review_gallery(state: Any, filter_value: str, page_value: Any) -> Lis
     start = (page - 1) * FRAME_REVIEW_PAGE_SIZE
     selected = records[start:start + FRAME_REVIEW_PAGE_SIZE]
     gallery: List[Tuple[Image.Image, str]] = []
+    selected_id = _normalize_asset_id(selected_asset_id)
     cache_dir = str((state or {}).get("cache_dir", "")) if isinstance(state, dict) else ""
     for record in selected:
+        is_selected = selected_id > 0 and _normalize_asset_id(record.get("asset_id")) == selected_id
         caption = _frame_review_caption(record)
+        if is_selected:
+            caption = "✓ " + caption
         try:
             bbox = record.get("display_bbox") or _frame_candidate_bbox(record) or record.get("candidate_bbox")
             preview_path = build_review_preview(
@@ -4015,6 +4158,8 @@ def _frame_review_gallery(state: Any, filter_value: str, page_value: Any) -> Lis
             preview_image = load_gallery_image(preview_path, max_size=(1240, 720))
             if preview_image is None:
                 raise ValueError("generated preview could not be decoded")
+            if is_selected:
+                preview_image = ImageOps.expand(preview_image, border=8, fill=(45, 115, 230))
             gallery.append((preview_image, caption))
         except Exception as exc:
             # Never return the original external path to Gradio. Even the
@@ -4022,6 +4167,8 @@ def _frame_review_gallery(state: Any, filter_value: str, page_value: Any) -> Lis
             # trigger another InvalidPathError.
             fallback = load_gallery_image(record.get("source_path", ""), max_size=(1024, 1024))
             if fallback is not None:
+                if is_selected:
+                    fallback = ImageOps.expand(fallback, border=8, fill=(45, 115, 230))
                 gallery.append((fallback, f"{caption}\nPreview error: {exc}"))
     return gallery
 
@@ -4050,9 +4197,9 @@ def scan_frame_review_ui(
     progress=gr.Progress(track_tqdm=False),
 ):
     if not trigger_word or not str(trigger_word).strip():
-        return {}, tr("Bitte zuerst ein Triggerwort eingeben.", "Please enter a trigger word first."), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Triggerwort fehlt", "❌ Trigger word missing")
+        return {}, tr("Bitte zuerst ein Triggerwort eingeben.", "Please enter a trigger word first."), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Triggerwort fehlt", "❌ Trigger word missing")
     if not input_folder or not os.path.isdir(input_folder):
-        return {}, tr("Input-Ordner nicht gefunden.", "Input folder not found."), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Input fehlt", "❌ Input missing")
+        return {}, tr("Input-Ordner nicht gefunden.", "Input folder not found."), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Input fehlt", "❌ Input missing")
 
     output_root, cache_dir = _frame_ui_paths(input_folder, trigger_word)
     workspace = load_project_workspace(input_folder, trigger_word)
@@ -4060,14 +4207,24 @@ def scan_frame_review_ui(
         return {}, tr(
             "Bitte zuerst die pHash-/Datei-Vorprüfung auf der Startseite ausführen.",
             "Please run the pHash/file preflight on the start page first.",
-        ), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfung fehlt", "❌ Preflight missing")
+        ), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfung fehlt", "❌ Preflight missing")
     if not _workspace_preflight_is_current(input_folder, trigger_word, workspace):
         return {}, tr(
             "Der Input-Ordner hat sich seit der Vorprüfung geändert. Bitte die Vorprüfung auf der Startseite erneut ausführen.",
             "The input folder changed after preflight. Please rerun preflight on the start page.",
-        ), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfung veraltet", "❌ Preflight stale")
+        ), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfung veraltet", "❌ Preflight stale")
 
     all_paths = scan_frame_source_images(input_folder, output_root)
+    workspace, asset_id_by_path = ensure_project_asset_registry(
+        input_folder,
+        trigger_word,
+        image_paths=all_paths,
+        workspace=workspace,
+    )
+
+    def asset_id_for(path: str) -> int:
+        return int(asset_id_by_path.get(os.path.normcase(os.path.abspath(path)), 0) or 0)
+
     early_cache_path = os.path.join(cache_dir, "early_results.json")
     try:
         with open(early_cache_path, "r", encoding="utf-8") as handle:
@@ -4083,7 +4240,7 @@ def scan_frame_review_ui(
         return {}, tr(
             "Die Vorprüfungsdaten fehlen oder sind leer. Bitte die Vorprüfung auf der Startseite erneut ausführen.",
             "Preflight data is missing or empty. Please rerun preflight on the start page.",
-        ), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfungsdaten fehlen", "❌ Preflight data missing")
+        ), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfungsdaten fehlen", "❌ Preflight data missing")
     paths = [
         path for path in all_paths
         if os.path.normcase(os.path.abspath(path)) in survivor_paths
@@ -4106,7 +4263,9 @@ def scan_frame_review_ui(
             source_hash, hash_changed = _frame_hash_with_index_ui(path, hash_index)
             hash_index_dirty = hash_index_dirty or hash_changed
             analysis = analyze_frame_cleanup(path, cache_dir, source_hash=source_hash, settings=settings, use_cache=True)
-            user = user_map.get(source_hash, {}) or {}
+            current_asset_id = asset_id_for(path)
+            user = user_map.get(f"asset:{current_asset_id}", {}) if current_asset_id > 0 else {}
+            user = user or user_map.get(source_hash, {}) or {}
             user_decision = str(user.get("decision", "auto") or "auto")
             display_bbox = user.get("bbox") if user_decision in {"manual", "accept"} else analysis.get("candidate_bbox")
             selected_candidate_index = 0
@@ -4116,6 +4275,7 @@ def scan_frame_review_ui(
                         selected_candidate_index = candidate_index
                         break
             records.append({
+                "asset_id": asset_id_for(path),
                 "source_hash": source_hash,
                 "source_path": path,
                 "filename": os.path.basename(path),
@@ -4137,6 +4297,7 @@ def scan_frame_review_ui(
             })
         except Exception as exc:
             records.append({
+                "asset_id": asset_id_for(path),
                 "source_hash": "",
                 "source_path": path,
                 "filename": os.path.basename(path),
@@ -4151,6 +4312,7 @@ def scan_frame_review_ui(
                 "display_bbox": None,
                 "cache_hit": False,
             })
+    records.sort(key=lambda record: _normalize_asset_id(record.get("asset_id")))
     if hash_index_dirty:
         try:
             _save_frame_hash_index_ui(cache_dir, hash_index)
@@ -4168,7 +4330,7 @@ def scan_frame_review_ui(
     workspace["frame"] = frame_state
     workspace.setdefault("preflight", {})
     workspace.update({
-        "schema_version": "workspace-v1",
+        "schema_version": "workspace-v2-asset-ids",
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "input_folder": os.path.abspath(input_folder),
         "trigger_word": str(trigger_word).strip(),
@@ -4188,14 +4350,45 @@ def scan_frame_review_ui(
     }
     filtered = _frame_filter_records(state, "review")
     pages = _frame_page_choices(len(filtered))
-    gallery = _frame_review_gallery(state, "review", "1")
+    if filtered:
+        record = filtered[0]
+        asset_id = _normalize_asset_id(record.get("asset_id"))
+        current_key = _frame_current_option_key(record, state)
+        detail, bbox = _frame_option_detail(record, current_key)
+        detail += tr(
+            f"  \nDetektor: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · Layout `{record.get('layout_class','plain_photo')}` · Vorschläge `{len(record.get('candidates',[]) or [])}`. "
+            "Die erste sichtbare Aufnahme wurde automatisch für den Vergleich ausgewählt.",
+            f"  \nDetector: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · layout `{record.get('layout_class','plain_photo')}` · suggestions `{len(record.get('candidates',[]) or [])}`. "
+            "The first visible image was selected automatically for comparison.",
+        )
+        option_gallery, option_radio = _frame_option_gallery_update(record, state)
+        position, previous_update, next_update = _frame_viewer_navigation_updates(
+            state, "review", asset_id
+        )
+        gallery = _frame_review_gallery_update(state, "review", "1", asset_id)
+        return (
+            state,
+            _frame_review_summary_md(state),
+            gr.update(choices=pages, value="1"),
+            gallery,
+            asset_id,
+            detail,
+            option_gallery,
+            option_radio,
+            position,
+            previous_update,
+            next_update,
+            int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]),
+            tr(f"✅ {len(records)} Bilder lokal geprüft", f"✅ {len(records)} images checked locally"),
+        )
+
     return (
         state,
         _frame_review_summary_md(state),
         gr.update(choices=pages, value="1"),
-        gallery,
-        "",
-        tr("_Kein Bild ausgewählt._", "_No image selected._"),
+        gr.update(value=[], selected_index=None),
+        0,
+        tr("_Keine Bilder in diesem Filter._", "_No images in this filter._"),
         gr.update(value=[], selected_index=None),
         gr.update(choices=[], value=None),
         tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"),
@@ -4213,10 +4406,41 @@ def refresh_frame_review_page_ui(state: Any, filter_value: str, page_value: Any)
         page = str(min(max(1, int(page_value or 1)), len(choices)))
     except Exception:
         page = "1"
+
+    try:
+        page_start = (int(page) - 1) * FRAME_REVIEW_PAGE_SIZE
+    except Exception:
+        page_start = 0
+    record = records[page_start] if 0 <= page_start < len(records) else None
+    if record:
+        asset_id = _normalize_asset_id(record.get("asset_id"))
+        current_key = _frame_current_option_key(record, state)
+        detail, bbox = _frame_option_detail(record, current_key)
+        detail += tr(
+            "  \nDas erste Bild der gewählten Ansicht wurde automatisch geladen.",
+            "  \nThe first image in the selected view was loaded automatically.",
+        )
+        option_gallery, option_radio = _frame_option_gallery_update(record, state)
+        position, previous_update, next_update = _frame_viewer_navigation_updates(
+            state, filter_value, asset_id
+        )
+        return (
+            gr.update(choices=choices, value=page),
+            _frame_review_gallery_update(state, filter_value, page, asset_id),
+            asset_id,
+            detail,
+            option_gallery,
+            option_radio,
+            position,
+            previous_update,
+            next_update,
+            int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]),
+        )
+
     option_gallery, option_radio = _frame_option_gallery_update(None, state)
     return (
-        gr.update(choices=choices, value=page), _frame_review_gallery(state, filter_value, page),
-        "", tr("_Kein Bild ausgewählt._", "_No image selected._"),
+        gr.update(choices=choices, value=page), gr.update(value=[], selected_index=None),
+        0, tr("_Keine Bilder in dieser Ansicht._", "_No images in this view._"),
         option_gallery, option_radio,
         tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"),
         gr.update(interactive=False), gr.update(interactive=False),
@@ -4224,15 +4448,36 @@ def refresh_frame_review_page_ui(state: Any, filter_value: str, page_value: Any)
     )
 
 
-def select_frame_review_image_ui(state: Any, filter_value: str, page_value: Any, evt: gr.SelectData):
+def _event_index(evt: Any) -> Any:
+    """Read a Gradio selection index without requiring a ``value`` field.
+
+    Gradio 6 may emit programmatic Gallery/Image select events containing only
+    ``index``. Annotating the callback as ``gr.SelectData`` makes Gradio access
+    a missing ``value`` before our callback can run, producing ``KeyError:
+    'value'``. Raw ``gr.EventData`` remains compatible with both automatic and
+    user-triggered events.
+    """
+    index = getattr(evt, "index", None)
+    if index is not None:
+        return index
+    data = getattr(evt, "_data", None)
+    if isinstance(data, dict):
+        return data.get("index")
+    return None
+
+
+def select_frame_review_image_ui(state: Any, filter_value: str, page_value: Any, evt: gr.EventData):
     records = _frame_filter_records(state, filter_value)
     try:
         page = max(1, int(page_value or 1))
-        index = (page - 1) * FRAME_REVIEW_PAGE_SIZE + int(evt.index)
+        event_index = _event_index(evt)
+        if isinstance(event_index, (list, tuple)):
+            event_index = event_index[0]
+        index = (page - 1) * FRAME_REVIEW_PAGE_SIZE + int(event_index)
         record = records[index]
     except Exception:
         empty_gallery, empty_radio = _frame_option_gallery_update(None, state)
-        return "", tr("Auswahl konnte nicht aufgelöst werden.", "Could not resolve selection."), empty_gallery, empty_radio, tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0
+        return 0, tr("Auswahl konnte nicht aufgelöst werden.", "Could not resolve selection."), empty_gallery, empty_radio, tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0
     current_key = _frame_current_option_key(record, state)
     detail, bbox = _frame_option_detail(record, current_key)
     detail += tr(
@@ -4242,26 +4487,27 @@ def select_frame_review_image_ui(state: Any, filter_value: str, page_value: Any,
         "The previews are comparison-only. Choose exactly one option directly underneath; it is applied without a separate save step.",
     )
     option_gallery, option_radio = _frame_option_gallery_update(record, state)
+    asset_id = _normalize_asset_id(record.get("asset_id"))
     position, previous_update, next_update = _frame_viewer_navigation_updates(
-        state, filter_value, record.get("source_hash", "")
+        state, filter_value, asset_id
     )
-    return record.get("source_hash", ""), detail, option_gallery, option_radio, position, previous_update, next_update, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+    return asset_id, detail, option_gallery, option_radio, position, previous_update, next_update, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
 
 
 def navigate_frame_review_image_ui(
     state: Any,
     filter_value: str,
-    source_hash: str,
+    asset_id: Any,
     direction: int,
 ):
-    """Move the comparison viewer to the previous or next filtered image."""
-    records, current_index = _frame_selection_location(state, filter_value, source_hash)
+    """Move the comparison viewer by persistent integer asset ID."""
+    records, current_index = _frame_selection_location(state, filter_value, asset_id)
     if not records:
         empty_gallery, empty_radio = _frame_option_gallery_update(None, state)
         return (
             gr.update(choices=["1"], value="1"),
             gr.update(value=[], selected_index=None),
-            "",
+            0,
             tr("_Kein Bild ausgewählt._", "_No image selected._"),
             empty_gallery,
             empty_radio,
@@ -4286,13 +4532,14 @@ def navigate_frame_review_image_ui(
         "The previews are comparison-only. Choose exactly one option directly underneath.",
     )
     option_gallery, option_radio = _frame_option_gallery_update(record, state)
+    target_asset_id = _normalize_asset_id(record.get("asset_id"))
     position, previous_update, next_update = _frame_viewer_navigation_updates(
-        state, filter_value, record.get("source_hash", "")
+        state, filter_value, target_asset_id
     )
     return (
         gr.update(choices=pages, value=page),
-        _frame_review_gallery_update(state, filter_value, page, record.get("source_hash", "")),
-        record.get("source_hash", ""),
+        _frame_review_gallery_update(state, filter_value, page, target_asset_id),
+        target_asset_id,
         detail,
         option_gallery,
         option_radio,
@@ -4302,11 +4549,11 @@ def navigate_frame_review_image_ui(
         int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]),
     )
 
-def select_frame_candidate_ui(state: Any, filter_value: str, page_value: Any, source_hash: str, candidate_value: Any):
+def select_frame_candidate_ui(state: Any, filter_value: str, page_value: Any, asset_id: Any, candidate_value: Any):
     if isinstance(state, dict):
         state = dict(state)
         state["records"] = [dict(r) for r in (state.get("records", []) or [])]
-    record = _find_frame_record(state, source_hash)
+    record = _find_frame_record(state, asset_id)
     if not record:
         return state, _frame_review_gallery(state, filter_value, page_value), tr("Kein Bild ausgewählt.", "No image selected."), 0, 0, 0, 0
     try:
@@ -4320,7 +4567,7 @@ def select_frame_candidate_ui(state: Any, filter_value: str, page_value: Any, so
         f"**{record.get('filename','')}** – Variante `{int(record['selected_candidate_index']) + 1}` · `{candidate.get('crop_type','unknown')}` · {float(candidate.get('confidence',0)):.1%} · `{bbox}`",
         f"**{record.get('filename','')}** – Variant `{int(record['selected_candidate_index']) + 1}` · `{candidate.get('crop_type','unknown')}` · {float(candidate.get('confidence',0)):.1%} · `{bbox}`",
     )
-    return state, _frame_review_gallery(state, filter_value, page_value), detail, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+    return state, _frame_review_gallery(state, filter_value, page_value, asset_id), detail, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
 
 
 
@@ -4328,12 +4575,12 @@ def apply_frame_option_ui(
     state: Any,
     filter_value: str,
     page_value: Any,
-    source_hash: str,
+    asset_id: Any,
     option_key: Any,
 ):
     """Persist one option immediately and refresh both galleries."""
     option_key = str(option_key or "original")
-    record = _find_frame_record(state, source_hash)
+    record = _find_frame_record(state, asset_id)
     if not record:
         empty_gallery, empty_radio = _frame_option_gallery_update(None, state)
         return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value), tr("Kein Bild ausgewählt.", "No image selected."), empty_gallery, empty_radio, 0, 0, 0, 0, tr("❌ Keine Auswahl", "❌ No selection")
@@ -4343,44 +4590,52 @@ def apply_frame_option_ui(
         # Existing manual choice remains selected; no re-save is needed.
         detail, bbox = _frame_option_detail(record, option_key)
         option_gallery, option_radio = _frame_option_gallery_update(record, state)
-        return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, source_hash), detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), tr("✅ Manueller Crop bleibt aktiv", "✅ Manual crop remains active")
+        return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, asset_id), detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), tr("✅ Manueller Crop bleibt aktiv", "✅ Manual crop remains active")
     elif option_key.startswith("candidate:"):
         decision, candidate_value = "accept", option_key.split(":", 1)[1]
     else:
         decision, candidate_value = "keep_original", None
 
     updated = set_frame_review_decision_ui(
-        state, filter_value, page_value, source_hash, decision, candidate_value,
+        state, filter_value, page_value, asset_id, decision, candidate_value,
         0, 0, 0, 0,
     )
     new_state, summary, main_gallery, _message, status = updated
-    record = _find_frame_record(new_state, source_hash)
+    record = _find_frame_record(new_state, asset_id)
     detail, bbox = _frame_option_detail(record, option_key) if record else (tr("Auswahl gespeichert.", "Selection saved."), [0, 0, 0, 0])
     option_gallery, option_radio = _frame_option_gallery_update(record, new_state)
     return new_state, summary, main_gallery, detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), status
 
 
-def restore_frame_auto_ui(state: Any, filter_value: str, page_value: Any, source_hash: str):
-    record = _find_frame_record(state, source_hash)
+def restore_frame_auto_ui(state: Any, filter_value: str, page_value: Any, asset_id: Any):
+    record = _find_frame_record(state, asset_id)
     if not record:
         empty_gallery, empty_radio = _frame_option_gallery_update(None, state)
         return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value), tr("Kein Bild ausgewählt.", "No image selected."), empty_gallery, empty_radio, 0, 0, 0, 0, tr("❌ Keine Auswahl", "❌ No selection")
     width, height = record.get("original_size") or [0, 0]
-    updated = set_frame_review_decision_ui(state, filter_value, page_value, source_hash, "auto", None, 0, 0, width, height)
+    updated = set_frame_review_decision_ui(state, filter_value, page_value, asset_id, "auto", None, 0, 0, width, height)
     new_state, summary, main_gallery, _message, status = updated
-    record = _find_frame_record(new_state, source_hash)
+    record = _find_frame_record(new_state, asset_id)
     key = _frame_current_option_key(record or {}, new_state)
     detail, bbox = _frame_option_detail(record or {}, key)
     option_gallery, option_radio = _frame_option_gallery_update(record, new_state)
     return new_state, summary, main_gallery, detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), status
 
 
-def _find_frame_record(state: Any, source_hash: str) -> Optional[Dict[str, Any]]:
+def _find_frame_record(state: Any, asset_id: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(state, dict):
         return None
-    for record in state.get("records", []) or []:
-        if str(record.get("source_hash", "")) == str(source_hash or ""):
-            return record
+    selected = _normalize_asset_id(asset_id)
+    if selected > 0:
+        for record in state.get("records", []) or []:
+            if _normalize_asset_id(record.get("asset_id")) == selected:
+                return record
+    # Migration fallback only; newly built frame states always use asset_id.
+    legacy_hash = str(asset_id or "")
+    if legacy_hash:
+        for record in state.get("records", []) or []:
+            if str(record.get("source_hash", "")) == legacy_hash:
+                return record
     return None
 
 
@@ -4401,6 +4656,7 @@ def _mark_frame_audit_dependency_stale(output_root: str, record: Dict[str, Any],
     from profile is blocked until that targeted re-audit has happened.
     """
     marker = {
+        "source_asset_id": _normalize_asset_id(record.get("asset_id")),
         "source_hash": str(record.get("source_hash", "")),
         "source_path": os.path.abspath(str(record.get("source_path", ""))),
         "filename": str(record.get("filename", "")),
@@ -4417,9 +4673,9 @@ def _mark_frame_audit_dependency_stale(output_root: str, record: Dict[str, Any],
         existing = payload.get("audit_stale_images", [])
         if not isinstance(existing, list):
             existing = []
-        key = marker["source_hash"] or marker["source_path"] or marker["filename"]
+        key = str(marker["source_asset_id"] or marker["source_hash"] or marker["source_path"] or marker["filename"])
         by_key = {
-            str(item.get("source_hash") or item.get("source_path") or item.get("filename") or ""): item
+            str(item.get("source_asset_id") or item.get("source_hash") or item.get("source_path") or item.get("filename") or ""): item
             for item in existing if isinstance(item, dict)
         }
         by_key[key] = marker
@@ -4434,7 +4690,7 @@ def set_frame_review_decision_ui(
     state: Any,
     filter_value: str,
     page_value: Any,
-    source_hash: str,
+    asset_id: Any,
     decision: str,
     candidate_value: Any,
     x1: Any, y1: Any, x2: Any, y2: Any,
@@ -4442,7 +4698,7 @@ def set_frame_review_decision_ui(
     if isinstance(state, dict):
         state = dict(state)
         state["records"] = [dict(r) for r in (state.get("records", []) or [])]
-    record = _find_frame_record(state, source_hash)
+    record = _find_frame_record(state, asset_id)
     if not record:
         return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value), tr("Kein Bild ausgewählt.", "No image selected."), tr("❌ Keine Auswahl", "❌ No selection")
     bbox = None
@@ -4450,16 +4706,17 @@ def set_frame_review_decision_ui(
         bbox = [int(x1), int(y1), int(x2), int(y2)]
         width, height = record.get("original_size") or frame_image_dimensions(record["source_path"])
         if not (0 <= bbox[0] < bbox[2] <= int(width) and 0 <= bbox[1] < bbox[3] <= int(height)):
-            return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, source_hash), tr("Ungültige Crop-Koordinaten.", "Invalid crop coordinates."), tr("❌ Ungültiger Crop", "❌ Invalid crop")
+            return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, asset_id), tr("Ungültige Crop-Koordinaten.", "Invalid crop coordinates."), tr("❌ Ungültiger Crop", "❌ Invalid crop")
     elif decision == "accept":
         bbox = _frame_candidate_bbox(record, candidate_value)
         if not isinstance(bbox, list) or len(bbox) != 4:
-            return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, source_hash), tr("Kein Crop-Vorschlag vorhanden.", "No crop suggestion available."), tr("❌ Kein Vorschlag", "❌ No suggestion")
+            return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, asset_id), tr("Kein Crop-Vorschlag vorhanden.", "No crop suggestion available."), tr("❌ Kein Vorschlag", "❌ No suggestion")
 
     old_decision = str(record.get("user_decision", "auto") or "auto")
     old_bbox = record.get("display_bbox") if old_decision in {"accept", "manual"} else None
     save_frame_user_decision(
-        state["output_root"], record["source_hash"], record["source_path"], decision, bbox=bbox
+        state["output_root"], record["source_hash"], record["source_path"], decision,
+        bbox=bbox, asset_id=_normalize_asset_id(record.get("asset_id"))
     )
     new_effective_bbox = bbox if decision in {"accept", "manual"} else None
     if old_decision != decision or old_bbox != new_effective_bbox:
@@ -4482,11 +4739,11 @@ def set_frame_review_decision_ui(
         "keep_original": tr("Original wird beibehalten.", "Original will be kept."),
         "auto": tr("Manuelle Entscheidung entfernt; Automatik gilt wieder.", "Manual decision removed; automatic behavior restored."),
     }.get(decision, decision)
-    return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, source_hash), message, f"✅ {message}"
+    return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, asset_id), message, f"✅ {message}"
 
 
-def preview_manual_frame_crop_ui(state: Any, source_hash: str, x1: Any, y1: Any, x2: Any, y2: Any):
-    record = _find_frame_record(state, source_hash)
+def preview_manual_frame_crop_ui(state: Any, asset_id: Any, x1: Any, y1: Any, x2: Any, y2: Any):
+    record = _find_frame_record(state, asset_id)
     if not record:
         return None, tr("Kein Bild ausgewählt.", "No image selected.")
     try:
@@ -4513,6 +4770,7 @@ def _manual_crop_marker_base(record: Optional[Dict[str, Any]]) -> Tuple[Optional
         return None, {}
     original_width, original_height = record.get("original_size") or frame_image_dimensions(record["source_path"])
     return preview, {
+        "asset_id": _normalize_asset_id(record.get("asset_id")),
         "source_hash": str(record.get("source_hash", "")),
         "preview_size": [int(preview.width), int(preview.height)],
         "original_size": [int(original_width), int(original_height)],
@@ -4520,9 +4778,9 @@ def _manual_crop_marker_base(record: Optional[Dict[str, Any]]) -> Tuple[Optional
     }
 
 
-def load_manual_crop_marker_ui(state: Any, source_hash: str):
+def load_manual_crop_marker_ui(state: Any, asset_id: Any):
     """Load a bounded original preview for the two-click crop marker."""
-    record = _find_frame_record(state, source_hash)
+    record = _find_frame_record(state, asset_id)
     preview, marker_state = _manual_crop_marker_base(record)
     if preview is None:
         return None, {}, tr(
@@ -4535,19 +4793,19 @@ def load_manual_crop_marker_ui(state: Any, source_hash: str):
     )
 
 
-def reset_manual_crop_marker_ui(state: Any, source_hash: str):
-    preview, marker_state, status = load_manual_crop_marker_ui(state, source_hash)
+def reset_manual_crop_marker_ui(state: Any, asset_id: Any):
+    preview, marker_state, status = load_manual_crop_marker_ui(state, asset_id)
     return preview, marker_state, 0, 0, 0, 0, None, status
 
 
 def mark_manual_crop_point_ui(
     state: Any,
-    source_hash: str,
+    asset_id: Any,
     marker_state: Any,
-    evt: gr.SelectData,
+    evt: gr.EventData,
 ):
     """Convert two clicks on a bounded preview into original-image crop bounds."""
-    record = _find_frame_record(state, source_hash)
+    record = _find_frame_record(state, asset_id)
     if not record:
         return None, {}, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), tr(
             "Kein Bild ausgewählt.", "No image selected."
@@ -4561,14 +4819,17 @@ def mark_manual_crop_point_ui(
         )
 
     current = dict(marker_state or {}) if isinstance(marker_state, dict) else {}
-    if current.get("source_hash") != source_hash:
+    if current.get("asset_id") != _normalize_asset_id(asset_id):
         current = fresh_state
     points = list(current.get("points") or [])
     if len(points) >= 2:
         points = []
 
     try:
-        click_x, click_y = evt.index
+        event_index = _event_index(evt)
+        if not isinstance(event_index, (list, tuple)) or len(event_index) < 2:
+            raise ValueError("missing image click coordinates")
+        click_x, click_y = event_index[:2]
         click_x = max(0, min(int(click_x), preview.width - 1))
         click_y = max(0, min(int(click_y), preview.height - 1))
     except Exception:
@@ -4749,7 +5010,7 @@ def initialize_workspace_ui(
     workspace = load_project_workspace(input_folder, trigger_word)
     workspace = dict(workspace or {})
     workspace.update({
-        "schema_version": "workspace-v1",
+        "schema_version": "workspace-v2-asset-ids",
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "input_folder": os.path.abspath(input_folder),
         "trigger_word": trigger_word,
@@ -4764,6 +5025,13 @@ def initialize_workspace_ui(
         "preflight": dict(workspace.get("preflight") or {}),
     })
     core_atomic_write_json(os.path.join(output_root, "_project_workspace.json"), workspace)
+    initial_images = scan_preflight_images(input_folder, output_root)
+    workspace, _asset_id_map = ensure_project_asset_registry(
+        input_folder,
+        trigger_word,
+        image_paths=initial_images,
+        workspace=workspace,
+    )
     # Persist the project context without rewriting the 90-field runtime contract.
     settings = load_settings()
     settings.update({
@@ -5175,7 +5443,7 @@ def build_ui() -> gr.Blocks:
                 fr_status = gr.Textbox(label=tr("Status", "Status"), interactive=False, max_lines=1)
                 fr_summary = gr.Markdown(tr("Noch keine Rahmenanalyse geladen.", "No frame analysis loaded yet."))
                 fr_state = gr.State({})
-                fr_selected_hash = gr.State("")
+                fr_selected_asset_id = gr.State(0)
                 with gr.Row():
                     fr_filter = gr.Dropdown(
                         label=tr("Anzeige", "View"),
@@ -5185,11 +5453,16 @@ def build_ui() -> gr.Blocks:
                     )
                     fr_page = gr.Dropdown(label=tr("Seite", "Page"), choices=["1"], value="1", allow_custom_value=False)
                 fr_gallery = gr.Gallery(
-                    label=tr("Original links – gewählter Crop rechts", "Original left – selected crop right"),
-                    columns=2,
+                    label=tr(
+                        "Bildauswahl nach eindeutiger ID – Original links, gewählter Crop rechts",
+                        "Image selection by unique ID – original left, selected crop right",
+                    ),
+                    columns=6,
                     rows=3,
-                    height=720,
+                    height=620,
                     object_fit="contain",
+                    allow_preview=False,
+                    selected_index=None,
                 )
                 fr_selected_info = gr.Markdown(tr("_Kein Bild ausgewählt._", "_No image selected._"))
                 gr.Markdown(tr(
@@ -5236,7 +5509,7 @@ def build_ui() -> gr.Blocks:
                 )
                 with gr.Row():
                     fr_auto_btn = gr.Button(tr("Automatische Entscheidung wiederherstellen", "Restore automatic decision"), variant="secondary")
-                with gr.Accordion(tr("Manueller Crop – zwei Klicks oder Koordinaten", "Manual crop – two clicks or coordinates"), open=False):
+                with gr.Accordion(tr("✂ Manueller Crop – zwei Klicks oder Koordinaten", "✂ Manual crop – two clicks or coordinates"), open=True):
                     gr.Markdown(tr(
                         "Setze im Originalbild zwei diagonal gegenüberliegende Eckpunkte. Ein dritter Klick beginnt automatisch eine neue Auswahl.",
                         "Set two diagonally opposite corner points in the original image. A third click automatically starts a new selection.",
@@ -6406,8 +6679,8 @@ def build_ui() -> gr.Blocks:
                     )
 
                     gr.Markdown(tr(
-                        "**Weiche Canon-Repräsentation:** Nach Bestätigung des Subject Profiles erhält die gewählte kanonische Haarfarbe einen abnehmenden Auswahlbonus. Die Headshot-/Medium-/Full-Body-Quoten bleiben unverändert. Review- und Reject-Bilder werden durch den Canon-Bonus niemals automatisch hochgesetzt; eine ausdrückliche Priority-Markierung bleibt davon unberührt.",
-                        "**Soft canon representation:** After the Subject Profile is confirmed, the selected canonical hair color receives a diminishing selection bonus. Headshot/medium/full-body quotas remain unchanged. Review and reject images are never promoted automatically by the canon bonus; an explicit Priority override remains unaffected.",
+                        "**Weiche Canon-Repräsentation:** Nach Bestätigung des Subject Profiles erhält die gewählte kanonische Haarfarbe einen abnehmenden Auswahlbonus. Die Headshot-/Medium-/Full-Body-Quoten bleiben unverändert. Review- und Reject-Bilder werden durch den Canon-Bonus niemals automatisch hochgesetzt; eine ausdrückliche Favoriten-Markierung bleibt davon unberührt.",
+                        "**Soft canon representation:** After the Subject Profile is confirmed, the selected canonical hair color receives a diminishing selection bonus. Headshot/medium/full-body quotas remain unchanged. Review and reject images are never promoted automatically by the canon bonus; an explicit Favorite override remains unaffected.",
                     ))
                     c_use_canon_representation = gr.Checkbox(
                         label=tr("Canon-Repräsentation bei der Auswahl fördern", "Promote canon representation during selection"),
@@ -7403,8 +7676,8 @@ def build_ui() -> gr.Blocks:
                     with gr.TabItem(tr("🧩 Identity Clustering", "🧩 Identity clustering")):
                         p_cluster_md = gr.Markdown("_kein Profil geladen_")
                         gr.Markdown(tr(
-                            "`core` gibt einen kleinen Ranking-Boost. `variation` und `body_reference` bleiben Trainingskandidaten. `review` und `exclude` gehen nicht in `01_train_ready`. Vollständig auditierte Rejects stehen immer im letzten Bucket, beginnen als `exclude`, und zeigen den Reject-Grund direkt am Bild. Ein einzelnes Bild kann aus seinem Bucket gelöst oder als Priority zwingend in Train Ready übernommen werden.",
-                            "`core` gives a small ranking boost. `variation` and `body_reference` remain training candidates. `review` and `exclude` do not go to `01_train_ready`. Fully audited rejects always appear in the last bucket, start as `exclude`, and show the reject reason on each image. An individual image can be detached from its bucket or forced into Train Ready as Priority.",
+                            "`core` gibt einen kleinen Ranking-Boost. `variation` und `body_reference` bleiben Trainingskandidaten. `review` und `exclude` gehen nicht in `01_train_ready`. Vollständig auditierte Rejects stehen immer im letzten Bucket, beginnen als `exclude`, und zeigen den Reject-Grund direkt am Bild. Ein einzelnes Bild kann über seine Asset-ID sicher aus dem Bucket gelöst oder als Favorit zwingend in Train Ready übernommen werden.",
+                            "`core` gives a small ranking boost. `variation` and `body_reference` remain training candidates. `review` and `exclude` do not go to `01_train_ready`. Fully audited rejects always appear in the last bucket, start as `exclude`, and show the reject reason on each image. An individual image can be moved safely by its asset ID or forced into Train Ready as a favorite.",
                         ))
                         with gr.Row():
                             with gr.Column(scale=3):
@@ -7456,19 +7729,11 @@ def build_ui() -> gr.Blocks:
                                 p_selected_cluster_image_info = gr.Markdown(tr("_Kein Bild ausgewählt._", "_No image selected._"))
                                 with gr.Row():
                                     p_detach_cluster_image_btn = gr.Button(tr("↗ Bild aus Bucket lösen", "↗ Detach image from bucket"), variant="secondary", scale=2)
-                                    p_priority_image_btn = gr.Button(tr("⭐ Als Priority markieren", "⭐ Mark as Priority"), variant="primary", scale=2)
-                                    p_unpriority_image_btn = gr.Button(tr("☆ Priority entfernen", "☆ Remove Priority"), variant="secondary", scale=2)
-                                p_priority_hazard_confirm = gr.Checkbox(
-                                    label=tr("Problematisches Priority-Bild trotzdem bestätigen", "Confirm problematic Priority image anyway"),
-                                    value=False,
-                                    info=tr(
-                                        "Nur nötig bei Duplikat-, Mehrpersonen-, ArcFace-Hard- oder technischen Warnungen.",
-                                        "Only needed for duplicate, multi-person, ArcFace-hard or technical warnings.",
-                                    ),
-                                )
+                                    p_priority_image_btn = gr.Button(tr("⭐ Zu Favoriten hinzufügen", "⭐ Add to favorites"), variant="primary", scale=2)
+                                    p_unpriority_image_btn = gr.Button(tr("☆ Favorit entfernen", "☆ Remove favorite"), variant="secondary", scale=2)
                                 gr.Markdown(tr(
-                                    "**Priority** überschreibt Qualitätswert, ArcFace, Bucket-Rolle, Quoten, Dubletten- und Caption-Remove-Entscheidungen. Problematische Fälle verlangen vorab die Bestätigung oben.",
-                                    "**Priority** overrides quality, ArcFace, bucket role, quotas, duplicate and caption-remove decisions. Problematic cases require the confirmation above first.",
+                                    "**Favoriten** werden mit goldenem Rahmen und Stern markiert. Sie überschreiben Qualitätswert, ArcFace, Bucket-Rolle, Quoten, Dubletten- und Caption-Remove-Entscheidungen und werden zwingend in Train Ready übernommen.",
+                                    "**Favorites** are marked with a gold frame and star. They override quality, ArcFace, bucket role, quotas, duplicate and caption-remove decisions and are forced into Train Ready.",
                                 ))
 
                     # ----- Subtab: Diagnostics -----
@@ -7584,12 +7849,12 @@ def build_ui() -> gr.Blocks:
                 )
 
                 p_priority_image_btn.click(
-                    fn=lambda t, i, p, c, img, pg, confirm: set_selected_image_priority_ui(t, i, p, c, img, pg, True, confirm),
-                    inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_selected_cluster_image_id, p_cluster_gallery_page, p_priority_hazard_confirm],
+                    fn=lambda t, i, p, c, img, pg: set_selected_image_priority_ui(t, i, p, c, img, pg, True),
+                    inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_selected_cluster_image_id, p_cluster_gallery_page],
                     outputs=[p_state, p_raw_json, p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_image_info, p_status],
                 )
                 p_unpriority_image_btn.click(
-                    fn=lambda t, i, p, c, img, pg: set_selected_image_priority_ui(t, i, p, c, img, pg, False, False),
+                    fn=lambda t, i, p, c, img, pg: set_selected_image_priority_ui(t, i, p, c, img, pg, False),
                     inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_selected_cluster_image_id, p_cluster_gallery_page],
                     outputs=[p_state, p_raw_json, p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_image_info, p_status],
                 )
@@ -7904,80 +8169,107 @@ def build_ui() -> gr.Blocks:
             fr_scan_btn.click(
                 fn=scan_frame_review_ui,
                 inputs=[w_trigger, w_input, w_frame_advanced],
-                outputs=[fr_state, fr_summary, fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
+                outputs=[fr_state, fr_summary, fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
                 concurrency_id="frame_review_local",
+            ).then(
+                fn=load_manual_crop_marker_ui,
+                inputs=[fr_state, fr_selected_asset_id],
+                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
+                show_progress="hidden",
             )
             fr_filter.change(
                 fn=refresh_frame_review_page_ui,
                 inputs=[fr_state, fr_filter, fr_page],
-                outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+                outputs=[fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+                show_progress="hidden",
+            ).then(
+                fn=load_manual_crop_marker_ui,
+                inputs=[fr_state, fr_selected_asset_id],
+                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
                 show_progress="hidden",
             )
             fr_page.input(
                 fn=refresh_frame_review_page_ui,
                 inputs=[fr_state, fr_filter, fr_page],
-                outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+                outputs=[fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+                show_progress="hidden",
+            ).then(
+                fn=load_manual_crop_marker_ui,
+                inputs=[fr_state, fr_selected_asset_id],
+                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
                 show_progress="hidden",
             )
             fr_gallery.select(
                 fn=select_frame_review_image_ui,
                 inputs=[fr_state, fr_filter, fr_page],
-                outputs=[fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+                outputs=[fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+            ).then(
+                fn=load_manual_crop_marker_ui,
+                inputs=[fr_state, fr_selected_asset_id],
+                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
+                show_progress="hidden",
             )
             fr_previous_btn.click(
                 fn=lambda st, flt, sid: navigate_frame_review_image_ui(st, flt, sid, -1),
-                inputs=[fr_state, fr_filter, fr_selected_hash],
-                outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+                inputs=[fr_state, fr_filter, fr_selected_asset_id],
+                outputs=[fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+                show_progress="hidden",
+            ).then(
+                fn=load_manual_crop_marker_ui,
+                inputs=[fr_state, fr_selected_asset_id],
+                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
                 show_progress="hidden",
             )
             fr_next_btn.click(
                 fn=lambda st, flt, sid: navigate_frame_review_image_ui(st, flt, sid, 1),
-                inputs=[fr_state, fr_filter, fr_selected_hash],
-                outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+                inputs=[fr_state, fr_filter, fr_selected_asset_id],
+                outputs=[fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
+                show_progress="hidden",
+            ).then(
+                fn=load_manual_crop_marker_ui,
+                inputs=[fr_state, fr_selected_asset_id],
+                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
                 show_progress="hidden",
             )
             fr_option_radio.input(
                 fn=apply_frame_option_ui,
-                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_option_radio],
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_asset_id, fr_option_radio],
                 outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_option_gallery, fr_option_radio, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
                 show_progress="hidden",
             )
             fr_auto_btn.click(
                 fn=restore_frame_auto_ui,
-                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash],
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_asset_id],
                 outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_option_gallery, fr_option_radio, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
                 show_progress="hidden",
             )
-            fr_selected_hash.change(
-                fn=load_manual_crop_marker_ui,
-                inputs=[fr_state, fr_selected_hash],
-                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
-                show_progress="hidden",
-            )
+            # The manual marker is refreshed explicitly after every action
+            # that can change the selected frame. This is more reliable than
+            # depending on a chained State.change event during initial loading.
             fr_manual_click_image.select(
                 fn=mark_manual_crop_point_ui,
-                inputs=[fr_state, fr_selected_hash, fr_manual_click_state],
+                inputs=[fr_state, fr_selected_asset_id, fr_manual_click_state],
                 outputs=[fr_manual_click_image, fr_manual_click_state, fr_x1, fr_y1, fr_x2, fr_y2, fr_manual_preview, fr_manual_status],
                 show_progress="hidden",
             )
             fr_reset_manual_click_btn.click(
                 fn=reset_manual_crop_marker_ui,
-                inputs=[fr_state, fr_selected_hash],
+                inputs=[fr_state, fr_selected_asset_id],
                 outputs=[fr_manual_click_image, fr_manual_click_state, fr_x1, fr_y1, fr_x2, fr_y2, fr_manual_preview, fr_manual_status],
                 show_progress="hidden",
             )
             fr_preview_manual_btn.click(
                 fn=preview_manual_frame_crop_ui,
-                inputs=[fr_state, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2],
+                inputs=[fr_state, fr_selected_asset_id, fr_x1, fr_y1, fr_x2, fr_y2],
                 outputs=[fr_manual_preview, fr_manual_status],
             )
             fr_accept_manual_btn.click(
                 fn=lambda st, flt, pg, sid, a, b, c, d: set_frame_review_decision_ui(st, flt, pg, sid, "manual", None, a, b, c, d),
-                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2],
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_asset_id, fr_x1, fr_y1, fr_x2, fr_y2],
                 outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_status],
             ).then(
                 fn=lambda st, sid: _frame_option_gallery_update(_find_frame_record(st, sid), st),
-                inputs=[fr_state, fr_selected_hash],
+                inputs=[fr_state, fr_selected_asset_id],
                 outputs=[fr_option_gallery, fr_option_radio],
                 show_progress="hidden",
             )

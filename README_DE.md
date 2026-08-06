@@ -21,7 +21,7 @@
 Der Bild-Curator folgt in der UI der tatsächlichen Verarbeitungsreihenfolge:
 
 1. **Start / Project** — Bildordner, Trigger Word und API-Key festlegen.
-2. **Preflight** — lokale Datei- und pHash-Duplikatprüfungen ausführen. Dabei wird keine OpenAI-Anfrage gestellt.
+2. **Preflight** — lokale Datei- und pHash-Duplikatprüfungen ausführen. Dabei wird keine OpenAI-Anfrage gestellt. Bereits bei der Projektinitialisierung erhält jedes Quellbild eine persistente ganzzahlige Bild-ID; die Rahmennavigation verwendet diese ID statt Dateinamen oder Galeriepositionen.
 3. **Frames** *(optional)* — lokale Crop-Vorschläge prüfen, Original behalten oder manuellen Crop definieren.
 4. **Audit & Selection** — Qualitäts-, Identitäts-, Diversitäts- und Captioning-Verarbeitung starten.
 5. **Subject Profile** — bei `Profile then Caption` das Profil prüfen oder bei `Single Pass` automatisch fortfahren lassen.
@@ -74,7 +74,7 @@ python dataset_curator_ui.py
 3. Optional in **Frames** einen lokalen Crop-Vorschlag auswählen, das Original beibehalten oder mit zwei Klicks auf diagonal gegenüberliegende Ecken einen rechteckigen manuellen Crop markieren.
 4. In **Audit & Selection** Trainingsziel auswählen und die gewünschten Audit-, Identitäts-, Diversitäts- und Captioning-Einstellungen festlegen.
    - **Single Pass** erstellt das Profil und beendet den Workflow automatisch.
-   - **Profile then Caption** pausiert nach der Profilerstellung, damit kanonische Merkmale, Cluster, Priority Images und Caption-Policies geprüft werden können.
+   - **Profile then Caption** pausiert nach der Profilerstellung, damit kanonische Merkmale, Cluster, Favoriten und Caption-Policies geprüft werden können.
 5. Ergebnisse in `curated_<trigger>/` prüfen. Die wichtigsten Ordner sind:
    - `01_train_ready` — exportierte Trainingsbilder und Captions
    - `02_keep_unused` — gute, aber nicht für die Zielgröße ausgewählte Bilder

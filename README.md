@@ -21,7 +21,7 @@
 The image curator follows the processing order in the UI:
 
 1. **Start / Project** — set the image folder, trigger word, and API key.
-2. **Preflight** — run local file and pHash duplicate checks. No OpenAI request is made.
+2. **Preflight** — run local file and pHash duplicate checks. No OpenAI request is made. Every source image already receives a persistent integer asset ID during project initialization; frame navigation uses that ID instead of filenames or gallery positions.
 3. **Frames** *(optional)* — inspect local crop suggestions, keep the original, or define a manual crop.
 4. **Audit & Selection** — run quality, identity, diversity, and caption processing.
 5. **Subject Profile** — review the profile when using `Profile then Caption`, or let `Single Pass` continue automatically.
@@ -74,7 +74,7 @@ python dataset_curator_ui.py
 3. Optionally use **Frames** to choose a local crop suggestion, retain the original, or mark a rectangular manual crop with two clicks on diagonally opposite corners.
 4. In **Audit & Selection**, choose the training target and configure the desired audit, identity, diversity, and caption settings.
    - **Single Pass** creates the profile and completes the workflow.
-   - **Profile then Caption** pauses after profile generation so you can review canonical traits, clusters, priority images, and caption policies.
+   - **Profile then Caption** pauses after profile generation so you can review canonical traits, clusters, favorites, and caption policies.
 5. Review the result in `curated_<trigger>/`. Key folders include:
    - `01_train_ready` — exported images and captions for training
    - `02_keep_unused` — good images not selected for the target size
