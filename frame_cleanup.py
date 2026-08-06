@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import threading
 import time
 import warnings
 from collections import Counter
@@ -46,7 +47,16 @@ try:
 except Exception:  # pragma: no cover
     cv2 = None
 
-FRAME_DETECTOR_SCHEMA_VERSION = "smart-frame-v4-nested-options"
+try:
+    import mediapipe as mp  # type: ignore
+except Exception:  # pragma: no cover - optional runtime safety enhancement
+    mp = None
+
+_MP_POSE = None
+_MP_POSE_INIT_ATTEMPTED = False
+_MP_POSE_LOCK = threading.Lock()
+
+FRAME_DETECTOR_SCHEMA_VERSION = "smart-frame-v5-subject-safe-canvas-ranking"
 FRAME_USER_DECISION_SCHEMA_VERSION = "v2-asset-id"
 FRAME_DECISION_FILENAME = "_frame_cleanup_decisions.json"
 FRAME_CACHE_SUBDIR = "frame_cleanup"
@@ -410,23 +420,184 @@ def _detect_face_boxes(preview: Image.Image) -> List[Tuple[int, int, int, int]]:
         return []
 
 
-def _bbox_preserves_faces(bbox: List[int], faces: List[Tuple[int, int, int, int]]) -> Tuple[bool, List[str]]:
-    x1, y1, x2, y2 = bbox
+def _get_pose_detector():
+    """Lazily create MediaPipe Pose for crop-safety checks.
+
+    The frame remover remains fully functional without MediaPipe. When it is
+    available (it is part of the normal project requirements), pose landmarks
+    are used only as a hard protection region. They never increase a crop
+    score and therefore never reward tighter portraits.
+    """
+    global _MP_POSE, _MP_POSE_INIT_ATTEMPTED
+    if _MP_POSE_INIT_ATTEMPTED:
+        return _MP_POSE
+    _MP_POSE_INIT_ATTEMPTED = True
+    if mp is None:
+        return None
+    try:
+        _MP_POSE = mp.solutions.pose.Pose(
+            static_image_mode=True,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.45,
+            min_tracking_confidence=0.45,
+        )
+    except Exception:
+        _MP_POSE = None
+    return _MP_POSE
+
+
+def _detect_subject_regions(
+    preview: Image.Image,
+    faces: List[Tuple[int, int, int, int]],
+) -> Tuple[List[List[int]], List[str]]:
+    """Return conservative regions that must remain inside a crop.
+
+    Face boxes are protected exactly with a small margin. MediaPipe pose, when
+    available, protects the visible body with a generous margin. No region is
+    used as a positive ranking signal; it can only reject or demote a crop.
+    """
+    width, height = preview.size
+    regions: List[List[int]] = []
+    sources: List[str] = []
+
+    # Face protection is deliberately local. Expanding a face into an imagined
+    # full body would block valid story-bar removal and would still be a guess.
+    # Body protection is handled by actual pose landmarks below.
+    for x, y, fw, fh in faces:
+        pad_x = max(4, int(round(fw * 0.18)))
+        pad_y = max(4, int(round(fh * 0.22)))
+        regions.append([
+            max(0, x - pad_x),
+            max(0, y - pad_y),
+            min(width, x + fw + pad_x),
+            min(height, y + fh + pad_y),
+        ])
+        sources.append("face")
+
+    pose = _get_pose_detector()
+    if pose is not None:
+        try:
+            rgb = np.asarray(preview.convert("RGB"), dtype=np.uint8)
+            with _MP_POSE_LOCK:
+                result = pose.process(rgb)
+            landmarks = getattr(result, "pose_landmarks", None)
+            if landmarks is not None:
+                xs: List[float] = []
+                ys: List[float] = []
+                for landmark in landmarks.landmark:
+                    visibility = float(getattr(landmark, "visibility", 0.0) or 0.0)
+                    if visibility < 0.35:
+                        continue
+                    lx = float(getattr(landmark, "x", -1.0))
+                    ly = float(getattr(landmark, "y", -1.0))
+                    if -0.05 <= lx <= 1.05 and -0.05 <= ly <= 1.05:
+                        xs.append(lx * width)
+                        ys.append(ly * height)
+                if len(xs) >= 8:
+                    raw_x1, raw_x2 = min(xs), max(xs)
+                    raw_y1, raw_y2 = min(ys), max(ys)
+                    body_w = max(1.0, raw_x2 - raw_x1)
+                    body_h = max(1.0, raw_y2 - raw_y1)
+                    pad_x = max(8, int(round(max(width * 0.025, body_w * 0.12))))
+                    pad_y = max(8, int(round(max(height * 0.018, body_h * 0.10))))
+                    regions.append([
+                        max(0, int(math.floor(raw_x1)) - pad_x),
+                        max(0, int(math.floor(raw_y1)) - pad_y),
+                        min(width, int(math.ceil(raw_x2)) + pad_x),
+                        min(height, int(math.ceil(raw_y2)) + pad_y),
+                    ])
+                    sources.append("pose")
+        except Exception:
+            pass
+
+    return regions, sources
+
+
+def _bbox_preserves_subject(
+    bbox: List[int],
+    subject_regions: List[List[int]],
+    region_sources: Optional[List[str]] = None,
+) -> Tuple[bool, List[str]]:
+    x1, y1, x2, y2 = [int(v) for v in bbox]
     flags: List[str] = []
-    for x, y, width, height in faces:
-        fx1, fy1, fx2, fy2 = x, y, x + width, y + height
-        intersection = max(0, min(x2, fx2) - max(x1, fx1)) * max(0, min(y2, fy2) - max(y1, fy1))
-        area = max(1, width * height)
-        if intersection / float(area) < 0.92:
-            flags.append("candidate_may_cut_detected_face")
+    sources = list(region_sources or [])
+    for index, region in enumerate(subject_regions):
+        if not isinstance(region, list) or len(region) != 4:
+            continue
+        rx1, ry1, rx2, ry2 = [int(v) for v in region]
+        source = sources[index] if index < len(sources) else "subject"
+        if x1 > rx1 or y1 > ry1 or x2 < rx2 or y2 < ry2:
+            flags.append(f"candidate_may_cut_{source}")
     return not flags, flags
+
+
+def _candidate_edge_canvas_waste(img: np.ndarray, bbox: List[int]) -> Tuple[float, Dict[str, float]]:
+    """Estimate artificial canvas still touching a candidate's edges.
+
+    This is a weak ranking signal only. It rewards removal of residual flat
+    canvas but never rewards a larger face or a tighter subject crop. A band is
+    considered suspicious only when it is both low-detail and separated from
+    the adjacent inner band by a meaningful texture/seam transition.
+    """
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 40 or y2 - y1 < 40:
+        return 1.0, {side: 1.0 for side in ("left", "right", "top", "bottom")}
+    crop = img[y1:y2, x1:x2]
+    gray = crop.mean(axis=2)
+    gx = np.abs(np.diff(gray, axis=1))
+    gy = np.abs(np.diff(gray, axis=0))
+    edge = np.zeros_like(gray, dtype=np.float32)
+    edge[:, :-1] += gx
+    edge[:-1, :] += gy
+    edge = (edge > 18).astype(np.float32)
+    ch, cw = gray.shape
+    band_x = max(4, min(36, int(round(cw * 0.055))))
+    band_y = max(4, min(36, int(round(ch * 0.055))))
+
+    def side_score(side: str) -> float:
+        if side == "left":
+            outer = edge[:, :band_x]
+            inner = edge[:, band_x:min(cw, band_x * 2)]
+            boundary = gx[:, min(cw - 2, band_x - 1)] if cw > 1 else np.zeros(ch)
+        elif side == "right":
+            outer = edge[:, max(0, cw - band_x):]
+            inner = edge[:, max(0, cw - band_x * 2):max(1, cw - band_x)]
+            boundary = gx[:, max(0, cw - band_x - 1)] if cw > 1 else np.zeros(ch)
+        elif side == "top":
+            outer = edge[:band_y, :]
+            inner = edge[band_y:min(ch, band_y * 2), :]
+            boundary = gy[min(ch - 2, band_y - 1), :] if ch > 1 else np.zeros(cw)
+        else:
+            outer = edge[max(0, ch - band_y):, :]
+            inner = edge[max(0, ch - band_y * 2):max(1, ch - band_y), :]
+            boundary = gy[max(0, ch - band_y - 1), :] if ch > 1 else np.zeros(cw)
+        if outer.size == 0 or inner.size == 0:
+            return 0.0
+        outer_edge = float(np.mean(outer))
+        inner_edge = float(np.mean(inner))
+        flatness = float(np.clip(1.0 - outer_edge / 0.18, 0.0, 1.0))
+        texture_gain = float(np.clip((inner_edge - outer_edge) / 0.13, 0.0, 1.0))
+        seam = float(np.clip((float(np.mean(boundary)) - 3.0) / 24.0, 0.0, 1.0))
+        transition = max(texture_gain, seam)
+        return float(np.clip(flatness * (0.20 + 0.80 * transition), 0.0, 1.0))
+
+    per_side = {side: round(side_score(side), 5) for side in ("left", "right", "top", "bottom")}
+    lr_pair = 0.5 * (per_side["left"] + per_side["right"])
+    tb_pair = 0.5 * (per_side["top"] + per_side["bottom"])
+    overall = max(max(per_side.values()), lr_pair, tb_pair)
+    return round(float(overall), 5), per_side
 
 
 def _build_candidate(
     accepted: Dict[str, Dict[str, Any]],
     preview_size: Tuple[int, int],
     original_size: Tuple[int, int],
-    faces: List[Tuple[int, int, int, int]],
+    subject_regions: List[List[int]],
+    subject_region_sources: List[str],
     min_content_px: int,
 ) -> Optional[Dict[str, Any]]:
     preview_w, preview_h = preview_size
@@ -451,7 +622,9 @@ def _build_candidate(
     retained_area = ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1])) / float(max(1, orig_w * orig_h))
     if retained_area < 0.42:
         return None
-    face_safe, safety_flags = _bbox_preserves_faces(preview_bbox, faces)
+    subject_safe, safety_flags = _bbox_preserves_subject(
+        preview_bbox, subject_regions, subject_region_sources
+    )
     scores = [float(v.get("score", 0)) for v in accepted.values()]
     confidence = sum(scores) / max(1, len(scores))
     if len(accepted) >= 2:
@@ -460,8 +633,11 @@ def _build_candidate(
         confidence += 0.035
     if any(v.get("kind") == "textured_canvas" for v in accepted.values()):
         confidence -= 0.025
-    if not face_safe:
-        confidence -= 0.30
+    if not subject_safe:
+        # Unsafe candidates may remain visible for explicit manual review, but
+        # they must never become the automatic best choice.
+        confidence -= 0.38
+        confidence = min(confidence, 0.57)
     single_side = len(accepted) == 1
     if single_side:
         only = next(iter(accepted.values()))
@@ -493,7 +669,9 @@ def _build_candidate(
         "confidence": round(confidence, 5),
         "retained_area_ratio": round(retained_area, 5),
         "signals": signals,
-        "face_safe": bool(face_safe),
+        "face_safe": bool(subject_safe),  # Backward-compatible UI field
+        "subject_safe": bool(subject_safe),
+        "subject_protection_sources": sorted(set(subject_region_sources)),
     }
 
 
@@ -621,6 +799,8 @@ def _nested_inner_image_candidates(
     img: np.ndarray,
     original_size: Tuple[int, int],
     faces: List[Tuple[int, int, int, int]],
+    subject_regions: List[List[int]],
+    subject_region_sources: List[str],
     min_content_px: int,
     allow_without_app_shell: bool = False,
 ) -> List[Dict[str, Any]]:
@@ -699,11 +879,10 @@ def _nested_inner_image_candidates(
                 contained_faces += 1
 
         evidence = (
-            0.34 * min(1.0, max(0.0, sat_gain) / 55.0)
-            + 0.30 * min(1.0, edge_support / 0.30)
+            0.38 * min(1.0, max(0.0, sat_gain) / 55.0)
+            + 0.34 * min(1.0, edge_support / 0.30)
             + 0.18 * centre_score
             + 0.10 * min(1.0, rectangularity)
-            + (0.08 if contained_faces else 0.0)
         )
         # A nested-photo proposal needs either a strong colour-domain change
         # (typical colour photo over a monochrome/blurred duplicate) or a
@@ -729,27 +908,36 @@ def _nested_inner_image_candidates(
         bbox = _scale_preview_bbox_to_original(preview_bbox, (w, h), original_size)
         if bbox[2] - bbox[0] < min_content_px or bbox[3] - bbox[1] < min_content_px:
             continue
+        subject_safe, safety_flags = _bbox_preserves_subject(
+            preview_bbox, subject_regions, subject_region_sources
+        )
+        confidence = min(0.79, 0.54 + evidence * 0.30)
+        if not subject_safe:
+            confidence = min(0.57, confidence - 0.18)
         candidates.append({
             "bbox": bbox,
             "preview_bbox": preview_bbox,
             "sides": ["nested"],
             "side_details": {},
-            "confidence": round(min(0.79, 0.54 + evidence * 0.30), 5),
+            "confidence": round(max(0.0, confidence), 5),
             "retained_area_ratio": round(area_ratio, 5),
             "signals": [
                 "nested_rectangular_photo",
                 f"nested_saturation_gain:{sat_gain:.1f}",
                 f"nested_edge_support:{edge_support:.2f}",
                 f"nested_faces:{contained_faces}",
+                *safety_flags,
             ],
-            "face_safe": True,
+            "face_safe": bool(subject_safe),
+            "subject_safe": bool(subject_safe),
+            "subject_protection_sources": sorted(set(subject_region_sources)),
             "crop_type": "nested_inner_image",
         })
 
     candidates.sort(key=lambda item: (
+        1 if bool(item.get("subject_safe", True)) else 0,
         float(item.get("confidence", 0)),
-        1 if any(str(v).startswith("nested_faces:") and not str(v).endswith(":0") for v in item.get("signals", [])) else 0,
-        -abs(float(item.get("retained_area_ratio", 0.5)) - 0.30),
+        float(item.get("retained_area_ratio", 0.0)),
     ), reverse=True)
     return candidates[:3]
 
@@ -858,7 +1046,7 @@ def classify_crop_type(candidate: Optional[Dict[str, Any]], layout_class: str, l
         return "nested_screenshot"
     if "overlay_crosses_frame_boundary" in flags:
         return "overlay_intrudes_content"
-    if layout_class == "vertical_story_canvas" or kinds & {"story_canvas", "blurred_canvas", "blurred_side_fill"}:
+    if layout_class == "vertical_story_canvas" or kinds & {"story_canvas", "blurred_canvas", "blurred_side_fill", "anchored_canvas"}:
         return "story_canvas"
     if layout_class == "uniform_canvas":
         return "uniform_canvas"
@@ -1018,6 +1206,54 @@ def _analyse_preview(
                 if previous is None or float(previous.get("score", 0)) < float(promoted.get("score", 0)):
                     accepted[side] = promoted
 
+    # A strong horizontal story/header boundary is valuable supporting evidence
+    # for weaker left/right canvas seams. Likewise, a coherent side pair may
+    # support a weaker top or bottom boundary. This specifically improves mixed
+    # top-plus-side layouts without making lone vertical edges more aggressive.
+    if settings.advanced_types:
+        horizontal_anchors = [
+            side for side in ("top", "bottom")
+            if side in accepted and float(accepted[side].get("score", 0)) >= 0.58
+        ]
+        left_c, right_c = side_candidates.get("left"), side_candidates.get("right")
+        if horizontal_anchors and left_c and right_c:
+            left_d = int(left_c.get("distance", 0))
+            right_d = int(right_c.get("distance", 0))
+            pair_ratio = min(left_d, right_d) / float(max(1, max(left_d, right_d)))
+            side_pair_usable = (
+                pair_ratio >= 0.42
+                and min(float(left_c.get("score", 0)), float(right_c.get("score", 0))) >= 0.44
+                and max(float(left_c.get("outer_edge", 1)), float(right_c.get("outer_edge", 1))) <= 0.20
+                and (
+                    min(float(left_c.get("texture_gain", 0)), float(right_c.get("texture_gain", 0))) >= 0.12
+                    or min(float(left_c.get("flatness", 0)), float(right_c.get("flatness", 0))) >= 0.50
+                )
+            )
+            if side_pair_usable:
+                for side, value in (("left", left_c), ("right", right_c)):
+                    promoted = dict(value)
+                    promoted["kind"] = "anchored_canvas"
+                    promoted["score"] = max(0.57, min(0.76, float(value.get("score", 0)) + 0.10))
+                    previous = accepted.get(side)
+                    if previous is None or float(previous.get("score", 0)) < float(promoted.get("score", 0)):
+                        accepted[side] = promoted
+
+        coherent_side_pair = "left" in accepted and "right" in accepted
+        if coherent_side_pair:
+            for side in ("top", "bottom"):
+                value = side_candidates.get(side)
+                if not value or side in accepted:
+                    continue
+                if (
+                    float(value.get("score", 0)) >= 0.46
+                    and float(value.get("outer_edge", 1)) <= 0.20
+                    and (float(value.get("continuity", 0)) >= 0.18 or float(value.get("texture_gain", 0)) >= 0.18)
+                ):
+                    promoted = dict(value)
+                    promoted["kind"] = "anchored_canvas"
+                    promoted["score"] = max(0.56, min(0.74, float(value.get("score", 0)) + 0.08))
+                    accepted[side] = promoted
+
     # Textured/gradient top and bottom bars can stand alone if the seam is strong.
     if settings.advanced_types:
         for side in ("top", "bottom"):
@@ -1047,15 +1283,27 @@ def _analyse_preview(
             accepted.clear()
 
     faces = _detect_face_boxes(preview)
+    subject_regions, subject_region_sources = _detect_subject_regions(preview, faces)
     candidate_sets: List[Dict[str, Dict[str, Any]]] = []
     app_viewport_variants = _app_viewport_candidate_sets(img) if bool(layout_metrics.get("app_screenshot")) else []
     candidate_sets.extend(app_viewport_variants)
+
+    def add_candidate_set(*sides: str) -> None:
+        values = {side: accepted[side] for side in sides if side in accepted}
+        if values and len(values) == len(sides):
+            candidate_sets.append(values)
+
     if accepted:
         candidate_sets.append(dict(accepted))
-    if "left" in accepted and "right" in accepted:
-        candidate_sets.append({"left": accepted["left"], "right": accepted["right"]})
-    if "top" in accepted and "bottom" in accepted:
-        candidate_sets.append({"top": accepted["top"], "bottom": accepted["bottom"]})
+    add_candidate_set("left", "right")
+    add_candidate_set("top", "bottom")
+    add_candidate_set("top", "left", "right")
+    add_candidate_set("bottom", "left", "right")
+    add_candidate_set("top", "bottom", "left")
+    add_candidate_set("top", "bottom", "right")
+    for horizontal in ("top", "bottom"):
+        for vertical in ("left", "right"):
+            add_candidate_set(horizontal, vertical)
     for side, value in accepted.items():
         if value.get("kind") == "solid_bar" and float(value.get("score", 0)) >= 0.78:
             candidate_sets.append({side: value})
@@ -1063,7 +1311,10 @@ def _analyse_preview(
     candidates: List[Dict[str, Any]] = []
     seen = set()
     for accepted_set in candidate_sets:
-        built = _build_candidate(accepted_set, (w, h), original_size, faces, settings.min_content_px)
+        built = _build_candidate(
+            accepted_set, (w, h), original_size,
+            subject_regions, subject_region_sources, settings.min_content_px
+        )
         if not built:
             continue
         key = tuple(built["bbox"])
@@ -1079,7 +1330,8 @@ def _analyse_preview(
     )
     if settings.advanced_types and nested_context:
         nested_candidates = _nested_inner_image_candidates(
-            img, original_size, faces, settings.min_content_px, allow_without_app_shell=True
+            img, original_size, faces, subject_regions, subject_region_sources,
+            settings.min_content_px, allow_without_app_shell=True
         )
         for nested in nested_candidates:
             key = tuple(nested.get("bbox", []))
@@ -1087,11 +1339,60 @@ def _analyse_preview(
                 seen.add(key)
                 candidates.append(nested)
 
-    def _candidate_rank(item: Dict[str, Any]) -> Tuple[float, int, float]:
-        side_count = len(item.get("sides", []) or [])
-        completeness_bonus = 0.035 * max(0, side_count - 1)
+    # Rank candidates by frame removal quality while explicitly preferring the
+    # less aggressive crop when evidence is similar. Subject/pose safety is a
+    # hard leading key. Face size is intentionally absent from every term.
+    support_scores = {
+        side: max(0.0, float(value.get("score", 0)))
+        for side, value in accepted.items()
+        if isinstance(value, dict)
+    }
+    total_support = max(1e-6, sum(support_scores.values()))
+    for candidate in candidates:
+        preview_bbox = [int(v) for v in (candidate.get("preview_bbox") or [0, 0, w, h])]
+        cropped_sides = set()
+        if preview_bbox[0] > 0:
+            cropped_sides.add("left")
+        if preview_bbox[1] > 0:
+            cropped_sides.add("top")
+        if preview_bbox[2] < w:
+            cropped_sides.add("right")
+        if preview_bbox[3] < h:
+            cropped_sides.add("bottom")
+        removed_support = sum(score for side, score in support_scores.items() if side in cropped_sides)
+        coverage = removed_support / total_support if support_scores else 0.0
+        residual = max(0.0, 1.0 - coverage) if support_scores else 0.0
+        waste, waste_by_side = _candidate_edge_canvas_waste(img, preview_bbox)
+        retained = float(candidate.get("retained_area_ratio", 1.0) or 1.0)
+        confidence_value = float(candidate.get("confidence", 0.0) or 0.0)
+        subject_safe = bool(candidate.get("subject_safe", candidate.get("face_safe", True)))
+        # Positive retained-area weight means an equally convincing wider crop
+        # beats a tighter one. Remaining canvas and omitted supported edges are
+        # penalized. There is no subject-size or face-size reward.
+        ranking_score = (
+            confidence_value
+            + 0.16 * coverage
+            - 0.16 * residual
+            - 0.10 * waste
+            + 0.075 * retained
+        )
+        if not subject_safe:
+            ranking_score -= 0.45
+        candidate["canvas_waste_ratio"] = round(float(waste), 5)
+        candidate["canvas_waste_by_side"] = waste_by_side
+        candidate["supported_edge_coverage"] = round(float(coverage), 5)
+        candidate["residual_frame_evidence"] = round(float(residual), 5)
+        candidate["ranking_score"] = round(float(ranking_score), 5)
+        candidate.setdefault("signals", []).extend([
+            f"canvas_waste:{waste:.2f}",
+            f"edge_coverage:{coverage:.2f}",
+        ])
+
+    def _candidate_rank(item: Dict[str, Any]) -> Tuple[int, float, float, float]:
+        subject_safe = 1 if bool(item.get("subject_safe", item.get("face_safe", True))) else 0
         retained = float(item.get("retained_area_ratio", 1.0) or 1.0)
-        return (float(item.get("confidence", 0)) + completeness_bonus, side_count, retained)
+        residual = float(item.get("residual_frame_evidence", 0.0) or 0.0)
+        return (subject_safe, float(item.get("ranking_score", 0.0)), retained, -residual)
 
     candidates.sort(key=_candidate_rank, reverse=True)
 
@@ -1185,6 +1486,8 @@ def _analyse_preview(
         "side_candidates": side_candidates,
         "preview_size": [w, h],
         "face_boxes_detected": len(faces),
+        "subject_regions_detected": len(subject_regions),
+        "subject_protection_sources": sorted(set(subject_region_sources)),
         "layout_class": layout_class,
         "crop_type": crop_type,
         "layout_flags": layout_flags,
