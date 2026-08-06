@@ -5130,10 +5130,10 @@ def _workspace_sync_payload(
     frame_mode: str,
     frame_pause: bool,
 ):
-    # Return independent update objects. Reusing the same component-update
-    # dictionary for several tabs can lead to unstable client reconciliation
-    # in some Gradio versions.
-    tab_updates = [gr.update(interactive=bool(ready)) for _ in range(4)]
+    # The main tabs stay permanently mounted and interactive. Readiness is
+    # carried only in workspace_ready_state and checked by each action. This
+    # avoids Gradio rebuilding TabItems after long callbacks and resetting the
+    # active tab to Start / Project.
     return (
         status, summary, bool(ready),
         trigger_word, input_folder, api_key,
@@ -5143,7 +5143,6 @@ def _workspace_sync_payload(
         frame_enabled, frame_advanced, frame_mode, frame_pause,
         trigger_word, input_folder,
         trigger_word, input_folder,
-        *tab_updates,
     )
 
 
@@ -5285,17 +5284,13 @@ def build_ui() -> gr.Blocks:
             )
         )
 
-        main_tabs_kwargs: Dict[str, Any] = {"selected": "workspace"}
-        try:
-            tabs_signature = inspect.signature(gr.Tabs.__init__)
-            if "key" in tabs_signature.parameters:
-                main_tabs_kwargs["key"] = "dataset-curator-main-tabs"
-            if "preserved_by_key" in tabs_signature.parameters:
-                main_tabs_kwargs["preserved_by_key"] = "selected"
-        except Exception:
-            pass
-
-        with gr.Tabs(**main_tabs_kwargs) as main_tabs:
+        # Keep the main tabs structurally stable for the whole UI lifetime.
+        # Dynamically updating TabItem.interactive or forcing Tabs.selected can
+        # make some Gradio 5/6 clients jump back to the first tab after a child
+        # callback and may even restore the constructor's old disabled state.
+        # Workflow prerequisites are therefore validated by the actions inside
+        # each tab instead of disabling/rebuilding the tabs themselves.
+        with gr.Tabs() as main_tabs:
 
             # ==============================================================
             # TAB 0: PROJECT WORKSPACE / LOCAL PREFLIGHT
@@ -5429,7 +5424,7 @@ def build_ui() -> gr.Blocks:
             # ==============================================================
             # TAB 1: FRAME PREPARATION
             # ==============================================================
-            with gr.TabItem(tr("1 · 🖼️ Rahmen", "1 · 🖼️ Frames"), id="frames", interactive=initial_preflight_ready) as frame_tab:
+            with gr.TabItem(tr("1 · 🖼️ Rahmen", "1 · 🖼️ Frames"), id="frames", interactive=True) as frame_tab:
                 gr.Markdown(tr(
                     "## Rahmenvorschläge prüfen\nDie pHash-Vorprüfung muss zuerst auf der Startseite abgeschlossen sein. "
                     "Bei unsicheren Fällen können mehrere lokale Crop-Varianten gewählt oder das Original beibehalten werden.",
@@ -5539,7 +5534,7 @@ def build_ui() -> gr.Blocks:
             # ==============================================================
             # TAB 2: AUDIT AND IMAGE SELECTION
             # ==============================================================
-            with gr.TabItem(tr("2 · 📸 Audit & Auswahl", "2 · 📸 Audit & Selection"), id="audit", interactive=initial_preflight_ready) as audit_tab:
+            with gr.TabItem(tr("2 · 📸 Audit & Auswahl", "2 · 📸 Audit & Selection"), id="audit", interactive=True) as audit_tab:
 
                 c_training_target = gr.Dropdown(
                     label=tr("Trainingsziel / Basismodell", "Training target / base model"),
@@ -7401,7 +7396,7 @@ def build_ui() -> gr.Blocks:
                     show_progress="hidden",
                 )
 
-            with gr.TabItem(tr("3 · 🧬 Subject Profile", "3 · 🧬 Subject Profile"), id="profile", interactive=initial_preflight_ready) as profile_tab:
+            with gr.TabItem(tr("3 · 🧬 Subject Profile", "3 · 🧬 Subject Profile"), id="profile", interactive=True) as profile_tab:
                 gr.Markdown(tr(
                     "### Profil bearbeiten und Captioning starten\n\n"
                     "Workflow:\n"
@@ -7961,7 +7956,7 @@ def build_ui() -> gr.Blocks:
             # ==============================================================
             # TAB 4: ERGEBNISSE
             # ==============================================================
-            with gr.TabItem(tr("4 · 📊 Ergebnisse", "4 · 📊 Results"), id="results", interactive=initial_preflight_ready) as results_tab:
+            with gr.TabItem(tr("4 · 📊 Ergebnisse", "4 · 📊 Results"), id="results", interactive=True) as results_tab:
                 gr.Markdown(tr("### Datensatz durchsuchen", "### Browse dataset"))
                 gr.Markdown(tr(
                     "Lade Ergebnisse eines früheren Curator-Laufs. Bilder werden mit Captions angezeigt.",
@@ -8134,7 +8129,6 @@ def build_ui() -> gr.Blocks:
                 c_min_side, c_use_filesize, c_min_filesize,
                 c_ig_frame_crop, c_ig_two_stage_bar, c_frame_cleanup_mode, c_frame_pause_on_medium,
                 p_trigger, p_input, r_trigger, r_input,
-                frame_tab, audit_tab, profile_tab, results_tab,
             ]
             workspace_common_inputs = [
                 w_trigger, w_input, w_api_key,
