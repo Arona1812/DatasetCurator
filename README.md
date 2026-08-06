@@ -71,7 +71,7 @@ python dataset_curator_ui.py
 
 1. Start the UI and enter the **input image folder**, a unique **trigger word**, and your **OpenAI API key** on **Start / Project**.
 2. Click **Run preflight**. Later modules unlock after the local checks finish.
-3. Optionally use **Frames** to choose a local crop suggestion, retain the original, or apply a manual crop.
+3. Optionally use **Frames** to choose a local crop suggestion, retain the original, or mark a rectangular manual crop with two clicks on diagonally opposite corners.
 4. In **Audit & Selection**, choose the training target and configure the desired audit, identity, diversity, and caption settings.
    - **Single Pass** creates the profile and completes the workflow.
    - **Profile then Caption** pauses after profile generation so you can review canonical traits, clusters, priority images, and caption policies.

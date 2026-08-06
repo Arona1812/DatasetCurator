@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from curator_core import natural_sort_key
+from curator_core import atomic_write_json as core_atomic_write_json, natural_sort_key
 
 try:
     import cv2  # type: ignore
@@ -67,11 +67,7 @@ class PHashSettings:
 
 
 def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    core_atomic_write_json(path, payload)
 
 
 def output_root_for(input_folder: str, trigger_word: str) -> str:

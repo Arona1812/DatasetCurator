@@ -109,32 +109,93 @@ def stable_hash(payload: Any) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def replace_file_with_retry(tmp: str, path: str) -> None:
+    """Replace ``path`` while tolerating short Windows/cloud-sync locks.
+
+    Dropbox, antivirus scanners and preview/indexing services can briefly open a
+    JSON file without delete sharing.  On Windows that makes an otherwise valid
+    ``os.replace`` fail with WinError 5 or 32.  Retry the atomic operation first;
+    only after the lock persists use a direct, fully flushed copy of the already
+    completed temporary file.
+    """
+    delays = [0.05, 0.10, 0.15, 0.25, 0.40, 0.60, 0.80, 1.00, 1.25, 1.50]
+    last_error: Optional[OSError] = None
+    for delay in delays:
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            # WinError 5 = access denied; WinError 32 = sharing violation.
+            if getattr(exc, "winerror", None) not in {5, 32} and exc.errno not in {13, 16}:
+                raise
+            last_error = exc
+        time.sleep(delay)
+
+    # Some sync clients block rename/delete sharing longer than normal writes.
+    # The temp file is complete and fsynced, so a direct copy is a safe final
+    # compatibility fallback and avoids losing an otherwise finished audit.
+    try:
+        with open(tmp, "rb") as source, open(path, "wb") as target:
+            shutil.copyfileobj(source, target, length=1024 * 1024)
+            target.flush()
+            try:
+                os.fsync(target.fileno())
+            except OSError:
+                pass
+        os.remove(tmp)
+        return
+    except OSError as fallback_error:
+        if last_error is not None:
+            raise PermissionError(
+                f"Could not replace or update '{path}' after repeated retries. "
+                "A cloud-sync client, antivirus scanner or another program may "
+                "still be holding the file open."
+            ) from fallback_error
+        raise
+
+
 def atomic_write_json(path: str, payload: Any) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-        handle.flush()
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        replace_file_with_retry(tmp, path)
+    finally:
         try:
-            os.fsync(handle.fileno())
+            if os.path.exists(tmp):
+                os.remove(tmp)
         except OSError:
             pass
-    os.replace(tmp, path)
 
 
 def atomic_write_text(path: str, text: str, *, newline: Optional[str] = None) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
     tmp = f"{path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-    with open(tmp, "w", encoding="utf-8", newline=newline) as handle:
-        handle.write(text)
-        handle.flush()
+    try:
+        with open(tmp, "w", encoding="utf-8", newline=newline) as handle:
+            handle.write(text)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        replace_file_with_retry(tmp, path)
+    finally:
         try:
-            os.fsync(handle.fileno())
+            if os.path.exists(tmp):
+                os.remove(tmp)
         except OSError:
             pass
-    os.replace(tmp, path)
 
 
 def caption_relevant_profile_snapshot(

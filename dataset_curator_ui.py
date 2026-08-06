@@ -134,6 +134,9 @@ UI_CSS = """
     align-self: center;
     min-width: 160px;
 }
+.manual-crop-marker img {
+    cursor: crosshair !important;
+}
 """
 
 
@@ -4502,6 +4505,141 @@ def preview_manual_frame_crop_ui(state: Any, source_hash: str, x1: Any, y1: Any,
         return None, tr(f"Ungültige Vorschau: {exc}", f"Invalid preview: {exc}")
 
 
+def _manual_crop_marker_base(record: Optional[Dict[str, Any]]) -> Tuple[Optional[Image.Image], Dict[str, Any]]:
+    if not record:
+        return None, {}
+    preview = load_gallery_image(str(record.get("source_path", "")), max_size=(1600, 1000))
+    if preview is None:
+        return None, {}
+    original_width, original_height = record.get("original_size") or frame_image_dimensions(record["source_path"])
+    return preview, {
+        "source_hash": str(record.get("source_hash", "")),
+        "preview_size": [int(preview.width), int(preview.height)],
+        "original_size": [int(original_width), int(original_height)],
+        "points": [],
+    }
+
+
+def load_manual_crop_marker_ui(state: Any, source_hash: str):
+    """Load a bounded original preview for the two-click crop marker."""
+    record = _find_frame_record(state, source_hash)
+    preview, marker_state = _manual_crop_marker_base(record)
+    if preview is None:
+        return None, {}, tr(
+            "Wähle zuerst oben ein Bild aus.",
+            "Select an image above first.",
+        )
+    return preview, marker_state, tr(
+        "Klick 1 setzt die erste Ecke, Klick 2 die diagonal gegenüberliegende Ecke.",
+        "Click 1 sets the first corner; click 2 sets the diagonally opposite corner.",
+    )
+
+
+def reset_manual_crop_marker_ui(state: Any, source_hash: str):
+    preview, marker_state, status = load_manual_crop_marker_ui(state, source_hash)
+    return preview, marker_state, 0, 0, 0, 0, None, status
+
+
+def mark_manual_crop_point_ui(
+    state: Any,
+    source_hash: str,
+    marker_state: Any,
+    evt: gr.SelectData,
+):
+    """Convert two clicks on a bounded preview into original-image crop bounds."""
+    record = _find_frame_record(state, source_hash)
+    if not record:
+        return None, {}, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), tr(
+            "Kein Bild ausgewählt.", "No image selected."
+        )
+
+    preview, fresh_state = _manual_crop_marker_base(record)
+    if preview is None:
+        return None, {}, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), tr(
+            "Das Originalbild konnte nicht für die Klickauswahl geladen werden.",
+            "The original image could not be loaded for click selection.",
+        )
+
+    current = dict(marker_state or {}) if isinstance(marker_state, dict) else {}
+    if current.get("source_hash") != source_hash:
+        current = fresh_state
+    points = list(current.get("points") or [])
+    if len(points) >= 2:
+        points = []
+
+    try:
+        click_x, click_y = evt.index
+        click_x = max(0, min(int(click_x), preview.width - 1))
+        click_y = max(0, min(int(click_y), preview.height - 1))
+    except Exception:
+        return preview, fresh_state, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), tr(
+            "Klickposition konnte nicht gelesen werden.",
+            "The click position could not be read.",
+        )
+
+    points.append([click_x, click_y])
+    current = fresh_state
+    current["points"] = points
+    draw = ImageDraw.Draw(preview)
+    marker_radius = max(5, round(min(preview.size) * 0.008))
+    line_width = max(3, round(min(preview.size) * 0.005))
+
+    def original_pixel(px: int, py: int) -> Tuple[int, int]:
+        original_width, original_height = current["original_size"]
+        mapped_x = round(px * max(0, original_width - 1) / max(1, preview.width - 1))
+        mapped_y = round(py * max(0, original_height - 1) / max(1, preview.height - 1))
+        return int(mapped_x), int(mapped_y)
+
+    for px, py in points:
+        draw.ellipse(
+            [px - marker_radius, py - marker_radius, px + marker_radius, py + marker_radius],
+            outline=(255, 255, 255),
+            fill=(220, 30, 30),
+            width=max(2, line_width // 2),
+        )
+
+    first_x, first_y = original_pixel(*points[0])
+    if len(points) == 1:
+        return preview, current, first_x, first_y, 0, 0, None, tr(
+            "Erste Ecke gesetzt. Klicke jetzt auf die diagonal gegenüberliegende Ecke.",
+            "First corner set. Now click the diagonally opposite corner.",
+        )
+
+    (px1, py1), (px2, py2) = points
+    draw.rectangle(
+        [min(px1, px2), min(py1, py2), max(px1, px2), max(py1, py2)],
+        outline=(220, 30, 30),
+        width=line_width,
+    )
+    second_x, second_y = original_pixel(px2, py2)
+    original_width, original_height = current["original_size"]
+    x1 = min(first_x, second_x)
+    y1 = min(first_y, second_y)
+    x2 = min(int(original_width), max(first_x, second_x) + 1)
+    y2 = min(int(original_height), max(first_y, second_y) + 1)
+    if x2 <= x1 or y2 <= y1:
+        return preview, current, x1, y1, x2, y2, gr.update(), tr(
+            "Die beiden Punkte liegen zu nah beieinander. Klicke erneut, um eine neue Auswahl zu beginnen.",
+            "The two points are too close together. Click again to start a new selection.",
+        )
+
+    compare_preview: Any = gr.update()
+    try:
+        preview_path = build_review_preview(
+            record["source_path"], [x1, y1, x2, y2], state["cache_dir"], source_hash=record["source_hash"]
+        )
+        loaded = load_gallery_image(preview_path, max_size=(1240, 720))
+        if loaded is not None:
+            compare_preview = loaded
+    except Exception:
+        pass
+
+    return preview, current, x1, y1, x2, y2, compare_preview, tr(
+        f"Rechteck gesetzt: `{x1}, {y1}, {x2}, {y2}`. Mit **Manuellen Crop übernehmen** speichern.",
+        f"Rectangle set: `{x1}, {y1}, {x2}, {y2}`. Save it with **Accept manual crop**.",
+    )
+
+
 def reset_frame_detector_cache_ui(trigger_word: str, input_folder: str):
     if not trigger_word or not os.path.isdir(input_folder):
         return {}, tr("Triggerwort/Input fehlen.", "Trigger word/input missing."), gr.update(choices=["1"], value="1"), [], tr("❌ Eingaben fehlen", "❌ Missing input")
@@ -5098,7 +5236,22 @@ def build_ui() -> gr.Blocks:
                 )
                 with gr.Row():
                     fr_auto_btn = gr.Button(tr("Automatische Entscheidung wiederherstellen", "Restore automatic decision"), variant="secondary")
-                with gr.Accordion(tr("Manuelle Crop-Grenzen", "Manual crop bounds"), open=False):
+                with gr.Accordion(tr("Manueller Crop – zwei Klicks oder Koordinaten", "Manual crop – two clicks or coordinates"), open=False):
+                    gr.Markdown(tr(
+                        "Setze im Originalbild zwei diagonal gegenüberliegende Eckpunkte. Ein dritter Klick beginnt automatisch eine neue Auswahl.",
+                        "Set two diagonally opposite corner points in the original image. A third click automatically starts a new selection.",
+                    ))
+                    fr_manual_click_state = gr.State({})
+                    fr_manual_click_image = gr.Image(
+                        label=tr("Crop im Original markieren", "Mark crop in original"),
+                        type="pil",
+                        interactive=False,
+                        height=700,
+                        buttons=["fullscreen"],
+                        elem_classes=["manual-crop-marker"],
+                    )
+                    with gr.Row():
+                        fr_reset_manual_click_btn = gr.Button(tr("Klickauswahl zurücksetzen", "Reset click selection"), variant="secondary")
                     with gr.Row():
                         fr_x1 = gr.Number(label="X1 / links", value=0, precision=0)
                         fr_y1 = gr.Number(label="Y1 / oben", value=0, precision=0)
@@ -7793,6 +7946,24 @@ def build_ui() -> gr.Blocks:
                 fn=restore_frame_auto_ui,
                 inputs=[fr_state, fr_filter, fr_page, fr_selected_hash],
                 outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_option_gallery, fr_option_radio, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
+                show_progress="hidden",
+            )
+            fr_selected_hash.change(
+                fn=load_manual_crop_marker_ui,
+                inputs=[fr_state, fr_selected_hash],
+                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
+                show_progress="hidden",
+            )
+            fr_manual_click_image.select(
+                fn=mark_manual_crop_point_ui,
+                inputs=[fr_state, fr_selected_hash, fr_manual_click_state],
+                outputs=[fr_manual_click_image, fr_manual_click_state, fr_x1, fr_y1, fr_x2, fr_y2, fr_manual_preview, fr_manual_status],
+                show_progress="hidden",
+            )
+            fr_reset_manual_click_btn.click(
+                fn=reset_manual_crop_marker_ui,
+                inputs=[fr_state, fr_selected_hash],
+                outputs=[fr_manual_click_image, fr_manual_click_state, fr_x1, fr_y1, fr_x2, fr_y2, fr_manual_preview, fr_manual_status],
                 show_progress="hidden",
             )
             fr_preview_manual_btn.click(

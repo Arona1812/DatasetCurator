@@ -17,7 +17,6 @@ import traceback
 import warnings
 import atexit
 import platform
-from pathlib import Path
 from importlib import metadata as importlib_metadata
 from collections import Counter, defaultdict
 from contextlib import contextmanager
@@ -59,6 +58,7 @@ from curator_core import (
     normalize_run_config_payload,
     normalized_caption_policy,
     natural_sort_key,
+    replace_file_with_retry,
     stable_hash,
 )
 from pose_rules import (
@@ -3626,7 +3626,7 @@ def save_clip_embedding_cached(file_hash: str, vec: np.ndarray) -> None:
     path = get_clip_cache_path(file_hash)
     tmp = path + ".tmp.npy"
     np.save(tmp, vec.astype(np.float32))
-    os.replace(tmp, path)
+    replace_file_with_retry(tmp, path)
 
 
 def _init_clip_model() -> bool:
@@ -3778,7 +3778,7 @@ def save_arcface_embedding_cached(file_hash: str, vec: np.ndarray) -> None:
     path = get_arcface_cache_path(file_hash)
     tmp = path + ".tmp.npy"
     np.save(tmp, vec.astype(np.float32))
-    os.replace(tmp, path)
+    replace_file_with_retry(tmp, path)
 
 
 def compute_arcface_embedding(image_path: str, file_hash: str) -> Optional[np.ndarray]:
@@ -12047,7 +12047,7 @@ def write_csv_atomic(path: str, fieldnames: List[str], rows: List[Dict[str, Any]
                 if isinstance(row_copy.get("clip_embedding"), np.ndarray):
                     row_copy["clip_embedding"] = ""
                 writer.writerow(row_copy)
-        os.replace(tmp, path)
+        replace_file_with_retry(tmp, path)
     finally:
         try:
             if os.path.exists(tmp):

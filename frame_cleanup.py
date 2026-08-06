@@ -24,6 +24,11 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
 try:
+    from curator_core import atomic_write_json as core_atomic_write_json
+except ImportError:  # Isolated Golden-Suite loading of this module
+    core_atomic_write_json = None
+
+try:
     from scipy.ndimage import uniform_filter1d  # type: ignore
 except Exception:  # pragma: no cover - small fallback for minimal installs
     def uniform_filter1d(values, size=3, mode="nearest"):
@@ -87,11 +92,32 @@ class DetectorSettings:
 
 
 def atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
+    if core_atomic_write_json is not None:
+        core_atomic_write_json(path, payload)
+        return
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            try:
+                os.fsync(handle.fileno())
+            except OSError:
+                pass
+        for delay in (0.05, 0.10, 0.20, 0.40, 0.80):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(delay)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 def file_sha1(path: str, chunk_size: int = 1024 * 1024) -> str:
