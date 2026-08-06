@@ -333,7 +333,7 @@ DEFAULTS: Dict[str, Any] = {
     # IG-Frame-Detection
     "c_ig_frame_crop": True,
     "c_ig_two_stage_bar": True,
-    "c_frame_cleanup_mode": "suggest_only",
+    "c_frame_cleanup_mode": "auto_high_keep_medium",
     "c_frame_pause_on_medium": False,
     "c_frame_auto_accept_types": ["uniform_canvas", "story_bars"],
     "c_post_frame_phash_refresh": True,
@@ -714,7 +714,7 @@ def save_settings_fn(
         "c_subject_min_torso": c_subject_min_torso,
         "c_ig_frame_crop": c_ig_frame_crop,
         "c_ig_two_stage_bar": c_ig_two_stage_bar,
-        "c_frame_cleanup_mode": str(c_frame_cleanup_mode or "suggest_only"),
+        "c_frame_cleanup_mode": str(c_frame_cleanup_mode or "auto_high_keep_medium"),
         "c_frame_pause_on_medium": bool(c_frame_pause_on_medium),
         "c_use_clip": c_use_clip, "c_use_phash": c_use_phash,
         "c_phash_thresh": c_phash_thresh, "c_clip_thresh": c_clip_thresh,
@@ -3586,7 +3586,7 @@ def build_run_config_from_ui_values(values: Tuple[Any, ...], *, continue_from_pr
         "SUBJECT_MIN_TORSO_LANDMARKS": int(v["subject_min_torso"]),
         "ENABLE_IG_FRAME_CROP": bool(v["ig_frame_crop"]),
         "IG_FRAME_TWO_STAGE_BAR_DETECT": bool(v["ig_two_stage_bar"]),
-        "FRAME_CLEANUP_MODE": str(v["frame_cleanup_mode"] or "suggest_only"),
+        "FRAME_CLEANUP_MODE": str(v["frame_cleanup_mode"] or "auto_high_keep_medium"),
         "FRAME_PAUSE_ON_MEDIUM_REVIEW": bool(v["frame_pause_on_medium"]),
         "USE_EARLY_PHASH_DEDUP": bool(v["use_early_phash"]),
         "USE_EARLY_PHASH_LOOP1": bool(v["use_early_phash_loop1"]),
@@ -3812,7 +3812,9 @@ def load_results(input_folder, trigger_word, subfolder, page=1):
 
 FRAME_REVIEW_PAGE_SIZE = 18
 FRAME_REVIEW_FILTER_CHOICES = [
-    ("review", "Mittlere Sicherheit / zu prüfen", "Medium confidence / review"),
+    ("review", "Mittlere Sicherheit", "Medium confidence"),
+    ("suggestions", "Unbestätigte Vorschläge / zu prüfen", "Unconfirmed suggestions / review"),
+    ("automatic", "Automatisch angewendet", "Applied automatically"),
     ("high", "Hohe Sicherheit", "High confidence"),
     ("detected", "Alle erkannten Rahmen", "All detected frames"),
     ("decided", "Manuell entschieden", "Manually decided"),
@@ -3863,12 +3865,80 @@ def _save_frame_hash_index_ui(cache_dir: str, payload: Dict[str, Any]) -> None:
     _atomic_write_json(os.path.join(cache_dir, "file_hash_index.json"), payload)
 
 
+def _frame_best_candidate(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    candidates = list(record.get("candidates", []) or [])
+    if not candidates:
+        return None
+    best = candidates[0]
+    bbox = best.get("bbox") if isinstance(best, dict) else None
+    if not isinstance(bbox, list) or len(bbox) != 4:
+        return None
+    return best
+
+
+def _frame_best_preview_bbox(record: Dict[str, Any]) -> Optional[List[int]]:
+    """Return the best local proposal for visible High/Medium preselection."""
+    if str(record.get("confidence_level", "low") or "low") not in {"high", "medium"}:
+        return None
+    best = _frame_best_candidate(record)
+    if not best:
+        return None
+    return [int(v) for v in best.get("bbox", [])]
+
+
+def _frame_auto_applies_best_candidate(record: Dict[str, Any], state: Any = None) -> bool:
+    """Whether project policy applies candidate 0 without a manual decision."""
+    if str(record.get("user_decision", "auto") or "auto") != "auto":
+        return False
+    best = _frame_best_candidate(record)
+    if not best:
+        return False
+    level = str(record.get("confidence_level", "low") or "low")
+    if level not in {"high", "medium"}:
+        return False
+    frame_mode = (
+        str((state or {}).get("frame_mode", "auto_high_keep_medium") or "auto_high_keep_medium")
+        if isinstance(state, dict) else "auto_high_keep_medium"
+    )
+    allowed = {
+        str(v) for v in ((state or {}).get("auto_accept_types", []) or [])
+    } if isinstance(state, dict) else set()
+    crop_type = str(best.get("crop_type", record.get("crop_type", "unknown")) or "unknown")
+    if crop_type not in allowed:
+        return False
+    if frame_mode == "auto_high_review_medium":
+        return level == "high"
+    if frame_mode == "auto_high_keep_medium":
+        return level in {"high", "medium"}
+    return False
+
+
+def _frame_current_selection_kind(record: Dict[str, Any], state: Any = None) -> str:
+    """Return saved, automatic, suggestion, or original for UI labelling."""
+    if str(record.get("user_decision", "auto") or "auto") != "auto":
+        return "saved"
+    if _frame_auto_applies_best_candidate(record, state):
+        return "automatic"
+    if _frame_best_preview_bbox(record) is not None:
+        return "suggestion"
+    return "original"
+
+
 def _frame_filter_records(state: Any, filter_value: str) -> List[Dict[str, Any]]:
     records = list((state or {}).get("records", []) or []) if isinstance(state, dict) else []
     records.sort(key=lambda record: _normalize_asset_id(record.get("asset_id")))
     value = str(filter_value or "review")
     if value == "review":
-        return [r for r in records if r.get("confidence_level") == "medium"]
+        return [r for r in records if str(r.get("confidence_level", "low")) == "medium"]
+    if value == "suggestions":
+        return [
+            r for r in records
+            if str(r.get("confidence_level", "low")) in {"high", "medium"}
+            and str(r.get("user_decision", "auto") or "auto") == "auto"
+            and not _frame_auto_applies_best_candidate(r, state)
+        ]
+    if value == "automatic":
+        return [r for r in records if _frame_auto_applies_best_candidate(r, state)]
     if value == "high":
         return [r for r in records if r.get("confidence_level") == "high"]
     if value == "detected":
@@ -4028,18 +4098,25 @@ def _frame_current_option_key(record: Dict[str, Any], state: Any = None) -> str:
                 return str(entry["key"])
         return "candidate:0" if record.get("candidates") else "original"
 
-    frame_mode = str((state or {}).get("frame_mode", "suggest_only")) if isinstance(state, dict) else "suggest_only"
-    allowed = {str(v) for v in ((state or {}).get("auto_accept_types", []) or [])} if isinstance(state, dict) else set()
-    crop_type = str(record.get("crop_type", "unknown") or "unknown")
-    level = str(record.get("confidence_level", "low") or "low")
-    auto_uses_crop = (
-        crop_type in allowed
-        and (
-            (frame_mode == "auto_high_review_medium" and level == "high")
-            or (frame_mode == "auto_high_keep_medium" and level in {"high", "medium"})
-        )
-    )
-    return "candidate:0" if auto_uses_crop and record.get("candidates") else "original"
+    # High and medium findings always open on the detector's best-ranked
+    # proposal. Project mode decides only whether that proposal is applied
+    # automatically; it no longer decides which option the reviewer first sees.
+    return "candidate:0" if _frame_best_preview_bbox(record) is not None else "original"
+
+
+def _frame_effective_preview_bbox(record: Dict[str, Any], state: Any = None) -> Optional[List[int]]:
+    """Return the bbox represented by the current UI selection."""
+    key = _frame_current_option_key(record, state)
+    if key == "original":
+        return None
+    if key == "manual" and isinstance(record.get("display_bbox"), list):
+        return [int(v) for v in record.get("display_bbox", [])]
+    for entry in _frame_option_entries(record):
+        if str(entry.get("key")) == key:
+            bbox = entry.get("bbox")
+            if isinstance(bbox, list) and len(bbox) == 4:
+                return [int(v) for v in bbox]
+    return None
 
 
 def _crop_option_preview(record: Dict[str, Any], bbox: Optional[List[int]]) -> Optional[Image.Image]:
@@ -4069,22 +4146,31 @@ def _frame_option_gallery_update(record: Optional[Dict[str, Any]], state: Any = 
     if not record:
         return gr.update(value=[], selected_index=None), gr.update(choices=[], value=None)
     current_key = _frame_current_option_key(record, state)
+    selection_kind = _frame_current_selection_kind(record, state)
     values: List[Tuple[Image.Image, str]] = []
     choices: List[Tuple[str, str]] = []
-    for index, entry in enumerate(_frame_option_entries(record)):
+    for entry in _frame_option_entries(record):
         image = _crop_option_preview(record, entry.get("bbox"))
         if image is None:
             image = Image.new("RGB", (480, 480), (52, 52, 52))
             drawer = ImageDraw.Draw(image)
             drawer.text((24, 220), tr("Vorschau nicht lesbar", "Preview unavailable"), fill=(235, 235, 235))
-        marker = "✓ " if entry["key"] == current_key else ""
         if entry["key"] == "original":
-            caption = marker + tr("Original behalten", "Keep original")
+            base_caption = tr("Original behalten", "Keep original")
         else:
             confidence = float(entry.get("confidence", 0) or 0)
-            caption = marker + f"{entry['label']} · {entry.get('crop_type','unknown')} · {confidence:.0%}"
-        values.append((image, caption))
-        choices.append((caption.replace("✓ ", ""), str(entry["key"])))
+            base_caption = f"{entry['label']} · {entry.get('crop_type','unknown')} · {confidence:.0%}"
+
+        marker = ""
+        if entry["key"] == current_key:
+            marker = {
+                "saved": tr("✓ GESPEICHERT · ", "✓ SAVED · "),
+                "automatic": tr("⚙ AUTO · ", "⚙ AUTO · "),
+                "suggestion": tr("★ VORSCHLAG · ", "★ SUGGESTION · "),
+                "original": tr("✓ ORIGINAL · ", "✓ ORIGINAL · "),
+            }.get(selection_kind, "✓ ")
+        values.append((image, marker + base_caption))
+        choices.append((base_caption, str(entry["key"])))
     return (
         # The comparison gallery is deliberately display-only. Selection is
         # performed exclusively by the radio control immediately underneath.
@@ -4093,32 +4179,52 @@ def _frame_option_gallery_update(record: Optional[Dict[str, Any]], state: Any = 
     )
 
 
-def _frame_option_detail(record: Dict[str, Any], option_key: str) -> Tuple[str, List[int]]:
+def _frame_option_detail(record: Dict[str, Any], option_key: str, state: Any = None) -> Tuple[str, List[int]]:
     asset_id = _normalize_asset_id(record.get("asset_id"))
+    selection_kind = _frame_current_selection_kind(record, state)
+    if selection_kind == "saved":
+        status_de = "Die Entscheidung ist gespeichert."
+        status_en = "The decision is saved."
+    elif selection_kind == "automatic":
+        status_de = "Diese lokal bestbewertete Variante wird gemäß Projektmodus automatisch angewendet."
+        status_en = "This locally best-ranked variant is applied automatically by the project mode."
+    elif selection_kind == "suggestion":
+        status_de = "Lokal beste Variante vorausgewählt – noch nicht bestätigt. Mit „Aktuelle Auswahl übernehmen“ verbindlich speichern."
+        status_en = "Locally best variant preselected — not confirmed yet. Use ‘Accept current selection’ to save it explicitly."
+    else:
+        status_de = "Kein belastbarer Rahmenfund; das Original bleibt aktiv."
+        status_en = "No reliable frame finding; the original remains active."
+
     if option_key == "original":
         width, height = record.get("original_size") or [0, 0]
         return tr(
-            f"**ID {asset_id} · {record.get('filename','')}** – Original wird beibehalten. Die Entscheidung wurde sofort gespeichert.",
-            f"**ID {asset_id} · {record.get('filename','')}** – Original is kept. The decision was saved immediately.",
+            f"**ID {asset_id} · {record.get('filename','')}** – Original behalten. {status_de}",
+            f"**ID {asset_id} · {record.get('filename','')}** – Keep original. {status_en}",
         ), [0, 0, int(width), int(height)]
     for entry in _frame_option_entries(record):
         if entry["key"] == option_key:
             bbox = entry.get("bbox") or [0, 0, *(record.get("original_size") or [0, 0])]
             return tr(
-                f"**ID {asset_id} · {record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Sofort gespeichert.",
-                f"**ID {asset_id} · {record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Saved immediately.",
+                f"**ID {asset_id} · {record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. {status_de}",
+                f"**ID {asset_id} · {record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. {status_en}",
             ), [int(v) for v in bbox]
     width, height = record.get("original_size") or [0, 0]
     return tr("Unbekannte Auswahl.", "Unknown selection."), [0, 0, int(width), int(height)]
 
 
-def _frame_review_caption(record: Dict[str, Any]) -> str:
+def _frame_review_caption(record: Dict[str, Any], state: Any = None) -> str:
     asset_id = _normalize_asset_id(record.get("asset_id"))
     level = str(record.get("confidence_level", "low")).upper()
     confidence = float(record.get("confidence", 0) or 0)
-    decision = str(record.get("user_decision", "auto") or "auto")
+    selection_kind = _frame_current_selection_kind(record, state)
+    status = {
+        "saved": "SAVED",
+        "automatic": "AUTO",
+        "suggestion": "SUGGESTION",
+        "original": "ORIGINAL",
+    }.get(selection_kind, selection_kind.upper())
     sides = ", ".join(record.get("candidate_sides", []) or []) or "-"
-    return f"ID {asset_id} · {record.get('filename', '')}\n{level} {confidence:.0%} | {sides} | {decision}"
+    return f"ID {asset_id} · {record.get('filename', '')}\n{level} {confidence:.0%} | {sides} | {status}"
 
 
 def _frame_review_gallery(
@@ -4147,11 +4253,11 @@ def _frame_review_gallery(
     cache_dir = str((state or {}).get("cache_dir", "")) if isinstance(state, dict) else ""
     for record in selected:
         is_selected = selected_id > 0 and _normalize_asset_id(record.get("asset_id")) == selected_id
-        caption = _frame_review_caption(record)
+        caption = _frame_review_caption(record, state)
         if is_selected:
             caption = "✓ " + caption
         try:
-            bbox = record.get("display_bbox") or _frame_candidate_bbox(record) or record.get("candidate_bbox")
+            bbox = _frame_effective_preview_bbox(record, state)
             preview_path = build_review_preview(
                 record["source_path"], bbox, cache_dir, source_hash=record["source_hash"]
             )
@@ -4176,15 +4282,20 @@ def _frame_review_gallery(
 def _frame_review_summary_md(state: Any) -> str:
     if not isinstance(state, dict) or not state.get("records"):
         return tr("Noch keine Rahmenanalyse geladen.", "No frame analysis loaded yet.")
-    summary = frame_decision_summary(state.get("records", []))
-    decisions = Counter(str(r.get("user_decision", "auto")) for r in state.get("records", []))
+    records = list(state.get("records", []) or [])
+    summary = frame_decision_summary(records)
+    decisions = Counter(str(r.get("user_decision", "auto")) for r in records)
+    automatic_count = sum(1 for record in records if _frame_auto_applies_best_candidate(record, state))
+    suggestion_count = sum(1 for record in records if _frame_current_selection_kind(record, state) == "suggestion")
     return tr(
         f"**{summary['total']} Bilder lokal geprüft:** {summary['high']} hohe Sicherheit, "
         f"{summary['medium']} mittlere Sicherheit, {summary['low']} ohne belastbaren Rahmenfund.  "
+        f"Automatisch angewendet: **{automatic_count}** · unbestätigte Vorschläge: **{suggestion_count}**.  "
         f"Manuell: {decisions.get('accept',0)} übernommen, {decisions.get('manual',0)} manuell, "
         f"{decisions.get('keep_original',0)} Original behalten. **Keine LLM-Aufrufe.**",
         f"**{summary['total']} images checked locally:** {summary['high']} high confidence, "
         f"{summary['medium']} medium confidence, {summary['low']} without a reliable frame.  "
+        f"Applied automatically: **{automatic_count}** · unconfirmed suggestions: **{suggestion_count}**.  "
         f"Manual: {decisions.get('accept',0)} accepted, {decisions.get('manual',0)} manual, "
         f"{decisions.get('keep_original',0)} original kept. **No LLM calls.**",
     )
@@ -4251,9 +4362,11 @@ def scan_frame_review_ui(
     hash_index = _load_frame_hash_index_ui(cache_dir)
     hash_index_dirty = False
     workspace_frame = dict(workspace.get("frame") or {})
+    frame_mode = str(workspace_frame.get("mode", "auto_high_keep_medium") or "auto_high_keep_medium")
+    auto_accept_types = list(workspace_frame.get("auto_accept_types") or [])
     settings = SmartFrameDetectorSettings(
         advanced_types=bool(advanced_types),
-        auto_accept_types=tuple(str(v) for v in (workspace_frame.get("auto_accept_types") or [])),
+        auto_accept_types=tuple(str(v) for v in auto_accept_types),
     )
     records: List[Dict[str, Any]] = []
     total = max(1, len(paths))
@@ -4267,7 +4380,16 @@ def scan_frame_review_ui(
             user = user_map.get(f"asset:{current_asset_id}", {}) if current_asset_id > 0 else {}
             user = user or user_map.get(source_hash, {}) or {}
             user_decision = str(user.get("decision", "auto") or "auto")
-            display_bbox = user.get("bbox") if user_decision in {"manual", "accept"} else analysis.get("candidate_bbox")
+            analysis_candidates = list(analysis.get("candidates", []) or [])
+            if user_decision in {"manual", "accept"}:
+                display_bbox = user.get("bbox")
+            elif user_decision == "keep_original":
+                display_bbox = None
+            elif str(analysis.get("confidence_level", "low") or "low") in {"high", "medium"} and analysis_candidates:
+                # Visual preselection is independent of automatic-acceptance policy.
+                display_bbox = analysis_candidates[0].get("bbox")
+            else:
+                display_bbox = None
             selected_candidate_index = 0
             if user_decision == "accept" and isinstance(user.get("bbox"), list):
                 for candidate_index, candidate in enumerate(analysis.get("candidates", []) or []):
@@ -4289,7 +4411,7 @@ def scan_frame_review_ui(
                 "layout_flags": analysis.get("layout_flags", []),
                 "recommendation": analysis.get("recommendation", "keep_original"),
                 "crop_type": analysis.get("crop_type", "unknown"),
-                "candidates": list(analysis.get("candidates", []) or []),
+                "candidates": analysis_candidates,
                 "selected_candidate_index": selected_candidate_index,
                 "user_decision": user_decision,
                 "display_bbox": display_bbox,
@@ -4345,8 +4467,8 @@ def scan_frame_review_ui(
         "advanced_types": bool(advanced_types),
         "preflight_survivor_count": len(paths),
         "preflight_skipped_count": max(0, len(all_paths) - len(paths)),
-        "frame_mode": str(workspace_frame.get("mode", "suggest_only") or "suggest_only"),
-        "auto_accept_types": list(workspace_frame.get("auto_accept_types") or []),
+        "frame_mode": frame_mode,
+        "auto_accept_types": auto_accept_types,
     }
     filtered = _frame_filter_records(state, "review")
     pages = _frame_page_choices(len(filtered))
@@ -4354,7 +4476,7 @@ def scan_frame_review_ui(
         record = filtered[0]
         asset_id = _normalize_asset_id(record.get("asset_id"))
         current_key = _frame_current_option_key(record, state)
-        detail, bbox = _frame_option_detail(record, current_key)
+        detail, bbox = _frame_option_detail(record, current_key, state)
         detail += tr(
             f"  \nDetektor: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · Layout `{record.get('layout_class','plain_photo')}` · Vorschläge `{len(record.get('candidates',[]) or [])}`. "
             "Die erste sichtbare Aufnahme wurde automatisch für den Vergleich ausgewählt.",
@@ -4415,7 +4537,7 @@ def refresh_frame_review_page_ui(state: Any, filter_value: str, page_value: Any)
     if record:
         asset_id = _normalize_asset_id(record.get("asset_id"))
         current_key = _frame_current_option_key(record, state)
-        detail, bbox = _frame_option_detail(record, current_key)
+        detail, bbox = _frame_option_detail(record, current_key, state)
         detail += tr(
             "  \nDas erste Bild der gewählten Ansicht wurde automatisch geladen.",
             "  \nThe first image in the selected view was loaded automatically.",
@@ -4479,10 +4601,10 @@ def select_frame_review_image_ui(state: Any, filter_value: str, page_value: Any,
         empty_gallery, empty_radio = _frame_option_gallery_update(None, state)
         return 0, tr("Auswahl konnte nicht aufgelöst werden.", "Could not resolve selection."), empty_gallery, empty_radio, tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0
     current_key = _frame_current_option_key(record, state)
-    detail, bbox = _frame_option_detail(record, current_key)
+    detail, bbox = _frame_option_detail(record, current_key, state)
     detail += tr(
         f"  \\nDetektor: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · Layout `{record.get('layout_class','plain_photo')}` · Vorschläge `{len(record.get('candidates',[]) or [])}`. "
-        "Die Vorschaubilder sind nur zum Vergleichen. Wähle direkt darunter genau eine Option; sie wird ohne zusätzlichen Speichern-Schritt übernommen.",
+        "Die Vorschaubilder sind nur zum Vergleichen. Änderungen an der Auswahl werden sofort gespeichert; eine bereits markierte unbestätigte Vorauswahl kannst du mit „Aktuelle Auswahl übernehmen“ bestätigen.",
         f"  \\nDetector: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · layout `{record.get('layout_class','plain_photo')}` · suggestions `{len(record.get('candidates',[]) or [])}`. "
         "The previews are comparison-only. Choose exactly one option directly underneath; it is applied without a separate save step.",
     )
@@ -4524,10 +4646,10 @@ def navigate_frame_review_image_ui(
     page = str((target_index // FRAME_REVIEW_PAGE_SIZE) + 1)
     pages = _frame_page_choices(len(records))
     current_key = _frame_current_option_key(record, state)
-    detail, bbox = _frame_option_detail(record, current_key)
+    detail, bbox = _frame_option_detail(record, current_key, state)
     detail += tr(
         f"  \\nDetektor: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · Layout `{record.get('layout_class','plain_photo')}` · Vorschläge `{len(record.get('candidates',[]) or [])}`. "
-        "Die Vorschaubilder sind nur zum Vergleichen. Wähle direkt darunter genau eine Option.",
+        "Die Vorschaubilder sind nur zum Vergleichen. Änderungen werden sofort gespeichert; eine bereits markierte Vorauswahl wird über „Aktuelle Auswahl übernehmen“ bestätigt.",
         f"  \\nDetector: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · layout `{record.get('layout_class','plain_photo')}` · suggestions `{len(record.get('candidates',[]) or [])}`. "
         "The previews are comparison-only. Choose exactly one option directly underneath.",
     )
@@ -4588,7 +4710,7 @@ def apply_frame_option_ui(
         decision, candidate_value = "keep_original", None
     elif option_key == "manual":
         # Existing manual choice remains selected; no re-save is needed.
-        detail, bbox = _frame_option_detail(record, option_key)
+        detail, bbox = _frame_option_detail(record, option_key, state)
         option_gallery, option_radio = _frame_option_gallery_update(record, state)
         return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, asset_id), detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), tr("✅ Manueller Crop bleibt aktiv", "✅ Manual crop remains active")
     elif option_key.startswith("candidate:"):
@@ -4602,7 +4724,7 @@ def apply_frame_option_ui(
     )
     new_state, summary, main_gallery, _message, status = updated
     record = _find_frame_record(new_state, asset_id)
-    detail, bbox = _frame_option_detail(record, option_key) if record else (tr("Auswahl gespeichert.", "Selection saved."), [0, 0, 0, 0])
+    detail, bbox = _frame_option_detail(record, option_key, new_state) if record else (tr("Auswahl gespeichert.", "Selection saved."), [0, 0, 0, 0])
     option_gallery, option_radio = _frame_option_gallery_update(record, new_state)
     return new_state, summary, main_gallery, detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), status
 
@@ -4617,7 +4739,7 @@ def restore_frame_auto_ui(state: Any, filter_value: str, page_value: Any, asset_
     new_state, summary, main_gallery, _message, status = updated
     record = _find_frame_record(new_state, asset_id)
     key = _frame_current_option_key(record or {}, new_state)
-    detail, bbox = _frame_option_detail(record or {}, key)
+    detail, bbox = _frame_option_detail(record or {}, key, new_state)
     option_gallery, option_radio = _frame_option_gallery_update(record, new_state)
     return new_state, summary, main_gallery, detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), status
 
@@ -4732,7 +4854,7 @@ def set_frame_review_decision_ui(
     elif decision == "keep_original":
         record["display_bbox"] = None
     else:
-        record["display_bbox"] = record.get("candidate_bbox")
+        record["display_bbox"] = _frame_best_preview_bbox(record)
     message = {
         "accept": tr("Crop-Vorschlag übernommen.", "Crop suggestion accepted."),
         "manual": tr("Manueller Crop gespeichert.", "Manual crop saved."),
@@ -5017,7 +5139,7 @@ def initialize_workspace_ui(
         "output_root": output_root,
         "frame": {
             "enabled": bool(frame_enabled),
-            "mode": str(frame_mode or "suggest_only"),
+            "mode": str(frame_mode or "auto_high_keep_medium"),
             "auto_accept_types": list(frame_auto_accept_types or []),
             "pause_on_medium": bool(frame_pause_on_medium),
             "post_frame_duplicate_refresh": bool(post_frame_duplicate_refresh),
@@ -5039,7 +5161,7 @@ def initialize_workspace_ui(
         "c_input": input_folder,
         "c_api_key": api_key,
         "c_ig_frame_crop": bool(frame_enabled),
-        "c_frame_cleanup_mode": str(frame_mode or "suggest_only"),
+        "c_frame_cleanup_mode": str(frame_mode or "auto_high_keep_medium"),
         "c_frame_pause_on_medium": bool(frame_pause_on_medium),
         "c_frame_auto_accept_types": list(frame_auto_accept_types or []),
         "c_post_frame_phash_refresh": bool(post_frame_duplicate_refresh),
@@ -5092,7 +5214,7 @@ def run_workspace_preflight_ui(
     workspace = run_project_preflight(
         str(input_folder).strip(), str(trigger_word).strip(), settings,
         frame_enabled=bool(frame_enabled),
-        frame_mode=str(frame_mode or "suggest_only"),
+        frame_mode=str(frame_mode or "auto_high_keep_medium"),
         frame_auto_accept_types=list(frame_auto_accept_types or []),
         frame_pause_on_medium=bool(frame_pause_on_medium),
         post_frame_duplicate_refresh=bool(post_frame_duplicate_refresh),
@@ -5392,11 +5514,15 @@ def build_ui() -> gr.Blocks:
                     w_frame_mode = gr.Dropdown(
                         label=tr("Automatische Übernahme", "Automatic acceptance"),
                         choices=[
-                            (tr("Nur Vorschläge – nichts automatisch", "Suggestions only – never automatic"), "suggest_only"),
-                            (tr("Nur hohe Sicherheit automatisch", "Auto-accept high confidence only"), "auto_high_review_medium"),
-                            (tr("Hohe und mittlere Sicherheit automatisch", "Auto-accept high and medium confidence"), "auto_high_keep_medium"),
+                            (tr("Nur vorauswählen – nichts automatisch anwenden", "Preselect only – never apply automatically"), "suggest_only"),
+                            (tr("Hohe Sicherheit automatisch; Medium vorauswählen", "Auto-apply high confidence; preselect medium"), "auto_high_review_medium"),
+                            (tr("Hohe und mittlere Sicherheit automatisch", "Auto-apply high and medium confidence"), "auto_high_keep_medium"),
                         ],
-                        value=S.get("c_frame_cleanup_mode", "suggest_only"),
+                        value=S.get("c_frame_cleanup_mode", "auto_high_keep_medium"),
+                        info=tr(
+                            "High und Medium zeigen immer zuerst die lokal bestbewertete Variante. Diese Auswahl steuert nur, ob sie automatisch angewendet oder zunächst als unbestätigter Vorschlag angezeigt wird.",
+                            "High and medium findings always show the locally best-ranked variant first. This setting only controls whether it is applied automatically or shown as an unconfirmed suggestion.",
+                        ),
                     )
                     w_frame_auto_types = gr.CheckboxGroup(
                         label=tr("Crop-Typen, die automatisch akzeptiert werden dürfen", "Crop types eligible for automatic acceptance"),
@@ -5462,8 +5588,10 @@ def build_ui() -> gr.Blocks:
                 fr_selected_info = gr.Markdown(tr("_Kein Bild ausgewählt._", "_No image selected._"))
                 gr.Markdown(tr(
                     "### Vergleichsansicht für das markierte Bild\nAlle lokal gefundenen Varianten stehen dauerhaft nebeneinander. **Original behalten** ist immer die erste Option. "
+                    "Bei hoher und mittlerer Sicherheit ist die lokal bestbewertete Variante bereits vorausgewählt. **AUTO** bedeutet, dass der Projektmodus sie direkt anwendet; **VORSCHLAG** bedeutet, dass sie noch bestätigt werden muss. "
                     "Die Bilder in dieser Ansicht sind nicht anklickbar; die Entscheidung erfolgt ausschließlich direkt darunter. Mit **Vorheriges/Nächstes Bild** kannst du hier durch die aktuelle gefilterte Bilderliste wechseln.",
                     "### Comparison viewer for the selected image\nAll locally found variants remain visible side by side. **Keep original** is always the first option. "
+                    "For high- and medium-confidence findings, the locally best-ranked variant is already preselected. **AUTO** means the project mode applies it directly; **SUGGESTION** means it still needs confirmation. "
                     "Images in this viewer are not clickable; the decision is made only with the selector directly underneath. Use **Previous/Next image** to move through the current filtered image list here.",
                 ))
                 with gr.Row(equal_height=True):
@@ -5496,13 +5624,14 @@ def build_ui() -> gr.Blocks:
                     elem_classes=["frame-comparison-gallery"],
                 )
                 fr_option_radio = gr.Radio(
-                    label=tr("Auswahl für dieses Bild – wird sofort gespeichert", "Choice for this image – saved immediately"),
+                    label=tr("Auswahl für dieses Bild – Änderungen werden sofort gespeichert", "Choice for this image – changes are saved immediately"),
                     choices=[],
                     value=None,
                     interactive=True,
                     elem_classes=["frame-option-selector"],
                 )
                 with gr.Row():
+                    fr_accept_current_btn = gr.Button(tr("✓ Aktuelle Auswahl übernehmen", "✓ Accept current selection"), variant="primary")
                     fr_auto_btn = gr.Button(tr("Automatische Entscheidung wiederherstellen", "Restore automatic decision"), variant="secondary")
                 with gr.Accordion(tr("✂ Manueller Crop – zwei Klicks oder Koordinaten", "✂ Manual crop – two clicks or coordinates"), open=True):
                     gr.Markdown(tr(
@@ -6313,15 +6442,15 @@ def build_ui() -> gr.Blocks:
                     c_frame_cleanup_mode = gr.Dropdown(
                         label=tr("Verhalten bei Rahmenfunden", "Frame-cleanup behavior"),
                         choices=[
-                            (tr("Hohe Sicherheit automatisch; mittlere Fälle prüfen", "Auto-apply high confidence; review medium cases"), "auto_high_review_medium"),
+                            (tr("Hohe Sicherheit automatisch; Medium vorauswählen", "Auto-apply high confidence; preselect medium"), "auto_high_review_medium"),
                             (tr("Hohe und mittlere Sicherheit automatisch anwenden", "Auto-apply high and medium confidence"), "auto_high_keep_medium"),
-                            (tr("Nur Vorschläge; nichts automatisch beschneiden", "Suggestions only; never auto-crop"), "suggest_only"),
+                            (tr("Nur vorauswählen; nichts automatisch anwenden", "Preselect only; never apply automatically"), "suggest_only"),
                         ],
-                        value=S.get("c_frame_cleanup_mode", "suggest_only"),
+                        value=S.get("c_frame_cleanup_mode", "auto_high_keep_medium"),
                         allow_custom_value=False,
                         info=tr(
-                            "Sicherer Standard: Nur Vorschläge. Nach bestandenem Regressionstest kann der automatische Modus bewusst aktiviert werden. Mittlere Fälle erscheinen im Tab Rahmenprüfung. Es entstehen keine LLM-Aufrufe.",
-                            "Safe default: suggestions only. Automatic mode can be enabled deliberately after regression validation. Medium cases appear in the Frame Review tab. No LLM calls are made.",
+                            "High und Medium öffnen immer mit der lokal bestbewerteten Variante. Standardmäßig werden beide automatisch angewendet. Nicht freigegebene komplexe Crop-Typen bleiben als vorausgewählter Review-Vorschlag sichtbar. Es entstehen keine LLM-Aufrufe.",
+                            "High and medium findings always open with the locally best-ranked variant. By default both are applied automatically. Complex crop types that are not eligible remain visible as preselected review suggestions. No LLM calls are made.",
                         ),
                     )
                     c_frame_pause_on_medium = gr.Checkbox(
@@ -8226,6 +8355,12 @@ def build_ui() -> gr.Blocks:
                 show_progress="hidden",
             )
             fr_option_radio.input(
+                fn=apply_frame_option_ui,
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_asset_id, fr_option_radio],
+                outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_option_gallery, fr_option_radio, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
+                show_progress="hidden",
+            )
+            fr_accept_current_btn.click(
                 fn=apply_frame_option_ui,
                 inputs=[fr_state, fr_filter, fr_page, fr_selected_asset_id, fr_option_radio],
                 outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_option_gallery, fr_option_radio, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
