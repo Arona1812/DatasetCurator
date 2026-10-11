@@ -50,6 +50,8 @@ from frame_cleanup import (
     resolve_frame_cleanup as resolve_smart_frame_cleanup,
 )
 
+from openai_models import ROUTINE_MODEL, PROFILE_MODEL, normalize_reasoning, prepare_response_payload
+
 from curator_core import (
     APP_VERSION,
     OutputTransaction,
@@ -185,8 +187,8 @@ CANCEL_FILE = ""
 # - vergibt seltener vorsichtiges 'review' fuer harmlose Bilder
 # Im Gegenzug ist mini ~5-10x teurer pro Audit als nano. Bei typischen
 # Datasetgroessen (<200 Bildern) ist das vernachlaessigbar.
-AI_MODEL = "gpt-5.6-luna"
-TRIGGER_CHECK_MODEL = "gpt-5.6-luna"
+AI_MODEL = ROUTINE_MODEL
+TRIGGER_CHECK_MODEL = ROUTINE_MODEL
 OPENAI_TOKEN_LIMIT_TOTAL = 0  # 0 = disabled
 
 # GPT-5.6 stage-specific reasoning. Image audits and per-image captions are
@@ -575,7 +577,7 @@ HEARTBEAT_INTERVAL_SECONDS = 15.0
 
 # Performance/cache internals. Caches intentionally remain inside the curated
 # dataset folder; no data is moved to LOCALAPPDATA.
-LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION = "v1"
+LOCAL_ANALYSIS_CACHE_SCHEMA_VERSION = "v2_tasks"
 FILE_HASH_INDEX_SCHEMA_VERSION = "v1"
 IG_FRAME_ANALYSIS_MAX_SIDE = 1024
 FILE_HASH_INDEX_FLUSH_EVERY = 25
@@ -620,9 +622,9 @@ VARIABLE_FEATURE_CAPTION_MODE = "canonical_deviations"
 # Krea 2 quality-caption mode. Only final selected images are sent for a
 # dedicated natural-language caption after the subject profile is known.
 USE_KREA_AI_CAPTIONING = True
-KREA_CAPTION_MODEL = "gpt-5.6-luna"
+KREA_CAPTION_MODEL = ROUTINE_MODEL
 USE_KREA_CAPTION_REPAIR = True
-KREA_CAPTION_REPAIR_MODEL = "gpt-5.6-terra"
+KREA_CAPTION_REPAIR_MODEL = PROFILE_MODEL
 KREA_CAPTION_IMAGE_DETAIL = "high"
 KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v6-active-policy-fingerprint"
 CAPTION_POLICY = {
@@ -723,7 +725,7 @@ PROFILE_BODY_BUILD_MIN_FRACTION = 0.30
 PROFILE_BODY_PRIORITY_SAMPLE_MAX = 24
 
 # Normalizer-Modell: Terra balances cross-image consistency and cost.
-PROFILE_NORMALIZER_MODEL = "gpt-5.6-terra"
+PROFILE_NORMALIZER_MODEL = PROFILE_MODEL
 
 # Cache-Version fuer zentrale Subject-Profile. Bei Aenderungen am
 # Profile-Schema oder an der Normalizer-Logik inkrementieren.
@@ -3011,25 +3013,26 @@ def _init_local_vision_models() -> None:
         started = time.perf_counter()
         if HAVE_MP:
             try:
-                MP_FACE = mp.solutions.face_detection.FaceDetection(
-                    model_selection=1,
-                    min_detection_confidence=0.5,
-                )
-                MP_POSE = mp.solutions.pose.Pose(
-                    static_image_mode=True,
-                    model_complexity=1,
-                    enable_segmentation=False,
-                    min_detection_confidence=0.5,
-                )
+                from local_vision import TasksAdapter
+                MP_FACE = TasksAdapter("face", os.path.join(CACHE_DIR, "local_models"))
             except RunCancelled:
                 raise
-            except Exception:
+            except Exception as exc:
                 MP_FACE = None
+                print(f"Local face detection unavailable ({type(exc).__name__}).")
+            try:
+                from local_vision import TasksAdapter
+                MP_POSE = TasksAdapter("pose", os.path.join(CACHE_DIR, "local_models"))
+            except RunCancelled:
+                raise
+            except Exception as exc:
                 MP_POSE = None
+                print(f"Local pose detection unavailable ({type(exc).__name__}).")
         if HAVE_CV2:
             try:
                 cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-                HAAR_CASCADE = cv2.CascadeClassifier(cascade_path)
+                if os.path.isfile(cascade_path):
+                    HAAR_CASCADE = cv2.CascadeClassifier(cascade_path)
             except RunCancelled:
                 raise
             except Exception:
@@ -4131,25 +4134,7 @@ def _validate_subject_profile_core(profile: Dict[str, Any]) -> None:
 
 
 def normalize_reasoning_effort_for_model(model: str, effort: Optional[str]) -> Optional[str]:
-    """Validate UI reasoning values and keep them compatible with model families."""
-    if effort is None:
-        return None
-    normalized = str(effort).strip().lower()
-    if normalized in {"", "auto", "default"}:
-        return None
-    allowed = {"none", "low", "medium", "high", "xhigh", "max"}
-    if normalized not in allowed:
-        safe_print(f"   ⚠️ Unknown reasoning effort '{effort}', using 'none'.")
-        return "none"
-
-    model_name = str(model or "").strip().lower()
-    if normalized == "max" and not model_name.startswith("gpt-5.6"):
-        safe_print(
-            f"   ⚠️ Reasoning effort 'max' is only used for GPT-5.6 in this curator; "
-            f"using 'xhigh' for {model}."
-        )
-        return "xhigh"
-    return normalized
+    return normalize_reasoning(model, effort)
 
 
 def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "responses_api") -> Dict[str, Any]:
@@ -4170,18 +4155,7 @@ def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "
         started_at, stop_event, thread = start_phase_heartbeat(attempt_label)
         try:
             assert_openai_token_budget_available(phase_label)
-            request_payload = {"model": model, **payload}
-            reasoning_effort = normalize_reasoning_effort_for_model(
-                model, request_payload.pop("_reasoning_effort", None)
-            )
-            if reasoning_effort:
-                request_payload["reasoning"] = {"effort": reasoning_effort}
-
-            # Current GPT-5.4/5.5/5.6 reasoning configurations do not need
-            # sampling parameters. Remove temperature whenever effort is set.
-            model_name = str(model).strip().lower()
-            if reasoning_effort and model_name.startswith(("gpt-5.4", "gpt-5.5", "gpt-5.6")):
-                request_payload.pop("temperature", None)
+            request_payload = prepare_response_payload(model, payload)
 
             response = run_cancellable_call(
                 attempt_label,
@@ -12443,10 +12417,7 @@ def main() -> None:
             pf_hash = file_sha1(pf_path)
             pf_result = frame_cleanup_for_pipeline(pf_path, source_hash=pf_hash)
             pf_analysis = pf_result.get("frame_cleanup_analysis", {}) or {}
-            if (
-                str(pf_analysis.get("confidence_level", "low")) == "medium"
-                and str(pf_result.get("frame_cleanup_user_decision", "auto")) == "auto"
-            ):
+            if pf_result.get("frame_cleanup_review_pending"):
                 unresolved.append({
                     "source_hash": pf_hash,
                     "source_path": os.path.abspath(pf_path),
@@ -12466,7 +12437,7 @@ def main() -> None:
             safe_print("=" * 70)
             safe_print("FRAME REVIEW REQUIRED - AUDIT NOT STARTED")
             safe_print("=" * 70)
-            safe_print(f"{len(unresolved)} medium-confidence frame case(s) are still undecided.")
+            safe_print(f"{len(unresolved)} frame case(s) are still undecided.")
             safe_print("Open the Frame Review tab, accept a crop or keep the original, then start again.")
             safe_print("No paid image audit was started; local frame results are cached.")
             safe_print("=" * 70)
@@ -12559,10 +12530,7 @@ def main() -> None:
                     "frame_cleanup_signals": frame_analysis.get("signals", []),
                     "frame_cleanup_layout_class": frame_analysis.get("layout_class", "plain_photo"),
                     "frame_cleanup_layout_flags": frame_analysis.get("layout_flags", []),
-                    "frame_cleanup_review_pending": (
-                        frame_analysis.get("confidence_level") == "medium"
-                        and str(frame_result.get("frame_cleanup_user_decision", "auto")) == "auto"
-                    ),
+                    "frame_cleanup_review_pending": bool(frame_result.get("frame_cleanup_review_pending")),
                 })
                 if row["frame_cleanup_review_pending"]:
                     row.setdefault("status_notes", []).append("frame_cleanup_review_suggested")

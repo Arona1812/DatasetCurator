@@ -9,7 +9,7 @@
 ## What it does
 
 - Finds unreadable files, low-quality images, and near duplicates before paid API requests.
-- Detects screenshot borders and other layouts locally; originals are never overwritten.
+- Detects screenshot borders locally and offers an additional AI photo-region finder for difficult layouts; originals are never overwritten.
 - Audits images, selects a diverse dataset, and separates ready, review, and reject results.
 - Builds an optional **Subject Profile** to keep identity traits and captions consistent across the dataset.
 - Supports training-target presets for **ERNIE Image**, **Z-Image Base**, and **Krea 2**.
@@ -22,14 +22,14 @@ The image curator follows the processing order in the UI:
 
 1. **Start / Project** — set the image folder, trigger word, and API key.
 2. **Preflight** — run local file and pHash duplicate checks. No OpenAI request is made.
-3. **Frames** *(optional)* — inspect local crop suggestions, keep the original, or define a manual crop.
+3. **Frames** *(optional)* — review suggestions generated after preflight; use the additional AI finder for difficult screenshots or set a manual crop with two clicks. Saving advances to the next pending image.
 4. **Audit & Selection** — run quality, identity, diversity, and caption processing.
 5. **Subject Profile** — review the profile when using `Profile then Caption`, or let `Single Pass` continue automatically.
 6. **Results** — inspect the exported training, review, and cleanup buckets.
 
 ## Requirements
 
-- **Python 3.10**
+- **Python 3.13**
 - An **OpenAI API key and available API credit** for the audit and captioning pipeline. Local preflight and frame analysis work without it.
 - NVIDIA GPU acceleration is optional. The application can run on CPU.
 - **InsightFace** is optional for image curation, but required for Video Processor face matching and the ArcFace identity check.
@@ -47,14 +47,24 @@ The interface displays the installed source version from `git describe --tags --
 
 2. Double-click `start_curator.bat`.
 
-The launcher creates `curator_env`, installs core packages, tries to install optional InsightFace support, and opens the Gradio UI in your browser.
+The launcher creates `curator_env_py313`, installs core packages, tries to install optional InsightFace support, and opens the Gradio UI in your browser.
 
-> The Windows launcher currently installs CUDA 13.0 PyTorch and ONNX Runtime builds. It still works without an NVIDIA GPU, but a CPU-only manual installation is smaller.
+> The Windows launcher installs CUDA 13.0 PyTorch and ONNX Runtime builds by default. Use `start_curator.bat --cpu` for a portable installation without CUDA. The previous `curator_env` environment is preserved.
+
+Local face and pose detection now uses the MediaPipe Tasks API. Public model weights are downloaded and cached on first use; inference runs on your computer.
+
+## Model choice and photo-region finder
+
+The model preset in **Audit & Selection** configures all roles together: **Current ChatGPT** uses `chat-latest` for routine tasks, **Economical** uses `gpt-6-luna`, and **Quality** uses `gpt-6-astra`. Profile and repair roles use `gpt-6.1-sol` or `gpt-6-astra`, depending on the preset. Saved model choices are retained until you apply a preset. Individual models and the full option set remain available in the advanced sections.
+
+The additional frame finder combines OpenAI image understanding with local edge refinement. It proposes the complete photo area inside nested screenshots or blurred duplicate backgrounds. Starting this optional feature sends selected images to OpenAI and incurs API costs. Identical requests reuse cached proposals. AI proposals require confirmation and are never applied automatically. New projects also default to reviewing local suggestions.
+
+See [project review and next steps](PROJECT_REVIEW.md) for validation limits.
 
 ## Manual installation (Linux, macOS, or CPU-focused setup)
 
 ```bash
-python3.10 -m venv curator_env
+python3.13 -m venv curator_env
 source curator_env/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt

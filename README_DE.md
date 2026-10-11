@@ -9,7 +9,7 @@
 ## Was das Tool kann
 
 - Findet nicht lesbare Dateien, Bilder mit geringer Qualität und ähnliche Duplikate vor kostenpflichtigen API-Anfragen.
-- Erkennt Screenshot-Rahmen und andere Layouts lokal; Originaldateien werden nie überschrieben.
+- Erkennt Screenshot-Rahmen lokal und bietet zusätzlich eine KI-Erkennung des eigentlichen Fotobereichs für schwierige Layouts; Originaldateien werden nie überschrieben.
 - Prüft Bilder, wählt einen vielfältigen Datensatz aus und trennt fertige, zu prüfende und ausgeschlossene Ergebnisse.
 - Erstellt optional ein **Subject Profile**, damit Identitätsmerkmale und Captions im gesamten Datensatz konsistent bleiben.
 - Unterstützt Trainingsziel-Voreinstellungen für **ERNIE Image**, **Z-Image Base** und **Krea 2**.
@@ -22,14 +22,14 @@ Der Bild-Curator folgt in der UI der tatsächlichen Verarbeitungsreihenfolge:
 
 1. **Start / Project** — Bildordner, Trigger Word und API-Key festlegen.
 2. **Preflight** — lokale Datei- und pHash-Duplikatprüfungen ausführen. Dabei wird keine OpenAI-Anfrage gestellt.
-3. **Frames** *(optional)* — lokale Crop-Vorschläge prüfen, Original behalten oder manuellen Crop definieren.
+3. **Frames** *(optional)* — nach Preflight automatisch erzeugte Vorschläge prüfen. Bei schwierigen Screenshots die zusätzliche KI-Erkennung starten; Vorschlag wählen oder mit zwei Klicks einen manuellen Crop setzen. Nach der Entscheidung folgt das nächste offene Bild.
 4. **Audit & Selection** — Qualitäts-, Identitäts-, Diversitäts- und Captioning-Verarbeitung starten.
 5. **Subject Profile** — bei `Profile then Caption` das Profil prüfen oder bei `Single Pass` automatisch fortfahren lassen.
 6. **Results** — exportierte Trainings-, Review- und Nachbearbeitungsordner prüfen.
 
 ## Voraussetzungen
 
-- **Python 3.10**
+- **Python 3.13**
 - Ein **OpenAI-API-Key mit verfügbarem Guthaben** für Audit- und Captioning-Pipeline. Lokaler Preflight und Frame-Analyse funktionieren ohne ihn.
 - NVIDIA-GPU-Beschleunigung ist optional. Die Anwendung kann auch auf der CPU laufen.
 - **InsightFace** ist für die normale Bildkuratierung optional, aber für Personenabgleich im Video Processor und den ArcFace Identity Check erforderlich.
@@ -47,14 +47,24 @@ Die UI zeigt die installierte Quellversion über `git describe --tags --always -
 
 2. `start_curator.bat` doppelklicken.
 
-Der Launcher erstellt `curator_env`, installiert die Kernpakete, versucht die optionale InsightFace-Unterstützung zu installieren und öffnet die Gradio-UI im Browser.
+Der Launcher erstellt `curator_env_py313`, installiert die Kernpakete, versucht die optionale InsightFace-Unterstützung zu installieren und öffnet die Gradio-UI im Browser.
 
-> Der Windows-Launcher installiert derzeit CUDA-13.0-Builds von PyTorch und ONNX Runtime. Das Tool funktioniert auch ohne NVIDIA-GPU, für eine reine CPU-Installation ist die manuelle Installation aber schlanker.
+> Der Windows-Launcher installiert standardmäßig CUDA-13.0-Builds von PyTorch und ONNX Runtime. Für eine portable Installation ohne CUDA `start_curator.bat --cpu` verwenden. Die frühere Umgebung `curator_env` bleibt erhalten.
+
+Die lokale Gesicht- und Posenerkennung verwendet die aktuelle MediaPipe Tasks API. Beim ersten benötigten Einsatz werden öffentliche Modellgewichte heruntergeladen und im lokalen Cache gespeichert. Die Erkennung verarbeitet Bilder auf dem eigenen Rechner.
+
+## Modellwahl und Rahmenfinder
+
+Unter **Audit & Selection** stellt die Modell-Voreinstellung alle Rollen gemeinsam um: **Aktuelles ChatGPT** verwendet `chat-latest` für Routineaufgaben, **Sparsam** `gpt-6-luna`, **Qualität** `gpt-6-astra`. Profil- und Reparaturaufgaben verwenden je nach Voreinstellung `gpt-6.1-sol` oder `gpt-6-astra`. Bestehende gespeicherte Modellnamen werden nicht automatisch überschrieben. Einzelne Modelle und weitere Einstellungen bleiben in den erweiterten Bereichen verfügbar.
+
+Der zusätzliche Rahmenfinder kombiniert Bildverständnis über die Responses API mit einer lokalen Verfeinerung an Bildkanten. Er kann beispielsweise das Foto innerhalb eines verschachtelten Screenshots oder vor einem unscharfen Hintergrund finden. Diese Funktion wird ausdrücklich gestartet, sendet ausgewählte Bilder an OpenAI und verursacht API-Kosten. Identische Anfragen werden aus dem Cache wiederverwendet. KI-Vorschläge müssen bestätigt werden; sie werden nicht automatisch zugeschnitten. Die Standard-Voreinstellung für neue Projekte zeigt auch lokale Vorschläge zur Prüfung an.
+
+Siehe [Projektbewertung und nächste Schritte](PROJECT_REVIEW.md) für die Grenzen der bisherigen Validierung.
 
 ## Manuelle Installation (Linux, macOS oder CPU-orientiertes Setup)
 
 ```bash
-python3.10 -m venv curator_env
+python3.13 -m venv curator_env
 source curator_env/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt

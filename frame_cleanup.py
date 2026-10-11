@@ -364,6 +364,8 @@ def _detect_face_boxes(preview: Image.Image) -> List[Tuple[int, int, int, int]]:
         return []
     try:
         cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
+        if not os.path.isfile(cascade_path):
+            return []
         cascade = cv2.CascadeClassifier(cascade_path)
         if cascade.empty():
             return []
@@ -1265,15 +1267,49 @@ def materialize_crop(
     return destination
 
 
+def automatic_crop_bbox(analysis: Dict[str, Any], mode: str, allowed_types: Iterable[str]) -> Optional[List[int]]:
+    """One policy for the UI queue and the actual pipeline crop.
+
+    Complex layouts always require a decision, even if their type is allowed.
+    """
+    if set(analysis.get("layout_flags") or []) & {
+        "nested_app_screenshot", "nested_inner_image_detected", "overlay_crosses_frame_boundary",
+        "semantic_review_required",
+    } or analysis.get("layout_class") in {"collage", "circular_crop"} or analysis.get("crop_type") in {"nested_inner_image", "semantic_photo"}:
+        return None
+    level = analysis.get("confidence_level", "low")
+    eligible = (mode == "auto_high_review_medium" and level == "high") or (
+        mode == "auto_high_keep_medium" and level in {"high", "medium"}
+    )
+    bbox = analysis.get("candidate_bbox")
+    if eligible and analysis.get("crop_type") in set(allowed_types) and isinstance(bbox, list) and len(bbox) == 4:
+        return list(bbox)
+    return None
+
+
+def frame_needs_review(analysis: Dict[str, Any], mode: str, allowed_types: Iterable[str], user_decision: str = "auto") -> bool:
+    if user_decision != "auto":
+        return False
+    if automatic_crop_bbox(analysis, mode, allowed_types) is not None:
+        return False
+    return analysis.get("confidence_level") in {"high", "medium"} or analysis.get("recommendation") == "review"
+
+
 def resolve_frame_cleanup(
     image_path: str,
     source_hash: str,
     cache_dir: str,
     output_root: str,
-    mode: str = "auto_high_review_medium",
+    mode: str = "suggest_only",
     settings: Optional[DetectorSettings] = None,
 ) -> Dict[str, Any]:
     analysis = analyze_frame_cleanup(image_path, cache_dir, source_hash, settings=settings, use_cache=True)
+    # Semantic proposals are optional, separately cached, and never auto-applied.
+    from vision_frames import load_photo_proposal, attach_photo_proposal
+    semantic = load_photo_proposal(cache_dir, source_hash)
+    if semantic:
+        analysis = dict(analysis)
+        attach_photo_proposal(analysis, semantic)
     user_payload = load_user_decisions(output_root)
     user = (user_payload.get("decisions", {}) or {}).get(source_hash) or {}
     user_decision = str(user.get("decision", "auto") or "auto")
@@ -1286,17 +1322,14 @@ def resolve_frame_cleanup(
     elif user_decision == "keep_original":
         applied_by = "user_keep_original"
     else:
-        mode = str(mode or "auto_high_review_medium")
+        mode = str(mode or "suggest_only")
         crop_type = str(analysis.get("crop_type", "unknown") or "unknown")
-        allowed_types = {str(v) for v in (settings.auto_accept_types if settings else ())}
-        type_allowed = crop_type in allowed_types
-        if mode == "auto_high_review_medium" and analysis.get("confidence_level") == "high" and type_allowed:
-            bbox = analysis.get("candidate_bbox")
-            applied_by = f"auto_high:{crop_type}"
-        elif mode == "auto_high_keep_medium" and analysis.get("confidence_level") in {"high", "medium"} and type_allowed:
-            bbox = analysis.get("candidate_bbox")
-            applied_by = f"auto_high_or_medium:{crop_type}"
-        elif mode in {"auto_high_review_medium", "auto_high_keep_medium"} and analysis.get("confidence_level") in {"high", "medium"} and not type_allowed:
+        allowed_types = settings.auto_accept_types if settings else DetectorSettings().auto_accept_types
+        bbox = automatic_crop_bbox(analysis, mode, allowed_types)
+        if bbox is not None:
+            prefix = "auto_high" if mode == "auto_high_review_medium" else "auto_high_or_medium"
+            applied_by = f"{prefix}:{crop_type}"
+        elif mode in {"auto_high_review_medium", "auto_high_keep_medium"} and frame_needs_review(analysis, mode, allowed_types):
             applied_by = f"policy_review:{crop_type}"
         elif mode == "suggest_only":
             applied_by = "suggest_only"
@@ -1312,6 +1345,9 @@ def resolve_frame_cleanup(
         "frame_cleanup_applied": effective_path != image_path,
         "frame_cleanup_applied_by": applied_by,
         "frame_cleanup_user_decision": user_decision,
+        "frame_cleanup_review_pending": frame_needs_review(
+            analysis, mode, (settings or DetectorSettings()).auto_accept_types, user_decision
+        ),
         "frame_cleanup_bbox": [int(v) for v in bbox] if isinstance(bbox, list) and len(bbox) == 4 else None,
         "frame_cleanup_analysis": analysis,
     }

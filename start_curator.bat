@@ -29,16 +29,19 @@ echo ========================================
 echo.
 
 :: --- Step 1: Virtual environment ---
-if exist "curator_env\Scripts\activate.bat" (
+if exist "curator_env_py313\Scripts\activate.bat" (
     echo Step 1 of 3: Virtual environment found
 ) else (
     echo Step 1 of 3: Creating virtual environment
-    py -3.10 -m venv curator_env
+    py -3.13 -m venv curator_env_py313
     if errorlevel 1 goto err_python
     echo       Created
 )
 
-call curator_env\Scripts\activate.bat
+:: Use a separate environment; existing Python 3.10 installs are preserved.
+curator_env_py313\Scripts\python.exe -c "import sys; sys.exit(0 if sys.version_info[:2] == (3,13) else 1)"
+if errorlevel 1 goto err_environment
+call curator_env_py313\Scripts\activate.bat
 
 :: --- Step 2: Dependencies ---
 echo Step 2 of 3: Checking dependencies
@@ -46,7 +49,7 @@ call :verify_dependencies
 if errorlevel 1 (
     echo       Missing or broken core dependencies detected
     echo.
-    if exist "curator_env\_install_done.marker" (
+    if exist "curator_env_py313\_install_done.marker" (
         echo Step 2 of 3: Migrating from v1 install
         echo.
         call :do_migrate_v1_to_v2
@@ -55,7 +58,7 @@ if errorlevel 1 (
         echo Step 2 of 3: Installing/repairing dependencies
         echo       This may take a few minutes
         echo.
-        call :do_install
+        call :do_install %*
         if errorlevel 1 goto err_install
     )
 
@@ -64,14 +67,14 @@ if errorlevel 1 (
     call :verify_dependencies
     if errorlevel 1 goto err_verify
 
-    echo done > "curator_env\_install_done.marker_v2"
+    echo done > "curator_env_py313\_install_done.marker_v2"
     echo.
     echo       Dependencies ready
 ) else (
-    if exist "curator_env\_install_done.marker_v2" (
+    if exist "curator_env_py313\_install_done.marker_v2" (
         echo       Dependencies verified
     ) else (
-        echo done > "curator_env\_install_done.marker_v2"
+        echo done > "curator_env_py313\_install_done.marker_v2"
         echo       Dependencies verified and marker created
     )
 )
@@ -131,7 +134,7 @@ exit /b 0
 :: ============================================================
 :verify_dependencies
 
-python -c "import importlib.util, sys; mods=['requests','PIL','numpy','scipy','mediapipe','torch','torchvision','open_clip','cv2','onnxruntime','sklearn','gradio']; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print('      Python ' + sys.version.split()[0]); print('      Missing core: ' + (', '.join(missing) if missing else 'none')); sys.exit(1 if missing else 0)"
+python check_runtime.py
 
 exit /b %errorlevel%
 
@@ -141,7 +144,7 @@ exit /b %errorlevel%
 :: ============================================================
 :verify_optional_dependencies
 
-python -c "import importlib.util, sys; mods=['insightface']; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print('      Missing optional: ' + (', '.join(missing) if missing else 'none')); sys.exit(1 if missing else 0)"
+python check_runtime.py --optional
 
 exit /b %errorlevel%
 
@@ -151,29 +154,45 @@ exit /b %errorlevel%
 :: ============================================================
 :do_install
 
+if /I "%~1"=="--cpu" (
+    python -m pip install --upgrade pip setuptools wheel
+    if errorlevel 1 exit /b 1
+    python -m pip install -r requirements.txt
+    if errorlevel 1 exit /b 1
+    exit /b 0
+)
+
 echo       - pip upgrade
 python -m pip install --upgrade pip setuptools wheel
+if errorlevel 1 exit /b 1
 
 echo       - Base packages
 python -m pip install requests pillow numpy scipy
+if errorlevel 1 exit /b 1
 
 echo       - MediaPipe
 python -m pip install mediapipe==0.10.33
+if errorlevel 1 exit /b 1
 
 echo       - PyTorch + CUDA
 python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu130
+if errorlevel 1 exit /b 1
 
 echo       - OpenCLIP
 python -m pip install open_clip_torch
+if errorlevel 1 exit /b 1
 
 echo       - OpenCV, scikit-learn
 python -m pip install opencv-python scikit-learn
+if errorlevel 1 exit /b 1
 
 echo       - ONNX Runtime (GPU)
 python -m pip install onnxruntime-gpu
+if errorlevel 1 exit /b 1
 
 echo       - Gradio UI
-python -m pip install gradio
+python -m pip install "gradio>=5,<7"
+if errorlevel 1 exit /b 1
 
 call :do_install_optional
 
@@ -205,9 +224,11 @@ python -m pip uninstall -y onnxruntime
 
 echo       - Installing GPU onnxruntime
 python -m pip install onnxruntime-gpu
+if errorlevel 1 exit /b 1
 
 echo       - Verifying insightface is up to date
 python -m pip install --upgrade insightface
+if errorlevel 1 exit /b 1
 
 exit /b 0
 
@@ -217,8 +238,17 @@ exit /b 0
 :: ============================================================
 :err_python
 echo.
-echo ERROR: Python 3.10 not found
+echo ERROR: Python 3.13 not found
 echo Please install it from: https://www.python.org/downloads/
+pause
+exit /b 1
+
+:err_environment
+
+echo.
+echo ERROR: curator_env_py313 is broken or does not use Python 3.13.
+echo Rename that environment folder and rerun this launcher to create a fresh one.
+echo Your datasets, settings and previous curator_env remain unchanged.
 pause
 exit /b 1
 
@@ -232,8 +262,8 @@ exit /b 1
 echo.
 echo ERROR: Dependencies are still missing after installation/repair.
 echo Please check the output above. Common fixes:
-echo   curator_env\Scripts\python.exe -m pip install scikit-learn
-echo   curator_env\Scripts\python.exe -m pip install opencv-python
+echo   curator_env_py313\Scripts\python.exe -m pip install scikit-learn
+echo   curator_env_py313\Scripts\python.exe -m pip install opencv-python
 pause
 exit /b 1
 
