@@ -18,7 +18,7 @@ from PIL import Image
 
 from curator_core import atomic_write_json, stable_hash
 from frame_cleanup import image_dimensions, load_bounded_rgb
-from openai_models import PROFILE_MODEL, prepare_response_payload
+from openai_models import FRAME_VISION_MODEL, prepare_response_payload
 
 PROMPT_VERSION = "photo-region-v1"
 PROMPT = """Find the actual photographic image area in this input for a person/character training dataset.
@@ -100,7 +100,7 @@ def refine_to_edges(preview: Image.Image, bbox: List[int], original_size: tuple)
 
 
 def propose_photo_region(image_path: str, source_hash: str, cache_dir: str, api_key: str,
-                         model: str = PROFILE_MODEL, post: Callable = requests.post) -> Dict[str, Any]:
+                         model: str = FRAME_VISION_MODEL, post: Callable = requests.post) -> Dict[str, Any]:
     key = stable_hash({"source": source_hash, "model": model, "prompt": PROMPT_VERSION})
     cache = Path(cache_dir) / "vision_frames" / f"{key}.json"
     if cache.is_file():
@@ -118,7 +118,8 @@ def propose_photo_region(image_path: str, source_hash: str, cache_dir: str, api_
     preview.save(buffer, format="JPEG", quality=92)
     url = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
     payload = prepare_response_payload(model, {
-        "store": False, "_reasoning_effort": "low", "max_output_tokens": 4096,
+        "store": False, "_reasoning_effort": "none" if model == FRAME_VISION_MODEL else "low",
+        "max_output_tokens": 1024 if model == FRAME_VISION_MODEL else 4096,
         "input": [{"role": "user", "content": [
             {"type": "input_text", "text": PROMPT},
             {"type": "input_image", "image_url": url, "detail": "high"},

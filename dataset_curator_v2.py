@@ -48,6 +48,7 @@ from frame_cleanup import (
     FRAME_DETECTOR_SCHEMA_VERSION,
     analyze_frame_cleanup as analyze_smart_frame_cleanup,
     resolve_frame_cleanup as resolve_smart_frame_cleanup,
+    filter_excluded_sources,
 )
 
 from openai_models import ROUTINE_MODEL, PROFILE_MODEL, normalize_reasoning, prepare_response_payload
@@ -7928,6 +7929,9 @@ def _priority_filename_set(profile: Optional[Dict[str, Any]]) -> set:
 
 
 def is_priority_image(row: Dict[str, Any], profile: Optional[Dict[str, Any]]) -> bool:
+    # Explicit dataset removal wins over an older profile Priority flag.
+    if row.get("frame_cleanup_user_decision") == "exclude" or row.get("dataset_excluded"):
+        return False
     if bool(row.get("priority_image")):
         return True
     image_id = str(row.get("profile_image_id") or profile_image_id(row) or "").strip()
@@ -8201,6 +8205,8 @@ def rebuild_selection_from_identity_roles(
     overflow_items: List[Dict[str, Any]] = []
     priority_rows: List[Dict[str, Any]] = []
     for row in all_rows:
+        if row.get("frame_cleanup_user_decision") == "exclude" or row.get("dataset_excluded"):
+            continue
         if row.get("priority_image"):
             priority_rows.append(row)
             continue
@@ -12354,6 +12360,13 @@ def main() -> None:
 
     safe_print(f"Images found: {len(image_paths)}")
 
+    # Remove explicit exclusions before choosing duplicate representatives.
+    # The survivor fingerprint also invalidates early results when an image is
+    # excluded or restored, so a hidden duplicate can become the new survivor.
+    image_paths, frame_excluded_rows = filter_excluded_sources(image_paths, OUTPUT_ROOT)
+    if frame_excluded_rows:
+        safe_print(f"Excluded in Frames: {len(frame_excluded_rows)} image(s); no image audit will run for these.")
+
     _early_started = time.perf_counter()
     dataset_fp = dataset_fingerprint(image_paths)
     update_run_manifest("running", input_dataset_fingerprint=dataset_fp, input_image_count=len(image_paths))
@@ -12458,7 +12471,7 @@ def main() -> None:
     safe_print(f"Starting audit for trigger word: {TRIGGER_WORD}")
     safe_print("")
 
-    all_rows: List[Dict[str, Any]] = list(early_reject_rows)
+    all_rows: List[Dict[str, Any]] = list(early_reject_rows) + frame_excluded_rows
     # Sammelt alle Smart-Crop-Paare fuer den Vergleichs-Export
     crop_pairs: List[Dict[str, Any]] = []
 

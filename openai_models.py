@@ -8,6 +8,7 @@ from copy import deepcopy
 from typing import Any, Dict, Optional
 
 ROUTINE_MODEL = "gpt-6-luna"
+FRAME_VISION_MODEL = ROUTINE_MODEL
 PROFILE_MODEL = "gpt-6.1-sol"
 CHATGPT_MODEL = "chat-latest"
 MODEL_CHOICES = [

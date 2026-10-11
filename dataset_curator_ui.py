@@ -30,7 +30,8 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 import gradio as gr
 from PIL import Image, ImageDraw, ImageOps
 
-from openai_models import MODEL_CHOICES, model_preset
+from openai_models import MODEL_CHOICES, FRAME_VISION_MODEL, model_preset
+from frame_group_review import build_group_plan, validate_group_selection
 from vision_frames import propose_photo_region, load_photo_proposal, attach_photo_proposal
 
 from curator_core import (
@@ -3541,6 +3542,50 @@ def _validate_run_values(values: Tuple[Any, ...]) -> Tuple[Optional[Dict[str, An
     return v, None
 
 
+def audit_run_overview_ui(trigger_word, input_folder, target, model, pipeline_mode, frame_state):
+    """Read-only run preview; never load credentials or start image/model work."""
+    import html
+    escape = lambda value: html.escape(str(value)).replace("|", "&#124;")
+    workspace = load_project_workspace(input_folder, trigger_word) if input_folder and trigger_word else {}
+    preflight = workspace.get("preflight", {}) or {}
+    current = bool(preflight.get("completed")) and _workspace_preflight_is_current(input_folder, trigger_word, workspace)
+    lines = [tr("### Dein nächster Lauf", "### Your next run")]
+    if current:
+        lines.append(tr(f"**Vorprüfung bereit:** {preflight.get('survivor_count', 0)} Bilder nach Datei- und Duplikatprüfung.",
+                        f"**Preflight ready:** {preflight.get('survivor_count', 0)} images after file and duplicate checks."))
+    else:
+        lines.append(tr("**Zuerst auf Start die Vorprüfung ausführen oder aktualisieren.**", "**Run or refresh preflight on Start first.**"))
+    same_project = isinstance(frame_state, dict) and os.path.normcase(os.path.abspath(frame_state.get("output_root") or ".")) == os.path.normcase(os.path.abspath(output_root_for(input_folder or ".", trigger_word or "")))
+    if current and same_project and frame_state.get("records"):
+        records = frame_state["records"]
+        mode, allowed = frame_state.get("frame_mode", "suggest_only"), frame_state.get("auto_accept_types", [])
+        automatic = sum(r.get("user_decision", "auto") == "auto" and automatic_crop_bbox(r, mode, allowed) is not None for r in records)
+        pending = sum(frame_needs_review(r, mode, allowed, r.get("user_decision", "auto")) for r in records)
+        excluded = sum(r.get("user_decision") == "exclude" for r in records)
+        lines.append(tr(f"**Rahmen:** {automatic} automatisch · {pending} offen · {excluded} ausgeschlossen.",
+                        f"**Frames:** {automatic} automatic · {pending} pending · {excluded} excluded."))
+        if pending:
+            lines.append(tr("Offene Vorschläge in Modul 1 prüfen; die eingestellte Rahmenregel bestimmt, ob der Lauf dafür pausiert.",
+                            "Review pending proposals in module 1; the selected frame policy determines whether the run pauses for them."))
+    elif (workspace.get("frame") or {}).get("enabled"):
+        lines.append(tr("**Rahmen:** Modul 1 lokal laden, um aktuelle Entscheidungen und offene Vorschläge zu sehen.",
+                        "**Frames:** load module 1 locally to see current decisions and pending proposals."))
+    flow = tr("Audit → Profil prüfen → Captions und Export separat starten", "Audit → review profile → start captions and export separately") if pipeline_mode == "profile_then_caption" else tr("Audit → Profil → Captions → Export", "Audit → profile → captions → export")
+    lines.extend([tr(f"**Ziel:** {int(target or 0)} Bilder · **Audit-Modell:** {escape(model)}", f"**Target:** {int(target or 0)} images · **Audit model:** {escape(model)}"), f"**{tr('Ablauf', 'Flow')}:** {flow}"])
+    stage = _load_json_dict(caption_stage_path_for(input_folder or ".", trigger_word or "")) if input_folder and trigger_word else {}
+    profile = _load_json_dict(subject_profile_path_for(input_folder or ".", trigger_word or "")) if stage else {}
+    if stage:
+        if stage.get("audit_stale_images") or profile.get("audit_stale_images"):
+            lines.append(tr("**Vorhandener Audit-Stand muss aktualisiert werden:** Rahmenentscheidungen wurden nachträglich geändert.",
+                            "**Existing audit needs updating:** frame decisions changed afterwards."))
+        else:
+            lines.append(tr("**Audit-Stand vorhanden:** Im Profil-Tab prüfen, ob Captions und Export fortgesetzt werden können.",
+                            "**Audit stage available:** check the Profile tab to continue captions and export."))
+    lines.append(tr("Diese Übersicht ist lokal. Erst „Audit starten“ beginnt die Verarbeitung mit möglichen API-Kosten.",
+                    "This preview is local. Only Start audit begins processing that may incur API costs."))
+    return "\n\n".join(lines)
+
+
 def start_curator(*values):
     v, error = _validate_run_values(values)
     if error:
@@ -3694,6 +3739,7 @@ FRAME_REVIEW_FILTER_CHOICES = [
     ("high", "Hohe Sicherheit", "High confidence"),
     ("detected", "Alle erkannten Rahmen", "All detected frames"),
     ("decided", "Manuell entschieden", "Manually decided"),
+    ("excluded", "Ausgeschlossen", "Excluded"),
     ("all", "Alle Bilder", "All images"),
 ]
 
@@ -3744,6 +3790,10 @@ def _save_frame_hash_index_ui(cache_dir: str, payload: Dict[str, Any]) -> None:
 def _frame_filter_records(state: Any, filter_value: str) -> List[Dict[str, Any]]:
     records = list((state or {}).get("records", []) or []) if isinstance(state, dict) else []
     value = str(filter_value or "review")
+    if value == "excluded":
+        return [r for r in records if r.get("user_decision") == "exclude"]
+    if value not in {"all", "decided"}:
+        records = [r for r in records if r.get("user_decision") != "exclude"]
     if value == "review":
         return [r for r in records if frame_needs_review(
             r, state.get("frame_mode", "suggest_only"), state.get("auto_accept_types", []),
@@ -3884,7 +3934,7 @@ def _frame_option_entries(record: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _frame_current_option_key(record: Dict[str, Any], state: Any = None) -> str:
     decision = str(record.get("user_decision", "auto") or "auto")
-    if decision == "keep_original":
+    if decision in {"keep_original", "exclude"}:
         return "original"
     if decision == "manual":
         return "manual"
@@ -3932,7 +3982,10 @@ def _frame_option_gallery_update(record: Optional[Dict[str, Any]], state: Any = 
     if not record:
         return gr.update(value=[], selected_index=None), gr.update(choices=[], value=None)
     current_key = _frame_current_option_key(record, state)
-    confirmed = record.get("user_decision", "auto") != "auto"
+    confirmed = record.get("user_decision", "auto") in {"accept", "manual", "keep_original"}
+    automatic = (record.get("user_decision", "auto") == "auto" and
+                 automatic_crop_bbox(record, (state or {}).get("frame_mode", "suggest_only"),
+                                     (state or {}).get("auto_accept_types", [])) is not None)
     values: List[Tuple[Image.Image, str]] = []
     choices: List[Tuple[str, str]] = []
     for index, entry in enumerate(_frame_option_entries(record)):
@@ -3941,7 +3994,7 @@ def _frame_option_gallery_update(record: Optional[Dict[str, Any]], state: Any = 
             image = Image.new("RGB", (480, 480), (52, 52, 52))
             drawer = ImageDraw.Draw(image)
             drawer.text((24, 220), tr("Vorschau nicht lesbar", "Preview unavailable"), fill=(235, 235, 235))
-        marker = "✓ " if confirmed and entry["key"] == current_key else ""
+        marker = "✓ " if (confirmed or automatic) and entry["key"] == current_key else ""
         if entry["key"] == "original":
             caption = marker + tr("Original behalten", "Keep original")
         else:
@@ -3953,7 +4006,7 @@ def _frame_option_gallery_update(record: Optional[Dict[str, Any]], state: Any = 
         # The comparison gallery is deliberately display-only. Selection is
         # performed exclusively by the radio control immediately underneath.
         gr.update(value=values, selected_index=None),
-        gr.update(choices=choices, value=current_key if confirmed and any(v == current_key for _l, v in choices) else None),
+        gr.update(choices=choices, value=current_key if (confirmed or automatic) and any(v == current_key for _l, v in choices) else None),
     )
 
 
@@ -3973,8 +4026,10 @@ def _frame_option_detail(record: Dict[str, Any], option_key: str) -> Tuple[str, 
                     f"**{record.get('filename','')}** – AI photo region · `{bbox}`. {entry.get('reason','')}",
                 ), [int(v) for v in bbox]
             return tr(
-                f"**{record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Sofort gespeichert.",
-                f"**{record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Saved immediately.",
+                f"**{record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Sofort gespeichert."
+                + (" **Fotogrenze unsicher – Bildinhalt prüfen.**" if "photo_boundary_uncertain" in record.get("layout_flags", []) else ""),
+                f"**{record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Saved immediately."
+                + (" **Photo boundary uncertain – check image content.**" if "photo_boundary_uncertain" in record.get("layout_flags", []) else ""),
             ), [int(v) for v in bbox]
     width, height = record.get("original_size") or [0, 0]
     return tr("Unbekannte Auswahl.", "Unknown selection."), [0, 0, int(width), int(height)]
@@ -4037,14 +4092,18 @@ def _frame_review_summary_md(state: Any) -> str:
     automatic = sum(1 for r in state.get("records", []) if r.get("user_decision", "auto") == "auto"
                     and automatic_crop_bbox(r, state.get("frame_mode", "suggest_only"), state.get("auto_accept_types", [])) is not None)
     return tr(
-        f"**{pending} offen · {automatic} automatisch · {summary['total']} Bilder lokal geprüft:**** {summary['high']} hohe Sicherheit, "
+        f"**{pending} offen · {automatic} automatisch · {summary['total']} Bilder lokal geprüft:** {summary['high']} hohe Sicherheit, "
         f"{summary['medium']} mittlere Sicherheit, {summary['low']} ohne belastbaren Rahmenfund.  "
         f"Manuell: {decisions.get('accept',0)} übernommen, {decisions.get('manual',0)} manuell, "
-        f"{decisions.get('keep_original',0)} Original behalten. **Keine LLM-Aufrufe.**",
+        f"{decisions.get('keep_original',0)} Original behalten, {decisions.get('exclude',0)} ausgeschlossen. "
+        + ("**Automatik aus: nur Vorschläge.** " if state.get('frame_mode', 'suggest_only') == 'suggest_only' else "**Automatik aktiv; unsichere Fotogrenzen bleiben zur Prüfung.** ")
+        + "Die Zählung oben umfasst lokale Ergebnisse; KI-Aufrufe werden separat angezeigt.",
         f"**{pending} pending · {automatic} automatic · {summary['total']} images checked locally:** {summary['high']} high confidence, "
         f"{summary['medium']} medium confidence, {summary['low']} without a reliable frame.  "
         f"Manual: {decisions.get('accept',0)} accepted, {decisions.get('manual',0)} manual, "
-        f"{decisions.get('keep_original',0)} original kept. **No LLM calls.**",
+        f"{decisions.get('keep_original',0)} original kept, {decisions.get('exclude',0)} excluded. "
+        + ("**Automation off: suggestions only.** " if state.get('frame_mode', 'suggest_only') == 'suggest_only' else "**Automation active; uncertain photo boundaries still require review.** ")
+        + "Counts above cover local results; AI calls are reported separately.",
     )
 
 
@@ -4194,6 +4253,11 @@ def scan_frame_review_ui(
         "frame_mode": str(workspace_frame.get("mode", "suggest_only") or "suggest_only"),
         "auto_accept_types": list(workspace_frame.get("auto_accept_types") or []),
     }
+    confirmed_crops = [r for r in records if r.get("user_decision") in {"accept", "manual"} and r.get("display_bbox")]
+    if confirmed_crops:
+        state["last_confirmed_crop_hash"] = max(
+            confirmed_crops, key=lambda r: str(user_map.get(r["source_hash"], {}).get("updated_at", ""))
+        )["source_hash"]
     filtered = _frame_filter_records(state, "review")
     pages = _frame_page_choices(len(filtered))
     gallery = _frame_review_gallery(state, "review", "1")
@@ -4412,6 +4476,50 @@ def save_manual_frame_and_navigate_ui(state, filter_value, page_value, source_ha
     return (new_state, summary, *navigate_frame_review_image_ui(new_state, filter_value, selected_hash, 0), status)
 
 
+def exclude_frame_and_navigate_ui(state, filter_value, page_value, source_hash, advance):
+    _, previous_index = _frame_selection_location(state, filter_value, source_hash)
+    updated, summary, _, _, status = set_frame_review_decision_ui(
+        state, filter_value, page_value, source_hash, "exclude", None, 0, 0, 0, 0,
+    )
+    records = _frame_filter_records(updated, filter_value)
+    target_hash = source_hash
+    if advance and not str(status).startswith("❌") and records:
+        remaining = next((i for i, r in enumerate(records) if r.get("source_hash") == source_hash), -1)
+        index = remaining + 1 if remaining >= 0 else max(0, previous_index)
+        target_hash = records[min(index, len(records)-1)]["source_hash"]
+    return (updated, summary, *navigate_frame_review_image_ui(updated, filter_value, target_hash, 0), status)
+
+
+def set_frame_automation_ui(state, mode, allowed_types, filter_value):
+    if not isinstance(state, dict) or not state.get("records"):
+        return (state, _frame_review_summary_md(state), tr("Zuerst Rahmen lokal analysieren.", "Analyze frames locally first."))
+    if mode not in {"suggest_only", "auto_high_review_medium", "auto_high_keep_medium"}:
+        raise ValueError("unsupported frame automation mode")
+    allowed = [value for value, _de, _en in FRAME_AUTO_ACCEPT_TYPE_CHOICES if value in (allowed_types or [])]
+    if mode != "suggest_only" and not allowed:
+        return state, _frame_review_summary_md(state), tr("Mindestens eine Zuschnittart auswählen oder die empfohlene Automatik verwenden.",
+                                                        "Select at least one crop type or use recommended automation.")
+    updated = dict(state, frame_mode=mode, auto_accept_types=allowed)
+    for record in state["records"]:
+        if record.get("user_decision", "auto") != "auto":
+            continue
+        before = automatic_crop_bbox(record, state.get("frame_mode", "suggest_only"), state.get("auto_accept_types", []))
+        after = automatic_crop_bbox(record, mode, allowed)
+        if before != after:
+            _mark_frame_audit_dependency_stale(state["output_root"], record, "auto", after)
+    path = os.path.join(state["output_root"], "_project_workspace.json")
+    workspace = _load_json_dict(path)
+    workspace["frame"] = {**workspace.get("frame", {}), "mode": mode, "auto_accept_types": allowed}
+    core_atomic_write_json(path, workspace)
+    settings = load_settings()
+    settings.update(c_frame_cleanup_mode=mode, c_frame_auto_accept_types=allowed)
+    core_atomic_write_json(SETTINGS_PATH, settings)
+    count = sum(r.get("user_decision", "auto") == "auto" and automatic_crop_bbox(r, mode, allowed) is not None for r in state["records"])
+    message = tr(f"{count} Zuschnitte automatisch aktiv. Manuelle Entscheidungen bleiben bestehen; unsichere Grenzen brauchen Prüfung.",
+                 f"{count} automatic crops active. Manual decisions are preserved; uncertain boundaries need review.")
+    return updated, _frame_review_summary_md(updated), message
+
+
 def scan_frames_after_preflight_ui(trigger_word, input_folder, advanced_types, enabled, ready, progress=gr.Progress()):
     if not enabled or not ready:
         return tuple(gr.skip() for _ in range(16))
@@ -4544,12 +4652,13 @@ def set_frame_review_decision_ui(
     record["user_decision"] = decision
     if decision in {"manual", "accept"}:
         record["display_bbox"] = bbox
+        state["last_confirmed_crop_hash"] = source_hash
         if decision == "accept":
             try:
                 record["selected_candidate_index"] = int(candidate_value)
             except Exception:
                 pass
-    elif decision == "keep_original":
+    elif decision in {"keep_original", "exclude"}:
         record["display_bbox"] = None
     else:
         record["display_bbox"] = record.get("candidate_bbox")
@@ -4557,9 +4666,70 @@ def set_frame_review_decision_ui(
         "accept": tr("Crop-Vorschlag übernommen.", "Crop suggestion accepted."),
         "manual": tr("Manueller Crop gespeichert.", "Manual crop saved."),
         "keep_original": tr("Original wird beibehalten.", "Original will be kept."),
+        "exclude": tr("Bild aus dem Datensatz ausgeschlossen. Die Quelldatei bleibt erhalten.", "Image excluded from the dataset. The source file is preserved."),
         "auto": tr("Manuelle Entscheidung entfernt; Automatik gilt wieder.", "Manual decision removed; automatic behavior restored."),
     }.get(decision, decision)
     return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, source_hash), message, f"✅ {message}"
+
+
+def preview_frame_group_ui(state, source_hash):
+    source = _find_frame_record(state, source_hash)
+    if not source or source.get("user_decision") not in {"manual", "accept"}:
+        source_hash = (state or {}).get("last_confirmed_crop_hash", "")
+        source = _find_frame_record(state, source_hash)
+    plan = build_group_plan((state or {}).get("records", []), source_hash)
+    gallery, choices, valid = [], [], []
+    try:
+        for target in plan.get("targets", []):
+            record = _find_frame_record(state, target["source_hash"])
+            preview = build_review_preview(record["source_path"], target["bbox"], state["cache_dir"],
+                                           source_hash=record["source_hash"])
+            image = load_gallery_image(preview, max_size=(1240, 720))
+            if image is None:
+                raise ValueError("preview unavailable")
+            gallery.append((image, record["filename"]))
+            choices.append((record["filename"], record["source_hash"]))
+            valid.append(record["source_hash"])
+    except Exception:
+        return {}, [], gr.update(choices=[], value=[]), tr("Vorschau fehlgeschlagen. Bitte Rahmenanalyse neu laden.", "Preview failed. Please reload frame analysis."), gr.update(interactive=False)
+    message = (tr(f"Vorlage: **{source['filename']}** · {len(valid)} ähnliche Bilder. Original links, Vorlagenzuschnitt rechts. Alle ausgewählten Bilder vor dem Speichern prüfen.",
+                  f"Template: **{source['filename']}** · {len(valid)} similar images. Original on the left, template crop on the right. Review every selected image before saving.")
+               if valid else tr("Zuerst einen Zuschnitt bestätigen. Es werden nur offene Bilder mit ähnlichen Grenzen, Seitenverhältnis und Layout angeboten.",
+                                "Confirm a crop first. Only undecided images with similar bounds, aspect ratio and layout are offered."))
+    return plan, gallery, gr.update(choices=choices, value=valid), message, gr.update(interactive=bool(valid))
+
+
+def apply_frame_group_ui(state, plan, selected, filter_value, page_value):
+    new_state = dict(state or {})
+    new_state["records"] = [dict(r) for r in new_state.get("records", [])]
+    count = 0
+    try:
+        targets = validate_group_selection(new_state["records"], plan, selected)
+        # Check every source before persisting any decision. Preview caches are
+        # keyed by hash, so changed files must never receive stale coordinates.
+        for key in [plan["source_hash"], *(t["source_hash"] for t in targets)]:
+            record = _find_frame_record(new_state, key)
+            if frame_file_sha1(record["source_path"]) != key:
+                raise ValueError("source changed")
+        persisted = load_frame_user_decisions(new_state["output_root"]).get("decisions", {})
+        if persisted.get(plan["source_hash"], {}).get("bbox") != plan["source_bbox"]:
+            raise ValueError("template decision changed")
+        for target in targets:
+            if persisted.get(target["source_hash"], {}).get("decision", "auto") != "auto":
+                raise ValueError("decision changed")
+        for target in targets:
+            record = _find_frame_record(new_state, target["source_hash"])
+            save_frame_user_decision(new_state["output_root"], record["source_hash"], record["source_path"], "manual", target["bbox"])
+            record.update(user_decision="manual", display_bbox=target["bbox"])
+            count += 1
+            _mark_frame_audit_dependency_stale(new_state["output_root"], record, "manual", target["bbox"])
+        message = tr(f"Vorlagenzuschnitt für {count} Bilder gespeichert.", f"Template crop saved for {count} images.")
+    except Exception:
+        message = tr(f"{count} Bilder gespeichert. Die übrigen wurden nicht übernommen; Vorschau bitte erneut laden.",
+                     f"{count} images saved. Remaining images were not applied; please reload the preview.")
+    return (new_state, _frame_review_summary_md(new_state),
+            _frame_review_gallery_update(new_state, filter_value, page_value), message,
+            {}, gr.update(value=[], choices=[]), [], gr.update(interactive=False))
 
 
 def preview_manual_frame_crop_ui(state: Any, source_hash: str, x1: Any, y1: Any, x2: Any, y2: Any):
@@ -5121,13 +5291,43 @@ def build_ui() -> gr.Blocks:
                 fr_summary = gr.Markdown(tr("Noch keine Rahmenanalyse geladen.", "No frame analysis loaded yet."))
                 fr_state = gr.State({})
                 fr_selected_hash = gr.State("")
+                with gr.Accordion(tr("Ähnliche Bilder gemeinsam prüfen", "Similar images · review together"), open=True):
+                    gr.Markdown(tr("Der ausgewählte oder zuletzt bestätigte Zuschnitt dient als Vorlage. Vorschauen prüfen und unpassende Bilder abwählen; erst der Speichern-Knopf übernimmt die Auswahl.",
+                                   "The selected or last confirmed crop serves as a template. Review previews and deselect unsuitable images; only the save button applies the selection."))
+                    fr_group_plan = gr.State({})
+                    fr_group_preview_btn = gr.Button(tr("Ähnliche Bilder mit diesem Zuschnitt zeigen", "Show similar images with this crop"))
+                    fr_group_status = gr.Markdown("")
+                    fr_group_gallery = gr.Gallery(label=tr("Original links · Vorlagenzuschnitt rechts", "Original left · template crop right"),
+                                                  columns=1, rows=1, height=520, object_fit="contain", interactive=False, fit_columns=False, visible=False)
+                    fr_group_selection = gr.CheckboxGroup(label=tr("Zuschnitt für diese Bilder übernehmen", "Apply crop to these images"), choices=[], visible=False)
+                    fr_group_apply_btn = gr.Button(tr("Ausgewählte Zuschnitte speichern", "Save selected crops"), variant="primary", interactive=False, visible=False)
+                with gr.Accordion(tr("Automatik für lokale Zuschnitte", "Automatic local crop decisions"), open=True):
+                    fr_automation_mode = gr.Dropdown(
+                        label=tr("Automatische Übernahme", "Automatic acceptance"),
+                        choices=[(tr("Nur Vorschläge", "Suggestions only"), "suggest_only"),
+                                 (tr("Hohe Sicherheit automatisch", "Automatically apply high confidence"), "auto_high_review_medium"),
+                                 (tr("Hohe und mittlere Sicherheit automatisch", "Automatically apply high and medium confidence"), "auto_high_keep_medium")],
+                        value=S.get("c_frame_cleanup_mode", "suggest_only"),
+                    )
+                    fr_automation_types = gr.CheckboxGroup(
+                        label=tr("Zulässige Zuschnittarten", "Eligible crop types"),
+                        choices=[(tr(de, en), value) for value, de, en in FRAME_AUTO_ACCEPT_TYPE_CHOICES],
+                        value=S.get("c_frame_auto_accept_types", ["uniform_canvas", "story_bars"]),
+                    )
+                    with gr.Row():
+                        fr_recommended_auto_btn = gr.Button(tr("Hohe Sicherheit übernehmen (empfohlen)", "Apply high confidence (recommended)"), variant="primary")
+                        fr_automation_btn = gr.Button(tr("Eigene Automatik anwenden", "Apply custom automatic decisions"), variant="secondary")
+                    gr.Markdown(tr("Übernimmt passende offene Vorschläge und aktualisiert die Anzeige sofort. Unsichere Fotogrenzen, verschachtelte Screenshots, KI-Vorschläge und bestehende manuelle Entscheidungen bleiben zur Prüfung bzw. unverändert.",
+                                   "Applies eligible pending suggestions and immediately updates the view. Uncertain photo boundaries, nested screenshots and AI suggestions still require review; existing manual decisions are preserved."))
                 with gr.Accordion(tr("Neuer Rahmenfinder: Fotobereich mit KI erkennen", "New frame finder: identify photo region with AI"), open=False):
                     gr.Markdown(tr(
                         "Die KI sucht das eigentliche Foto auch in verschachtelten Screenshots. Lokale Kanten verfeinern den Zuschnitt. Vorschläge werden zur Prüfung ergänzt. **Diese Aktion sendet Bilder an OpenAI und kostet API-Tokens.** Cache-Treffer sind kostenlos.",
                         "AI locates the actual photo, including nested screenshots. Local edges refine the crop. Proposals are added for review. **This action sends images to OpenAI and uses paid API tokens.** Cached results are free.",
                     ))
                     with gr.Row():
-                        fr_ai_model = gr.Dropdown(label=tr("Modell", "Model"), choices=OPENAI_MODEL_PRESET_CHOICES, value="gpt-6.1-sol", **openai_model_dropdown_kwargs())
+                        fr_ai_model = gr.Dropdown(label=tr("Modell", "Model"), choices=OPENAI_MODEL_PRESET_CHOICES, value=FRAME_VISION_MODEL,
+                                                 info=tr("GPT-6 Luna: sparsame Voreinstellung. Sol bleibt für schwierige Fälle wählbar. Luna ist noch nicht an deinen Rahmenreferenzen getestet.",
+                                                         "GPT-6 Luna: economical default. Sol remains available for difficult cases. Luna has not yet been tested on your frame references."), **openai_model_dropdown_kwargs())
                         fr_ai_scope = gr.Radio(label=tr("Umfang", "Scope"), choices=[(tr("Ausgewähltes Bild", "Selected image"), "selected"), (tr("Aktuelle Seite (max. 18 Bilder)", "Current page (up to 18 images)"), "page")], value="selected")
                     with gr.Row():
                         fr_ai_btn = gr.Button(tr("Fotobereiche mit KI finden", "Find photo regions with AI"), variant="primary")
@@ -5196,7 +5396,9 @@ def build_ui() -> gr.Blocks:
                     value=True,
                 )
                 with gr.Row():
+                    fr_confirm_selected_btn = gr.Button(tr("Auswahl bestätigen", "Confirm selected option"), variant="primary", interactive=False)
                     fr_auto_btn = gr.Button(tr("Automatische Entscheidung wiederherstellen", "Restore automatic decision"), variant="secondary")
+                    fr_exclude_btn = gr.Button(tr("Bild aus Datensatz ausschließen", "Exclude image from dataset"), variant="stop")
                 with gr.Accordion(tr("Manuelle Crop-Grenzen", "Manual crop bounds"), open=False):
                     gr.Markdown(tr("Klicke zwei gegenüberliegende Ecken des Fotobereichs an. Die Koordinaten werden automatisch gesetzt.",
                                    "Click two opposite corners of the photo region. Coordinates are filled automatically."))
@@ -5231,6 +5433,14 @@ def build_ui() -> gr.Blocks:
                     "**Pipeline-Auswahl:** ERNIE und Z-Image verwenden strukturierte lokale Captions; Krea 2 verwendet nach der Auswahl natürliche GPT-Captions.",
                     "**Pipeline selection:** ERNIE and Z-Image use structured local captions; Krea 2 uses natural GPT captions after selection.",
                 ))
+                c_pipeline_mode = gr.Radio(
+                    label=tr("Ablauf nach dem Audit", "After the audit"),
+                    choices=[(tr("Profil automatisch nutzen und exportieren", "Use profile automatically and export"), "single_pass"),
+                             (tr("Profil zuerst selbst prüfen", "Review profile first"), "profile_then_caption")],
+                    value=S["c_pipeline_mode"],
+                    info=tr("Bei eigener Prüfung pausiert der Lauf vor Captions und Export. Weiter geht es in Modul 3 · Subject Profile.",
+                            "Review first pauses before captions and export. Continue in module 3 · Subject Profile."),
+                )
 
                 with gr.Row():
                     c_model_preset = gr.Dropdown(
@@ -5349,24 +5559,6 @@ def build_ui() -> gr.Blocks:
                                     "Used only when trigger checking is enabled. `none` is normally sufficient.",
                                 ),
                             )
-
-                # ── Aktionen ──
-                gr.Markdown("---")
-                with gr.Row():
-                    c_start_btn = gr.Button(tr("▶ Curator starten", "▶ Start curator"), variant="primary", scale=3)
-                    c_stop_btn = gr.Button(tr("⏹ Abbrechen", "⏹ Cancel"), variant="stop", scale=1)
-                    c_save_btn = gr.Button(tr("💾 Einstellungen speichern", "💾 Save settings"), variant="secondary", scale=2)
-
-                with gr.Row():
-                    c_status = gr.Textbox(label=tr("Status", "Status"), interactive=False, max_lines=1, scale=2)
-                    c_openai_usage = gr.Textbox(label=tr("OpenAI Tokens", "OpenAI tokens"), interactive=False, max_lines=1, value=tr("💰 0 Requests | 0 Tokens", "💰 0 requests | 0 tokens"), scale=2)
-                c_progress = gr.Slider(label=tr("Fortschritt", "Progress"), minimum=0, maximum=1, step=0.01, value=0, interactive=False)
-
-                with gr.Row():
-                    with gr.Column(scale=3):
-                        c_log = gr.Textbox(label=tr("Live-Log", "Live log"), lines=18, max_lines=18, interactive=False, elem_classes=["log-box"])
-                    with gr.Column(scale=2):
-                        c_gallery = gr.Gallery(label=tr("Train-Ready Vorschau", "Train-ready preview"), columns=3, rows=3, height=380, object_fit="cover")
 
                 with gr.Accordion(tr("Weitere Einstellungen", "More settings"), open=False):
                     with gr.Tabs():
@@ -6688,18 +6880,6 @@ def build_ui() -> gr.Blocks:
                                     "👉 **Editing the profile** and starting captioning from the profile is done "
                                     "in the dedicated `🧬 Subject Profile` tab.",
                                 ))
-                                c_pipeline_mode = gr.Dropdown(
-                                    label=tr("Pipeline-Modus", "Pipeline mode"),
-                                    choices=[
-                                        (tr("Single Pass – Profil automatisch nutzen", "Single pass – use profile automatically"), "single_pass"),
-                                        (tr("Profile then Caption – UI-Gate (Profil-Tab nutzen)", "Profile then caption – UI gate (use Profile tab)"), "profile_then_caption"),
-                                    ],
-                                    value=S["c_pipeline_mode"],
-                                    info=tr(
-                                        "Single Pass nutzt das Profil automatisch. Profile then Caption pausiert nach dem Profil-Build, du gehst dann in den Profil-Tab und startest Captioning dort separat.",
-                                        "Single pass uses the profile automatically. Profile then Caption pauses after the profile build; switch to the Profile tab to edit and start captioning separately.",
-                                    ),
-                                )
                                 c_profile_normalizer_model = gr.Dropdown(
                                     label=tr("Profile-Normalizer-Modell", "Profile normalizer model"),
                                     choices=OPENAI_MODEL_PRESET_CHOICES,
@@ -7056,6 +7236,26 @@ def build_ui() -> gr.Blocks:
                                     ),
                                 )
 
+                # ── Aktionen ──
+                gr.Markdown("---")
+                c_run_overview = gr.Markdown()
+                c_refresh_overview = gr.Button(tr("Laufübersicht aktualisieren · lokal", "Refresh run preview · local"), variant="secondary")
+                with gr.Row():
+                    c_start_btn = gr.Button(tr("▶ Audit starten", "▶ Start audit"), variant="primary", scale=3)
+                    c_stop_btn = gr.Button(tr("⏹ Abbrechen", "⏹ Cancel"), variant="stop", scale=1)
+                    c_save_btn = gr.Button(tr("💾 Einstellungen speichern", "💾 Save settings"), variant="secondary", scale=2)
+
+                with gr.Row():
+                    c_status = gr.Textbox(label=tr("Status", "Status"), interactive=False, max_lines=1, scale=2)
+                    c_openai_usage = gr.Textbox(label=tr("OpenAI Tokens", "OpenAI tokens"), interactive=False, max_lines=1, value=tr("💰 0 Requests | 0 Tokens", "💰 0 requests | 0 tokens"), scale=2)
+                c_progress = gr.Slider(label=tr("Fortschritt", "Progress"), minimum=0, maximum=1, step=0.01, value=0, interactive=False)
+
+                with gr.Row():
+                    with gr.Column(scale=3):
+                        c_log = gr.Textbox(label=tr("Live-Log", "Live log"), lines=18, max_lines=18, interactive=False, elem_classes=["log-box"])
+                    with gr.Column(scale=2):
+                        c_gallery = gr.Gallery(label=tr("Train-Ready Vorschau", "Train-ready preview"), columns=3, rows=3, height=380, object_fit="cover")
+
                 # Alle Curator-Inputs als Liste (fuer Save und Start)
                 c_apply_models.click(
                     fn=model_preset, inputs=[c_model_preset],
@@ -7096,6 +7296,11 @@ def build_ui() -> gr.Blocks:
                     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
                 ]
 
+                overview_inputs = [c_trigger, c_input, c_target, c_model, c_pipeline_mode, fr_state]
+                c_refresh_overview.click(fn=audit_run_overview_ui, inputs=overview_inputs, outputs=c_run_overview, queue=False)
+                audit_tab.select(fn=audit_run_overview_ui, inputs=overview_inputs, outputs=c_run_overview, queue=False)
+                for overview_control in (c_target, c_model, c_pipeline_mode):
+                    overview_control.change(fn=audit_run_overview_ui, inputs=overview_inputs, outputs=c_run_overview, queue=False)
                 c_run_event = c_start_btn.click(
                     fn=start_curator,
                     inputs=curator_inputs,
@@ -7945,15 +8150,80 @@ def build_ui() -> gr.Blocks:
                 inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_option_radio, fr_advance],
                 outputs=[fr_state, fr_summary, *frame_navigation_outputs, fr_status],
                 show_progress="hidden",
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            )
+            fr_exclude_btn.click(
+                fn=exclude_frame_and_navigate_ui,
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_advance],
+                outputs=[fr_state, fr_summary, *frame_navigation_outputs, fr_status],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            )
+            fr_option_radio.change(
+                fn=lambda option: gr.update(interactive=bool(option)), inputs=[fr_option_radio],
+                outputs=[fr_confirm_selected_btn], show_progress="hidden",
+            )
+            fr_confirm_selected_btn.click(
+                fn=save_frame_and_navigate_ui,
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_option_radio, fr_advance],
+                outputs=[fr_state, fr_summary, *frame_navigation_outputs, fr_status],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            )
+            fr_automation_btn.click(
+                fn=set_frame_automation_ui,
+                inputs=[fr_state, fr_automation_mode, fr_automation_types, fr_filter],
+                outputs=[fr_state, fr_summary, fr_status],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            ).then(
+                fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
+                inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
+            )
+            fr_recommended_auto_btn.click(
+                fn=lambda st, flt: set_frame_automation_ui(st, "auto_high_review_medium", ["uniform_canvas", "story_bars"], flt),
+                inputs=[fr_state, fr_filter], outputs=[fr_state, fr_summary, fr_status],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            ).then(
+                fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
+                inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
+            )
+            fr_state.change(
+                fn=lambda st: (gr.update(value=st.get("frame_mode", "suggest_only")),
+                               gr.update(value=st.get("auto_accept_types", [])),
+                               gr.update(value=st.get("frame_mode", "suggest_only")),
+                               gr.update(value=st.get("frame_mode", "suggest_only")),
+                               gr.update(value=st.get("auto_accept_types", []))) if st.get("records") else tuple(gr.skip() for _ in range(5)),
+                inputs=[fr_state], outputs=[fr_automation_mode, fr_automation_types, w_frame_mode,
+                                           c_frame_cleanup_mode, w_frame_auto_types],
+                show_progress="hidden",
             )
             fr_auto_btn.click(
                 fn=restore_frame_auto_ui,
                 inputs=[fr_state, fr_filter, fr_page, fr_selected_hash],
                 outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_option_gallery, fr_option_radio, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
                 show_progress="hidden",
+                concurrency_id="frame_review_local", concurrency_limit=1,
             ).then(
                 fn=lambda st, flt, sid: navigate_frame_review_image_ui(st, flt, sid, 0),
                 inputs=[fr_state, fr_filter, fr_selected_hash], outputs=frame_navigation_outputs,
+            )
+            fr_group_preview_btn.click(
+                fn=preview_frame_group_ui, inputs=[fr_state, fr_selected_hash],
+                outputs=[fr_group_plan, fr_group_gallery, fr_group_selection, fr_group_status, fr_group_apply_btn],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            )
+            fr_group_plan.change(
+                fn=lambda plan: tuple(gr.update(visible=bool(plan.get("targets"))) for _ in range(3)),
+                inputs=[fr_group_plan], outputs=[fr_group_gallery, fr_group_selection, fr_group_apply_btn],
+                show_progress="hidden",
+            )
+            fr_group_apply_btn.click(
+                fn=apply_frame_group_ui,
+                inputs=[fr_state, fr_group_plan, fr_group_selection, fr_filter, fr_page],
+                outputs=[fr_state, fr_summary, fr_gallery, fr_group_status, fr_group_plan,
+                         fr_group_selection, fr_group_gallery, fr_group_apply_btn],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            ).then(
+                fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
+                inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
             )
             fr_preview_manual_btn.click(
                 fn=preview_manual_frame_crop_ui,
@@ -7970,6 +8240,7 @@ def build_ui() -> gr.Blocks:
                 inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2, fr_advance],
                 outputs=[fr_state, fr_summary, *frame_navigation_outputs, fr_status],
                 show_progress="hidden",
+                concurrency_id="frame_review_local", concurrency_limit=1,
             )
             fr_reset_cache_btn.click(
                 fn=reset_frame_detector_cache_ui,
