@@ -51,6 +51,12 @@ from frame_cleanup import (
     filter_excluded_sources,
 )
 
+from training_targets import (
+    normalize_training_target, caption_profile_for_training_target, is_krea_target,
+    adapt_caption_for_target, target_export_metadata, AUDIT_FACTS_VERSION,
+    NEUTRAL_AUDIT_GUIDANCE, NEUTRAL_PROFILE_GUIDANCE,
+)
+
 from openai_models import ROUTINE_MODEL, PROFILE_MODEL, normalize_reasoning, prepare_response_payload
 
 from curator_core import (
@@ -623,11 +629,19 @@ VARIABLE_FEATURE_CAPTION_MODE = "canonical_deviations"
 # Krea 2 quality-caption mode. Only final selected images are sent for a
 # dedicated natural-language caption after the subject profile is known.
 USE_KREA_AI_CAPTIONING = True
+# Empty retains the legacy CLI path. The UI explicitly selects a first-caption
+# provider; final composition then uses audited observations and profile rules.
+INITIAL_CAPTION_ENGINE = ""
+INITIAL_CAPTION_FLORENCE_TASK = "<MORE_DETAILED_CAPTION>"
+INITIAL_CAPTION_PYTHON = ""
+INITIAL_CAPTION_WEIGHTS = ""
+CAPTION_COMPOSITION_MODE = "local"
+PREPARE_CAPTION_DETAILS_ONLY = False
 KREA_CAPTION_MODEL = ROUTINE_MODEL
 USE_KREA_CAPTION_REPAIR = True
 KREA_CAPTION_REPAIR_MODEL = PROFILE_MODEL
 KREA_CAPTION_IMAGE_DETAIL = "high"
-KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v6-active-policy-fingerprint"
+KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v7-observation-and-profile-policy"
 CAPTION_POLICY = {
     "include_gender_class": True,
     "include_skin_tone": True, 
@@ -737,7 +751,7 @@ PROFILE_NORMALIZER_MODEL = PROFILE_MODEL
 #       kanonische Profil-Brille ueberschrieben werden.
 #   v7: Erweiterte Profile-Vokabulare inkl. hair_length und
 #       body_height_impression; Body-Build ersetzt stocky durch broad_build.
-PROFILE_CACHE_SCHEMA_VERSION = "v14"
+PROFILE_CACHE_SCHEMA_VERSION = "v15"
 
 # ── SMART PRE-CROP (Post-API Headshot-Zoom) ────────────────────────────────────────────────
 # Nach dem API-Audit des Originals: wenn das Bild groß ist und das Gesicht klein,
@@ -807,24 +821,14 @@ SUBJECT_MIN_TORSO_LANDMARKS = 2
 SUBJECT_LANDMARK_VIS_MIN = 0.55
 
 
-def _normalize_training_target_bootstrap(value: Optional[str]) -> str:
-    v = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if v in {"z_image_base", "zimage", "z_image"}:
-        return "z_image_base"
-    if v in {"krea2", "krea_2", "krea2_character", "krea_2_character"}:
-        return "krea2"
-    return "ernie"
-
-
-def _caption_profile_for_target_bootstrap(value: Optional[str]) -> str:
-    target = _normalize_training_target_bootstrap(value)
-    return "krea2_character" if target == "krea2" else target
+_normalize_training_target_bootstrap = normalize_training_target
+_caption_profile_for_target_bootstrap = caption_profile_for_training_target
 
 
 # ── UI-Config Override ────────────────────────────────────────────────────────
 # Wird von dataset_curator_ui.py geschrieben. Überschreibt die Standardwerte
 # oben mit den Werten aus der Weboberfläche. Ohne UI wird dieser Block ignoriert.
-_UI_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_config.json")
+_UI_CONFIG_PATH = os.environ.get("DATASET_CURATOR_CONFIG_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_config.json")
 # Interne Konstanten, die nie von der UI ueberschrieben werden duerfen.
 # IG_FRAME_CACHE_VERSION insbesondere: wenn der User eine alte UI-Config mit
 # einer veralteten Version auf den Curator losliesse, wuerden alte Caches
@@ -899,7 +903,7 @@ elif isinstance(globals().get("_ui_cfg"), dict) and "CAPTION_PROFILE" in _ui_cfg
 else:
     TRAINING_TARGET = _normalize_training_target_bootstrap(TRAINING_TARGET)
 CAPTION_PROFILE = _caption_profile_for_target_bootstrap(TRAINING_TARGET)
-USE_KREA_AI_CAPTIONING = TRAINING_TARGET == "krea2"
+USE_KREA_AI_CAPTIONING = is_krea_target(TRAINING_TARGET) and not bool(INITIAL_CAPTION_ENGINE)
 
 # Keep environment and in-script config consistent (also helps if other libs/tools
 # look at OPENAI_API_KEY).
@@ -1171,6 +1175,7 @@ def commit_output_transaction() -> Dict[str, int]:
     tx = _ACTIVE_OUTPUT_TRANSACTION
     if tx is None:
         return {}
+    core_atomic_write_json(os.path.join(TRAIN_READY_DIR, "image_target.json"), target_export_metadata(TRAINING_TARGET))
     counts = tx.commit(globals())
     _ACTIVE_OUTPUT_TRANSACTION = None
     safe_print("   ✅ Transactional export committed; previous complete dataset replaced atomically.")
@@ -1707,57 +1712,16 @@ def clean_audit_string(text: Optional[str]) -> str:
 # ============================================================
 
 
-def normalize_training_target(value: Optional[str]) -> str:
-    v = normalize_text(value)
-    if v in {"ernie", "shared_compact"}:
-        return "ernie"
-    if v in {"z_image_base", "z-image_base", "zimage", "z_image"}:
-        return "z_image_base"
-    if v in {"krea2", "krea_2", "krea2_character", "krea_2_character"}:
-        return "krea2"
-    return "ernie"
-
-
-def caption_profile_for_training_target(value: Optional[str]) -> str:
-    target = normalize_training_target(value)
-    return "krea2_character" if target == "krea2" else target
-
-
-def normalize_caption_profile(value: Optional[str]) -> str:
-    # Legacy helper: old configs/reports may still contain caption-profile names.
+def normalize_caption_profile(value):
     return caption_profile_for_training_target(value)
 
 
-def training_target_audit_guidance(target: Optional[str] = None) -> str:
-    t = normalize_training_target(target or globals().get("TRAINING_TARGET", "ernie"))
-    if t == "krea2":
-        return (
-            "TRAINING TARGET: Krea 2 character LoRA. Preserve natural-language-relevant "
-            "scene facts, full-person usefulness, body orientation, camera framing, temporary "
-            "appearance changes and exact visible accessories. Keep stable identity facts raw; "
-            "the Subject Profile decides later whether they belong to the trigger or caption."
-        )
-    if t == "z_image_base":
-        return (
-            "TRAINING TARGET: Z-Image Base character LoRA. Prioritize compact, controllable "
-            "visual attributes and reliable separation of stable identity from variable traits."
-        )
-    return (
-        "TRAINING TARGET: ERNIE Image character LoRA. Capture visible identity anchors as well "
-        "as scene-specific details because the downstream caption policy is intentionally explicit."
-    )
+def training_target_audit_guidance(target=None):
+    return NEUTRAL_AUDIT_GUIDANCE
 
 
-def training_target_profile_guidance(target: Optional[str] = None) -> str:
-    t = normalize_training_target(target or globals().get("TRAINING_TARGET", "ernie"))
-    if t == "krea2":
-        return (
-            "For Krea 2, treat the Subject Profile as the canonical identity and terminology layer. "
-            "Record all recurring piercings/accessories in inventories even when they are not canonical."
-        )
-    if t == "z_image_base":
-        return "For Z-Image Base, favor a clean canonical identity and explicit variable-feature policies."
-    return "For ERNIE, retain reliable visible identity anchors for explicit downstream captions."
+def training_target_profile_guidance(target=None):
+    return NEUTRAL_PROFILE_GUIDANCE
 
 
 def enforce_caption_policy_profile(profile: Optional[str], policy: Dict[str, Any]) -> Dict[str, Any]:
@@ -3350,7 +3314,7 @@ def cache_path_for_file(file_hash: str) -> str:
 #        eye_appearance, look_context, makeup_style, costume_accessories
 #        plus datasetweite Hair-/Eye-Variability-Policies fuer Stable Profile.
 AUDIT_CACHE_SCHEMA_VERSION = "v16"
-AUDIT_PROMPT_VERSION = "audit-v16-structured-pose-edit-provenance"
+AUDIT_PROMPT_VERSION = "audit-v17-generator-independent-facts"
 EARLY_RESULT_CACHE_SCHEMA_VERSION = "v1"
 
 
@@ -3373,7 +3337,8 @@ def audit_cache_key(
         str(base_hash),
         (model or "").strip().lower(),
         str(reasoning_effort or "none"),
-        normalize_training_target(globals().get("TRAINING_TARGET", "ernie")),
+        AUDIT_FACTS_VERSION,
+        str(TRIGGER_WORD),
     ])
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
@@ -5582,7 +5547,7 @@ def get_hair_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_
 
     include_all = bool(active_policy.get("include_hair_always"))
     include_variable = bool(active_policy.get("include_hair_when_variable"))
-    color_deviation = _feature_deviation(current_color, baseline_color, _appearance_hair_family)
+    color_deviation = _feature_deviation(current_color, baseline_color, _profile_hair_color)
     form_deviation = _feature_deviation(current_form, baseline_form)
 
     if include_all:
@@ -5629,24 +5594,43 @@ def get_eye_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_t
     canonical = profile.get("canonical_features", {}) if isinstance(profile, dict) else {}
     stable_identity = profile.get("stable_identity", {}) if isinstance(profile, dict) else {}
     stats = (profile.get("profile_variability_stats", {}) or {}).get("eye_color", {}) if isinstance(profile, dict) else {}
-    reliable = bool(image_traits.get("eye_color_reliable"))
-    current = normalize_text(image_traits.get("eye_color_base", "")) if reliable else ""
+    reliable = bool(image_traits.get("eye_color_reliable", eye_color_is_reliable(item)))
     baseline = normalize_text(canonical.get("eye_color", "")) or normalize_text(stable_identity.get("eye_color", "")) or _stats_mode_token(stats)
-    variable = bool(stats.get("variation_detected", stats.get("unique", 0) >= 2))
+    confirmed = profile.get("user_confirmed_identity_overrides", {}) or {}
+    confirmed_canonical = confirmed.get("canonical_features", {}) or {}
+    confirmed_stable = confirmed.get("stable_identity", {}) or {}
+    confirmed_eye = "eye_color" in confirmed_canonical or "eye_color" in confirmed_stable
+    if confirmed_eye:
+        baseline = normalize_text(confirmed_canonical.get("eye_color", confirmed_stable.get("eye_color", "")))
+    if baseline in {"unclear", "unknown", "not_visible", "none"}:
+        baseline = ""
+    observed = normalize_text(image_traits.get("eye_color_observed", "")) or normalize_text(image_traits.get("eye_color_base", "")) or canonical_eye_color(item)
+    appearance = normalize_text(image_traits.get("eye_appearance", "")) or canonical_eye_appearance(item)
+    lens_deviation = appearance in {"colored_contact_lenses", "circle_lenses", "cosmetic_lenses"}
+    visible = bool(image_traits.get("eye_color_visible", reliable or _eyes_are_visible(item)))
+    # Natural eye color belongs to the consolidated identity. A minority audit
+    # is not evidence of contact lenses. Keep its observation separate.
+    current = observed if lens_deviation else ((baseline or observed) if reliable else "")
+    if confirmed_eye and not baseline and not lens_deviation:
+        current = ""
+    variable = lens_deviation or bool(stats.get("variation_detected", False))
     mode = normalize_text(globals().get("VARIABLE_FEATURE_CAPTION_MODE", "canonical_deviations"))
     enabled = bool(active_policy.get("include_eye_color_when_variable"))
-    if enabled and mode == "all_visible_when_variable":
+    if active_policy.get("include_eye_color"):
+        must_caption = bool(visible and current)
+    elif enabled and mode == "all_visible_when_variable":
         must_caption = bool(current and variable)
     else:
-        # Eye color is especially error-prone. A single contrary audit is not
-        # enough to establish a real identity variation; require at least two
-        # reliable minority observations before captioning deviations.
-        must_caption = bool(enabled and variable and current and _feature_deviation(current, baseline, _eye_color_family))
+        must_caption = bool(enabled and lens_deviation and current and _feature_deviation(current, baseline, _eye_color_family))
+    must_caption = bool(must_caption and visible)
     phrase = f"{_phrase_from_token(current)} eyes" if must_caption and current else ""
     return {
         "phrase": phrase,
         "must_caption": bool(phrase),
         "current": current,
+        "observed": observed,
+        "visible": visible,
+        "appearance": appearance,
         "baseline": baseline,
         "variable": variable,
         "reliable": reliable,
@@ -5760,7 +5744,8 @@ def get_glasses_feature_state(item: Dict[str, Any], profile: Dict[str, Any], ima
     variability = (profile.get("profile_variability_stats", {}) or {}).get("glasses", {}) if isinstance(profile, dict) else {}
     frame_variability = (profile.get("profile_variability_stats", {}) or {}).get("glasses_frame", {}) if isinstance(profile, dict) else {}
 
-    visible = bool(image_traits.get("glasses_visible")) or _profile_bool(item.get("has_glasses_now"))
+    observation = image_traits.get("glasses_observation") or _glasses_observation_state(item)
+    visible = observation == "present"
     current_position = normalize_text(image_traits.get("glasses_position", "")) or infer_glasses_position(item)
     baseline_desc = compact_trait(glasses_profile.get("canonical_description"))
     baseline_shape = normalize_text(canonical.get("glasses_frame_shape", ""))
@@ -5820,9 +5805,10 @@ def get_glasses_feature_state(item: Dict[str, Any], profile: Dict[str, Any], ima
     else:
         must_caption = False
 
-    if must_caption and current_family == "no_glasses":
-        phrase = "without glasses"
-    elif must_caption and current_family == "regular_glasses":
+    # Neither an occluded accessory nor a verified absence is a visible pair
+    # of glasses. Caption switches only govern observed glasses.
+    must_caption = bool(must_caption and visible)
+    if must_caption and current_family == "regular_glasses":
         phrase = phrase or baseline_desc or "eyeglasses"
         if current_position == "on_head":
             phrase = f"{phrase} resting on the head"
@@ -5845,6 +5831,7 @@ def get_glasses_feature_state(item: Dict[str, Any], profile: Dict[str, Any], ima
         "current_fingerprint": current_fingerprint,
         "baseline_fingerprint": baseline_fingerprint,
         "variable": variable,
+        "observation": observation,
         "position": current_position,
         "mode": mode,
     }
@@ -6219,7 +6206,7 @@ def subject_profile_settings_fingerprint() -> str:
         "reasoning_effort": PROFILE_REASONING_EFFORT,
         "sample_threshold": int(PROFILE_SAMPLE_THRESHOLD),
         "sample_size": int(PROFILE_SAMPLE_SIZE),
-        "training_target": normalize_training_target(TRAINING_TARGET),
+        "facts_version": AUDIT_FACTS_VERSION,
     })
 
 
@@ -6306,11 +6293,28 @@ def _weighted_mode_clean(rows: List[Dict[str, Any]], field: str) -> str:
     return max(scores, key=lambda value: (scores[value], len(value))) if scores else ""
 
 
+def caption_profile_evidence_for_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Cross-check first-caption claims without changing audited image facts."""
+    if not row.get("initial_caption"):
+        return None
+    from caption_profile_evidence import compare_caption
+    return compare_caption(
+        row, audit_hair=canonical_hair_color(row), audit_eye=canonical_eye_color(row),
+        eye_reliable=eye_color_is_reliable(row),
+        glasses_state=_glasses_observation_state(row))
+
+
+def attach_initial_caption_evidence_summary(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    from caption_profile_evidence import profile_summary
+    profile["initial_caption_evidence_summary"] = profile_summary(rows, caption_profile_evidence_for_row)
+    return profile
+
+
 def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
-    """Hash ueber die relevanten Audit-Felder, nicht ueber Captions/Outputnamen."""
+    """Hash audit fields and the bounded first-caption cross-check provenance."""
     relevant: List[Dict[str, Any]] = []
     for row in rows:
-        relevant.append({
+        item = {
             "image_id": profile_image_id(row),
             "file_hash": row.get("file_hash", ""),
             "original_filename": row.get("original_filename", ""),
@@ -6346,14 +6350,18 @@ def profile_input_hash(rows: List[Dict[str, Any]]) -> str:
             "priority_image": bool(row.get("priority_image")),
             "identity_cluster_role": row.get("identity_cluster_role", ""),
             "profile_weight": round(float(row.get("profile_weight", profile_role_weight(row)) or 0.0), 3),
-        })
+        }
+        evidence = caption_profile_evidence_for_row(row)
+        if evidence:
+            item["initial_caption_evidence"] = evidence
+        relevant.append(item)
     relevant.sort(key=lambda x: (str(x.get("image_id", "")), str(x.get("original_filename", ""))))
     payload = {
         "schema": PROFILE_CACHE_SCHEMA_VERSION,
         "trigger": SAFE_TRIGGER,
         "normalizer_model": str(PROFILE_NORMALIZER_MODEL).strip().lower(),
         "reasoning_effort": str(PROFILE_REASONING_EFFORT),
-        "training_target": normalize_training_target(globals().get("TRAINING_TARGET", "ernie")),
+        "facts_version": AUDIT_FACTS_VERSION,
         "items": relevant,
     }
     return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -6666,6 +6674,9 @@ def _profile_sample_payload(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "visual_style_type": row.get("visual_style_type", ""),
             },
         })
+        evidence = caption_profile_evidence_for_row(row)
+        if evidence:
+            payload_rows[-1]["initial_caption_agreements"] = evidence.get("agreements") or {}
     return payload_rows
 
 
@@ -6678,6 +6689,7 @@ All input images are intended to show the same subject. Some outliers may exist.
 
 Important:
 - Stable identity traits must be canonical and consistent across captions.
+- The initial_caption_agreements are narrow matches between a free image description and the structured audit. They can support confidence and terminology for an already audited trait. They are not independent visual proof. Never infer a missing trait from this field, and never override the audit, dataset frequencies, or confirmed user values because of it. Caption disagreements and unverified claims are omitted here and reported separately for review.
 - Each sampled image includes profile_weight. Treat explicit Priority images (3.0) as the strongest identity evidence, Core images (2.0) next, body_reference (1.35) as extra body evidence, and ordinary variation (1.0) normally. Do not turn a styling attribute into stable identity solely because one weighted image shows it; use the weights to resolve genuine conflicts.
 - Use single, clean tokens or short phrases. No hedge words, no 'or'-phrases, no 'none visible'.
 - For skin tone, account for studio-lighting bias: studio or ring-light images can make darker skin read lighter.
@@ -7057,7 +7069,10 @@ def canonical_hair_color_modifier(row: Dict[str, Any]) -> str:
     return ""
 
 
-def eye_color_is_reliable(row: Dict[str, Any]) -> bool:
+def _eyes_are_visible(row: Dict[str, Any]) -> bool:
+    local_facts = row.get("local_caption_facts", {}) or {}
+    if local_facts and local_facts.get("eye_visibility") != "visible":
+        return False
     color = normalize_text(row.get("eye_color", ""))
     if not color or not _profile_bool(row.get("face_visible")):
         return False
@@ -7065,11 +7080,9 @@ def eye_color_is_reliable(row: Dict[str, Any]) -> bool:
         return False
     if normalize_text(row.get("visual_style_type")) in {"black_and_white", "heavy_smoothing", "beauty_filter"}:
         return False
-    if normalize_text(row.get("occlusion_type")) in {"sunglasses_occluding_eyes", "mask", "hat_shadow", "motion_blur", "face_partly_out_of_frame"}:
+    if normalize_text(row.get("occlusion_type")) in {"sunglasses_occluding_eyes", "mask", "hat_shadow", "motion_blur", "face_partly_out_of_frame", "face_occluded", "eyes_occluded", "hair_covering_face", "hand_covering_face", "object_covering_face", "crop_cutoff"}:
         return False
     if normalize_text(row.get("gaze_category")) in {"eyes_closed", "partly_closed"}:
-        return False
-    if normalize_text(row.get("eye_appearance")) in {"colored_contact_lenses", "circle_lenses", "cosmetic_lenses", "unnatural_eye_color", "unclear"}:
         return False
     if normalize_text(row.get("glasses_lens_type")) in {"sunglasses", "tinted_lenses", "reflective_lenses"}:
         return False
@@ -7078,6 +7091,31 @@ def eye_color_is_reliable(row: Dict[str, Any]) -> bool:
     if float(row.get("color_tint_strength", 0.0) or 0.0) >= 0.55:
         return False
     return True
+
+
+def eye_color_is_reliable(row: Dict[str, Any]) -> bool:
+    return _eyes_are_visible(row) and canonical_eye_appearance(row) not in {
+        "colored_contact_lenses", "circle_lenses", "cosmetic_lenses", "unnatural_eye_color", "unclear"
+    }
+
+
+def _glasses_observation_state(row: Dict[str, Any]) -> str:
+    """Keep missing/occluded evidence out of the no-glasses frequency count."""
+    position = normalize_text(row.get("glasses_position", ""))
+    detected = _profile_bool(row.get("has_glasses_now")) or bool(compact_trait(row.get("glasses_description")))
+    observation = row.get("glasses_observation", "")
+    if observation in {"occluded", "uncertain"}:
+        return observation
+    if detected and position != "not_visible":
+        return "present"
+    if position == "not_visible" and detected:
+        return "uncertain"
+    occlusion = normalize_text(row.get("occlusion_type", ""))
+    if not _profile_bool(row.get("face_visible")) or occlusion not in {"", "none", "no_occlusion"}:
+        return "occluded"
+    if "has_glasses_now" not in row:
+        return "uncertain"
+    return "absent" if not _profile_bool(row["has_glasses_now"]) else "uncertain"
 
 
 def infer_glasses_position(row: Dict[str, Any]) -> str:
@@ -7612,6 +7650,8 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
         "hair_form": canonical_hair_form(row),
         "hair_length": canonical_hair_length(row),
         "eye_color_base": canonical_eye_color(row) if eye_color_is_reliable(row) else "",
+        "eye_color_observed": canonical_eye_color(row),
+        "eye_color_visible": _eyes_are_visible(row),
         "eye_color_reliable": eye_color_is_reliable(row),
         "eye_appearance": canonical_eye_appearance(row),
         "body_height_impression": canonical_body_height_impression(row),
@@ -7621,7 +7661,8 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
         "costume_accessories": canonical_costume_accessories(row),
         "freckles_visible": bool(compact_trait(row.get("freckles_description"))),
         "freckles_description": compact_trait(row.get("freckles_description")),
-        "glasses_visible": _profile_bool(row.get("has_glasses_now")) or bool(compact_trait(row.get("glasses_description"))),
+        "glasses_visible": _glasses_observation_state(row) == "present",
+        "glasses_observation": _glasses_observation_state(row),
         "glasses_description": compact_trait(row.get("glasses_description")),
         "glasses_frame_shape": normalize_text(row.get("glasses_frame_shape")),
         "beard_pattern": normalize_text(normalize_beard_tag(row.get("beard_description", "")).get("pattern", "")),
@@ -8420,10 +8461,22 @@ def _weighted_trait_mode(traits: List[Dict[str, Any]], field: str, reliable_fiel
         if reliable_field and not bool(trait.get(reliable_field)):
             continue
         value = normalize_text(trait.get(field, ""))
+        if field == "hair_color_base":
+            value = _profile_hair_color(value)
         if not value or value in {"none", "unknown", "unclear", "not_visible", "n_a"}:
             continue
         scores[value] += max(0.0, float(trait.get("profile_weight", 1.0) or 0.0))
     return max(scores, key=lambda value: (scores[value], len(value))) if scores else ""
+
+
+def _profile_hair_color(value: str) -> str:
+    """Merge nearby color labels for frequency; retain raw image descriptions."""
+    value = normalize_text(value)
+    if value in {"blonde", "dark_blonde", "platinum", "light_blonde"}:
+        return "blonde"
+    if value in {"brown", "light_brown", "dark_brown"}:
+        return "brown"
+    return value
 
 
 def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -8438,7 +8491,7 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
     trait_rows = list(per_image.values()) if isinstance(per_image, dict) else []
 
     hair_color_variable, hair_color_stats = _trait_variance(
-        [t.get("hair_color_base", "") for t in trait_rows], min_unique=4, max_mode_fraction=0.72
+        [_profile_hair_color(t.get("hair_color_base", "")) for t in trait_rows], min_unique=4, max_mode_fraction=0.72
     )
     hair_form_variable, hair_form_stats = _trait_variance(
         [t.get("hair_form", "") for t in trait_rows], min_unique=5, max_mode_fraction=0.70
@@ -8446,6 +8499,12 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
     eye_color_variable, eye_color_stats = _trait_variance(
         [t.get("eye_color_base", "") for t in trait_rows if bool(t.get("eye_color_reliable"))], min_unique=3, max_mode_fraction=0.78
     )
+    hair_color_stats["raw_counts"] = dict(Counter(t.get("hair_color_base", "") for t in trait_rows if t.get("hair_color_base")))
+    # Natural eye colors are observations of one fixed identity trait. Real
+    # lens changes are tracked independently by eye_appearance below.
+    eye_color_variable = False
+    eye_color_stats["observed_variation"] = eye_color_stats["variation_detected"]
+    eye_color_stats["variation_detected"] = False
     hair_modifier_stats = _state_stats([
         t.get("hair_color_modifier", "") for t in trait_rows
         if normalize_text(t.get("hair_color_modifier", ""))
@@ -8458,6 +8517,9 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
 
     glasses_states: List[str] = []
     for t in trait_rows:
+        observation = t.get("glasses_observation", "")
+        if observation in {"occluded", "uncertain"} or (not observation and not t.get("glasses_visible")):
+            continue
         desc = normalize_text(t.get("glasses_description", ""))
         lens = normalize_text(t.get("glasses_lens_type", ""))
         if any(k in desc for k in ["sunglass", "shades"]) or lens in {"sunglasses", "tinted_lenses", "reflective_lenses"}:
@@ -8503,12 +8565,33 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
         appearance_mode = "natural_identity"
 
     canonical = profile.setdefault("canonical_features", {})
-    if not normalize_text(canonical.get("hair_color", "")):
-        canonical["hair_color"] = _weighted_trait_mode(trait_rows, "hair_color_base") or hair_color_stats.get("mode", "")
+    confirmed = profile.get("user_confirmed_identity_overrides", {}) or {}
+    confirmed_canonical = confirmed.get("canonical_features", {}) or {}
+    confirmed_stable = confirmed.get("stable_identity", {}) or {}
+    confirmed_markers = confirmed.get("identity_markers", {}) or {}
+    if glasses_stats["total"] and "glasses" not in confirmed_markers:
+        glasses = profile.setdefault("identity_markers", {}).setdefault("glasses", {})
+        regular_count = glasses_stats["counts"].get("regular_glasses", 0)
+        glasses["wears_regularly"] = regular_count / glasses_stats["total"] >= 0.60
+        glasses["frequency"] = f"{regular_count}/{glasses_stats['total']} observable images"
+        descriptions = [compact_trait(t.get("glasses_description")) for t in regular_glasses_traits if compact_trait(t.get("glasses_description"))]
+        if descriptions:
+            glasses["canonical_description"] = Counter(descriptions).most_common(1)[0][0]
+    if "hair_color" not in confirmed_canonical and hair_color_stats.get("mode"):
+        canonical["hair_color"] = hair_color_stats["mode"]
+    elif "hair_color" in confirmed_canonical:
+        canonical["hair_color"] = confirmed_canonical["hair_color"]
     if not normalize_text(canonical.get("hair_form", "")):
         canonical["hair_form"] = _weighted_trait_mode(trait_rows, "hair_form") or hair_form_stats.get("mode", "")
-    if not normalize_text(canonical.get("eye_color", "")):
-        canonical["eye_color"] = normalize_text((profile.get("stable_identity", {}) or {}).get("eye_color", "")) or _weighted_trait_mode(trait_rows, "eye_color_base", "eye_color_reliable") or eye_color_stats.get("mode", "")
+    if "eye_color" in confirmed_canonical or "eye_color" in confirmed_stable:
+        canonical["eye_color"] = confirmed_canonical.get("eye_color", confirmed_stable.get("eye_color", ""))
+        if "eye_color" in confirmed_stable:
+            profile.setdefault("stable_identity", {})["eye_color"] = confirmed_stable["eye_color"]
+    elif eye_color_stats.get("mode"):
+        canonical["eye_color"] = eye_color_stats["mode"]
+        profile.setdefault("stable_identity", {})["eye_color"] = eye_color_stats["mode"]
+    elif not normalize_text(canonical.get("eye_color", "")):
+        canonical["eye_color"] = normalize_text((profile.get("stable_identity", {}) or {}).get("eye_color", ""))
     if not normalize_text(canonical.get("beard_pattern", "")):
         canonical["beard_pattern"] = _weighted_trait_mode(trait_rows, "beard_pattern") or beard_pattern_stats.get("mode", "")
     if not normalize_text(canonical.get("beard_color", "")):
@@ -8549,6 +8632,18 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
         "look_context_counts": dict(look_counts.most_common(10)),
         "cosplay_fraction": round(cosplay_fraction, 3),
     }
+    profile["profile_normalization"] = {
+        "hair_color": {"recommended": hair_color_stats.get("mode", ""), "counts": hair_color_stats["counts"], "raw_counts": hair_color_stats["raw_counts"]},
+        "eye_color": {"recommended": eye_color_stats.get("mode", ""), "counts": eye_color_stats["counts"], "selected": canonical.get("eye_color", ""), "source": "user" if "eye_color" in confirmed_canonical or "eye_color" in confirmed_stable else "frequency"},
+    }
+    if eye_color_stats.get("mode") and "eye_color" not in confirmed_canonical and "eye_color" not in confirmed_stable:
+        total = eye_color_stats["total"]
+        fraction = eye_color_stats["mode_fraction"]
+        profile.setdefault("confidence", {})["eye_color"] = {
+            "level": "high" if total >= 5 and fraction >= 0.8 else ("medium" if total >= 2 else "low"),
+            "reasoning": f"Natural eye-color frequency across {total} usable observations: {eye_color_stats['counts']}. Minority observations are retained as evidence, not treated as lens changes.",
+            "outliers": [image_id for image_id, traits in per_image.items() if traits.get("eye_color_reliable") and traits.get("eye_color_base") != eye_color_stats["mode"]],
+        }
 
     notes = profile.setdefault("normalizer_notes", [])
     if hair_color_stats.get("variation_detected"):
@@ -8644,6 +8739,11 @@ def attach_piercing_inventory(profile: Dict[str, Any], rows: List[Dict[str, Any]
         for x in (markers.get("piercing_inventory", []) or [])
         if isinstance(x, dict) and normalize_text(x.get("location"))
     }
+    confirmed_inventory = ((profile.get("user_confirmed_identity_overrides", {}) or {}).get("identity_markers", {}) or {}).get("piercing_inventory", []) or []
+    confirmed_roles = {
+        _canonical_piercing_location(x.get("location")): normalize_text(x.get("role", ""))
+        for x in confirmed_inventory if isinstance(x, dict)
+    }
     inventory = []
     for loc in sorted(observations):
         desc_counts = Counter(observations[loc])
@@ -8653,12 +8753,12 @@ def attach_piercing_inventory(profile: Dict[str, Any], rows: List[Dict[str, Any]
         if category == "ear_jewelry" and len(desc_counts) >= 2 and (canonical_count / max(1, len(observations[loc]))) < 0.70:
             canonical_desc = "earring"
         old = existing.get(loc, {})
-        role = normalize_text(old.get("role", ""))
+        role = confirmed_roles.get(loc) or normalize_text(old.get("role", ""))
+        if role == "canonical" and loc not in confirmed_roles:
+            role = "variable"
         if role not in {"canonical", "variable", "accessory", "ignore"}:
             if category == "ear_jewelry":
                 role = "accessory"
-            elif (hits / total) >= 0.40:
-                role = "canonical"
             else:
                 role = "variable"
         inventory.append({
@@ -8761,6 +8861,7 @@ def build_subject_profile(profile_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     profile["per_image_traits"] = per_image
     profile = attach_piercing_inventory(profile, rows)
     profile = attach_profile_variability_policies(profile, rows)
+    profile = attach_initial_caption_evidence_summary(profile, rows)
     profile["input_hash"] = input_hash
     profile["profile_schema_version"] = PROFILE_CACHE_SCHEMA_VERSION
     profile["normalizer_settings_fingerprint"] = subject_profile_settings_fingerprint()
@@ -8857,6 +8958,7 @@ def refresh_subject_profile_from_existing_audits(
     profile["per_image_traits"] = per_image
     profile = attach_piercing_inventory(profile, eligible)
     profile = attach_profile_variability_policies(profile, eligible)
+    profile = attach_initial_caption_evidence_summary(profile, eligible)
 
     explicit = existing_profile.get("user_confirmed_identity_overrides", {}) or {}
     if isinstance(explicit, dict) and explicit:
@@ -8936,6 +9038,101 @@ def make_json_safe(value: Any) -> Any:
     return value
 
 
+def prepare_initial_captions(rows: List[Dict[str, Any]]) -> None:
+    """Describe effective images once, before profile composition. No silent fallback."""
+    if not INITIAL_CAPTION_ENGINE:
+        return
+    from initial_captions import (settings, local_resources, image_sha256,
+                                 cached_caption, store_caption, PROMPT)
+    import subprocess
+    import tempfile
+    root = Path(__file__).resolve().parent
+    engine = INITIAL_CAPTION_ENGINE
+    python, weights = "", {}
+    if engine != "gpt-6-luna":
+        python, weights = local_resources(root, engine, INITIAL_CAPTION_PYTHON, INITIAL_CAPTION_WEIGHTS)
+    config = settings(engine, INITIAL_CAPTION_FLORENCE_TASK, weights.get("revision", ""))
+    cache_dir = os.path.join(CACHE_DIR, "initial_captions")
+    os.makedirs(cache_dir, exist_ok=True)
+    pending = {}
+    cases = []
+    for row in rows:
+        raise_if_cancelled("initial captions")
+        path = row_effective_image_path(row)
+        digest = image_sha256(path)
+        record = cached_caption(cache_dir, digest, config)
+        if record:
+            row["initial_caption"] = record
+            continue
+        pending.setdefault(digest, []).append(row)
+        if len(pending[digest]) == 1:
+            cases.append({"path": path, "image_sha256": digest})
+    safe_print(f"First captions: {engine} | {len(cases)} new images, {len(rows) - sum(len(x) for x in pending.values())} cached")
+    if engine == "gpt-6-luna":
+        for case in cases:
+            raise_if_cancelled("initial Luna caption")
+            with open_local_image(case["path"]) as opened:
+                image = ImageOps.exif_transpose(opened).convert("RGB")
+            encoded = _encode_pil_for_api(image, max_side=max(image.size))
+            response = responses_api_call(engine, {
+                "model": engine, "reasoning": {"effort": "none"}, "max_output_tokens": 4096,
+                "input": [{"role": "user", "content": [
+                    {"type": "input_text", "text": PROMPT},
+                    {"type": "input_image", "image_url": "data:image/jpeg;base64," + encoded, "detail": "high"}]}],
+            }, phase_label="initial_caption")
+            if _responses_incomplete_reason(response):
+                raise ValueError("Initial Luna caption was incomplete; no final export was started.")
+            if image_sha256(case["path"]) != case["image_sha256"]:
+                raise RuntimeError("Image changed during initial captioning")
+            raw = extract_response_text(response)
+            record = store_caption(cache_dir, case["image_sha256"], config,
+                {"status": "ok", "caption": raw, "raw_output": raw, "hit_token_limit": False,
+                 "response_model": response.get("model", engine), "usage": response.get("usage", {})})
+            for row in pending[case["image_sha256"]]:
+                row["initial_caption"] = record
+    elif cases:
+        with tempfile.TemporaryDirectory(prefix="caption_batch_", dir=cache_dir) as batch:
+            job = os.path.join(batch, "job.json")
+            core_atomic_write_json(job, {"settings": config, "weights": weights, "cases": cases, "cache_dir": cache_dir})
+            with open(os.path.join(batch, "worker.log"), "w+", encoding="utf-8") as log:
+                proc = subprocess.Popen([python, str(root / "initial_caption_worker.py"), job],
+                    stdout=log, stderr=subprocess.STDOUT, cwd=str(root),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                try:
+                    with open(os.path.join(batch, "worker.log"), "r", encoding="utf-8", errors="replace") as reader:
+                        pending_log = ""
+                        while proc.poll() is None:
+                            raise_if_cancelled("local initial captions")
+                            pending_log += reader.read().replace("\r", "\n")
+                            lines = pending_log.split("\n")
+                            pending_log = lines.pop()
+                            for line in lines:
+                                if "Initial caption ready:" in line:
+                                    safe_print(line)
+                            time.sleep(0.2)
+                        remainder = pending_log + reader.read()
+                        for line in remainder.splitlines():
+                            if "Initial caption ready:" in line:
+                                safe_print(line)
+                    if proc.returncode:
+                        log.seek(0)
+                        raise RuntimeError("Local initial captions failed: " + log.read()[-3000:])
+                finally:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=5)
+        for case in cases:
+            record = cached_caption(cache_dir, case["image_sha256"], config)
+            if not record or image_sha256(case["path"]) != case["image_sha256"]:
+                raise RuntimeError("Local caption missing or image changed; final export blocked.")
+            for row in pending[case["image_sha256"]]:
+                row["initial_caption"] = record
+
+
 def save_caption_stage(
     *,
     all_rows: List[Dict[str, Any]],
@@ -8956,7 +9153,8 @@ def save_caption_stage(
     """
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
     stage = {
-        "stage_schema_version": "v1",
+        "stage_schema_version": "v2",
+        "initial_caption_engine": INITIAL_CAPTION_ENGINE,
         "trigger_word": TRIGGER_WORD,
         "safe_trigger": SAFE_TRIGGER,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -9040,6 +9238,11 @@ def _sync_row_update(row_map: Dict[str, Dict[str, Any]], row: Dict[str, Any]) ->
             "new_basename": row.get("new_basename", ""),
             "final_caption": row.get("final_caption", ""),
         })
+        for key in ("initial_caption", "caption_composition_source", "caption_detail_changes",
+                    "caption_detail_rejected", "caption_source", "caption_model", "caption_retry_count",
+                    "primary_caption_error", "final_caption_valid", "caption_validation_error"):
+            if key in row:
+                target[key] = row[key]
 
 
 def _write_captioned_image(row: Dict[str, Any], out_dir: str, new_basename: str, global_rules: Dict[str, Any], subject_profile: Dict[str, Any]) -> None:
@@ -9051,6 +9254,15 @@ def _write_captioned_image(row: Dict[str, Any], out_dir: str, new_basename: str,
     cropped.save(img_out, "JPEG", quality=100)
     with open(txt_out, "w", encoding="utf-8") as f:
         f.write(row["final_caption"])
+    if row.get("initial_caption"):
+        core_atomic_write_json(os.path.join(out_dir, f"{new_basename}.caption.json"), {
+            "original_filename": row.get("original_filename"),
+            "initial_caption": row["initial_caption"], "final_caption": row["final_caption"],
+            "composition_source": row.get("caption_composition_source", "audited_observations_and_subject_profile"),
+            "detail_changes": row.get("caption_detail_changes", {}),
+            "rejected_details": row.get("caption_detail_rejected", []),
+            "training_target": TRAINING_TARGET, "caption_policy": CAPTION_POLICY,
+        })
 
 
 def build_reject_export_text(
@@ -9345,6 +9557,7 @@ def write_caption_stage_reports(
         "canon_representation_reject_candidates": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("reject_candidates", 0),
         "canon_representation_max_quality_gap": canon_representation_summary(all_rows, selected_sorted, subject_profile).get("max_quality_gap", 0),
         "training_target": normalize_training_target(TRAINING_TARGET),
+        "image_target": target_export_metadata(TRAINING_TARGET),
         "pipeline_mode": str(PIPELINE_MODE),
         "caption_profile": caption_profile_for_training_target(TRAINING_TARGET),
         "variable_feature_mode": str(VARIABLE_FEATURE_CAPTION_MODE),
@@ -9352,10 +9565,10 @@ def write_caption_stage_reports(
         "run_config_schema_version": str((_ui_cfg or {}).get("RUN_CONFIG_SCHEMA_VERSION", "")) if isinstance(globals().get("_ui_cfg"), dict) else "",
         "run_config_fingerprint": str((_ui_cfg or {}).get("RUN_CONFIG_FINGERPRINT", "")) if isinstance(globals().get("_ui_cfg"), dict) else "",
         "audit_model": AI_MODEL,
-        "krea_ai_captioning": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_AI_CAPTIONING),
-        "krea_caption_model": KREA_CAPTION_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" else "",
-        "krea_caption_repair_enabled": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_CAPTION_REPAIR),
-        "krea_caption_repair_model": KREA_CAPTION_REPAIR_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_CAPTION_REPAIR else "",
+        "krea_ai_captioning": bool(is_krea_target(TRAINING_TARGET) and USE_KREA_AI_CAPTIONING),
+        "krea_caption_model": KREA_CAPTION_MODEL if is_krea_target(TRAINING_TARGET) else "",
+        "krea_caption_repair_enabled": bool(is_krea_target(TRAINING_TARGET) and USE_KREA_CAPTION_REPAIR),
+        "krea_caption_repair_model": KREA_CAPTION_REPAIR_MODEL if is_krea_target(TRAINING_TARGET) and USE_KREA_CAPTION_REPAIR else "",
         "caption_primary_count": sum(1 for r in selected_sorted if r.get("caption_source") == "gpt_primary"),
         "caption_repair_count": sum(1 for r in selected_sorted if r.get("caption_source") == "gpt_repair"),
         "caption_local_fallback_count": sum(1 for r in selected_sorted if r.get("caption_source") == "local_fallback"),
@@ -9472,6 +9685,14 @@ def continue_caption_from_profile() -> None:
     warnings = stage.get("warnings", []) or []
     valid_candidate_count = int(stage.get("valid_candidate_count", 0) or 0)
 
+    # Profile refresh can consume first-caption cross-checks. Verify their
+    # effective images before any profile normalization or export mutation.
+    from initial_captions import image_sha256, validate_record
+    for row in all_rows:
+        record = row.get("initial_caption")
+        if record:
+            validate_record(record, image_sha256(row_effective_image_path(row)), record.get("settings", {}))
+
     # Backward-compatible profile migration: older paused runs do not yet
     # contain canonical_features or the generalized hair/eye/beard/glasses
     # variability statistics. Rebuild only the normalized per-image profile
@@ -9554,6 +9775,15 @@ def continue_caption_from_profile() -> None:
             "Review/reject candidates are never promoted automatically by the canon bonus; explicit user Priority remains the only override."
         )
 
+    from initial_captions import image_sha256, validate_record
+    for row in list(selected_sorted) + list(unselected_keep) + (list(review_items) if EXPORT_REVIEW_IMAGES else []):
+        record = row.get("initial_caption")
+        if record:
+            validate_record(record, image_sha256(row_effective_image_path(row)), record.get("settings", {}))
+        if CAPTION_COMPOSITION_MODE == "luna_text" and int(row.get("face_count_local") or 0) <= 1:
+            from caption_details import cached_details
+            if not record or cached_details(CACHE_DIR, str(record.get("caption") or "")) is None:
+                raise ValueError("Luna text details are not prepared. Prepare them in the profile view before exporting.")
     begin_output_transaction("continue_from_profile")
     clean_caption_output_dirs()
     row_map = {r.get("original_filename"): r for r in all_rows if r.get("original_filename")}
@@ -10469,7 +10699,7 @@ def canonical_hair_match_strength(row: Dict[str, Any], profile: Optional[Dict[st
     current = normalize_text(traits.get("hair_color_base", "")) or canonical_hair_color(row)
     if not current:
         return 0.0
-    if current == canonical:
+    if _profile_hair_color(current) == _profile_hair_color(canonical):
         return 1.0
 
     near_map = {
@@ -11052,11 +11282,7 @@ def build_local_caption(
 
     profile_policies = profile.get("profile_policies", {}) if isinstance(profile, dict) else {}
     skin_tone = compact_trait(stable_identity.get("skin_tone")) or compact_trait(item.get("skin_tone"))
-    eye_policy = normalize_text(profile_policies.get("eye_color_policy"))
-    if eye_policy == "caption_when_clear_or_variable":
-        eye_color = compact_trait(image_traits.get("eye_color_base")) or compact_trait(item.get("eye_color"))
-    else:
-        eye_color = compact_trait(stable_identity.get("eye_color")) or compact_trait(item.get("eye_color"))
+    eye_state = get_eye_feature_state(item, profile, image_traits, active_policy)
     # Body-Build-Sticky-Empty: Wenn das Profile bewusst body_build = "" gesetzt hat
     # (z.B. wegen Headshot-Dominanz oder User-Override im UI), darf NICHT auf den
     # per-image Audit-Wert zurueckgefallen werden. Sonst wuerde die Demotion sinnlos.
@@ -11149,8 +11375,8 @@ def build_local_caption(
     if caption_profile in {"ernie", "shared_compact"}:
         if hair_tag:
             anchor_parts.append(hair_tag)
-        if active_policy.get("include_eye_color") and eye_color:
-            anchor_parts.append(f"{_phrase_from_token(eye_color)} eyes")
+        if eye_state.get("must_caption") and eye_state.get("phrase"):
+            anchor_parts.append(eye_state["phrase"])
         if active_policy["include_skin_tone"] and skin_tone:
             anchor_parts.append(f"{skin_tone} skin")
 
@@ -11175,7 +11401,6 @@ def build_local_caption(
     if caption_profile not in {"ernie", "shared_compact"} and hair_tag and hair_state.get("must_caption"):
         trait_bits.append(hair_tag)
 
-    eye_state = get_eye_feature_state(item, profile, image_traits, active_policy)
     if caption_profile not in {"ernie", "shared_compact"} and eye_state.get("must_caption") and eye_state.get("phrase"):
         trait_bits.append(eye_state.get("phrase"))
 
@@ -11541,7 +11766,7 @@ def build_krea_ai_caption(
             "glasses_position": glasses_state.get("position", ""),
             "hair": hair_state.get("phrase", "") or item.get("hair_description", ""),
             "hair_color_modifier": hair_state.get("current_modifier", ""),
-            "eye_color": eye_state.get("current", "") if eye_state.get("reliable") else "",
+            "eye_color": eye_state.get("current", "") if eye_state.get("visible") else "",
             "eye_color_reliable": bool(eye_state.get("reliable")),
             "visible_piercings_and_ear_jewelry": piercing_state.get("phrases", []),
             "visible_tattoos": tattoo_state.get("phrases", []) if tattoo_state.get("must_caption") else [],
@@ -11762,15 +11987,66 @@ def build_caption(
     global_rules: Dict[str, Any],
     subject_profile: Optional[Dict[str, Any]] = None,
 ) -> str:
+    if INITIAL_CAPTION_ENGINE or item.get("initial_caption"):
+        item["caption_detail_changes"] = {}
+        item["caption_detail_rejected"] = []
+        item["caption_composition_source"] = "audited_observations_and_subject_profile"
+        _set_caption_metadata(item, source="profile_local", model="local_deterministic", retry_count=0)
+        if CAPTION_COMPOSITION_MODE == "luna_text" and item.get("initial_caption"):
+            from caption_details import cached_details, enriched_row
+            # Multi-person scene excerpts cannot establish who owns a feature.
+            if int(item.get("face_count_local") or 0) <= 1:
+                details = cached_details(CACHE_DIR, str(item["initial_caption"].get("caption") or ""))
+                if details is None:
+                    raise ValueError("Prepare Luna text details in the profile view before exporting with this mode.")
+                enriched = enriched_row(item, details)
+                item["caption_detail_changes"] = enriched["caption_detail_changes"]
+                item["caption_detail_rejected"] = enriched["caption_detail_rejected"]
+                item["caption_composition_source"] = "initial_caption_excerpts_audit_and_subject_profile"
+                _set_caption_metadata(item, source="luna_text_details_local_profile", model="gpt-6-luna", retry_count=0)
+                return adapt_caption_for_target(TRAINING_TARGET, build_local_caption(enriched, global_rules, subject_profile))
+        # The free description is retained as evidence. Never splice unfiltered
+        # identity/hidden-feature claims into policy-controlled training text.
+        return adapt_caption_for_target(TRAINING_TARGET, build_local_caption(item, global_rules, subject_profile))
     profile_name = caption_profile_for_training_target(globals().get("TRAINING_TARGET", globals().get("CAPTION_PROFILE", "ernie")))
     use_ai = (
-        normalize_training_target(globals().get("TRAINING_TARGET", "ernie")) == "krea2"
+        is_krea_target(globals().get("TRAINING_TARGET", "ernie"))
         and bool(USE_KREA_AI_CAPTIONING)
         and bool(item.get("selected") or item.get("output_bucket") == "train_ready")
     )
     if use_ai:
         return build_krea_ai_caption(item, global_rules, subject_profile)
-    return build_local_caption(item, global_rules, subject_profile)
+    return adapt_caption_for_target(TRAINING_TARGET, build_local_caption(item, global_rules, subject_profile))
+
+
+def request_caption_details(payload: Dict[str, Any]) -> Dict[str, Any]:
+    response = responses_api_call("gpt-6-luna", payload, phase_label="caption_text_details")
+    if _responses_incomplete_reason(response):
+        raise ValueError("Luna text details are incomplete; no guessed continuation is used.")
+    return _parse_json_object_text(extract_response_text(response))
+
+
+def prepare_caption_details_only() -> None:
+    from caption_details import prepare_details
+    from initial_captions import image_sha256, validate_record
+    stage = load_caption_stage()
+    profile = load_confirmed_subject_profile(stage)
+    if _frame_audit_stale_entries(stage, profile):
+        raise RuntimeError("Frames changed since the audit. Refresh the normal run first.")
+    rows = [r for r in stage.get("all_rows", []) if r.get("initial_caption")
+            and r.get("base_status") in {"keep", "review"} and r.get("arcface_flag") != "hard"
+            and int(r.get("face_count_local") or 0) <= 1]
+    if not rows:
+        raise RuntimeError("No prepared first descriptions found. Run initial captioning first.")
+    # Validate the complete batch before the first paid text request.
+    for row in rows:
+        record = row["initial_caption"]
+        validate_record(record, image_sha256(row_effective_image_path(row)), record.get("settings", {}))
+    for index, row in enumerate(rows, 1):
+        raise_if_cancelled("caption text details")
+        prepare_details(CACHE_DIR, row, request_caption_details)
+        safe_print(f"Text details ready: {index}/{len(rows)} | {row.get('original_filename', '')}")
+    safe_print("Text details ready. Refresh the local profile caption preview; no images or profile were overwritten.")
 
 
 # ============================================================
@@ -12206,6 +12482,7 @@ def update_run_manifest(status: str, **extra: Any) -> None:
         "run_id": str(globals().get("RUN_ID", "") or ""),
         "status": str(status),
         "training_target": normalize_training_target(TRAINING_TARGET),
+        "image_target": target_export_metadata(TRAINING_TARGET),
         "pipeline_mode": str(PIPELINE_MODE),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "effective_config": _effective_config_for_manifest(),
@@ -12302,6 +12579,14 @@ def generate_dashboard(all_rows: List[Dict[str, Any]], selected: List[Dict[str, 
 
 def main() -> None:
     raise_if_cancelled("startup")
+    if PREPARE_CAPTION_DETAILS_ONLY:
+        prepare_caption_details_only()
+        return
+    if INITIAL_CAPTION_ENGINE and INITIAL_CAPTION_ENGINE != "gpt-6-luna" and not CONTINUE_FROM_PROFILE:
+        # Fail before paid audits when the selected local provider is not installed.
+        from initial_captions import local_resources
+        local_resources(Path(__file__).resolve().parent, INITIAL_CAPTION_ENGINE,
+                        INITIAL_CAPTION_PYTHON, INITIAL_CAPTION_WEIGHTS)
     reset_performance_stats()
     warnings: List[str] = []
     budget_limit_reached = False
@@ -13277,6 +13562,16 @@ def main() -> None:
     # Nur verwertbare Keep-Bilder: train_ready + keep_unused. Reject/Review
     # beeinflussen das Profil nicht, weil sie oft genau die fehlerhaften
     # Audit-Werte enthalten, die wir herausfiltern wollen.
+    # Retain descriptions for all non-reject candidates, including images that
+    # can be promoted during manual profile review. Cached descriptions survive
+    # profile, trigger and target changes.
+    prepare_initial_captions([r for r in all_rows if r.get("base_status") in {"keep", "review"} and r.get("arcface_flag") != "hard"])
+    if CAPTION_COMPOSITION_MODE == "luna_text" and PIPELINE_MODE == "single_pass":
+        from caption_details import prepare_details
+        for row in all_rows:
+            if row.get("initial_caption") and int(row.get("face_count_local") or 0) <= 1:
+                raise_if_cancelled("automatic caption text details")
+                prepare_details(CACHE_DIR, row, request_caption_details)
     profile_source_rows = list(selected) + list(unselected_keep)
     subject_profile = build_subject_profile(profile_source_rows)
     subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
@@ -13290,8 +13585,9 @@ def main() -> None:
         key=lambda r: (shot_order.get(r.get("shot_type"), 9), -int(r.get("quality_total", 0)))
     )
 
-    if PIPELINE_MODE == "profile_then_caption":
-        save_caption_stage(
+    # Automatic runs retain the same reviewable intermediate state as manual
+    # runs. Revisiting the profile does not require another image description.
+    save_caption_stage(
             all_rows=all_rows,
             selected_sorted=selected_sorted,
             review_items=review_items,
@@ -13302,7 +13598,8 @@ def main() -> None:
             identity_summary=identity_summary,
             warnings=warnings,
             valid_candidate_count=len(valid_candidates),
-        )
+    )
+    if PIPELINE_MODE == "profile_then_caption":
         safe_print("")
         safe_print("=" * 70)
         safe_print("PROFILE READY - CAPTION EXPORT PAUSED")
@@ -13346,17 +13643,7 @@ def main() -> None:
         counters[bucket] += 1
 
         row["output_bucket"] = bucket
-        row["new_basename"] = new_basename
-        caption = build_caption(row, global_rules, subject_profile)
-        row["final_caption"] = caption
-
-        cropped = body_aware_crop(row_effective_image_path(row), row)
-        img_out = os.path.join(out_dir, f"{new_basename}.jpg")
-        txt_out = os.path.join(out_dir, f"{new_basename}.txt")
-
-        cropped.save(img_out, "JPEG", quality=100)
-        with open(txt_out, "w", encoding="utf-8") as f:
-            f.write(caption)
+        _write_captioned_image(row, out_dir, new_basename, global_rules, subject_profile)
 
     if EXPORT_REVIEW_IMAGES:
         review_export = sorted(review_items, key=lambda r: -int(r.get("quality_total", 0)))
@@ -13374,16 +13661,8 @@ def main() -> None:
 
             counters[bucket] += 1
             row["output_bucket"] = bucket
-            row["new_basename"] = new_basename
-            row["final_caption"] = build_caption(row, global_rules, subject_profile)
-
             try:
-                cropped = body_aware_crop(row_effective_image_path(row), row)
-                img_out = os.path.join(out_dir, f"{new_basename}.jpg")
-                txt_out = os.path.join(out_dir, f"{new_basename}.txt")
-                cropped.save(img_out, "JPEG", quality=100)
-                with open(txt_out, "w", encoding="utf-8") as f:
-                    f.write(row["final_caption"])
+                _write_captioned_image(row, out_dir, new_basename, global_rules, subject_profile)
             except RunCancelled:
                 raise
             except Exception:
@@ -13398,16 +13677,8 @@ def main() -> None:
         new_basename = f"{SAFE_TRIGGER}_unused_{counters['keep_unused']:03d}"
         counters["keep_unused"] += 1
         row["output_bucket"] = "keep_unused"
-        row["new_basename"] = new_basename
-        row["final_caption"] = build_caption(row, global_rules, subject_profile)
-
         try:
-            cropped = body_aware_crop(row_effective_image_path(row), row)
-            img_out = os.path.join(KEEP_UNUSED_DIR, f"{new_basename}.jpg")
-            txt_out = os.path.join(KEEP_UNUSED_DIR, f"{new_basename}.txt")
-            cropped.save(img_out, "JPEG", quality=100)
-            with open(txt_out, "w", encoding="utf-8") as f:
-                f.write(row["final_caption"])
+            _write_captioned_image(row, KEEP_UNUSED_DIR, new_basename, global_rules, subject_profile)
         except RunCancelled:
             raise
         except Exception:
@@ -13735,6 +14006,7 @@ def main() -> None:
         "subject_profile_sample_size": (subject_profile or {}).get("sample_size", 0),
         "subject_profile_total_usable_images": (subject_profile or {}).get("total_usable_images", 0),
         "training_target": normalize_training_target(TRAINING_TARGET),
+        "image_target": target_export_metadata(TRAINING_TARGET),
         "pipeline_mode": str(PIPELINE_MODE),
         "caption_profile": caption_profile_for_training_target(TRAINING_TARGET),
         "variable_feature_mode": str(VARIABLE_FEATURE_CAPTION_MODE),
@@ -13742,10 +14014,10 @@ def main() -> None:
         "run_config_schema_version": str((_ui_cfg or {}).get("RUN_CONFIG_SCHEMA_VERSION", "")) if isinstance(globals().get("_ui_cfg"), dict) else "",
         "run_config_fingerprint": str((_ui_cfg or {}).get("RUN_CONFIG_FINGERPRINT", "")) if isinstance(globals().get("_ui_cfg"), dict) else "",
         "audit_model": AI_MODEL,
-        "krea_ai_captioning": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_AI_CAPTIONING),
-        "krea_caption_model": KREA_CAPTION_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" else "",
-        "krea_caption_repair_enabled": bool(normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_CAPTION_REPAIR),
-        "krea_caption_repair_model": KREA_CAPTION_REPAIR_MODEL if normalize_training_target(TRAINING_TARGET) == "krea2" and USE_KREA_CAPTION_REPAIR else "",
+        "krea_ai_captioning": bool(is_krea_target(TRAINING_TARGET) and USE_KREA_AI_CAPTIONING),
+        "krea_caption_model": KREA_CAPTION_MODEL if is_krea_target(TRAINING_TARGET) else "",
+        "krea_caption_repair_enabled": bool(is_krea_target(TRAINING_TARGET) and USE_KREA_CAPTION_REPAIR),
+        "krea_caption_repair_model": KREA_CAPTION_REPAIR_MODEL if is_krea_target(TRAINING_TARGET) and USE_KREA_CAPTION_REPAIR else "",
         "caption_primary_count": sum(1 for r in selected_sorted if r.get("caption_source") == "gpt_primary"),
         "caption_repair_count": sum(1 for r in selected_sorted if r.get("caption_source") == "gpt_repair"),
         "caption_local_fallback_count": sum(1 for r in selected_sorted if r.get("caption_source") == "local_fallback"),

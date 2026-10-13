@@ -136,9 +136,28 @@ Eine lokale, nur lesende Laufübersicht aktualisiert sich beim Öffnen des Audit
 
 55 lokale Regressionen bestehen. Im Browser wurde die isolierte 48-Bild-Testkopie geladen: acht automatische Zuschnitte, 27 offene Entscheidungen, ein Ausschluss; Wechsel zur eigenen Profilprüfung aktualisiert den angezeigten Ablauf. Die Vorschau auf Port 7876 enthält keinen API-Key und verändert keine Nutzerkonfiguration. Kein neuer KI-Audit und keine neue Qualitätsmessung. Screenshot: `Datasets/audit_review/audit_overview_verified.png`.
 
+## Gemeinsame Bildfakten und neun Exportziele
+
+Eine gemeinsame Registry in `training_targets.py` ersetzt die getrennten Zielzuordnungen in UI, Konfiguration und Backend. Sie enthält ERNIE Image, Z-Image Base, Krea 2 Raw/Turbo, Qwen-Image 2.1, Ideogram 4 (experimentell), FLUX.2 dev und FLUX.2 Klein 4B/9B Base. Bestehende Krea-2-Schlüssel werden auf Raw abgebildet; unbekannte Ziele lösen einen Fehler aus statt unbemerkt ERNIE zu wählen. Der Arbeitsumfang bleibt bei einzelnen RGB-Bildern.
+
+Audit und Profil verwenden nun zielunabhängige Anweisungen und Fingerprints. Zielwechsel verändern weiterhin Caption-/Laufkonfiguration, aber nicht den Bildfakten-Cache. Bildinhalt, Variante, Modell, Reasoning und Trigger bleiben relevante Audit-Schlüssel. Der Wechsel zur neuen Prompt-Version invalidiert alte zielabhängige Audit-Caches beim nächsten vollständigen Audit. Bereits gespeicherte Auswahlstände bleiben exportierbar.
+
+Die Exporttransaktion schreibt `image_target.json` zusammen mit Bildern und Captions. Ideogram erhält eine minimale strukturierte JSON-Beschreibung ohne erfundene Koordinaten; eine vollständige Szenenzerlegung ist nicht umgesetzt. Alle anderen Ziele erhalten Text-Captions. Exportieren in denselben Ausgabeordner ersetzt weiterhin den vorherigen Export.
+
+59 lokale Tests bestehen. Ein gespeicherter, simulierter Audit-Stand wurde über den tatsächlichen Exportweg für alle neun Ziele exportiert; Quellen und gespeicherter Auswahlstand blieben unverändert. Netzwerkaufrufe waren dabei gesperrt. Nach Ergänzung des Trigger-Cache-Schlüssels bestehen die vier Ziel-Regressionen erneut. Die Dropdown-Auswahl wurde zusätzlich im Browser geprüft (`Datasets/audit_review/image_targets_verified.png`). Keine neuen API-Aufrufe, kein realer Trainingsvergleich; insbesondere die neuen Caption-Voreinstellungen sind noch keine gemessene Qualitätsverbesserung.
+
+## Getrennte Erstbeschreibung und Profilzusammensetzung (12.10.2026)
+
+Florence 2, JoyCaption und GPT-6 Luna sind als Erstcaption-Provider unabhängig vom Zielmodell auswählbar. Florence hat drei Detailstufen; Very Detailed ist voreingestellt. Eigene GPU-Batch-Prozesse halten die Python-3.13-Hauptanwendung von den unterschiedlichen Modellabhängigkeiten getrennt. Bild-Hashes, Provider-Einstellungen, Rohtexte und Modellrevisionen liegen in einem vom Profil unabhängigen Cache. Profilansicht und Export erhalten dieselben Caption-Regeln; Vorschauen beziehen ungespeicherte Editorwerte ein und zeigen den tatsächlichen Export-Ausschnitt. Der Bestätigungs-/Exportbutton speichert Editorwerte vor dem Fortsetzen.
+
+Lokal werden Audit-Merkmale verwendet. Optional extrahiert Luna wörtlich belegte Szenendetails aus dem gespeicherten Beschreibungstext, ohne Bilder oder Personenprofile erneut zu senden. Die eigentliche Profilbereinigung bleibt lokal. Identität und Schmuckmerkmale werden nicht über diesen Zusatzadapter eingeschleust. Textdetails sind unabhängig von späteren Profiländerungen gecacht; der manuelle Export startet dafür keine verdeckten API-Anfragen. Quellbindung ersetzt keine Prüfung der Bildwahrheit. Zusätzliche Schmuckbeobachtungen und die Qualität des neuen Textschritts bleiben offen.
+
+88 Tests bestanden. Die produktiven Florence-/JoyCaption-Worker wurden jeweils an einem echten Referenzbild offline ausgeführt. Luna-Textdetails wurden mit simulierten Antworten geprüft; kein zusätzlicher API-Test, kein Trainingslauf. Einrichtung und Grenzen stehen in `CAPTION_PIPELINE.md`.
+
 ## Quellen
 
 - [OpenAI: aktueller Modellleitfaden](https://developers.openai.com/api/docs/guides/latest-model) und [ChatGPT-Alias](https://developers.openai.com/api/docs/models/chat-latest).
 - [OpenAI: Bildverarbeitung und Grenzen räumlicher Genauigkeit](https://developers.openai.com/api/docs/guides/images-vision). Daraus folgt die Kombination mit lokaler Verfeinerung und manueller Bestätigung.
 - [MediaPipe: Face Detector in Python](https://developers.google.com/edge/mediapipe/solutions/vision/face_detector/python) und [Pose Landmarker in Python](https://developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker/python).
 - [SAM 2: offizielles Repository](https://github.com/facebookresearch/sam2).
+- [AI Toolkit: Bildmodelle](https://ostris.com/docs/ai-toolkit/models), [Qwen-Image 2](https://ostris.com/docs/ai-toolkit/models/qwen-image-2), [Krea 2](https://ostris.com/docs/ai-toolkit/models/krea2) und [Ideogram 4](https://ostris.com/docs/ai-toolkit/models/ideogram4).

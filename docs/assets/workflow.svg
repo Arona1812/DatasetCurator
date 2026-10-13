@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="title desc">
+  <title id="title">DatasetCurator workflow</title>
+  <desc id="desc">Four steps: import photos, clean and review images, build a person profile and captions, export a LoRA training set.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827"/>
+      <stop offset="1" stop-color="#1c3150"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#62d6bc"/>
+      <stop offset="1" stop-color="#79a8ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-25%" y="-25%" width="150%" height="160%">
+      <feDropShadow dx="0" dy="12" stdDeviation="13" flood-color="#050b15" flood-opacity=".25"/>
+    </filter>
+  </defs>
+  <rect width="1280" height="360" rx="26" fill="url(#background)"/>
+  <circle cx="1220" cy="30" r="170" fill="#315681" opacity=".18"/>
+  <circle cx="45" cy="330" r="165" fill="#245b64" opacity=".17"/>
+  <text x="62" y="55" font-family="Arial, Helvetica, sans-serif" font-size="16" font-weight="700" letter-spacing="2.6" fill="#80e1cf">PERSON LoRA DATASET</text>
+  <text x="62" y="92" font-family="Arial, Helvetica, sans-serif" font-size="32" font-weight="700" fill="#ffffff">From image folder to training set</text>
+
+  <g filter="url(#shadow)" font-family="Arial, Helvetica, sans-serif">
+    <g transform="translate(60 125)">
+      <rect width="267" height="184" rx="18" fill="#f7fafc"/>
+      <rect x="22" y="22" width="53" height="46" rx="8" fill="#dce7f5"/>
+      <path d="M28 35h17l5 6h19v21H28z" fill="#78aaf0"/>
+      <rect x="83" y="28" width="33" height="41" rx="5" fill="#c5d9ed" transform="rotate(7 99 48)"/>
+      <rect x="98" y="25" width="33" height="41" rx="5" fill="#95c4d4" transform="rotate(-7 114 45)"/>
+      <text x="22" y="105" font-size="19" font-weight="700" fill="#17324b">1  Import images</text>
+      <text x="22" y="133" font-size="15" fill="#52647a">Choose a folder and trigger</text>
+      <text x="22" y="155" font-size="15" fill="#52647a">word for one person.</text>
+    </g>
+    <g transform="translate(358 125)">
+      <rect width="267" height="184" rx="18" fill="#f7fafc"/>
+      <rect x="22" y="22" width="61" height="49" rx="8" fill="#e7eff8" stroke="#91a7bf" stroke-width="2"/>
+      <rect x="30" y="29" width="45" height="35" rx="2" fill="#add6c4"/>
+      <path d="M36 56l13-14 9 10 7-7 9 11" fill="none" stroke="#3f947b" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M99 35l8 8 14-17" fill="none" stroke="#2aa98b" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="22" y="105" font-size="19" font-weight="700" fill="#17324b">2  Clean &amp; review</text>
+      <text x="22" y="133" font-size="15" fill="#52647a">Find duplicates, check frames,</text>
+      <text x="22" y="155" font-size="15" fill="#52647a">keep the useful shots.</text>
+    </g>
+    <g transform="translate(656 125)">
+      <rect width="267" height="184" rx="18" fill="#f7fafc"/>
+      <circle cx="47" cy="42" r="13" fill="#92b4de"/>
+      <path d="M25 73c0-15 10-23 22-23s22 8 22 23" fill="#92b4de"/>
+      <rect x="82" y="27" width="49" height="6" rx="3" fill="#72c8b0"/>
+      <rect x="82" y="43" width="65" height="6" rx="3" fill="#adc3d8"/>
+      <rect x="82" y="59" width="40" height="6" rx="3" fill="#adc3d8"/>
+      <text x="22" y="105" font-size="19" font-weight="700" fill="#17324b">3  Profile &amp; caption</text>
+      <text x="22" y="133" font-size="15" fill="#52647a">Compare visible traits and</text>
+      <text x="22" y="155" font-size="15" fill="#52647a">prepare training captions.</text>
+    </g>
+    <g transform="translate(954 125)">
+      <rect width="267" height="184" rx="18" fill="#f7fafc"/>
+      <rect x="24" y="25" width="49" height="47" rx="6" fill="#a6c6eb"/>
+      <path d="M31 61l12-14 9 8 8-12 7 18" fill="none" stroke="#fff" stroke-width="3" stroke-linejoin="round"/>
+      <rect x="83" y="27" width="48" height="6" rx="3" fill="#72c8b0"/>
+      <rect x="83" y="44" width="62" height="6" rx="3" fill="#adc3d8"/>
+      <rect x="83" y="61" width="37" height="6" rx="3" fill="#adc3d8"/>
+      <text x="22" y="105" font-size="19" font-weight="700" fill="#17324b">4  Export dataset</text>
+      <text x="22" y="133" font-size="15" fill="#52647a">Get images, captions and</text>
+      <text x="22" y="155" font-size="15" fill="#52647a">a reviewable report.</text>
+    </g>
+  </g>
+  <g fill="none" stroke="url(#accent)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M330 217h20m-7-7 7 7-7 7"/>
+    <path d="M628 217h20m-7-7 7 7-7 7"/>
+    <path d="M926 217h20m-7-7 7 7-7 7"/>
+  </g>
+</svg>

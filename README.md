@@ -1,126 +1,77 @@
-# LoRA Dataset Curator
+# DatasetCurator
 
-[Deutsch](README_DE.md) · [MIT License](LICENSE) · [Third-party licenses](thirdparty-lic.md)
+**Turn a folder of person photos into a reviewable LoRA training dataset.** DatasetCurator is a local web app that helps you clean images, check identity consistency, build a person profile, and export images with training captions.
 
-**LoRA Dataset Curator** is a local web UI for turning an image folder into a curated, captioned training dataset for **character LoRAs**. It is optimized for consistent person/character datasets, combining duplicate detection, image-quality checks, optional local frame cleanup, OpenAI-assisted image audits, identity-consistency checks, and dataset-aware captioning. A separate video helper can extract useful frames from source videos.
+[Deutsch](README_DE.md) · [License](LICENSE) · [Caption pipeline](CAPTION_PIPELINE.md)
 
-> The repository contains code only. External APIs and model weights are subject to their own terms and licenses.
+![DatasetCurator workflow: import, review, profile and caption, export](docs/assets/workflow.svg)
 
 ## What it does
 
-- Finds unreadable files, low-quality images, and near duplicates before paid API requests.
-- Detects screenshot borders locally and offers an additional AI photo-region finder for difficult layouts; originals are never overwritten.
-- Audits images, selects a diverse dataset, and separates ready, review, and reject results.
-- Builds an optional **Subject Profile** to keep identity traits and captions consistent across the dataset.
-- Supports training-target presets for **ERNIE Image**, **Z-Image Base**, and **Krea 2**.
-- Exports images, captions, CSV, JSONL, and a Markdown dataset report.
-- Extracts sharp, pose-diverse frames of a reference person from videos (optional Video Processor).
+- **Clean the image set:** detect unreadable files, near duplicates, and quality problems before image audit requests.
+- **Remove screenshot frames:** get local crop suggestions, review similar layouts together, or mark an image for exclusion. Source images stay untouched.
+- **Select useful photos:** audit quality and identity, then keep a varied set of portraits, medium shots, and full-body images.
+- **Build a Subject Profile:** find the person's usual appearance while keeping visible changes such as hair, glasses, piercings, and tattoos controllable.
+- **Create training captions:** save first descriptions from Florence 2, JoyCaption, or GPT-6 Luna; compose final captions from the image audit, profile, and selected caption rules. Preview them before export.
+- **Export for image LoRAs:** choose among nine image training targets, including ERNIE Image, Z-Image, Krea 2, Qwen-Image 2.1, FLUX.2, and experimental Ideogram 4.
 
-## Workflow
-
-The image curator follows the processing order in the UI:
-
-1. **Start / Project** — set the image folder, trigger word, and API key.
-2. **Preflight** — run local file and pHash duplicate checks. No OpenAI request is made.
-3. **Frames** *(optional)* — review suggestions generated after preflight; use the additional AI finder for difficult screenshots or set a manual crop with two clicks. Saving advances to the next pending image.
-4. **Audit & Selection** — run quality, identity, diversity, and caption processing.
-5. **Subject Profile** — review the profile when using `Profile then Caption`, or let `Single Pass` continue automatically.
-6. **Results** — inspect the exported training, review, and cleanup buckets.
+The image workflow is the focus. An optional Video Processor can extract candidate photos from videos.
 
 ## Requirements
 
-- **Python 3.13**
-- An **OpenAI API key and available API credit** for the audit and captioning pipeline. Local preflight and frame analysis work without it.
-- NVIDIA GPU acceleration is optional. The application can run on CPU.
-- **InsightFace** is optional for image curation, but required for Video Processor face matching and the ArcFace identity check.
+- **Python 3.13**.
+- **OpenAI API key and available credit** for image audits, optional AI frame finding, and GPT-6 Luna captions. Local preflight and frame suggestions work without a key.
+- **NVIDIA CUDA GPU** only if you want to run Florence 2 or JoyCaption locally. The main app and CPU installation do not require one.
+- **InsightFace** is optional for image curation; ArcFace identity matching and Video Processor face matching need it.
 
-The interface displays the installed source version from `git describe --tags --always --dirty`. It therefore reflects the checked-out Git tag, commits after that tag, and uncommitted changes rather than a manually maintained version string.
+The Python package list is in [requirements.txt](requirements.txt).
 
-## Quick start on Windows
+## Install
 
-1. Clone the repository:
+### Windows
 
-   ```bash
-   git clone https://github.com/Arona1812/DatasetCurator.git
-   cd DatasetCurator
-   ```
+```powershell
+git clone https://github.com/Arona1812/DatasetCurator.git
+cd DatasetCurator
+.\start_curator.bat
+```
 
-2. Double-click `start_curator.bat`.
+You can also double-click `start_curator.bat`. It creates a Python 3.13 environment, installs the app dependencies, and opens the interface. For an installation without CUDA packages, run `.\start_curator.bat --cpu`.
 
-The launcher creates `curator_env_py313`, installs core packages, tries to install optional InsightFace support, and opens the Gradio UI in your browser.
+Florence 2 and JoyCaption need **separate local model weights and a CUDA GPU**; the launcher does not install those workers. See [local caption setup](CAPTION_PIPELINE.md#lokale-einrichtung). To start without them, select **GPT-6 Luna** for first descriptions in *Audit & Selection*. Luna sends those images to OpenAI and uses API credit.
 
-> The Windows launcher installs CUDA 13.0 PyTorch and ONNX Runtime builds by default. Use `start_curator.bat --cpu` for a portable installation without CUDA. The previous `curator_env` environment is preserved.
-
-Local face and pose detection now uses the MediaPipe Tasks API. Public model weights are downloaded and cached on first use; inference runs on your computer.
-
-## Model choice and photo-region finder
-
-The model preset in **Audit & Selection** configures all roles together: **Current ChatGPT** uses `chat-latest` for routine tasks, **Economical** uses `gpt-6-luna`, and **Quality** uses `gpt-6-astra`. Profile and repair roles use `gpt-6.1-sol` or `gpt-6-astra`, depending on the preset. Saved model choices are retained until you apply a preset. Individual models and the full option set remain available in the advanced sections.
-
-The additional frame finder combines OpenAI image understanding with local edge refinement. It proposes the complete photo area inside nested screenshots or blurred duplicate backgrounds. Starting this optional feature sends selected images to OpenAI and incurs API costs. Identical requests reuse cached proposals. AI proposals require confirmation and are never applied automatically. New projects also default to reviewing local suggestions.
-
-See [project review and next steps](PROJECT_REVIEW.md) for validation limits.
-
-## Manual installation (Linux, macOS, or CPU-focused setup)
+### Linux or macOS
 
 ```bash
-python3.13 -m venv curator_env
-source curator_env/bin/activate
+git clone https://github.com/Arona1812/DatasetCurator.git
+cd DatasetCurator
+python3.13 -m venv .venv
+source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
-
-# Optional: required for Video Processor and ArcFace identity checking.
-pip install insightface
-
+python -m pip install -r requirements.txt
 python dataset_curator_ui.py
 ```
 
-`requirements.txt` uses portable default packages. For NVIDIA/CUDA acceleration, install the PyTorch and ONNX Runtime variants matching your driver and platform; see [PyTorch installation instructions](https://pytorch.org/get-started/locally/). InsightFace can require [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) on Windows.
+The Windows launcher is the maintained setup path. The manual installation uses portable packages; optional InsightFace and GPU builds need platform-specific setup. See [installation notes](docs/INSTALLATION.md).
 
-## Using the image curator
+## Your first dataset
 
-1. Start the UI and enter the **input image folder**, a unique **trigger word**, and your **OpenAI API key** on **Start / Project**.
-2. Click **Run preflight**. Later modules unlock after the local checks finish.
-3. Optionally use **Frames** to choose a local crop suggestion, retain the original, or apply a manual crop.
-4. In **Audit & Selection**, choose the training target and configure the desired audit, identity, diversity, and caption settings.
-   - **Single Pass** creates the profile and completes the workflow.
-   - **Profile then Caption** pauses after profile generation so you can review canonical traits, clusters, priority images, and caption policies.
-5. Review the result in `curated_<trigger>/`. Key folders include:
-   - `01_train_ready` — exported images and captions for training
-   - `02_keep_unused` — good images not selected for the target size
-   - `03_caption_remove` — images needing caption work
-   - `04_review`, `05_reject`, `06_needs_manual_review` — images needing a decision or excluded by the workflow
+1. In **Start / Project**, choose the image folder, set a unique trigger word, and enter your API key.
+2. Run **Preflight**. Review any suggested frame crops in **Frames**; you can keep the original or exclude a photo.
+3. In **Audit & Selection**, choose a training target and first-caption model. Choose **Review profile first** to pause before export, or use the automatic profile decision.
+4. Check the **Subject Profile** and caption preview, then export. Inspect the result under `curated_<trigger>/`.
 
-The project workspace also stores reports and caches below `curated_<trigger>/`; source images remain unchanged.
+`01_train_ready` contains the selected images and matching `.txt` captions. Other folders keep unused, review, and rejected images separate. The export also includes a report and target metadata. Your input folder is not overwritten.
 
-## Training targets
+## Before training
 
-| Target | Caption approach |
-| --- | --- |
-| **ERNIE Image** | Structured captions with visible identity anchors. |
-| **Z-Image Base** | Compact structured captions; the trigger token carries stable identity. |
-| **Krea 2** | Dataset-aware natural-language captions after final image selection. |
+The nine targets are export choices, not nine proven LoRA recipes. ERNIE Image, Z-Image Base, and Krea 2 Raw have dedicated caption-field presets; the others currently start from general settings that you can change. Ideogram 4 uses an experimental JSON export. **Review the images and captions before training.** Training quality has not yet been measured across all targets.
 
-Target presets provide starting values. Settings changed in the UI remain authoritative for the run.
+For deeper use, see the [caption workflow](CAPTION_PIPELINE.md), [frame review guide](docs/FRAME_REVIEW.md), and [current project status](PROJECT_REVIEW.md).
+For questions or problems, [open a GitHub issue](https://github.com/Arona1812/DatasetCurator/issues).
 
-## Optional Video Processor
+## Privacy and license
 
-Open **Video Processor** in the UI, provide a video folder, an output folder, and a clear reference image of the target person. With InsightFace installed, it samples supported videos (`mp4`, `mov`, `mkv`, `avi`), matches the reference person, and saves sharp, pose-diverse frames for the image curator.
+The app runs locally. Image audits and the optional Luna captioner send selected images to OpenAI; local preflight, frame suggestions, Florence 2, and JoyCaption run on your machine. API keys can be saved in ignored local settings files, so do not share those files.
 
-## API, privacy, and licenses
-
-- The project uses the OpenAI Responses API through `requests`; no `openai` Python package is required.
-- Provide the key in the UI or through `OPENAI_API_KEY`. It is used locally and is not committed to the repository. Local UI settings can retain it in ignored runtime files; do not share those files.
-- The project does not include a youth-protection or NSFW suitability filter. Review your data and outputs before training.
-- This project's code is licensed under the [MIT License](LICENSE). See [thirdparty-lic.md](thirdparty-lic.md) for dependency details.
-- InsightFace code is MIT, but its pretrained model weights, including `buffalo_l`, have separate restrictions and are described as non-commercial research use. Obtain the required license directly from InsightFace before commercial use.
-
-## Status and support
-
-This is a work in progress. Please verify exported images and captions before using them for training.
-
-If the project helps you, you can optionally support development at [Buy Me a Coffee](https://buymeacoffee.com/arona1812). Donations do not change any license terms.
-
-## Disclaimer
-
-The software is provided **as is**, without warranty. You are responsible for complying with the terms of OpenAI, InsightFace, and every other service or model you use.
+The code is [MIT licensed](LICENSE). Dependencies and model weights have their own terms; see [third-party licenses](thirdparty-lic.md).

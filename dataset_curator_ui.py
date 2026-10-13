@@ -22,6 +22,7 @@ import signal
 import time
 import uuid
 import warnings
+import tempfile
 from glob import glob
 from collections import Counter
 from pathlib import Path
@@ -29,6 +30,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import gradio as gr
 from PIL import Image, ImageDraw, ImageOps
+from initial_captions import ENGINES as INITIAL_CAPTION_ENGINES, FLORENCE_TASKS
 
 from openai_models import MODEL_CHOICES, FRAME_VISION_MODEL, model_preset
 from frame_group_review import build_group_plan, validate_group_selection
@@ -372,6 +374,9 @@ DEFAULTS: Dict[str, Any] = {
     "c_captions": list(SHARED_COMPACT_CAPTION_FIELDS),
     "c_variable_feature_mode": "canonical_deviations",
     "c_krea_caption_model": "gpt-6-luna",
+    "c_initial_caption_engine": "florence2",
+    "c_initial_caption_task": "<MORE_DETAILED_CAPTION>",
+    "c_caption_composition_mode": "local",
     "c_krea_caption_reasoning_effort": "none",
     "c_use_krea_caption_repair": True,
     "c_krea_caption_repair_model": "gpt-6.1-sol",
@@ -451,35 +456,47 @@ CAPTION_PROFILE_PRESETS: Dict[str, List[str]] = {
 }
 
 
-def normalize_training_target(value: Optional[str]) -> str:
-    v = (value or "").strip().lower()
-    if v in {"ernie", "shared_compact"}:
-        return "ernie"
-    if v in {"z_image_base", "z-image_base", "zimage", "z_image"}:
-        return "z_image_base"
-    if v in {"krea2", "krea_2", "krea2_character", "krea_2_character"}:
-        return "krea2"
-    return "ernie"
+from training_targets import (
+    normalize_training_target, caption_profile_for_training_target, IMAGE_TARGETS,
+    image_target, is_krea_target,
+)
 
 
-def caption_profile_for_training_target(value: Optional[str]) -> str:
-    target = normalize_training_target(value)
-    return "krea2_character" if target == "krea2" else target
+def training_target_choices():
+    return [(t.label, t.key) for t in IMAGE_TARGETS.values()]
 
 
-def training_target_choices() -> List[Tuple[str, str]]:
-    return [
-        (tr("ERNIE Image", "ERNIE Image"), "ernie"),
-        (tr("Z-Image Base", "Z-Image Base"), "z_image_base"),
-        (tr("Krea 2", "Krea 2"), "krea2"),
-    ]
+def training_target_details_ui(value):
+    target = image_target(value)
+    caption = tr("strukturierte JSON-Captions", "structured JSON captions") if target.caption_format == "ideogram_json" else tr("natürliche Text-Captions", "natural text captions")
+    engine = tr("Zusammensetzung aus Audit und Profil; Erstbeschreibung separat wählbar", "composition from audit and profile; initial description chosen separately")
+    if target.key in {"ernie", "z_image_base", "krea2"}:
+        preset = tr("Eigenes Caption-Feld-Preset vorhanden.", "Dedicated caption-field preset available.")
+    elif target.key == "krea2_turbo":
+        preset = tr("Verwendet derzeit die allgemeinen Z-Image-Felder; ein eigenes Turbo-Preset ist noch nicht validiert.",
+                    "Currently uses the general Z-Image fields; a dedicated Turbo preset has not been validated.")
+    else:
+        preset = tr("Verwendet derzeit die allgemeinen Z-Image-Felder; ein eigenes Ziel-Preset ist noch nicht validiert.",
+                    "Currently uses the general Z-Image fields; a dedicated target preset has not been validated.")
+    return tr(
+        f"**{target.label}:** {caption}, {engine}. Bildaudit und Profil sind vom Trainingsziel unabhängig. "
+        f"{preset} "
+        "Export für einzelne RGB-Bilder; Referenzpaare und Transparenz werden noch nicht exportiert. "
+        "AI-Toolkit-Unterstützung geprüft; Trainingsqualität dieses Exportprofils noch nicht gemessen. "
+        "Ein Zielwechsel setzt die Caption-Felder auf das Ziel-Preset zurück; andere Einstellungen bleiben erhalten.",
+        f"**{target.label}:** {caption}, {engine}. Image audit and profile are generator-independent. "
+        f"{preset} "
+        "Single RGB image export; reference pairs and transparency are not exported yet. "
+        "AI Toolkit support checked; training quality of this export profile has not been measured. "
+        "Changing targets resets caption fields to the target preset; other settings are preserved.",
+    )
 
 
 def get_caption_preset_values(target: Optional[str]) -> List[str]:
     normalized = normalize_training_target(target)
     if normalized in CAPTION_PROFILE_PRESETS:
         return list(CAPTION_PROFILE_PRESETS[normalized])
-    return list(DEFAULTS["c_captions"])
+    return list(Z_IMAGE_BASE_CAPTION_FIELDS)
 
 
 def resolve_caption_fields_for_target(
@@ -507,16 +524,9 @@ def apply_training_target_defaults(
     krea_caption_reasoning_effort: str,
     pipeline_mode: str,
 ):
-    """Load target defaults. Later checkbox edits never change the target."""
+    """Change only target-specific caption fields; preserve unrelated user choices."""
     normalized = normalize_training_target(target)
     fields = resolve_caption_fields_for_target(normalized, current_fields)
-    if normalized == "krea2":
-        return (
-            fields, 20, 0.40, 0.35, 0.25,
-            "gpt-6-luna", "none", "none", "low",
-            "gpt-6.1-sol", "low", "gpt-6-luna", "none",
-            "profile_then_caption",
-        )
     return (
         fields, target_size, ratio_h, ratio_m, ratio_f,
         audit_model, audit_reasoning_effort, trigger_reasoning_effort,
@@ -528,7 +538,7 @@ def apply_training_target_defaults(
 
 def caption_policy_adjustment_note(target: Optional[str], selected_fields: Optional[List[str]]) -> str:
     normalized = normalize_training_target(target)
-    preset = set(CAPTION_PROFILE_PRESETS.get(normalized, []))
+    preset = set(get_caption_preset_values(normalized))
     selected = set(selected_fields or [])
     if selected == preset:
         return tr("✅ Standardregeln des Trainingsziels aktiv.", "✅ Training-target default rules active.")
@@ -661,6 +671,8 @@ def save_settings_fn(
     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size,
     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
+    c_initial_caption_engine, c_initial_caption_task,
+    c_caption_composition_mode,
     # Video
     v_source, v_target, v_ref, v_fpm, v_fps, v_sim, v_sharp,
 ):
@@ -741,6 +753,9 @@ def save_settings_fn(
         "c_exp_review": c_exp_review, "c_exp_reject": c_exp_reject,
         "c_exp_compare": c_exp_compare,
         "c_controlled_buckets": c_controlled_buckets,
+        "c_initial_caption_engine": c_initial_caption_engine,
+        "c_initial_caption_task": c_initial_caption_task,
+        "c_caption_composition_mode": c_caption_composition_mode,
         "v_source": v_source, "v_target": v_target, "v_ref": v_ref,
         "v_fpm": v_fpm, "v_fps": v_fps, "v_sim": v_sim, "v_sharp": v_sharp,
     }
@@ -1024,6 +1039,13 @@ def save_subject_profile_ui(trigger_word: str, input_folder: str, profile_json_t
         if not isinstance(profile, dict):
             return tr("❌ Profil muss ein JSON-Objekt sein.", "❌ Profile must be a JSON object.")
         profile["force_only_when_visible"] = True
+        # Saving the editable JSON is also an explicit profile decision. Keep
+        # it authoritative during the same rebuilds as the guided editor.
+        profile["user_confirmed_identity_overrides"] = {
+            key: dict(profile[key])
+            for key in ("stable_identity", "canonical_features", "identity_markers")
+            if isinstance(profile.get(key), dict)
+        }
         os.makedirs(os.path.dirname(path), exist_ok=True)
         core_atomic_write_json(path, profile)
         return tr(f"✅ Profil gespeichert: {path}", f"✅ Profile saved: {path}")
@@ -1390,6 +1412,20 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
         notes_md = "**" + tr("Normalizer-Notizen", "Normalizer notes") + ":**\n\n" + "\n".join(f"- {n}" for n in notes[:12])
     else:
         notes_md = tr("_Keine Normalizer-Notizen._", "_No normalizer notes._")
+    caption_evidence = profile.get("initial_caption_evidence_summary") or {}
+    if caption_evidence.get("providers"):
+        agreements = sum((caption_evidence.get("agreements") or {}).values())
+        conflicts = sum((caption_evidence.get("conflicts") or {}).values())
+        unverified = sum((caption_evidence.get("unverified") or {}).values())
+        notes_md += "\n\n**" + tr("Erstbeschreibung gegen Bildaudit", "Initial description versus image audit") + "**"
+        notes_md += tr(f"\n\n{agreements} Übereinstimmungen · {conflicts} Widersprüche · {unverified} zusätzliche, ungeprüfte Hinweise. "
+                       "Nur Übereinstimmungen stützen das Profil; die Bildaudits bleiben maßgeblich.",
+                       f"\n\n{agreements} agreements · {conflicts} conflicts · {unverified} additional unverified cues. "
+                       "Only agreements support the profile; image audits remain authoritative.")
+        for example in (caption_evidence.get("review_examples") or [])[:12]:
+            filename = str(example.get("filename") or "").replace("`", "'")
+            labels = list((example.get("conflicts") or {})) + list((example.get("unverified") or {}))
+            notes_md += f"\n- `{filename}`: " + ", ".join(labels)
 
     raw_json = json.dumps(profile, ensure_ascii=False, indent=2)
 
@@ -1427,6 +1463,10 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
             f"✅ Profil geladen — Sample {sample}/{total} | {model} | schema {schema}",
             f"✅ Profile loaded — sample {sample}/{total} | {model} | schema {schema}",
         )
+    if caption_evidence.get("providers"):
+        conflicts = sum((caption_evidence.get("conflicts") or {}).values())
+        status += tr(f" | Erstcaption-Gegenprüfung: {conflicts} Widersprüche",
+                     f" | initial-caption cross-check: {conflicts} conflicts")
 
     return (
         profile, raw_json,
@@ -1452,54 +1492,10 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     )
 
 
-def save_profile_from_editor(
-    trigger_word: str,
-    input_folder: str,
-    raw_profile_json: str,
-    gender: str,
-    skin_tone: str,
-    eye_color: str,
-    hair_texture: str,
-    body_build: str,
-    body_height_impression: str,
-    hair_color_baseline: str,
-    beard_pattern: str,
-    beard_color: str,
-    glasses_regular: bool,
-    glasses_desc: str,
-    freckles_present: bool,
-    freckles_desc: str,
-    piercing_table: Any,
-) -> str:
-    """Speichert die Editor-Werte zurueck ins _subject_profile.json.
 
-    Wir behalten den Rest des Profils (per_image_traits, identity_markers,
-    confidence, notes) und ueberschreiben gezielt die vom User bearbeiteten
-    Felder. raw_profile_json ist der Backup-Zustand fuer den Fall, dass die
-    Datei zwischenzeitlich geloescht wurde.
-    """
-    path = subject_profile_path_for(input_folder, trigger_word)
-    profile: Dict[str, Any] = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                profile = json.load(f) or {}
-        except Exception:
-            profile = {}
-    if not isinstance(profile, dict):
-        profile = {}
-
-    if not profile and raw_profile_json.strip():
-        try:
-            backup = json.loads(raw_profile_json)
-            if isinstance(backup, dict):
-                profile = backup
-        except Exception:
-            pass
-
-    if not profile:
-        return tr("❌ Kein Profil zum Speichern vorhanden.", "❌ No profile to save.")
-
+def apply_profile_editor_values(profile, gender, skin_tone, eye_color, hair_texture, body_build, body_height_impression, hair_color_baseline, beard_pattern, beard_color, glasses_regular, glasses_desc, freckles_present, freckles_desc, piercing_table):
+    """Apply the same unsaved editor fields for preview and persistence."""
+    profile = json.loads(json.dumps(profile))
     stable = profile.setdefault("stable_identity", {})
     stable["gender"] = (gender or "").strip()
     stable["skin_tone"] = (skin_tone or "").strip()
@@ -1579,6 +1575,141 @@ def save_profile_from_editor(
             "piercing_baseline": list(markers.get("piercing_baseline", []) or []),
         },
     }
+
+    return profile
+
+
+def profile_caption_choices(trigger_word, input_folder):
+    stage = _load_caption_stage_for_profile_ui(trigger_word, input_folder)
+    rows = stage.get("all_rows") or []
+    names = [str(r.get("original_filename")) for r in rows if isinstance(r, dict)
+             and r.get("base_status") in {"keep", "review"} and r.get("arcface_flag") != "hard"]
+    return gr.update(choices=names, value=names[0] if names else None)
+
+
+def initial_caption_readiness_ui(engine):
+    if engine == "gpt-6-luna":
+        return tr("Luna nutzt den Projekt-API-Key. Neue Erstbeschreibungen senden Bilder an OpenAI und verbrauchen das eingestellte Tokenbudget.",
+                  "Luna uses the project API key. New descriptions send images to OpenAI and use the configured token budget.")
+    try:
+        from initial_captions import local_resources
+        local_resources(SCRIPT_DIR, engine)
+        return tr("Lokale Laufzeit und Modellgewichte gefunden. Die GPU muss beim Erstcaptioning ausreichend frei sein. Audit und Profilmodelle bleiben separat eingestellt.",
+                  "Local runtime and model weights found. The GPU needs enough free memory for initial captioning. Audit and profile models remain configured separately.")
+    except Exception:
+        return tr("Lokaler Provider noch nicht eingerichtet. Hinweise in CAPTION_PIPELINE.md; alternativ Luna wählen. Ein fehlender Provider wird vor dem kostenpflichtigen Audit gemeldet.",
+                  "Local provider is not installed yet. See CAPTION_PIPELINE.md or choose Luna. A missing provider is reported before paid audits.")
+
+
+def preview_profile_caption(trigger_word, input_folder, raw_profile_json, filename,
+                            target, caption_options, variable_mode, composition_mode, controlled_buckets, *editor_values):
+    """Preview unsaved editor fields without saving profile, audit or exports."""
+    try:
+        stage = _load_caption_stage_for_profile_ui(trigger_word, input_folder)
+        profile = _load_json_dict(subject_profile_path_for(input_folder, trigger_word))
+        if not profile:
+            profile = json.loads(raw_profile_json or "{}")
+        if not profile or not stage:
+            raise ValueError(tr("Erst einen Lauf vorbereiten und das Profil laden.", "Prepare a run and load its profile first."))
+        if stage.get("audit_stale_images") or profile.get("audit_stale_images"):
+            raise ValueError(tr("Rahmen wurden seit dem Audit geändert. Zuerst den normalen Lauf aktualisieren.", "Frames changed since the audit. Refresh the normal run first."))
+        profile = apply_profile_editor_values(profile, *editor_values)
+        row = next((r for r in stage.get("all_rows", []) if r.get("original_filename") == filename), None)
+        if not row:
+            raise ValueError(tr("Ein vorbereitetes Bild auswählen.", "Select a prepared image."))
+        from initial_captions import image_sha256
+        image_path = (row.get("effective_image_path") or row.get("frame_crop_path")
+                      or row.get("original_path") or row.get("source_original_path") or "")
+        if not image_path:
+            raise ValueError("Prepared image has no effective source path")
+        initial = row.get("initial_caption") or {}
+        if initial and image_sha256(image_path) != initial.get("image_sha256"):
+            raise ValueError(tr("Bild seit der Erstbeschreibung geändert. Lauf aktualisieren.", "Image changed since its description. Refresh the run."))
+        config = {"TRIGGER_WORD": trigger_word, "TRAINING_TARGET": target,
+                  "CAPTION_POLICY": {key: key in (caption_options or []) for key in CAPTION_FIELD_CHOICES},
+                  "VARIABLE_FEATURE_CAPTION_MODE": variable_mode, "CAPTION_COMPOSITION_MODE": composition_mode,
+                  "USE_CONTROLLED_BUCKETS": bool(controlled_buckets)}
+        with tempfile.TemporaryDirectory(prefix="curator_caption_preview_") as scratch:
+            request, result = os.path.join(scratch, "request.json"), os.path.join(scratch, "result.json")
+            preview_image_path = os.path.join(scratch, "export_preview.jpg")
+            core_atomic_write_json(request, {"config": config, "profile": profile, "row": row,
+                                            "global_rules": stage.get("global_rules", {}),
+                                            "cache_dir": os.path.join(output_root_for(input_folder, trigger_word), "_cache"),
+                                            "preview_image_path": preview_image_path})
+            proc = subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "caption_preview.py"), request, result],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if proc.returncode:
+                raise ValueError(proc.stderr[-1500:] or "Caption preview failed")
+            caption = _load_json_dict(result)["caption"]
+            with Image.open(preview_image_path) as opened:
+                image = opened.convert("RGB")
+        status = tr("Vorschau mit aktuellen, noch ungespeicherten Profilwerten und Caption-Schaltern. Keine Modellanfrage. Zusätzliche freie Details sind Referenz; der Satzaufbau nutzt die Audit-Merkmale.",
+                    "Preview uses current unsaved profile fields and caption switches. No model request. Additional free details are evidence; composition uses audited observations.")
+        if composition_mode == "luna_text":
+            status = tr("Vorschau aus zwischengespeicherten Luna-Textdetails und aktuellen Profilregeln. Keine neue Modellanfrage. Identität und sichtbare Piercings/Brillen werden weiterhin durch Audit und Profil geregelt.",
+                        "Preview uses cached Luna text details and current profile rules. No new model request. Audit and profile still control identity and visible piercings/glasses.")
+        return image, initial.get("caption", tr("Dieser ältere Lauf enthält noch keine separate Erstbeschreibung.", "This older run has no separate initial description.")), caption, status
+    except Exception as exc:
+        return None, "", "", str(exc)
+
+
+def save_profile_before_export(*values):
+    message = save_profile_from_editor(*values)
+    if not message.startswith("✅"):
+        raise gr.Error(message)
+    return message
+
+
+def save_profile_from_editor(
+    trigger_word: str,
+    input_folder: str,
+    raw_profile_json: str,
+    gender: str,
+    skin_tone: str,
+    eye_color: str,
+    hair_texture: str,
+    body_build: str,
+    body_height_impression: str,
+    hair_color_baseline: str,
+    beard_pattern: str,
+    beard_color: str,
+    glasses_regular: bool,
+    glasses_desc: str,
+    freckles_present: bool,
+    freckles_desc: str,
+    piercing_table: Any,
+) -> str:
+    """Speichert die Editor-Werte zurueck ins _subject_profile.json.
+
+    Wir behalten den Rest des Profils (per_image_traits, identity_markers,
+    confidence, notes) und ueberschreiben gezielt die vom User bearbeiteten
+    Felder. raw_profile_json ist der Backup-Zustand fuer den Fall, dass die
+    Datei zwischenzeitlich geloescht wurde.
+    """
+    path = subject_profile_path_for(input_folder, trigger_word)
+    profile: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                profile = json.load(f) or {}
+        except Exception:
+            profile = {}
+    if not isinstance(profile, dict):
+        profile = {}
+
+    if not profile and raw_profile_json.strip():
+        try:
+            backup = json.loads(raw_profile_json)
+            if isinstance(backup, dict):
+                profile = backup
+        except Exception:
+            pass
+
+    if not profile:
+        return tr("❌ Kein Profil zum Speichern vorhanden.", "❌ No profile to save.")
+
+    profile = apply_profile_editor_values(profile, gender, skin_tone, eye_color, hair_texture, body_build, body_height_impression, hair_color_baseline, beard_pattern, beard_color, glasses_regular, glasses_desc, freckles_present, freckles_desc, piercing_table)
 
     notes = profile.setdefault("normalizer_notes", [])
     if isinstance(notes, list):
@@ -3408,6 +3539,8 @@ CURATOR_INPUT_NAMES = (
     "krea_caption_model", "krea_caption_reasoning_effort", "use_krea_caption_repair", "krea_caption_repair_model", "krea_caption_repair_reasoning_effort",
     "c_pipeline_mode", "c_profile_normalizer_model", "profile_reasoning_effort", "c_profile_sample_threshold", "c_profile_sample_size",
     "export_review", "export_reject", "export_crop_compare", "controlled_buckets",
+    "initial_caption_engine", "initial_caption_task",
+    "caption_composition_mode",
 )
 
 
@@ -3504,7 +3637,10 @@ def build_run_config_from_ui_values(values: Tuple[Any, ...], *, continue_from_pr
         "CAPTION_PROFILE": caption_profile_for_training_target(target),
         "CAPTION_POLICY": caption_policy,
         "VARIABLE_FEATURE_CAPTION_MODE": str(v["variable_feature_mode"] or "canonical_deviations"),
-        "USE_KREA_AI_CAPTIONING": target == "krea2",
+        "USE_KREA_AI_CAPTIONING": False,
+        "INITIAL_CAPTION_ENGINE": str(v["initial_caption_engine"] or "florence2"),
+        "INITIAL_CAPTION_FLORENCE_TASK": str(v["initial_caption_task"] or "<MORE_DETAILED_CAPTION>"),
+        "CAPTION_COMPOSITION_MODE": str(v["caption_composition_mode"] or "local"),
         "KREA_CAPTION_MODEL": str(v["krea_caption_model"] or "gpt-6-luna").strip(),
         "KREA_CAPTION_REASONING_EFFORT": str(v["krea_caption_reasoning_effort"] or "none"),
         "USE_KREA_CAPTION_REPAIR": bool(v["use_krea_caption_repair"]),
@@ -3639,6 +3775,20 @@ def start_caption_from_profile(*values):
     config = build_run_config_from_ui_values(values, continue_from_profile=True)
     train_dir = os.path.join(output_root_for(v["input_folder"], v["trigger_word"]), "01_train_ready")
     yield from run_script(CURATOR_SCRIPT, CURATOR_CONFIG, config, train_dir)
+
+
+def start_caption_text_details(*values):
+    v = _ui_values_dict(values)
+    if not str(v.get("api_key") or "").strip():
+        yield tr("Für Luna-Textdetails einen OpenAI API-Key im Projekt setzen.", "Set a project OpenAI API key for Luna text details."), [], 0, "API key missing", ""
+        return
+    if not os.path.isfile(caption_stage_path_for(v["input_folder"], v["trigger_word"])):
+        yield tr("Zuerst Erstbeschreibungen vorbereiten.", "Prepare initial descriptions first."), [], 0, "No stage", ""
+        return
+    config = build_run_config_from_ui_values(values, continue_from_profile=True)
+    config["PREPARE_CAPTION_DETAILS_ONLY"] = True
+    yield from run_script(CURATOR_SCRIPT, CURATOR_CONFIG, config,
+                          os.path.join(output_root_for(v["input_folder"], v["trigger_word"]), "01_train_ready"))
 
 
 
@@ -5425,21 +5575,48 @@ def build_ui() -> gr.Blocks:
                     choices=training_target_choices(),
                     value=normalize_training_target(S.get("c_training_target")),
                     info=tr(
-                        "Legt die Prompt-Familie, Caption-Engine und empfohlenen Standardwerte fest. Änderungen an einzelnen Caption-Regeln ändern dieses Trainingsziel nicht.",
-                        "Selects the prompt family, caption engine and recommended defaults. Editing individual caption rules never changes this training target.",
+                        "Bestimmt Caption-Format und Exportprofil. Bildaudit und Identitätsprofil sind unabhängig davon. Eigene Caption-Regeln bleiben innerhalb des gewählten Ziels möglich.",
+                        "Selects caption format and export profile. Image audit and identity profile are independent. Caption rules remain customizable within the selected target.",
                     ),
                 )
-                gr.Markdown(tr(
-                    "**Pipeline-Auswahl:** ERNIE und Z-Image verwenden strukturierte lokale Captions; Krea 2 verwendet nach der Auswahl natürliche GPT-Captions.",
-                    "**Pipeline selection:** ERNIE and Z-Image use structured local captions; Krea 2 uses natural GPT captions after selection.",
-                ))
+                c_training_target_details = gr.Markdown(training_target_details_ui(S.get("c_training_target")))
+                c_training_target.change(fn=training_target_details_ui, inputs=c_training_target, outputs=c_training_target_details, queue=False)
+                with gr.Row():
+                    c_initial_caption_engine = gr.Dropdown(
+                        label=tr("1 · Erstbeschreibung", "1 · Initial image description"),
+                        choices=[("Florence 2 · lokal", "florence2"), ("JoyCaption · lokal", "joycaption"), ("GPT-6 Luna · API", "gpt-6-luna")],
+                        value=S["c_initial_caption_engine"],
+                        info=tr("Unabhängig vom Trainingsziel. Die Rohbeschreibung bleibt erhalten. Lokale Modelle benötigen den eingerichteten GPU-Laufzeitordner; Luna sendet Bilder an OpenAI.",
+                                "Independent of training target. Raw descriptions are preserved. Local models need a configured GPU runtime; Luna sends images to OpenAI."),
+                    )
+                    c_initial_caption_task = gr.Dropdown(
+                        label=tr("Florence · Detailgrad", "Florence · Caption detail"),
+                        choices=[("Caption", "<CAPTION>"), ("Detailed Caption", "<DETAILED_CAPTION>"), ("Very Detailed Caption", "<MORE_DETAILED_CAPTION>")],
+                        value=S["c_initial_caption_task"],
+                        visible=S["c_initial_caption_engine"] == "florence2",
+                        info=tr("Wirkt nur bei Florence. Very Detailed ist voreingestellt.", "Only affects Florence. Very Detailed is the default."),
+                    )
+                gr.Markdown(tr("**2 · Trainingscaption:** Das Personenprofil und die Caption-Felder regeln die Zusammensetzung. Lokal nutzt sie die Audit-Merkmale; optional lassen sich Szenendetails aus der Erstbeschreibung ergänzen.",
+                               "**2 · Training caption:** The person profile and caption fields control composition. Local composition uses audited observations; optionally add scene details from the first description."))
+                c_initial_caption_status = gr.Markdown(initial_caption_readiness_ui(S["c_initial_caption_engine"]))
+                c_initial_caption_engine.change(fn=initial_caption_readiness_ui, inputs=c_initial_caption_engine,
+                                                outputs=c_initial_caption_status, queue=False)
+                c_initial_caption_engine.change(fn=lambda engine: gr.update(visible=engine == "florence2"),
+                                                inputs=c_initial_caption_engine, outputs=c_initial_caption_task, queue=False)
+                c_caption_composition_mode = gr.Dropdown(
+                    label=tr("2 · Zusammensetzung der Trainingscaption", "2 · Training caption composition"),
+                    choices=[(tr("Lokal · Audit und Personenprofil", "Local · audit and person profile"), "local"),
+                             (tr("Luna-Textdetails + lokale Profilregeln", "Luna text details + local profile rules"), "luna_text")],
+                    value=S["c_caption_composition_mode"],
+                    info=tr("Lokal ist ohne weitere KI-Anfrage. Optional extrahiert Luna einmal Szenendetails aus dem gespeicherten Rohtext: keine erneute Bildübertragung, zusätzliche API-Kosten. Profiländerungen bleiben danach lokal.",
+                            "Local uses no additional AI request. Optionally Luna extracts scene details once from saved descriptions: no image retransmission, additional API costs. Profile changes stay local afterwards."))
                 c_pipeline_mode = gr.Radio(
                     label=tr("Ablauf nach dem Audit", "After the audit"),
                     choices=[(tr("Profil automatisch nutzen und exportieren", "Use profile automatically and export"), "single_pass"),
                              (tr("Profil zuerst selbst prüfen", "Review profile first"), "profile_then_caption")],
                     value=S["c_pipeline_mode"],
-                    info=tr("Bei eigener Prüfung pausiert der Lauf vor Captions und Export. Weiter geht es in Modul 3 · Subject Profile.",
-                            "Review first pauses before captions and export. Continue in module 3 · Subject Profile."),
+                    info=tr("Bei eigener Prüfung entstehen Erstbeschreibungen und Profil; der Lauf pausiert vor finaler Caption und Export. Vorschau und Fortsetzung in Modul 3 · Subject Profile.",
+                            "Review first prepares descriptions and profile, then pauses before final captions and export. Preview and continue in module 3 · Subject Profile."),
                 )
 
                 with gr.Row():
@@ -6937,8 +7114,8 @@ def build_ui() -> gr.Blocks:
                                     "aufgenommen werden – das beeinflusst, wie das LoRA später auf "
                                     "Prompts reagiert.\n\n"
                                     "**Trainingsziel und Caption-Policy:**\n\n"
-                                    "Das oben gewählte Trainingsziel bestimmt Workflow, Promptfamilie und Caption-Engine. "
-                                    "Die Einzelfelder hier steuern nur, welche Merkmale diese Engine verwenden darf.\n\n"
+                                    "Das oben gewählte Trainingsziel bestimmt Caption-Format und Feldvorgaben; der Erstbeschreibungs-Provider wird separat gewählt. "
+                                    "Die Einzelfelder hier steuern, welche Merkmale in die finale Caption aufgenommen werden.\n\n"
                                     "**Aktive Caption-Felder:**\n\n"
                                     "Welche Eigenschaften gehen in die Beschreibung? Die "
                                     "Antwort hängt am Basismodell:\n\n"
@@ -6979,8 +7156,8 @@ def build_ui() -> gr.Blocks:
                                     "analysis. You pick which attributes go into the captions – this "
                                     "affects how the LoRA later reacts to prompts.\n\n"
                                     "**Training target and caption policy:**\n\n"
-                                    "The training target selected above chooses the workflow, prompt family and caption engine. "
-                                    "The fields here only control which facts that engine may use.\n\n"
+                                    "The training target selected above chooses caption format and field defaults. "
+                                    "The initial description provider is selected independently; the fields here control final composition.\n\n"
                                     "**Active caption fields:**\n\n"
                                     "Which attributes go into the description? The answer "
                                     "depends on the base model:\n\n"
@@ -7014,8 +7191,8 @@ def build_ui() -> gr.Blocks:
                                     "</details>",
                                 ))
                                 gr.Markdown(tr(
-                                    "Das Trainingsziel wird oben gewählt. Die folgenden Felder passen nur die Caption-Policy an; die gewählte Prompt-Familie und Caption-Engine bleiben aktiv.",
-                                    "Choose the training target at the top. The fields below only customize caption policy; the selected prompt family and caption engine remain active.",
+                                    "Das Trainingsziel wird oben gewählt. Die folgenden Felder passen nur die Caption-Policy an; der Erstbeschreibungs-Provider wird separat oben gewählt.",
+                                    "Choose the training target at the top. The fields below only customize caption policy; choose the initial description provider separately at the top.",
                                 ))
                                 c_captions = gr.CheckboxGroup(
                                     label=tr("Aktive Caption-Felder", "Active caption fields"),
@@ -7065,6 +7242,7 @@ def build_ui() -> gr.Blocks:
                                     ),
                                 )
                                 c_krea_caption_model = gr.Dropdown(
+                                    visible=False,
                                     label=tr("Krea-2-Caption-Modell", "Krea 2 caption model"),
                                     choices=OPENAI_MODEL_PRESET_CHOICES,
                                     value=S["c_krea_caption_model"],
@@ -7075,6 +7253,7 @@ def build_ui() -> gr.Blocks:
                                     **openai_model_dropdown_kwargs(),
                                 )
                                 c_krea_caption_reasoning_effort = gr.Dropdown(
+                                    visible=False,
                                     label=tr("Reasoning Effort – Krea-Caption", "Reasoning effort – Krea caption"),
                                     choices=REASONING_EFFORT_CHOICES,
                                     value=S["c_krea_caption_reasoning_effort"],
@@ -7084,6 +7263,7 @@ def build_ui() -> gr.Blocks:
                                     ),
                                 )
                                 c_use_krea_caption_repair = gr.Checkbox(
+                                    visible=False,
                                     label=tr("Automatischen Caption-Reparaturversuch verwenden", "Use automatic caption repair attempt"),
                                     value=S["c_use_krea_caption_repair"],
                                     info=tr(
@@ -7093,6 +7273,7 @@ def build_ui() -> gr.Blocks:
                                 )
                                 with gr.Row():
                                     c_krea_caption_repair_model = gr.Dropdown(
+                                    visible=False,
                                         label=tr("Krea-2-Caption-Reparaturmodell", "Krea 2 caption repair model"),
                                         choices=OPENAI_MODEL_PRESET_CHOICES,
                                         value=S["c_krea_caption_repair_model"],
@@ -7103,6 +7284,7 @@ def build_ui() -> gr.Blocks:
                                         **openai_model_dropdown_kwargs(),
                                     )
                                     c_krea_caption_repair_reasoning_effort = gr.Dropdown(
+                                    visible=False,
                                         label=tr("Reasoning Effort – Caption-Reparatur", "Reasoning effort – caption repair"),
                                         choices=REASONING_EFFORT_CHOICES,
                                         value=S["c_krea_caption_repair_reasoning_effort"],
@@ -7294,6 +7476,8 @@ def build_ui() -> gr.Blocks:
                     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
                     c_profile_sample_threshold, c_profile_sample_size,
                     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
+                    c_initial_caption_engine, c_initial_caption_task,
+                    c_caption_composition_mode,
                 ]
 
                 overview_inputs = [c_trigger, c_input, c_target, c_model, c_pipeline_mode, fr_state]
@@ -7323,16 +7507,16 @@ def build_ui() -> gr.Blocks:
                     "2. Nach der Pause hier `Profil laden` klicken.\n"
                     "3. Stable Identity prüfen (Dropdowns mit Confidence-Anzeige), bei Bedarf korrigieren. Speziell **Body Build** prüfen — bei Headshot-Dominanz wird er auf leer gesetzt, das ist Absicht.\n"
                     "4. Variable Traits per Bucket-Sicht prüfen, Ausreißer per `Re-Bucket all` korrigieren.\n"
-                    "5. `Profil speichern` klicken.\n"
-                    "6. `Captioning aus bestätigtem Profil starten` — es läuft kein neues Audit, nur Export + Caption-Build.\n",
+                    "5. Ein Bild auswählen und die Caption-Vorschau aktualisieren; ungespeicherte Profiländerungen werden berücksichtigt.\n"
+                    "6. `Profil bestätigen, speichern und Captions exportieren` übernimmt die Editorwerte vor dem Export — keine neue Bilderkennung.\n",
                     "### Edit profile and start captioning\n\n"
                     "Workflow:\n"
                     "1. In the Curator tab set `Pipeline mode = Profile then Caption` and start a run.\n"
                     "2. After the pause click `Load profile` here.\n"
                     "3. Review stable identity (dropdowns with confidence indicators), correct if needed. Pay attention to **Body Build** — it is forced empty on headshot-dominated sets, by design.\n"
                     "4. Review variable traits in the bucket view; fix outliers via `Re-bucket all`.\n"
-                    "5. Click `Save profile`.\n"
-                    "6. `Start captioning from confirmed profile` — no new audit runs, only export + caption build.\n",
+                    "5. Select an image and refresh the caption preview; unsaved profile edits are included.\n"
+                    "6. `Confirm, save profile and export captions` saves your edits before composing captions; no new image recognition.\n",
                 ))
 
                 p_state = gr.State({})
@@ -7674,13 +7858,51 @@ def build_ui() -> gr.Blocks:
                             ),
                         )
 
+                with gr.Accordion(tr("Caption-Vorschau · aktuelle Profilwerte", "Caption preview · current profile fields"), open=True):
+                    p_caption_composition_mode = gr.Dropdown(label=tr("Zusammensetzung", "Composition"),
+                        choices=[(tr("Lokal · Audit und Personenprofil", "Local · audit and person profile"), "local"),
+                                 (tr("Luna-Textdetails + lokale Profilregeln", "Luna text details + local profile rules"), "luna_text")],
+                        value=S["c_caption_composition_mode"])
+                    p_caption_details_info = gr.Markdown(tr("**Luna-Textdetails:** Der optionale API-Schritt sendet nur gespeicherte Beschreibungen an OpenAI. Keine Bilder und kein Personenprofil. Zusätzliche Kosten; danach Vorschau aktualisieren. Ohne Vorbereitung bleibt dieser Modus gesperrt.",
+                                                           "**Luna text details:** The optional API step sends only saved descriptions to OpenAI. No images or person profile. Additional costs; refresh the preview afterwards. Prepare details before exporting with this mode."),
+                                                        visible=S["c_caption_composition_mode"] == "luna_text")
+                    p_caption_details_btn = gr.Button(tr("Luna-Textdetails vorbereiten · API-Kosten", "Prepare Luna text details · API costs"),
+                                                      visible=S["c_caption_composition_mode"] == "luna_text")
+                    p_caption_target = gr.Dropdown(label=tr("Trainingsziel", "Training target"), choices=training_target_choices(),
+                                                   value=normalize_training_target(S.get("c_training_target")))
+                    with gr.Accordion(tr("Caption-Felder und Abweichungen", "Caption fields and deviations"), open=False):
+                        p_caption_fields = gr.CheckboxGroup(label=tr("Aktive Caption-Felder", "Active caption fields"),
+                                                           choices=CAPTION_FIELD_CHOICES, value=S["c_captions"])
+                        p_caption_variable_mode = gr.Dropdown(label=tr("Variable Merkmale", "Variable features"),
+                            choices=[(tr("Nur Abweichungen vom Profil", "Only profile deviations"), "canonical_deviations"),
+                                     (tr("Jeder sichtbare Wert bei echter Variation", "Every visible value with genuine variation"), "all_visible_when_variable")],
+                            value=S["c_variable_feature_mode"])
+                    p_caption_image_choice = gr.Dropdown(label=tr("Vorbereitetes Bild", "Prepared image"), choices=[])
+                    with gr.Row():
+                        p_caption_reload = gr.Button(tr("Bilderliste laden", "Load image list"))
+                        p_caption_preview_btn = gr.Button(tr("Vorschau aktualisieren · keine KI-Anfrage", "Refresh preview · no AI request"), variant="secondary")
+                    with gr.Row():
+                        p_caption_image = gr.Image(label=tr("Exportvorschau", "Export preview"), height=360, interactive=False)
+                        with gr.Column():
+                            p_caption_raw = gr.Textbox(label=tr("1 · Unveränderte Erstbeschreibung", "1 · Unchanged initial description"), lines=6, interactive=False)
+                            p_caption_final = gr.Textbox(label=tr("2 · Trainingscaption mit Profilregeln", "2 · Training caption with profile rules"), lines=6, interactive=False)
+                    p_caption_preview_status = gr.Markdown(tr("Profil laden und Vorschau aktualisieren. Die Auswahl des Zielmodells und der Caption-Felder aus Modul 2 gilt auch hier.",
+                                                            "Load the profile and refresh the preview. Target model and caption fields from module 2 apply here too."))
+                    gr.Markdown(tr(
+                        "Florence- und JoyCaption-Texte werden beim Subject Profile mit dem Bildaudit gegengeprüft. "
+                        "Übereinstimmungen stützen bereits auditierte Merkmale; Widersprüche erscheinen in der Profil-Diagnostik. "
+                        "Die Trainingscaption nutzt weiterhin Audit und Profil. Optional ergänzt Luna belegte Szenenpassagen aus dem Rohtext.",
+                        "Florence and JoyCaption descriptions are cross-checked against the image audit for the Subject Profile. "
+                        "Agreements support audited traits; conflicts appear in profile diagnostics. "
+                        "Training captions still use audit and profile. Luna can optionally add grounded scene excerpts from the raw text."))
+
                 # Action bar
                 with gr.Row():
                     p_save_btn = gr.Button(tr("💾 Profil speichern", "💾 Save profile"), variant="secondary", scale=1)
                     p_reset_btn = gr.Button(tr("↩️ Reset auf Backup", "↩️ Reset to backup"), variant="secondary", scale=1)
                     p_continue_btn = gr.Button(
-                        tr("▶ Captioning aus bestätigtem Profil starten",
-                           "▶ Start captioning from confirmed profile"),
+                        tr("▶ Profil bestätigen, speichern und Captions exportieren",
+                           "▶ Confirm, save profile and export captions"),
                         variant="primary",
                         scale=2,
                     )
@@ -7720,7 +7942,33 @@ def build_ui() -> gr.Blocks:
                 ).then(
                     fn=lambda: ("", tr("_Kein Bild ausgewählt._", "_No image selected._")),
                     outputs=[p_selected_cluster_image_id, p_selected_cluster_image_info],
+                ).then(
+                    fn=profile_caption_choices, inputs=[p_trigger, p_input], outputs=[p_caption_image_choice],
                 )
+                p_editor_inputs = [p_trigger, p_input, p_raw_json,
+                    p_gender, p_skin, p_eyes, p_hair_texture, p_body, p_body_height,
+                    p_hair_color_baseline, p_beard_pattern, p_beard_color,
+                    p_glasses_regular, p_glasses_desc, p_freckles_present, p_freckles_desc, p_piercing_md]
+                p_caption_reload.click(fn=profile_caption_choices, inputs=[p_trigger, p_input], outputs=[p_caption_image_choice])
+                for main_control, profile_control in [(c_training_target, p_caption_target),
+                                                      (c_captions, p_caption_fields),
+                                                      (c_variable_feature_mode, p_caption_variable_mode),
+                                                      (c_caption_composition_mode, p_caption_composition_mode)]:
+                    main_control.change(fn=lambda value: value, inputs=main_control, outputs=profile_control, queue=False)
+                    profile_control.input(fn=lambda value: value, inputs=profile_control, outputs=main_control, queue=False)
+                p_caption_preview_btn.click(fn=preview_profile_caption,
+                    inputs=[p_trigger, p_input, p_raw_json, p_caption_image_choice,
+                            p_caption_target, p_caption_fields, p_caption_variable_mode, p_caption_composition_mode, c_controlled_buckets, *p_editor_inputs[3:]],
+                    outputs=[p_caption_image, p_caption_raw, p_caption_final, p_caption_preview_status],
+                    concurrency_id="caption_preview", concurrency_limit=1)
+                p_caption_composition_mode.change(fn=lambda mode: (gr.update(visible=mode == "luna_text"), gr.update(visible=mode == "luna_text")),
+                    inputs=[p_caption_composition_mode], outputs=[p_caption_details_btn, p_caption_details_info], queue=False)
+                for preview_control in [p_caption_target, p_caption_fields, p_caption_variable_mode, p_caption_composition_mode, c_controlled_buckets, *p_editor_inputs[3:]]:
+                    preview_control.change(fn=lambda: ("", tr("Werte geändert. Vorschau aktualisieren, bevor du die Caption beurteilst.",
+                                                            "Values changed. Refresh the preview before reviewing the caption.")),
+                                          outputs=[p_caption_final, p_caption_preview_status], queue=False)
+                p_caption_image_choice.change(fn=lambda: (None, "", "", tr("Bild ausgewählt. Vorschau aktualisieren.", "Image selected. Refresh the preview.")),
+                    outputs=[p_caption_image, p_caption_raw, p_caption_final, p_caption_preview_status], queue=False)
 
                 # Snapshot p_raw_json into the read-only diagnostics view
                 p_raw_json.change(
@@ -7862,17 +8110,22 @@ def build_ui() -> gr.Blocks:
                     return trigger_value, input_value
 
                 p_sync_event = p_continue_btn.click(
+                    fn=save_profile_before_export, inputs=p_editor_inputs, outputs=[p_status],
+                ).success(
                     fn=_sync_trigger_input,
                     inputs=[p_trigger, p_input],
                     outputs=[c_trigger, c_input],
                 )
-                p_run_event = p_sync_event.then(
+                p_run_event = p_sync_event.success(
                     fn=start_caption_from_profile,
                     inputs=curator_inputs,  # dieselbe Liste wie der ehemalige Continue-Button im Curator-Tab
                     outputs=[p_log, p_gallery, p_progress, p_status_run, p_openai_usage],
                     concurrency_id="dataset_curator_process",
                     concurrency_limit=1,
                 )
+                p_caption_details_btn.click(fn=start_caption_text_details, inputs=curator_inputs,
+                    outputs=[p_log, p_gallery, p_progress, p_status_run, p_openai_usage],
+                    concurrency_id="dataset_curator_process", concurrency_limit=1)
                 p_stop_btn.click(
                     fn=kill_process,
                     outputs=[p_status_run],
