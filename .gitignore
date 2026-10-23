@@ -7,6 +7,7 @@ curator_env/
 curator_env_py313/
 .venv/
 .venv313/
+.venv_*/
 venv/
 __pycache__/
 *.py[cod]
