@@ -501,10 +501,28 @@ ENABLE_VISUAL_STYLE_DIVERSITY = True
 VISUAL_STYLE_SOFT_LIMIT = 2          # ab dem 3. Bild gleichen Stils -> Penalty
 VISUAL_STYLE_PENALTY_WEIGHT = 8.0    # pro ueberzaehligem Bild gleichen Stils
 
-# CLIP Setup – ViT-L-14 ist deutlich besser für Person-Similarity als ViT-B-32
+# CLIP Setup. ViT-L-14 trennt Personen-Ähnlichkeit am besten, braucht auf der
+# CPU aber mehrere Sekunden pro Bild. ViT-B-32 ist auf der CPU rund 15-mal
+# schneller und für die Duplikatsuche ausreichend. "auto" wählt L-14 mit
+# NVIDIA-GPU und B-32 ohne GPU.
+CLIP_MODEL_CHOICE = "auto"  # auto | ViT-B-32 | ViT-L-14
+CLIP_MODEL_VARIANTS: Dict[str, Tuple[str, str]] = {
+    "ViT-B-32": ("ViT-B-32", "laion2b_s34b_b79k"),
+    "ViT-L-14": ("ViT-L-14", "laion2b_s32b_b82k"),
+}
 CLIP_MODEL_NAME = "ViT-L-14"
 CLIP_PRETRAINED = "laion2b_s32b_b82k"
 CLIP_DEVICE = "cuda" if HAVE_TORCH and torch.cuda.is_available() else "cpu"
+
+
+def resolve_clip_model() -> Tuple[str, str]:
+    """Set CLIP_MODEL_NAME/CLIP_PRETRAINED from CLIP_MODEL_CHOICE and return them."""
+    global CLIP_MODEL_NAME, CLIP_PRETRAINED
+    choice = str(globals().get("CLIP_MODEL_CHOICE", "auto") or "auto").strip()
+    if choice not in CLIP_MODEL_VARIANTS:
+        choice = "ViT-L-14" if CLIP_DEVICE == "cuda" else "ViT-B-32"
+    CLIP_MODEL_NAME, CLIP_PRETRAINED = CLIP_MODEL_VARIANTS[choice]
+    return CLIP_MODEL_NAME, CLIP_PRETRAINED
 
 # --------------------------------
 # Session-/Outfit-Clusterung
@@ -3615,6 +3633,7 @@ def save_cached_trigger_check(trigger_word: str, payload: Dict[str, Any]) -> Non
 # ============================================================
 
 def clip_cache_fingerprint() -> str:
+    resolve_clip_model()
     return stable_hash({
         "model": CLIP_MODEL_NAME,
         "pretrained": CLIP_PRETRAINED,
@@ -3660,6 +3679,8 @@ def _init_clip_model() -> bool:
             return False
         CLIP_INIT_ATTEMPTED = True
         started = time.perf_counter()
+        resolve_clip_model()
+        safe_print(f"   ⏳ Loading CLIP {CLIP_MODEL_NAME} on {CLIP_DEVICE} (first use downloads the weights) ...")
         try:
             CLIP_MODEL, _, CLIP_PREPROCESS = open_clip.create_model_and_transforms(
                 CLIP_MODEL_NAME,
@@ -12380,7 +12401,7 @@ def _effective_config_for_manifest() -> Dict[str, Any]:
         "FRAME_CLEANUP_MODE", "FRAME_PAUSE_ON_MEDIUM_REVIEW", "FRAME_AUTO_ACCEPT_TYPES", "POST_FRAME_DUPLICATE_REFRESH",
         "ENABLE_IG_FRAME_CROP", "IG_FRAME_TWO_STAGE_BAR_DETECT",
         "USE_ARCFACE_IDENTITY_CHECK", "ARCFACE_MODEL_PACK", "ARCFACE_DET_SIZE",
-        "USE_CLIP_DUPLICATE_SCORING", "CLIP_MODEL_NAME", "CLIP_PRETRAINED",
+        "USE_CLIP_DUPLICATE_SCORING", "CLIP_MODEL_CHOICE", "CLIP_MODEL_NAME", "CLIP_PRETRAINED",
         "ENABLE_IDENTITY_APPEARANCE_CLUSTERING", "ENABLE_CANON_REPRESENTATION_BONUS",
         "USE_CONTROLLED_BUCKETS",
     )

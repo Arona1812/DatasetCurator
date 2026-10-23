@@ -343,6 +343,7 @@ DEFAULTS: Dict[str, Any] = {
     "c_post_frame_phash_refresh": True,
     # Duplikate
     "c_use_clip": True,
+    "c_clip_model": "auto",
     "c_use_phash": True,
     "c_phash_thresh": 8,
     "c_clip_thresh": 0.985,
@@ -663,7 +664,7 @@ def save_settings_fn(
     c_use_early_phash_loop2, c_early_phash_thresh_2, c_early_phash_keep_2,
     c_subject_sanity, c_subject_min_torso,
     c_ig_frame_crop, c_ig_two_stage_bar, c_frame_cleanup_mode, c_frame_pause_on_medium,
-    c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
+    c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh, c_clip_model,
     c_smart_crop, c_crop_gain, c_crop_pad,
     c_medium_rescue_crop, c_medium_rescue_gain,
     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,
@@ -722,6 +723,7 @@ def save_settings_fn(
         "c_frame_pause_on_medium": bool(c_frame_pause_on_medium),
         "c_use_clip": c_use_clip, "c_use_phash": c_use_phash,
         "c_phash_thresh": c_phash_thresh, "c_clip_thresh": c_clip_thresh,
+        "c_clip_model": c_clip_model,
         "c_smart_crop": c_smart_crop, "c_crop_gain": c_crop_gain, "c_crop_pad": c_crop_pad,
         "c_medium_rescue_crop": c_medium_rescue_crop,
         "c_medium_rescue_gain": c_medium_rescue_gain,
@@ -3525,7 +3527,7 @@ CURATOR_INPUT_NAMES = (
     "face_min_blur_variance_headshot", "face_min_blur_variance_medium", "face_min_blur_variance_full_body",
     "use_early_phash", "use_early_phash_loop1", "early_phash_threshold_1", "early_phash_keep_per_group_1",
     "use_early_phash_loop2", "early_phash_threshold_2", "early_phash_keep_per_group_2", "subject_sanity", "subject_min_torso",
-    "ig_frame_crop", "ig_two_stage_bar", "frame_cleanup_mode", "frame_pause_on_medium", "use_clip", "use_phash", "phash_threshold", "clip_threshold",
+    "ig_frame_crop", "ig_two_stage_bar", "frame_cleanup_mode", "frame_pause_on_medium", "use_clip", "use_phash", "phash_threshold", "clip_threshold", "clip_model",
     "enable_smart_crop", "crop_min_gain", "crop_padding", "enable_medium_rescue_crop", "medium_rescue_min_gain",
     "use_clustering", "max_outfit", "max_session", "use_diversity", "c_use_canon_representation", "c_canon_representation_target", "c_canon_max_quality_gap",
     "use_pose_diversity", "pose_soft_limit", "pose_penalty_weight", "use_arcface", "arcface_hard", "arcface_soft", "arcface_trim",
@@ -3603,6 +3605,7 @@ def build_run_config_from_ui_values(values: Tuple[Any, ...], *, continue_from_pr
         "USE_PHASH_DUPLICATE_SCORING": bool(v["use_phash"]),
         "PHASH_HAMMING_THRESHOLD": int(v["phash_threshold"]),
         "CLIP_COSINE_THRESHOLD": float(v["clip_threshold"]),
+        "CLIP_MODEL_CHOICE": str(v["clip_model"] or "auto"),
         "ENABLE_SMART_PRECROP": bool(v["enable_smart_crop"]),
         "SMART_PRECROP_MIN_GAIN": float(v["crop_min_gain"]),
         "SMART_PRECROP_PADDING_FACTOR": float(v["crop_padding"]),
@@ -6607,8 +6610,8 @@ def build_ui() -> gr.Blocks:
                             label=tr("Bedeutungs-Vergleich (CLIP)", "Meaning-based (CLIP)"),
                             value=S["c_use_clip"],
                             info=tr(
-                                "Erkennt Bilder mit gleichem Inhalt (Outfit, Pose, Setting), auch wenn sie aus leicht anderen Winkeln aufgenommen wurden. Empfohlen: an. Braucht CLIP ViT-L-14 (wird beim ersten Lauf heruntergeladen).",
-                                "Detects images with the same content (outfit, pose, setting), even from slightly different angles. Recommended: on. Requires CLIP ViT-L-14 (auto-downloaded on first run).",
+                                "Erkennt Bilder mit gleichem Inhalt (Outfit, Pose, Setting), auch wenn sie aus leicht anderen Winkeln aufgenommen wurden. Empfohlen: an. Braucht CLIP (Modellwahl unten; wird beim ersten Lauf heruntergeladen).",
+                                "Detects images with the same content (outfit, pose, setting), even from slightly different angles. Recommended: on. Requires CLIP (model choice below; auto-downloaded on first run).",
                             ),
                         )
                         c_use_phash = gr.Checkbox(
@@ -6642,6 +6645,20 @@ def build_ui() -> gr.Blocks:
                                 "At what similarity (0–1) two images count as the same content. Recommended: 0.985 (conservative, only truly similar images get filtered). Below 0.97 becomes aggressive and may merge different images of the same person.",
                             ),
                         )
+
+                    c_clip_model = gr.Dropdown(
+                        label=tr("CLIP-Modell", "CLIP model"),
+                        choices=[
+                            (tr("Automatisch – ViT-L-14 mit NVIDIA-GPU, ViT-B-32 ohne", "Automatic – ViT-L-14 with NVIDIA GPU, ViT-B-32 without"), "auto"),
+                            (tr("ViT-B-32 – schnell, gut für Laptops ohne GPU", "ViT-B-32 – fast, good for laptops without GPU"), "ViT-B-32"),
+                            (tr("ViT-L-14 – genauer, auf der CPU mehrere Sekunden pro Bild", "ViT-L-14 – more accurate, several seconds per image on CPU"), "ViT-L-14"),
+                        ],
+                        value=S.get("c_clip_model", "auto"),
+                        info=tr(
+                            "Jedes Modell hat einen eigenen Cache. Ein Wechsel berechnet die CLIP-Werte einmal neu.",
+                            "Each model has its own cache. Switching recomputes the CLIP values once.",
+                        ),
+                    )
 
                 with gr.Accordion(tr("✂️ Smart Pre-Crop", "✂️ Smart pre-crop"), open=False):
                     gr.Markdown(tr(
@@ -7510,7 +7527,7 @@ def build_ui() -> gr.Blocks:
                     c_use_early_phash_loop2, c_early_phash_thresh_2, c_early_phash_keep_2,
                     c_subject_sanity, c_subject_min_torso,
                     c_ig_frame_crop, c_ig_two_stage_bar, c_frame_cleanup_mode, c_frame_pause_on_medium,
-                    c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh,
+                    c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh, c_clip_model,
                     c_smart_crop, c_crop_gain, c_crop_pad,
                     c_medium_rescue_crop, c_medium_rescue_gain,
                     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,
