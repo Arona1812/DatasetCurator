@@ -52,6 +52,9 @@ from preflight import ensure_asset_registry as ensure_project_asset_registry
 
 from curator_core import (
     APP_VERSION,
+    MODEL_AUDIT_DEFAULT,
+    MODEL_BALANCED_DEFAULT,
+    model_rejects_none_effort,
     OutputTransaction,
     atomic_write_json as core_atomic_write_json,
     atomic_write_text as core_atomic_write_text,
@@ -184,18 +187,15 @@ API_KEY = os.environ.get("OPENAI_API_KEY", "")
 RUN_ID = ""
 CANCEL_FILE = ""
 
-# Hauptmodell für Bildaudit + Triggerwortprüfung
-# gpt-5.4-mini liefert deutlich treffsicherere Audits als nano:
-# - erkennt Filter-induzierte Ueberbelichtung (Wachshaut/blown highlights)
-# - bewertet Body-Camera-Winkel realistischer
-# - vergibt seltener vorsichtiges 'review' fuer harmlose Bilder
-# Im Gegenzug ist mini ~5-10x teurer pro Audit als nano. Bei typischen
-# Datasetgroessen (<200 Bildern) ist das vernachlaessigbar.
-AI_MODEL = "gpt-5.6-luna"
-TRIGGER_CHECK_MODEL = "gpt-5.6-luna"
+# Hauptmodell für Bildaudit + Triggerwortprüfung. Die GPT-6-Stufen sind in
+# curator_core zentral hinterlegt (Luna = Massenaudit, 6.1 Sol = ausgewogen,
+# Astra = Spitzenmodell). Ältere gespeicherte Presets werden beim Laden der
+# Konfiguration automatisch auf die passende GPT-6-Stufe umgestellt.
+AI_MODEL = MODEL_AUDIT_DEFAULT
+TRIGGER_CHECK_MODEL = MODEL_AUDIT_DEFAULT
 OPENAI_TOKEN_LIMIT_TOTAL = 0  # 0 = disabled
 
-# GPT-5.6 stage-specific reasoning. Image audits and per-image captions are
+# Stage-specific reasoning. Image audits and per-image captions are
 # extraction tasks and use no reasoning. The single dataset-wide subject
 # profile call gets a small reasoning budget because it must reconcile
 # recurring and variable traits across many images.
@@ -626,9 +626,9 @@ VARIABLE_FEATURE_CAPTION_MODE = "canonical_deviations"
 # Krea 2 quality-caption mode. Only final selected images are sent for a
 # dedicated natural-language caption after the subject profile is known.
 USE_KREA_AI_CAPTIONING = True
-KREA_CAPTION_MODEL = "gpt-5.6-luna"
+KREA_CAPTION_MODEL = MODEL_AUDIT_DEFAULT
 USE_KREA_CAPTION_REPAIR = True
-KREA_CAPTION_REPAIR_MODEL = "gpt-5.6-terra"
+KREA_CAPTION_REPAIR_MODEL = MODEL_BALANCED_DEFAULT
 KREA_CAPTION_IMAGE_DETAIL = "high"
 KREA_CAPTION_PROMPT_VERSION = "krea2-natural-v6-active-policy-fingerprint"
 CAPTION_POLICY = {
@@ -728,8 +728,8 @@ PROFILE_BODY_BUILD_MIN_ABSOLUTE = 3
 PROFILE_BODY_BUILD_MIN_FRACTION = 0.30
 PROFILE_BODY_PRIORITY_SAMPLE_MAX = 24
 
-# Normalizer-Modell: Terra balances cross-image consistency and cost.
-PROFILE_NORMALIZER_MODEL = "gpt-5.6-terra"
+# Normalizer-Modell: the balanced tier reconciles traits across many images.
+PROFILE_NORMALIZER_MODEL = MODEL_BALANCED_DEFAULT
 
 # Cache-Version fuer zentrale Subject-Profile. Bei Aenderungen am
 # Profile-Schema oder an der Normalizer-Logik inkrementieren.
@@ -1883,6 +1883,11 @@ def clamp_int(v: int, lo: int, hi: int) -> int:
 OPENAI_PRICING_PER_1M_TOKENS: Dict[str, Dict[str, float]] = {
     # Keep this table small and explicit. Unknown/custom models simply suppress
     # the estimated-cost display instead of producing a misleading number.
+    # Standard-tier list prices per 1M tokens (USD), September/October 2026.
+    "gpt-6-luna": {"input": 0.10, "output": 0.50},
+    "gpt-6-sol": {"input": 2.00, "output": 10.00},
+    "gpt-6.1-sol": {"input": 2.00, "output": 10.00},
+    "gpt-6-astra": {"input": 10.00, "output": 50.00},
     "gpt-5.6-luna": {"input": 1.00, "output": 6.00},
     "gpt-5.6-terra": {"input": 2.50, "output": 15.00},
     "gpt-5.6-sol": {"input": 5.00, "output": 30.00},
@@ -4156,12 +4161,15 @@ def normalize_reasoning_effort_for_model(model: str, effort: Optional[str]) -> O
         return "none"
 
     model_name = str(model or "").strip().lower()
-    if normalized == "max" and not model_name.startswith("gpt-5.6"):
+    if normalized == "max" and not model_name.startswith(("gpt-5.6", "gpt-6")):
         safe_print(
-            f"   ⚠️ Reasoning effort 'max' is only used for GPT-5.6 in this curator; "
+            f"   ⚠️ Reasoning effort 'max' is only used for GPT-5.6/GPT-6 in this curator; "
             f"using 'xhigh' for {model}."
         )
         return "xhigh"
+    if normalized == "none" and model_rejects_none_effort(model_name):
+        # gpt-6-astra and gpt-6.1-sol answer "none" with HTTP 400.
+        return "low"
     return normalized
 
 
@@ -4190,10 +4198,10 @@ def responses_api_call(model: str, payload: Dict[str, Any], phase_label: str = "
             if reasoning_effort:
                 request_payload["reasoning"] = {"effort": reasoning_effort}
 
-            # Current GPT-5.4/5.5/5.6 reasoning configurations do not need
-            # sampling parameters. Remove temperature whenever effort is set.
+            # GPT-5.4+/GPT-6 reasoning configurations do not take sampling
+            # parameters. Remove temperature whenever effort is set.
             model_name = str(model).strip().lower()
-            if reasoning_effort and model_name.startswith(("gpt-5.4", "gpt-5.5", "gpt-5.6")):
+            if reasoning_effort and model_name.startswith(("gpt-5.4", "gpt-5.5", "gpt-5.6", "gpt-6")):
                 request_payload.pop("temperature", None)
 
             response = run_cancellable_call(

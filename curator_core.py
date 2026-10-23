@@ -447,3 +447,52 @@ class OutputTransaction:
                 shutil.rmtree(os.path.join(output_root, name), ignore_errors=True)
                 count += 1
         return count
+
+
+# ---------------------------------------------------------------------------
+# OpenAI model presets (shared by UI and pipeline)
+# ---------------------------------------------------------------------------
+# GPT-6 family (API, September 2026):
+#   gpt-6-luna   – efficient tier for per-image audits and captions
+#   gpt-6.1-sol  – balanced tier for the profile normalizer, repairs, escalation
+#   gpt-6-sol    – previous balanced tier, still accepts reasoning effort "none"
+#   gpt-6-astra  – flagship tier
+# gpt-6-astra and gpt-6.1-sol reject reasoning effort "none" (HTTP 400); the
+# pipeline raises such requests to "low" automatically.
+MODEL_AUDIT_DEFAULT = "gpt-6-luna"
+MODEL_BALANCED_DEFAULT = "gpt-6.1-sol"
+MODEL_FLAGSHIP_DEFAULT = "gpt-6-astra"
+
+OPENAI_MODEL_PRESETS: tuple = (
+    "gpt-6-luna",
+    "gpt-6.1-sol",
+    "gpt-6-sol",
+    "gpt-6-astra",
+)
+
+MODELS_WITHOUT_NONE_EFFORT: tuple = ("gpt-6-astra", "gpt-6.1-sol")
+
+# Saved settings from earlier releases point to retired presets. They are
+# moved to the tier that fills the same role in the GPT-6 family.
+LEGACY_MODEL_MIGRATION: Dict[str, str] = {
+    "gpt-5.6-luna": "gpt-6-luna",
+    "gpt-5.6-terra": "gpt-6.1-sol",
+    "gpt-5.6-sol": "gpt-6-astra",
+    "gpt-5.6": "gpt-6-astra",
+    "gpt-5.5": "gpt-6.1-sol",
+    "gpt-5.4": "gpt-6.1-sol",
+    "gpt-5.4-mini": "gpt-6-luna",
+    "gpt-5.4-nano": "gpt-6-luna",
+}
+
+
+def migrate_openai_model_name(value: Any) -> str:
+    """Return the GPT-6 replacement for a retired preset, else the value unchanged."""
+    text = str(value or "").strip()
+    return LEGACY_MODEL_MIGRATION.get(text.lower(), text)
+
+
+def model_rejects_none_effort(model: Any) -> bool:
+    """Whether a model refuses reasoning effort ``none``."""
+    name = str(model or "").strip().lower()
+    return any(name == prefix or name.startswith(prefix + "-") for prefix in MODELS_WITHOUT_NONE_EFFORT)

@@ -32,6 +32,10 @@ from PIL import Image, ImageDraw, ImageOps
 
 from curator_core import (
     APP_VERSION,
+    MODEL_AUDIT_DEFAULT,
+    MODEL_BALANCED_DEFAULT,
+    OPENAI_MODEL_PRESETS,
+    migrate_openai_model_name,
     atomic_write_json as core_atomic_write_json,
     normalize_run_config_payload,
     normalize_asset_id as core_normalize_asset_id,
@@ -284,11 +288,11 @@ DEFAULTS: Dict[str, Any] = {
     "c_input": r"",
     "c_target": 30,
     "c_api_key": "",
-    "c_model": "gpt-5.6-luna",
+    "c_model": MODEL_AUDIT_DEFAULT,
     "c_audit_reasoning_effort": "none",
     "c_openai_token_limit": 0,
     "c_use_trigger_check": False,
-    "c_trigger_model": "gpt-5.6-luna",
+    "c_trigger_model": MODEL_AUDIT_DEFAULT,
     "c_trigger_reasoning_effort": "none",
     "c_use_review_escalation": False,
     "c_review_escalation_model": "",
@@ -374,14 +378,14 @@ DEFAULTS: Dict[str, Any] = {
     "c_caption_profile": "ernie",  # legacy settings key
     "c_captions": list(SHARED_COMPACT_CAPTION_FIELDS),
     "c_variable_feature_mode": "canonical_deviations",
-    "c_krea_caption_model": "gpt-5.6-luna",
+    "c_krea_caption_model": MODEL_AUDIT_DEFAULT,
     "c_krea_caption_reasoning_effort": "none",
     "c_use_krea_caption_repair": True,
-    "c_krea_caption_repair_model": "gpt-5.6-terra",
+    "c_krea_caption_repair_model": MODEL_BALANCED_DEFAULT,
     "c_krea_caption_repair_reasoning_effort": "low",
     # Subject Profile / Phase 2
     "c_pipeline_mode": "single_pass",
-    "c_profile_normalizer_model": "gpt-5.6-terra",
+    "c_profile_normalizer_model": MODEL_BALANCED_DEFAULT,
     "c_profile_reasoning_effort": "low",
     "c_profile_sample_threshold": 100,
     "c_profile_sample_size": 80,
@@ -409,16 +413,9 @@ REASONING_EFFORT_CHOICES: List[str] = [
     "max",
 ]
 
-OPENAI_MODEL_PRESET_CHOICES: List[str] = [
-    "gpt-5.6-luna",
-    "gpt-5.6-terra",
-    "gpt-5.6-sol",
-    "gpt-5.6",
-    "gpt-5.4-mini",
-    "gpt-5.4-nano",
-    "gpt-5.4",
-    "gpt-5.5",
-]
+# GPT-6 presets live in curator_core; custom model names stay possible in the
+# dropdowns (allow_custom_value).
+OPENAI_MODEL_PRESET_CHOICES: List[str] = list(OPENAI_MODEL_PRESETS)
 
 CAPTION_FIELD_CHOICES: List[str] = [
     "include_gender_class",
@@ -525,8 +522,8 @@ def apply_training_target_defaults(
     if normalized == "krea2":
         return (
             fields, 20, 0.40, 0.35, 0.25,
-            "gpt-5.6-luna", "none", "none", "low",
-            "gpt-5.6-terra", "low", "gpt-5.6-luna", "none",
+            MODEL_AUDIT_DEFAULT, "none", "none", "low",
+            MODEL_BALANCED_DEFAULT, "low", MODEL_AUDIT_DEFAULT, "none",
             "profile_then_caption",
         )
     return (
@@ -592,6 +589,13 @@ def load_settings() -> Dict[str, Any]:
     # API Key aus Umgebungsvariable wenn nicht gespeichert
     if not settings.get("c_api_key"):
         settings["c_api_key"] = os.environ.get("OPENAI_API_KEY", "")
+    # Retired GPT-5.x presets from older settings files move to their GPT-6 tier.
+    for model_key in (
+        "c_model", "c_trigger_model", "c_review_escalation_model",
+        "c_krea_caption_model", "c_krea_caption_repair_model", "c_profile_normalizer_model",
+    ):
+        if settings.get(model_key):
+            settings[model_key] = migrate_openai_model_name(settings[model_key])
     legacy_target = saved.get("c_training_target") or saved.get("c_caption_profile") or settings.get("c_training_target")
     settings["c_training_target"] = normalize_training_target(legacy_target)
     settings["c_caption_profile"] = settings["c_training_target"]
@@ -1423,10 +1427,10 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     if str(model).strip().lower() == "fallback_local":
         short_error = primary_error[:240] + ("…" if len(primary_error) > 240 else "")
         status = tr(
-            f"⚠️ Lokales Fallback-Profil geladen — Terra-Normalisierung fehlgeschlagen. "
+            f"⚠️ Lokales Fallback-Profil geladen — Profil-Normalisierung fehlgeschlagen. "
             f"Sample {sample}/{total} | schema {schema}"
             + (f" | Ursache: {short_error}" if short_error else ""),
-            f"⚠️ Local fallback profile loaded — Terra normalization failed. "
+            f"⚠️ Local fallback profile loaded — profile normalization failed. "
             f"Sample {sample}/{total} | schema {schema}"
             + (f" | Cause: {short_error}" if short_error else ""),
         )
@@ -3626,14 +3630,14 @@ def build_run_config_from_ui_values(values: Tuple[Any, ...], *, continue_from_pr
         "CAPTION_POLICY": caption_policy,
         "VARIABLE_FEATURE_CAPTION_MODE": str(v["variable_feature_mode"] or "canonical_deviations"),
         "USE_KREA_AI_CAPTIONING": target == "krea2",
-        "KREA_CAPTION_MODEL": str(v["krea_caption_model"] or "gpt-5.6-luna").strip(),
+        "KREA_CAPTION_MODEL": str(v["krea_caption_model"] or MODEL_AUDIT_DEFAULT).strip(),
         "KREA_CAPTION_REASONING_EFFORT": str(v["krea_caption_reasoning_effort"] or "none"),
         "USE_KREA_CAPTION_REPAIR": bool(v["use_krea_caption_repair"]),
-        "KREA_CAPTION_REPAIR_MODEL": str(v["krea_caption_repair_model"] or "gpt-5.6-terra").strip(),
+        "KREA_CAPTION_REPAIR_MODEL": str(v["krea_caption_repair_model"] or MODEL_BALANCED_DEFAULT).strip(),
         "KREA_CAPTION_REPAIR_REASONING_EFFORT": str(v["krea_caption_repair_reasoning_effort"] or "low"),
         "PIPELINE_MODE": "profile_then_caption" if continue_from_profile else str(v["c_pipeline_mode"] or "single_pass"),
         "CONTINUE_FROM_PROFILE": bool(continue_from_profile),
-        "PROFILE_NORMALIZER_MODEL": str(v["c_profile_normalizer_model"] or "gpt-5.6-terra").strip(),
+        "PROFILE_NORMALIZER_MODEL": str(v["c_profile_normalizer_model"] or MODEL_BALANCED_DEFAULT).strip(),
         "PROFILE_REASONING_EFFORT": str(v["profile_reasoning_effort"] or "low"),
         "PROFILE_SAMPLE_THRESHOLD": int(v["c_profile_sample_threshold"]),
         "PROFILE_SAMPLE_SIZE": int(v["c_profile_sample_size"]),
@@ -3812,14 +3816,11 @@ def load_results(input_folder, trigger_word, subfolder, page=1):
 
 FRAME_REVIEW_PAGE_SIZE = 18
 FRAME_REVIEW_FILTER_CHOICES = [
-    ("review", "Mittlere Sicherheit", "Medium confidence"),
-    ("suggestions", "Unbestätigte Vorschläge / zu prüfen", "Unconfirmed suggestions / review"),
-    ("automatic", "Automatisch angewendet", "Applied automatically"),
-    ("high", "Hohe Sicherheit", "High confidence"),
-    ("detected", "Alle erkannten Rahmen", "All detected frames"),
-    ("decided", "Manuell entschieden", "Manually decided"),
+    ("uncertain", "Nicht sicher automatisch beschnitten", "Not safely auto-cropped"),
+    ("multiple", "Mehrere Entwürfe", "More than one draft"),
     ("all", "Alle Bilder", "All images"),
 ]
+FRAME_REVIEW_DEFAULT_FILTER = "uncertain"
 
 
 def _frame_ui_paths(input_folder: str, trigger_word: str) -> Tuple[str, str]:
@@ -3925,27 +3926,34 @@ def _frame_current_selection_kind(record: Dict[str, Any], state: Any = None) -> 
 
 
 def _frame_filter_records(state: Any, filter_value: str) -> List[Dict[str, Any]]:
+    """Return the records shown for one of the three review views.
+
+    * ``uncertain`` – the detector proposed a crop, but project policy does
+      not apply it automatically (manual decisions stay visible for changes).
+    * ``multiple`` – more than one crop draft exists.
+    * ``all`` – every analysed image.
+
+    Images without any crop proposal only appear under ``all``.
+    """
     records = list((state or {}).get("records", []) or []) if isinstance(state, dict) else []
     records.sort(key=lambda record: _normalize_asset_id(record.get("asset_id")))
-    value = str(filter_value or "review")
-    if value == "review":
-        return [r for r in records if str(r.get("confidence_level", "low")) == "medium"]
-    if value == "suggestions":
-        return [
-            r for r in records
-            if str(r.get("confidence_level", "low")) in {"high", "medium"}
-            and str(r.get("user_decision", "auto") or "auto") == "auto"
-            and not _frame_auto_applies_best_candidate(r, state)
-        ]
-    if value == "automatic":
-        return [r for r in records if _frame_auto_applies_best_candidate(r, state)]
-    if value == "high":
-        return [r for r in records if r.get("confidence_level") == "high"]
-    if value == "detected":
-        return [r for r in records if r.get("confidence_level") in {"high", "medium"}]
-    if value == "decided":
-        return [r for r in records if r.get("user_decision", "auto") != "auto"]
-    return records
+    value = str(filter_value or FRAME_REVIEW_DEFAULT_FILTER)
+    if value == "all":
+        return records
+
+    def drafts(record: Dict[str, Any]) -> int:
+        return sum(
+            1 for candidate in (record.get("candidates", []) or [])
+            if isinstance(candidate.get("bbox"), list) and len(candidate.get("bbox")) == 4
+        )
+
+    if value == "multiple":
+        return [r for r in records if drafts(r) >= 2]
+    # Default: uncertain. Older saved values ("review", "suggestions", ...) land here.
+    return [
+        r for r in records
+        if drafts(r) >= 1 and not _frame_auto_applies_best_candidate(r, state)
+    ]
 
 
 def _frame_page_choices(count: int) -> List[str]:
@@ -4287,17 +4295,21 @@ def _frame_review_summary_md(state: Any) -> str:
     decisions = Counter(str(r.get("user_decision", "auto")) for r in records)
     automatic_count = sum(1 for record in records if _frame_auto_applies_best_candidate(record, state))
     suggestion_count = sum(1 for record in records if _frame_current_selection_kind(record, state) == "suggestion")
+    uncertain_count = len(_frame_filter_records(state, "uncertain"))
+    multiple_count = len(_frame_filter_records(state, "multiple"))
     return tr(
         f"**{summary['total']} Bilder lokal geprüft:** {summary['high']} hohe Sicherheit, "
         f"{summary['medium']} mittlere Sicherheit, {summary['low']} ohne belastbaren Rahmenfund.  "
         f"Automatisch angewendet: **{automatic_count}** · unbestätigte Vorschläge: **{suggestion_count}**.  "
         f"Manuell: {decisions.get('accept',0)} übernommen, {decisions.get('manual',0)} manuell, "
-        f"{decisions.get('keep_original',0)} Original behalten. **Keine LLM-Aufrufe.**",
+        f"{decisions.get('keep_original',0)} Original behalten. **Keine LLM-Aufrufe.**  \n"
+        f"Ansichten: nicht sicher automatisch beschnitten **{uncertain_count}** · mehrere Entwürfe **{multiple_count}** · alle **{summary['total']}**.",
         f"**{summary['total']} images checked locally:** {summary['high']} high confidence, "
         f"{summary['medium']} medium confidence, {summary['low']} without a reliable frame.  "
         f"Applied automatically: **{automatic_count}** · unconfirmed suggestions: **{suggestion_count}**.  "
         f"Manual: {decisions.get('accept',0)} accepted, {decisions.get('manual',0)} manual, "
-        f"{decisions.get('keep_original',0)} original kept. **No LLM calls.**",
+        f"{decisions.get('keep_original',0)} original kept. **No LLM calls.**  \n"
+        f"Views: not safely auto-cropped **{uncertain_count}** · more than one draft **{multiple_count}** · all **{summary['total']}**.",
     )
 
 
@@ -4305,6 +4317,7 @@ def scan_frame_review_ui(
     trigger_word: str,
     input_folder: str,
     advanced_types: bool,
+    filter_value: str = FRAME_REVIEW_DEFAULT_FILTER,
     progress=gr.Progress(track_tqdm=False),
 ):
     if not trigger_word or not str(trigger_word).strip():
@@ -4470,7 +4483,8 @@ def scan_frame_review_ui(
         "frame_mode": frame_mode,
         "auto_accept_types": auto_accept_types,
     }
-    filtered = _frame_filter_records(state, "review")
+    view = str(filter_value or FRAME_REVIEW_DEFAULT_FILTER)
+    filtered = _frame_filter_records(state, view)
     pages = _frame_page_choices(len(filtered))
     if filtered:
         record = filtered[0]
@@ -4485,9 +4499,9 @@ def scan_frame_review_ui(
         )
         option_gallery, option_radio = _frame_option_gallery_update(record, state)
         position, previous_update, next_update = _frame_viewer_navigation_updates(
-            state, "review", asset_id
+            state, view, asset_id
         )
-        gallery = _frame_review_gallery_update(state, "review", "1", asset_id)
+        gallery = _frame_review_gallery_update(state, view, "1", asset_id)
         return (
             state,
             _frame_review_summary_md(state),
@@ -5570,7 +5584,7 @@ def build_ui() -> gr.Blocks:
                     fr_filter = gr.Dropdown(
                         label=tr("Anzeige", "View"),
                         choices=[(tr(de, en), value) for value, de, en in FRAME_REVIEW_FILTER_CHOICES],
-                        value="review",
+                        value=FRAME_REVIEW_DEFAULT_FILTER,
                         allow_custom_value=False,
                     )
                     fr_page = gr.Dropdown(label=tr("Seite", "Page"), choices=["1"], value="1", allow_custom_value=False)
@@ -5679,6 +5693,18 @@ def build_ui() -> gr.Blocks:
                     "**Pipeline-Auswahl:** ERNIE und Z-Image verwenden strukturierte lokale Captions; Krea 2 verwendet nach der Auswahl natürliche GPT-Captions.",
                     "**Pipeline selection:** ERNIE and Z-Image use structured local captions; Krea 2 uses natural GPT captions after selection.",
                 ))
+                c_pipeline_mode = gr.Radio(
+                    label=tr("Subject Profile: automatisch oder selbst prüfen?", "Subject profile: automatic or review it yourself?"),
+                    choices=[
+                        (tr("Automatisch – Profil erstellen und direkt captionen (Single Pass)", "Automatic – build the profile and caption right away (single pass)"), "single_pass"),
+                        (tr("Selbst prüfen – nach dem Profil anhalten, dann im Tab „3 · Subject Profile“ bearbeiten und Captioning starten", "Review it yourself – pause after the profile, then edit it in the “3 · Subject Profile” tab and start captioning there"), "profile_then_caption"),
+                    ],
+                    value=S["c_pipeline_mode"],
+                    info=tr(
+                        "Das Trainingsziel Krea 2 stellt beim Auswählen auf „Selbst prüfen“. Die Einstellung lässt sich danach frei ändern.",
+                        "Selecting the Krea 2 training target switches to “review it yourself”. You can change it freely afterwards.",
+                    ),
+                )
 
                 with gr.Row():
                     with gr.Column(scale=2):
@@ -5730,8 +5756,8 @@ def build_ui() -> gr.Blocks:
                             choices=OPENAI_MODEL_PRESET_CHOICES,
                             value=S["c_model"],
                             info=tr(
-                                "Hauptmodell für den ersten Audit-Durchlauf. Für Krea 2 empfohlen: `gpt-5.6-luna` ohne Reasoning. Schwierige Grenzfälle können optional an `gpt-5.6-terra` eskaliert werden. Eigene Modellnamen können bei unterstützter Gradio-Version trotzdem eingetragen werden.",
-                                "Main model for the first audit pass. Recommended for Krea 2: `gpt-5.6-luna` without reasoning. Difficult borderline cases can optionally escalate to `gpt-5.6-terra`. On supported Gradio versions, you can still enter custom model names.",
+                                "Hauptmodell für den ersten Audit-Durchlauf. Für Krea 2 empfohlen: `gpt-6-luna` ohne Reasoning. Schwierige Grenzfälle können optional an `gpt-6.1-sol` eskaliert werden. Eigene Modellnamen können bei unterstützter Gradio-Version trotzdem eingetragen werden.",
+                                "Main model for the first audit pass. Recommended for Krea 2: `gpt-6-luna` without reasoning. Difficult borderline cases can optionally escalate to `gpt-6.1-sol`. On supported Gradio versions, you can still enter custom model names.",
                             ),
                             **openai_model_dropdown_kwargs(),
                         )
@@ -5786,7 +5812,7 @@ def build_ui() -> gr.Blocks:
                         "<details>"
                         "<summary><b>ℹ️ Was bedeutet Eskalation und wann brauche ich das?</b></summary>"
                         "\n\n"
-                        "Standardmäßig bewertet ein einziges Modell (`gpt-5.6-luna` empfohlen) "
+                        "Standardmäßig bewertet ein einziges Modell (`gpt-6-luna` empfohlen) "
                         "alle Bilder. Frühere Nano-Modelle haben sich bei schwierigen visuellen Grenzfällen als zu "
                         "ungenau für die Erkennung von Filter-Hauttextur und extremen "
                         "Kamerawinkeln erwiesen – diese Bilder rutschten regelmäßig fälschlich "
@@ -5794,7 +5820,7 @@ def build_ui() -> gr.Blocks:
                         "Hauptmodell nicht klar als "
                         "'gut genug' oder 'rauswerfen' einordnen kann – kann der Curator diese "
                         "Bilder optional an ein **stärkeres zweites Modell** weiterleiten "
-                        "(z. B. `gpt-5.6-terra` oder `gpt-5.6-sol`).\n\n"
+                        "(z. B. `gpt-6.1-sol` oder `gpt-6-astra`).\n\n"
                         "**Drei Auslöser für Eskalation:**\n\n"
                         "**1. Bei Review:** Das Hauptmodell hat das Bild auf 'review' gesetzt "
                         "(also: 'ich kann mich nicht entscheiden') oder die Bewertung liegt im "
@@ -5811,14 +5837,14 @@ def build_ui() -> gr.Blocks:
                         "<details>"
                         "<summary><b>ℹ️ What is escalation and when do I need it?</b></summary>"
                         "\n\n"
-                        "By default, a single model (`gpt-5.6-luna` recommended) scores all "
+                        "By default, a single model (`gpt-6-luna` recommended) scores all "
                         "images. Earlier nano-class models proved too inaccurate at "
                         "spotting filter-smoothed skin and extreme camera angles - those "
                         "images regularly slipped into 'train_ready' incorrectly. For "
                         "**borderline cases** - "
                         "images the main model can't clearly classify as 'keep' or 'reject' - "
                         "the curator can optionally forward these images to a **stronger second "
-                        "model** (e.g. `gpt-5.6-terra` or `gpt-5.6-sol`).\n\n"
+                        "model** (e.g. `gpt-6.1-sol` or `gpt-6-astra`).\n\n"
                         "**Three escalation triggers:**\n\n"
                         "**1. On review:** Main model marked the image as 'review' (i.e. "
                         "'undecided') or the score falls inside the configured window. The "
@@ -5836,13 +5862,13 @@ def build_ui() -> gr.Blocks:
                         label=tr("Eskalation für schwierige Fälle aktivieren", "Enable escalation for difficult cases"),
                         value=S["c_use_review_escalation"],
                         info=tr(
-                            "Empfohlen: zunächst aus. `gpt-5.6-luna` übernimmt den Routine-Audit. "
+                            "Empfohlen: zunächst aus. `gpt-6-luna` übernimmt den Routine-Audit. "
                             "Aktiviere die Eskalation, wenn schwierige Grenzfälle gezielt durch "
-                            "`gpt-5.6-terra` oder `gpt-5.6-sol` nachgeprüft werden sollen. Zusätzliche "
+                            "`gpt-6.1-sol` oder `gpt-6-astra` nachgeprüft werden sollen. Zusätzliche "
                             "Kosten entstehen nur für tatsächlich eskalierte Bilder.",
-                            "Recommended: off initially. `gpt-5.6-luna` handles routine audits. "
+                            "Recommended: off initially. `gpt-6-luna` handles routine audits. "
                             "Enable escalation when difficult borderline cases should be rechecked "
-                            "by `gpt-5.6-terra` or `gpt-5.6-sol`. Extra cost applies only to images "
+                            "by `gpt-6.1-sol` or `gpt-6-astra`. Extra cost applies only to images "
                             "that are actually escalated.",
                         ),
                     )
@@ -5852,8 +5878,8 @@ def build_ui() -> gr.Blocks:
                             choices=[""] + OPENAI_MODEL_PRESET_CHOICES,
                             value=S["c_review_escalation_model"],
                             info=tr(
-                                "Stärkeres Modell für die Eskalation. Leer = Eskalation effektiv aus, auch wenn der Schalter oben an ist. Für Luna als Hauptmodell empfohlen: `gpt-5.6-terra`.",
-                                "Stronger model for escalation. Empty = escalation effectively off, even if the switch above is on. Recommended with Luna as the main model: `gpt-5.6-terra`.",
+                                "Stärkeres Modell für die Eskalation. Leer = Eskalation effektiv aus, auch wenn der Schalter oben an ist. Für Luna als Hauptmodell empfohlen: `gpt-6.1-sol`.",
+                                "Stronger model for escalation. Empty = escalation effectively off, even if the switch above is on. Recommended with Luna as the main model: `gpt-6.1-sol`.",
                             ),
                             **openai_model_dropdown_kwargs(),
                         )
@@ -5862,8 +5888,8 @@ def build_ui() -> gr.Blocks:
                             choices=REASONING_EFFORT_CHOICES,
                             value=S["c_review_escalation_reasoning_effort"],
                             info=tr(
-                                "Reasoning nur für tatsächlich eskalierte Grenzfälle. `low` ist der empfohlene Ausgangspunkt mit Terra; höhere Stufen erhöhen Laufzeit und Tokenverbrauch.",
-                                "Reasoning only for cases that are actually escalated. `low` is the recommended starting point with Terra; higher levels increase latency and token usage.",
+                                "Reasoning nur für tatsächlich eskalierte Grenzfälle. `low` ist der empfohlene Ausgangspunkt mit Sol; höhere Stufen erhöhen Laufzeit und Tokenverbrauch.",
+                                "Reasoning only for cases that are actually escalated. `low` is the recommended starting point with Sol; higher levels increase latency and token usage.",
                             ),
                         )
                     with gr.Row():
@@ -7078,7 +7104,7 @@ def build_ui() -> gr.Blocks:
                             ),
                         )
 
-                with gr.Accordion(tr("🧬 Subject Profile / Pipeline-Modus", "🧬 Subject Profile / pipeline mode"), open=False):
+                with gr.Accordion(tr("🧬 Subject Profile – Modell und Sampling", "🧬 Subject profile – model and sampling"), open=False):
                     gr.Markdown(tr(
                         "Phase 2 baut nach dem Bild-Audit ein zentrales Profil des Models. "
                         "Reject- und Review-Bilder werden dafür ausgeschlossen. Bei großen Datasets "
@@ -7094,25 +7120,13 @@ def build_ui() -> gr.Blocks:
                         "👉 **Editing the profile** and starting captioning from the profile is done "
                         "in the dedicated `🧬 Subject Profile` tab.",
                     ))
-                    c_pipeline_mode = gr.Dropdown(
-                        label=tr("Pipeline-Modus", "Pipeline mode"),
-                        choices=[
-                            (tr("Single Pass – Profil automatisch nutzen", "Single pass – use profile automatically"), "single_pass"),
-                            (tr("Profile then Caption – UI-Gate (Profil-Tab nutzen)", "Profile then caption – UI gate (use Profile tab)"), "profile_then_caption"),
-                        ],
-                        value=S["c_pipeline_mode"],
-                        info=tr(
-                            "Single Pass nutzt das Profil automatisch. Profile then Caption pausiert nach dem Profil-Build, du gehst dann in den Profil-Tab und startest Captioning dort separat.",
-                            "Single pass uses the profile automatically. Profile then Caption pauses after the profile build; switch to the Profile tab to edit and start captioning separately.",
-                        ),
-                    )
                     c_profile_normalizer_model = gr.Dropdown(
                         label=tr("Profile-Normalizer-Modell", "Profile normalizer model"),
                         choices=OPENAI_MODEL_PRESET_CHOICES,
                         value=S["c_profile_normalizer_model"],
                         info=tr(
-                            "Modell für den einen zusätzlichen Profil-Call pro Lauf. Für Krea 2 empfohlen: gpt-5.6-terra mit niedrigem Reasoning.",
-                            "Model for the single additional profile call per run. Recommended for Krea 2: gpt-5.6-terra with low reasoning.",
+                            "Modell für den einen zusätzlichen Profil-Call pro Lauf. Für Krea 2 empfohlen: gpt-6.1-sol mit niedrigem Reasoning.",
+                            "Model for the single additional profile call per run. Recommended for Krea 2: gpt-6.1-sol with low reasoning.",
                         ),
                         **openai_model_dropdown_kwargs(),
                     )
@@ -7234,7 +7248,7 @@ def build_ui() -> gr.Blocks:
                         "**Krea 2** – natural-language captions are generated after selection. "
                         "Stable identity and body traits such as tattoos are stored in the subject profile "
                         "and omitted from captions; scene-specific details remain captioned. Selecting this "
-                        "training target also applies the recommended 20-image, 40/35/25 distribution and Luna/Terra "
+                        "training target also applies the recommended 20-image, 40/35/25 distribution and Luna/Sol "
                         "model defaults.\n\n"
                         "**If unsure:** Choose the training target matching the base model."
                         "</details>",
@@ -7295,8 +7309,8 @@ def build_ui() -> gr.Blocks:
                         choices=OPENAI_MODEL_PRESET_CHOICES,
                         value=S["c_krea_caption_model"],
                         info=tr(
-                            "Nur beim Trainingsziel `Krea 2`: Erstellt nach der finalen Bildauswahl natürliche englische Captions aus Originalbild, Audit und bestätigtem Subject Profile. Empfehlung: gpt-5.6-luna.",
-                            "Only for the `Krea 2` training target: creates natural English captions after final image selection using the original image, audit and confirmed subject profile. Recommended: gpt-5.6-luna.",
+                            "Nur beim Trainingsziel `Krea 2`: Erstellt nach der finalen Bildauswahl natürliche englische Captions aus Originalbild, Audit und bestätigtem Subject Profile. Empfehlung: gpt-6-luna.",
+                            "Only for the `Krea 2` training target: creates natural English captions after final image selection using the original image, audit and confirmed subject profile. Recommended: gpt-6-luna.",
                         ),
                         **openai_model_dropdown_kwargs(),
                     )
@@ -7323,8 +7337,8 @@ def build_ui() -> gr.Blocks:
                             choices=OPENAI_MODEL_PRESET_CHOICES,
                             value=S["c_krea_caption_repair_model"],
                             info=tr(
-                                "Wird ausschließlich nach einem fehlgeschlagenen oder regelwidrigen ersten Caption-Versuch aufgerufen. Empfehlung: gpt-5.6-terra.",
-                                "Called only after a failed or policy-invalid first caption attempt. Recommended: gpt-5.6-terra.",
+                                "Wird ausschließlich nach einem fehlgeschlagenen oder regelwidrigen ersten Caption-Versuch aufgerufen. Empfehlung: gpt-6.1-sol.",
+                                "Called only after a failed or policy-invalid first caption attempt. Recommended: gpt-6.1-sol.",
                             ),
                             **openai_model_dropdown_kwargs(),
                         )
@@ -8292,7 +8306,7 @@ def build_ui() -> gr.Blocks:
             # ── Frame module callbacks with multiple candidate selection ──
             fr_scan_btn.click(
                 fn=scan_frame_review_ui,
-                inputs=[w_trigger, w_input, w_frame_advanced],
+                inputs=[w_trigger, w_input, w_frame_advanced, fr_filter],
                 outputs=[fr_state, fr_summary, fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
                 concurrency_id="frame_review_local",
             ).then(

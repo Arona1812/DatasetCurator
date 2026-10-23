@@ -22,9 +22,9 @@ The image curator follows the processing order in the UI:
 
 1. **Start / Project** — set the image folder, trigger word, and API key.
 2. **Preflight** — run local file and pHash duplicate checks. No OpenAI request is made. Every source image already receives a persistent integer asset ID during project initialization; frame navigation uses that ID instead of filenames or gallery positions.
-3. **Frames** *(optional)* — inspect local crop suggestions, keep the original, or define a manual crop. The local detector finds photos inside app screenshots, story canvases, polaroid frames and collages; an inner photo is always proposed first, the outer frame crop stays available as an alternative.
+3. **Frames** *(optional)* — inspect local crop suggestions, keep the original, or define a manual crop. The local detector finds photos inside app screenshots, story canvases, polaroid frames and collages; an inner photo is always proposed first, the outer frame crop stays available as an alternative. The view can be set to **Not safely auto-cropped**, **More than one draft** or **All images**.
 4. **Audit & Selection** — run quality, identity, diversity, and caption processing.
-5. **Subject Profile** — review the profile when using `Profile then Caption`, or let `Single Pass` continue automatically.
+5. **Subject Profile** — choose at the top of **Audit & Selection**: **Automatic** (single pass) runs through, **Review it yourself** pauses after the profile.
 6. **Results** — inspect the exported training, review, and cleanup buckets.
 
 ## Requirements
@@ -76,8 +76,9 @@ python dataset_curator_ui.py
 2. Click **Run preflight**. Later modules unlock after the local checks finish.
 3. Optionally use **Frames** to choose a local crop suggestion, retain the original, or mark a rectangular manual crop with two clicks on diagonally opposite corners.
 4. In **Audit & Selection**, choose the training target and configure the desired audit, identity, diversity, and caption settings.
-   - **Single Pass** creates the profile and completes the workflow.
-   - **Profile then Caption** pauses after profile generation so you can review canonical traits, clusters, favorites, and caption policies.
+   The choice **Subject profile: automatic or review it yourself?** sits directly below the training target.
+   - **Automatic (single pass)** creates the profile and completes the workflow.
+   - **Review it yourself (profile then caption)** pauses after profile generation so you can review canonical traits, clusters, favorites, and caption policies.
 5. Review the result in `curated_<trigger>/`. Key folders include:
    - `01_train_ready` — exported images and captions for training
    - `02_keep_unused` — good images not selected for the target size
