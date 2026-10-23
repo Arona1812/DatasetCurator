@@ -60,7 +60,7 @@ if errorlevel 1 (
         echo Step 2 of 3: Installing/repairing dependencies
         echo       This may take a few minutes
         echo.
-        call :do_install
+        call :do_install %*
         if errorlevel 1 goto err_install
     )
 
@@ -136,7 +136,7 @@ exit /b 0
 :: ============================================================
 :verify_dependencies
 
-python -c "import importlib.util, sys; mods=['requests','PIL','numpy','scipy','mediapipe','torch','torchvision','open_clip','cv2','onnxruntime','sklearn','gradio']; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print('      Python ' + sys.version.split()[0]); print('      Missing core: ' + (', '.join(missing) if missing else 'none')); sys.exit(1 if missing else 0)"
+python check_runtime.py
 
 exit /b %errorlevel%
 
@@ -146,7 +146,7 @@ exit /b %errorlevel%
 :: ============================================================
 :verify_optional_dependencies
 
-python -c "import importlib.util, sys; mods=['insightface']; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print('      Missing optional: ' + (', '.join(missing) if missing else 'none')); sys.exit(1 if missing else 0)"
+python check_runtime.py --optional
 
 exit /b %errorlevel%
 
@@ -156,29 +156,45 @@ exit /b %errorlevel%
 :: ============================================================
 :do_install
 
+if /I "%~1"=="--cpu" (
+    python -m pip install --upgrade pip setuptools wheel
+    if errorlevel 1 exit /b 1
+    python -m pip install -r requirements.txt
+    if errorlevel 1 exit /b 1
+    exit /b 0
+)
+
 echo       - pip upgrade
 python -m pip install --upgrade pip setuptools wheel
+if errorlevel 1 exit /b 1
 
 echo       - Base packages
 python -m pip install requests pillow numpy scipy
+if errorlevel 1 exit /b 1
 
 echo       - MediaPipe
 python -m pip install mediapipe==0.10.33
+if errorlevel 1 exit /b 1
 
 echo       - PyTorch + CUDA
 python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu130
+if errorlevel 1 exit /b 1
 
 echo       - OpenCLIP
 python -m pip install open_clip_torch
+if errorlevel 1 exit /b 1
 
 echo       - OpenCV, scikit-learn
 python -m pip install opencv-python scikit-learn
+if errorlevel 1 exit /b 1
 
 echo       - ONNX Runtime (GPU)
 python -m pip install onnxruntime-gpu
+if errorlevel 1 exit /b 1
 
 echo       - Gradio UI
-python -m pip install gradio
+python -m pip install "gradio>=5,<7"
+if errorlevel 1 exit /b 1
 
 call :do_install_optional
 
@@ -210,9 +226,11 @@ python -m pip uninstall -y onnxruntime
 
 echo       - Installing GPU onnxruntime
 python -m pip install onnxruntime-gpu
+if errorlevel 1 exit /b 1
 
 echo       - Verifying insightface is up to date
 python -m pip install --upgrade insightface
+if errorlevel 1 exit /b 1
 
 exit /b 0
 

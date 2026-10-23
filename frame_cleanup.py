@@ -55,7 +55,7 @@ try:
 except Exception:  # pragma: no cover - isolated loading of this module
     local_vision = None
 
-FRAME_DETECTOR_SCHEMA_VERSION = "smart-frame-v6-content-rectangles"
+FRAME_DETECTOR_SCHEMA_VERSION = "smart-frame-v7-content-rectangles-complete-frame"
 FRAME_USER_DECISION_SCHEMA_VERSION = "v2-asset-id"
 FRAME_DECISION_FILENAME = "_frame_cleanup_decisions.json"
 FRAME_CACHE_SUBDIR = "frame_cleanup"
@@ -221,7 +221,7 @@ def save_user_decision(
 ) -> Dict[str, Any]:
     payload = load_user_decisions(output_root)
     normalized = str(decision or "auto").strip().lower()
-    if normalized not in {"auto", "accept", "keep_original", "manual"}:
+    if normalized not in {"auto", "accept", "keep_original", "manual", "exclude"}:
         raise ValueError(f"unsupported frame decision: {decision}")
     normalized_asset_id = int(asset_id) if asset_id not in (None, "") and int(asset_id) > 0 else None
     decision_key = f"asset:{normalized_asset_id}" if normalized_asset_id is not None else source_hash
@@ -246,6 +246,31 @@ def save_user_decision(
     payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     atomic_write_json(user_decision_path(output_root), payload)
     return record
+
+
+def filter_excluded_sources(image_paths: Iterable[str], output_root: str):
+    """Remove manual dataset exclusions before audits, independently of crops."""
+    decisions = load_user_decisions(output_root).get("decisions", {})
+    # Decisions are keyed by "asset:<id>" since the asset-ID migration and by
+    # source hash in older files; the record itself always carries the hash.
+    excluded_hashes = set()
+    for key, value in decisions.items():
+        if not isinstance(value, dict) or value.get("decision") != "exclude":
+            continue
+        excluded_hashes.add(str(value.get("source_hash") or key))
+        if not str(key).startswith("asset:"):
+            excluded_hashes.add(str(key))
+    survivors, rows = [], []
+    for path in image_paths:
+        if not excluded_hashes or file_sha1(path) not in excluded_hashes:
+            survivors.append(path)
+            continue
+        rows.append({"original_filename": os.path.basename(path), "original_path": os.path.abspath(path),
+                     "base_status": "reject", "final_status": "reject", "quality_total": 0,
+                     "short_reason": "user_excluded_in_frames", "status_notes": ["user_excluded_in_frames"],
+                     "selected": False, "output_bucket": "", "new_basename": "",
+                     "frame_cleanup_user_decision": "exclude"})
+    return survivors, rows
 
 
 def reset_user_decisions(output_root: str) -> int:
@@ -483,6 +508,19 @@ def _detect_subject_regions(
     return regions, sources
 
 
+def _bbox_preserves_faces(bbox: List[int], faces: List[Tuple[int, int, int, int]]) -> Tuple[bool, List[str]]:
+    """Face-only safety check used by the photo_regions refinements."""
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    flags: List[str] = []
+    for x, y, width, height in faces:
+        fx1, fy1, fx2, fy2 = x, y, x + width, y + height
+        intersection = max(0, min(x2, fx2) - max(x1, fx1)) * max(0, min(y2, fy2) - max(y1, fy1))
+        area = max(1, width * height)
+        if intersection / float(area) < 0.92:
+            flags.append("candidate_may_cut_detected_face")
+    return not flags, flags
+
+
 def _bbox_preserves_subject(
     bbox: List[int],
     subject_regions: List[List[int]],
@@ -671,7 +709,9 @@ def _corner_layout_metrics(img: np.ndarray) -> Dict[str, Any]:
     top_dark = float(np.mean(gray[:band] < 35))
     bottom_dark = float(np.mean(gray[h - band:] < 35))
     aspect = h / float(max(1, w))
-    app_screenshot = bool(aspect >= 2.0 and top_dark >= 0.70 and bottom_dark >= 0.65)
+    # Story headers can extend into the first 8% band. The old 70% cutoff
+    # misclassified these screenshots as safe, simple top/bottom bars.
+    app_screenshot = bool(aspect >= 2.0 and top_dark >= 0.60 and bottom_dark >= 0.65)
     vertical_story_canvas = bool(
         aspect >= 1.45
         and horizontal_symmetry <= 22.0
@@ -2033,10 +2073,98 @@ def _analyse_preview(
     weak_content = [c for c in content_candidates if c not in strong_content]
     # Innermost photo first (user policy), then the remaining proposals.
     candidates = strong_content + deduped_legacy + weak_content
+    # When a content rectangle already leads with solid per-side support, the
+    # photo_regions refinements below only add alternatives behind it.
+    content_lead = bool(strong_content)
 
+    app_photo_candidates = []
+    if settings.advanced_types and bool(layout_metrics.get("app_screenshot")):
+        from photo_regions import app_photo_viewport, colour_inset_photo
+        viewport = app_photo_viewport(preview)
+        inset = colour_inset_photo(preview) if cv2 is not None else None
+        for box, signal in ((viewport,"app_photo_texture_viewport"),(inset,"colour_inset_photo")):
+            if not box:
+                continue
+            original_box = _scale_preview_bbox_to_original(box,(w,h),original_size)
+            safe,_ = _bbox_preserves_faces(box,faces)
+            if safe and min(original_box[2]-original_box[0],original_box[3]-original_box[1]) >= settings.min_content_px:
+                app_photo_candidates.append({"bbox":original_box,"preview_bbox":box,"sides":["inner_photo"],
+                    "side_details":{},"confidence":.74,"face_safe":True,
+                    "retained_area_ratio":(box[2]-box[0])*(box[3]-box[1])/(w*h),
+                    "signals":[signal],"crop_type":"nested_inner_image"})
+
+    if settings.advanced_types and candidates and nested_context and not content_lead:
+        from photo_regions import expand_photo_region, refine_photo_region
+        expanded = expand_photo_region(preview, candidates[0]["preview_bbox"])
+        if expanded:
+            recovered = dict(candidates[0])
+            recovered.update(
+                bbox=_scale_preview_bbox_to_original(expanded["bbox"], (w, h), original_size),
+                preview_bbox=expanded["bbox"], retained_area_ratio=round(expanded["area"], 5),
+                confidence=.74, crop_type="nested_inner_image",
+                signals=["photo_area_recovered"], side_details={},
+            )
+            candidates.insert(0, recovered)
+        refined = refine_photo_region(preview, candidates[0]["preview_bbox"])
+        if refined:
+            photo_bbox = _scale_preview_bbox_to_original(refined["bbox"], (w,h), original_size)
+            face_safe, _ = _bbox_preserves_faces(refined["bbox"], faces)
+            if face_safe and min(photo_bbox[2]-photo_bbox[0], photo_bbox[3]-photo_bbox[1]) >= settings.min_content_px:
+                candidates.insert(0, {
+                    "bbox": photo_bbox, "preview_bbox": refined["bbox"], "sides": ["inner_photo"],
+                    "side_details": {}, "confidence": .74, "face_safe": True,
+                    "retained_area_ratio": round(refined["area"],5),
+                    "signals": ["photo_region_refined", f"photo_seam_support:{refined['support']:.3f}"],
+                    "crop_type": "nested_inner_image",
+                })
+
+    if candidates and bool(layout_metrics.get("uniform_canvas")) and not content_lead:
+        from photo_regions import complete_black_frame
+        complete_frame = complete_black_frame(preview, min(min_border_x, min_border_y))
+        if complete_frame and complete_frame[1] >= min_border_y and h-complete_frame[3] >= min_border_y:
+            base = candidates[0]["preview_bbox"]
+            # Fill only an omitted outside edge. Never tighten an existing
+            # photo boundary or replace a recovered complete photo.
+            box = [complete_frame[i] if base[i] == (0 if i<2 else w if i==2 else h) else base[i] for i in range(4)]
+            completed = _scale_preview_bbox_to_original(box, (w,h), original_size)
+            safe, _ = _bbox_preserves_faces(box, faces)
+            if box != base and safe and min(completed[2]-completed[0], completed[3]-completed[1]) >= min(256, settings.min_content_px):
+                candidates.insert(0, {"bbox":completed,"preview_bbox":box,
+                    "sides":[side for side,distance in zip(("left","top","right","bottom"),(box[0],box[1],w-box[2],h-box[3])) if distance>0],
+                    "side_details":{},"confidence":.95,"face_safe":True,
+                    "retained_area_ratio":(box[2]-box[0])*(box[3]-box[1])/(w*h),
+                    "signals":["complete_black_frame"],"crop_type":"uniform_canvas"})
+
+    # Dedicated app domains supersede outer-shell crops; keep every previous
+    # alternative available. Both rules always require explicit review.
+    for choice in app_photo_candidates:
+        base = candidates[0] if candidates else None
+        outside_shell = bool(base and base["preview_bbox"][0]<=2 and base["preview_bbox"][2]>=w-2
+                             and base.get("crop_type") != "nested_inner_image")
+        if ("colour_inset_photo" in choice["signals"] or outside_shell) and not content_lead:
+            candidates.insert(0, choice)
+        else:
+            candidates.append(choice)
+        nested_candidates.insert(0,choice)
     best = candidates[0] if candidates else None
     confidence = float(best.get("confidence", 0)) if best else 0.0
     layout_flags: List[str] = []
+    if best and min(best["bbox"][2]-best["bbox"][0], best["bbox"][3]-best["bbox"][1]) < settings.min_content_px:
+        layout_flags.append("content_below_minimum")
+    # Legacy side-seam proposals inside app screenshots get an extra seam
+    # check. Content-rectangle proposals already carry their own per-side
+    # support and cap their confidence when a side lacks a straight seam.
+    if (
+        best
+        and settings.advanced_types
+        and nested_context
+        and "complete_black_frame" not in best.get("signals", [])
+        and not best.get("content_source")
+    ):
+        from photo_regions import boundary_evidence as photo_boundary_evidence
+        seam_support, _ = photo_boundary_evidence(preview, best["preview_bbox"])
+        if seam_support and min(seam_support) < .60:
+            layout_flags.append("photo_boundary_uncertain")
     if best and str(best.get("crop_type", "")) == "nested_inner_image":
         layout_flags.append("nested_inner_image_detected")
     elif any(str(c.get("crop_type", "")) == "nested_inner_image" for c in candidates):
@@ -2064,6 +2192,8 @@ def _analyse_preview(
             "nested_app_screenshot" in layout_flags
             and float((best or {}).get("edge_min_support", 0.0) or 0.0) < 0.75
         )
+        or "content_below_minimum" in layout_flags
+        or "photo_boundary_uncertain" in layout_flags
         or "overlay_crosses_frame_boundary" in layout_flags
         or "nested_inner_image_detected" in layout_flags
         or str((best or {}).get("crop_type", "")) == "nested_inner_image"
@@ -2246,16 +2376,52 @@ def materialize_crop(
     return destination
 
 
+def automatic_crop_bbox(analysis: Dict[str, Any], mode: str, allowed_types: Iterable[str]) -> Optional[List[int]]:
+    """One policy for the UI queue and the actual pipeline crop.
+
+    Complex layouts always require a decision, even if their type is allowed.
+    """
+    if set(analysis.get("layout_flags") or []) & {
+        "nested_app_screenshot", "nested_inner_image_detected", "overlay_crosses_frame_boundary",
+        "semantic_review_required",
+        "photo_boundary_uncertain",
+        "content_below_minimum",
+    } or analysis.get("layout_class") in {"collage", "circular_crop"} or analysis.get("crop_type") in {"nested_inner_image", "semantic_photo"}:
+        return None
+    level = analysis.get("confidence_level", "low")
+    eligible = (mode == "auto_high_review_medium" and level == "high") or (
+        mode == "auto_high_keep_medium" and level in {"high", "medium"}
+    )
+    bbox = analysis.get("candidate_bbox")
+    if eligible and analysis.get("crop_type") in set(allowed_types) and isinstance(bbox, list) and len(bbox) == 4:
+        return list(bbox)
+    return None
+
+
+def frame_needs_review(analysis: Dict[str, Any], mode: str, allowed_types: Iterable[str], user_decision: str = "auto") -> bool:
+    if user_decision != "auto":
+        return False
+    if automatic_crop_bbox(analysis, mode, allowed_types) is not None:
+        return False
+    return analysis.get("confidence_level") in {"high", "medium"} or analysis.get("recommendation") == "review"
+
+
 def resolve_frame_cleanup(
     image_path: str,
     source_hash: str,
     cache_dir: str,
     output_root: str,
-    mode: str = "auto_high_review_medium",
+    mode: str = "suggest_only",
     settings: Optional[DetectorSettings] = None,
     asset_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     analysis = analyze_frame_cleanup(image_path, cache_dir, source_hash, settings=settings, use_cache=True)
+    # Semantic proposals are optional, separately cached, and never auto-applied.
+    from vision_frames import load_photo_proposal, attach_photo_proposal
+    semantic = load_photo_proposal(cache_dir, source_hash)
+    if semantic:
+        analysis = dict(analysis)
+        attach_photo_proposal(analysis, semantic)
     user_payload = load_user_decisions(output_root)
     decisions = user_payload.get("decisions", {}) or {}
     normalized_asset_id = int(asset_id) if asset_id not in (None, "") and int(asset_id) > 0 else None
@@ -2270,18 +2436,17 @@ def resolve_frame_cleanup(
         applied_by = f"user_{user_decision}"
     elif user_decision == "keep_original":
         applied_by = "user_keep_original"
+    elif user_decision == "exclude":
+        applied_by = "user_exclude"
     else:
-        mode = str(mode or "auto_high_review_medium")
+        mode = str(mode or "suggest_only")
         crop_type = str(analysis.get("crop_type", "unknown") or "unknown")
-        allowed_types = {str(v) for v in (settings.auto_accept_types if settings else ())}
-        type_allowed = crop_type in allowed_types
-        if mode == "auto_high_review_medium" and analysis.get("confidence_level") == "high" and type_allowed:
-            bbox = analysis.get("candidate_bbox")
-            applied_by = f"auto_high:{crop_type}"
-        elif mode == "auto_high_keep_medium" and analysis.get("confidence_level") in {"high", "medium"} and type_allowed:
-            bbox = analysis.get("candidate_bbox")
-            applied_by = f"auto_high_or_medium:{crop_type}"
-        elif mode in {"auto_high_review_medium", "auto_high_keep_medium"} and analysis.get("confidence_level") in {"high", "medium"} and not type_allowed:
+        allowed_types = settings.auto_accept_types if settings else DetectorSettings().auto_accept_types
+        bbox = automatic_crop_bbox(analysis, mode, allowed_types)
+        if bbox is not None:
+            prefix = "auto_high" if mode == "auto_high_review_medium" else "auto_high_or_medium"
+            applied_by = f"{prefix}:{crop_type}"
+        elif mode in {"auto_high_review_medium", "auto_high_keep_medium"} and frame_needs_review(analysis, mode, allowed_types):
             applied_by = f"policy_review:{crop_type}"
         elif mode == "suggest_only":
             applied_by = "suggest_only"
@@ -2299,6 +2464,10 @@ def resolve_frame_cleanup(
         "frame_cleanup_applied": effective_path != image_path,
         "frame_cleanup_applied_by": applied_by,
         "frame_cleanup_user_decision": user_decision,
+        "dataset_excluded": user_decision == "exclude",
+        "frame_cleanup_review_pending": frame_needs_review(
+            analysis, mode, (settings or DetectorSettings()).auto_accept_types, user_decision
+        ),
         "frame_cleanup_bbox": [int(v) for v in bbox] if isinstance(bbox, list) and len(bbox) == 4 else None,
         "frame_cleanup_analysis": analysis,
     }

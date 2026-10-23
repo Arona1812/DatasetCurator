@@ -22,6 +22,7 @@ import signal
 import time
 import uuid
 import warnings
+import tempfile
 from glob import glob
 from collections import Counter
 from pathlib import Path
@@ -29,12 +30,14 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import gradio as gr
 from PIL import Image, ImageDraw, ImageOps
+from initial_captions import ENGINES as INITIAL_CAPTION_ENGINES, FLORENCE_TASKS
+
+from openai_models import MODEL_CHOICES, FRAME_VISION_MODEL, model_preset
+from frame_group_review import build_group_plan, validate_group_selection
+from vision_frames import propose_photo_region, load_photo_proposal, attach_photo_proposal
 
 from curator_core import (
     APP_VERSION,
-    MODEL_AUDIT_DEFAULT,
-    MODEL_BALANCED_DEFAULT,
-    OPENAI_MODEL_PRESETS,
     migrate_openai_model_name,
     atomic_write_json as core_atomic_write_json,
     normalize_run_config_payload,
@@ -58,6 +61,8 @@ from preflight import (
 from frame_cleanup import (
     DetectorSettings as SmartFrameDetectorSettings,
     analyze_frame_cleanup,
+    automatic_crop_bbox,
+    frame_needs_review,
     build_review_preview,
     decision_summary as frame_decision_summary,
     file_sha1 as frame_file_sha1,
@@ -143,9 +148,6 @@ UI_CSS = """
     text-align: center;
     align-self: center;
     min-width: 160px;
-}
-.manual-crop-marker img {
-    cursor: crosshair !important;
 }
 """
 
@@ -288,11 +290,11 @@ DEFAULTS: Dict[str, Any] = {
     "c_input": r"",
     "c_target": 30,
     "c_api_key": "",
-    "c_model": MODEL_AUDIT_DEFAULT,
+    "c_model": "gpt-6-luna",
     "c_audit_reasoning_effort": "none",
     "c_openai_token_limit": 0,
     "c_use_trigger_check": False,
-    "c_trigger_model": MODEL_AUDIT_DEFAULT,
+    "c_trigger_model": "gpt-6-luna",
     "c_trigger_reasoning_effort": "none",
     "c_use_review_escalation": False,
     "c_review_escalation_model": "",
@@ -337,7 +339,7 @@ DEFAULTS: Dict[str, Any] = {
     # IG-Frame-Detection
     "c_ig_frame_crop": True,
     "c_ig_two_stage_bar": True,
-    "c_frame_cleanup_mode": "auto_high_keep_medium",
+    "c_frame_cleanup_mode": "suggest_only",
     "c_frame_pause_on_medium": False,
     "c_frame_auto_accept_types": ["uniform_canvas", "story_bars"],
     "c_post_frame_phash_refresh": True,
@@ -379,14 +381,17 @@ DEFAULTS: Dict[str, Any] = {
     "c_caption_profile": "ernie",  # legacy settings key
     "c_captions": list(SHARED_COMPACT_CAPTION_FIELDS),
     "c_variable_feature_mode": "canonical_deviations",
-    "c_krea_caption_model": MODEL_AUDIT_DEFAULT,
+    "c_krea_caption_model": "gpt-6-luna",
+    "c_initial_caption_engine": "florence2",
+    "c_initial_caption_task": "<MORE_DETAILED_CAPTION>",
+    "c_caption_composition_mode": "local",
     "c_krea_caption_reasoning_effort": "none",
     "c_use_krea_caption_repair": True,
-    "c_krea_caption_repair_model": MODEL_BALANCED_DEFAULT,
+    "c_krea_caption_repair_model": "gpt-6.1-sol",
     "c_krea_caption_repair_reasoning_effort": "low",
     # Subject Profile / Phase 2
     "c_pipeline_mode": "single_pass",
-    "c_profile_normalizer_model": MODEL_BALANCED_DEFAULT,
+    "c_profile_normalizer_model": "gpt-6.1-sol",
     "c_profile_reasoning_effort": "low",
     "c_profile_sample_threshold": 100,
     "c_profile_sample_size": 80,
@@ -414,9 +419,7 @@ REASONING_EFFORT_CHOICES: List[str] = [
     "max",
 ]
 
-# GPT-6 presets live in curator_core; custom model names stay possible in the
-# dropdowns (allow_custom_value).
-OPENAI_MODEL_PRESET_CHOICES: List[str] = list(OPENAI_MODEL_PRESETS)
+OPENAI_MODEL_PRESET_CHOICES: List[str] = list(MODEL_CHOICES)
 
 CAPTION_FIELD_CHOICES: List[str] = [
     "include_gender_class",
@@ -461,35 +464,47 @@ CAPTION_PROFILE_PRESETS: Dict[str, List[str]] = {
 }
 
 
-def normalize_training_target(value: Optional[str]) -> str:
-    v = (value or "").strip().lower()
-    if v in {"ernie", "shared_compact"}:
-        return "ernie"
-    if v in {"z_image_base", "z-image_base", "zimage", "z_image"}:
-        return "z_image_base"
-    if v in {"krea2", "krea_2", "krea2_character", "krea_2_character"}:
-        return "krea2"
-    return "ernie"
+from training_targets import (
+    normalize_training_target, caption_profile_for_training_target, IMAGE_TARGETS,
+    image_target, is_krea_target,
+)
 
 
-def caption_profile_for_training_target(value: Optional[str]) -> str:
-    target = normalize_training_target(value)
-    return "krea2_character" if target == "krea2" else target
+def training_target_choices():
+    return [(t.label, t.key) for t in IMAGE_TARGETS.values()]
 
 
-def training_target_choices() -> List[Tuple[str, str]]:
-    return [
-        (tr("ERNIE Image", "ERNIE Image"), "ernie"),
-        (tr("Z-Image Base", "Z-Image Base"), "z_image_base"),
-        (tr("Krea 2", "Krea 2"), "krea2"),
-    ]
+def training_target_details_ui(value):
+    target = image_target(value)
+    caption = tr("strukturierte JSON-Captions", "structured JSON captions") if target.caption_format == "ideogram_json" else tr("natürliche Text-Captions", "natural text captions")
+    engine = tr("Zusammensetzung aus Audit und Profil; Erstbeschreibung separat wählbar", "composition from audit and profile; initial description chosen separately")
+    if target.key in {"ernie", "z_image_base", "krea2"}:
+        preset = tr("Eigenes Caption-Feld-Preset vorhanden.", "Dedicated caption-field preset available.")
+    elif target.key == "krea2_turbo":
+        preset = tr("Verwendet derzeit die allgemeinen Z-Image-Felder; ein eigenes Turbo-Preset ist noch nicht validiert.",
+                    "Currently uses the general Z-Image fields; a dedicated Turbo preset has not been validated.")
+    else:
+        preset = tr("Verwendet derzeit die allgemeinen Z-Image-Felder; ein eigenes Ziel-Preset ist noch nicht validiert.",
+                    "Currently uses the general Z-Image fields; a dedicated target preset has not been validated.")
+    return tr(
+        f"**{target.label}:** {caption}, {engine}. Bildaudit und Profil sind vom Trainingsziel unabhängig. "
+        f"{preset} "
+        "Export für einzelne RGB-Bilder; Referenzpaare und Transparenz werden noch nicht exportiert. "
+        "AI-Toolkit-Unterstützung geprüft; Trainingsqualität dieses Exportprofils noch nicht gemessen. "
+        "Ein Zielwechsel setzt die Caption-Felder auf das Ziel-Preset zurück; andere Einstellungen bleiben erhalten.",
+        f"**{target.label}:** {caption}, {engine}. Image audit and profile are generator-independent. "
+        f"{preset} "
+        "Single RGB image export; reference pairs and transparency are not exported yet. "
+        "AI Toolkit support checked; training quality of this export profile has not been measured. "
+        "Changing targets resets caption fields to the target preset; other settings are preserved.",
+    )
 
 
 def get_caption_preset_values(target: Optional[str]) -> List[str]:
     normalized = normalize_training_target(target)
     if normalized in CAPTION_PROFILE_PRESETS:
         return list(CAPTION_PROFILE_PRESETS[normalized])
-    return list(DEFAULTS["c_captions"])
+    return list(Z_IMAGE_BASE_CAPTION_FIELDS)
 
 
 def resolve_caption_fields_for_target(
@@ -517,16 +532,9 @@ def apply_training_target_defaults(
     krea_caption_reasoning_effort: str,
     pipeline_mode: str,
 ):
-    """Load target defaults. Later checkbox edits never change the target."""
+    """Change only target-specific caption fields; preserve unrelated user choices."""
     normalized = normalize_training_target(target)
     fields = resolve_caption_fields_for_target(normalized, current_fields)
-    if normalized == "krea2":
-        return (
-            fields, 20, 0.40, 0.35, 0.25,
-            MODEL_AUDIT_DEFAULT, "none", "none", "low",
-            MODEL_BALANCED_DEFAULT, "low", MODEL_AUDIT_DEFAULT, "none",
-            "profile_then_caption",
-        )
     return (
         fields, target_size, ratio_h, ratio_m, ratio_f,
         audit_model, audit_reasoning_effort, trigger_reasoning_effort,
@@ -538,7 +546,7 @@ def apply_training_target_defaults(
 
 def caption_policy_adjustment_note(target: Optional[str], selected_fields: Optional[List[str]]) -> str:
     normalized = normalize_training_target(target)
-    preset = set(CAPTION_PROFILE_PRESETS.get(normalized, []))
+    preset = set(get_caption_preset_values(normalized))
     selected = set(selected_fields or [])
     if selected == preset:
         return tr("✅ Standardregeln des Trainingsziels aktiv.", "✅ Training-target default rules active.")
@@ -678,6 +686,8 @@ def save_settings_fn(
     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size,
     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
+    c_initial_caption_engine, c_initial_caption_task,
+    c_caption_composition_mode,
     # Video
     v_source, v_target, v_ref, v_fpm, v_fps, v_sim, v_sharp,
 ):
@@ -719,7 +729,7 @@ def save_settings_fn(
         "c_subject_min_torso": c_subject_min_torso,
         "c_ig_frame_crop": c_ig_frame_crop,
         "c_ig_two_stage_bar": c_ig_two_stage_bar,
-        "c_frame_cleanup_mode": str(c_frame_cleanup_mode or "auto_high_keep_medium"),
+        "c_frame_cleanup_mode": str(c_frame_cleanup_mode or "suggest_only"),
         "c_frame_pause_on_medium": bool(c_frame_pause_on_medium),
         "c_use_clip": c_use_clip, "c_use_phash": c_use_phash,
         "c_phash_thresh": c_phash_thresh, "c_clip_thresh": c_clip_thresh,
@@ -759,6 +769,9 @@ def save_settings_fn(
         "c_exp_review": c_exp_review, "c_exp_reject": c_exp_reject,
         "c_exp_compare": c_exp_compare,
         "c_controlled_buckets": c_controlled_buckets,
+        "c_initial_caption_engine": c_initial_caption_engine,
+        "c_initial_caption_task": c_initial_caption_task,
+        "c_caption_composition_mode": c_caption_composition_mode,
         "v_source": v_source, "v_target": v_target, "v_ref": v_ref,
         "v_fpm": v_fpm, "v_fps": v_fps, "v_sim": v_sim, "v_sharp": v_sharp,
     }
@@ -1042,6 +1055,13 @@ def save_subject_profile_ui(trigger_word: str, input_folder: str, profile_json_t
         if not isinstance(profile, dict):
             return tr("❌ Profil muss ein JSON-Objekt sein.", "❌ Profile must be a JSON object.")
         profile["force_only_when_visible"] = True
+        # Saving the editable JSON is also an explicit profile decision. Keep
+        # it authoritative during the same rebuilds as the guided editor.
+        profile["user_confirmed_identity_overrides"] = {
+            key: dict(profile[key])
+            for key in ("stable_identity", "canonical_features", "identity_markers")
+            if isinstance(profile.get(key), dict)
+        }
         os.makedirs(os.path.dirname(path), exist_ok=True)
         core_atomic_write_json(path, profile)
         return tr(f"✅ Profil gespeichert: {path}", f"✅ Profile saved: {path}")
@@ -1411,6 +1431,20 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
         notes_md = "**" + tr("Normalizer-Notizen", "Normalizer notes") + ":**\n\n" + "\n".join(f"- {n}" for n in notes[:12])
     else:
         notes_md = tr("_Keine Normalizer-Notizen._", "_No normalizer notes._")
+    caption_evidence = profile.get("initial_caption_evidence_summary") or {}
+    if caption_evidence.get("providers"):
+        agreements = sum((caption_evidence.get("agreements") or {}).values())
+        conflicts = sum((caption_evidence.get("conflicts") or {}).values())
+        unverified = sum((caption_evidence.get("unverified") or {}).values())
+        notes_md += "\n\n**" + tr("Erstbeschreibung gegen Bildaudit", "Initial description versus image audit") + "**"
+        notes_md += tr(f"\n\n{agreements} Übereinstimmungen · {conflicts} Widersprüche · {unverified} zusätzliche, ungeprüfte Hinweise. "
+                       "Nur Übereinstimmungen stützen das Profil; die Bildaudits bleiben maßgeblich.",
+                       f"\n\n{agreements} agreements · {conflicts} conflicts · {unverified} additional unverified cues. "
+                       "Only agreements support the profile; image audits remain authoritative.")
+        for example in (caption_evidence.get("review_examples") or [])[:12]:
+            filename = str(example.get("filename") or "").replace("`", "'")
+            labels = list((example.get("conflicts") or {})) + list((example.get("unverified") or {}))
+            notes_md += f"\n- `{filename}`: " + ", ".join(labels)
 
     raw_json = json.dumps(profile, ensure_ascii=False, indent=2)
 
@@ -1448,6 +1482,10 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
             f"✅ Profil geladen — Sample {sample}/{total} | {model} | schema {schema}",
             f"✅ Profile loaded — sample {sample}/{total} | {model} | schema {schema}",
         )
+    if caption_evidence.get("providers"):
+        conflicts = sum((caption_evidence.get("conflicts") or {}).values())
+        status += tr(f" | Erstcaption-Gegenprüfung: {conflicts} Widersprüche",
+                     f" | initial-caption cross-check: {conflicts} conflicts")
 
     return (
         profile, raw_json,
@@ -1473,54 +1511,10 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
     )
 
 
-def save_profile_from_editor(
-    trigger_word: str,
-    input_folder: str,
-    raw_profile_json: str,
-    gender: str,
-    skin_tone: str,
-    eye_color: str,
-    hair_texture: str,
-    body_build: str,
-    body_height_impression: str,
-    hair_color_baseline: str,
-    beard_pattern: str,
-    beard_color: str,
-    glasses_regular: bool,
-    glasses_desc: str,
-    freckles_present: bool,
-    freckles_desc: str,
-    piercing_table: Any,
-) -> str:
-    """Speichert die Editor-Werte zurueck ins _subject_profile.json.
 
-    Wir behalten den Rest des Profils (per_image_traits, identity_markers,
-    confidence, notes) und ueberschreiben gezielt die vom User bearbeiteten
-    Felder. raw_profile_json ist der Backup-Zustand fuer den Fall, dass die
-    Datei zwischenzeitlich geloescht wurde.
-    """
-    path = subject_profile_path_for(input_folder, trigger_word)
-    profile: Dict[str, Any] = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                profile = json.load(f) or {}
-        except Exception:
-            profile = {}
-    if not isinstance(profile, dict):
-        profile = {}
-
-    if not profile and raw_profile_json.strip():
-        try:
-            backup = json.loads(raw_profile_json)
-            if isinstance(backup, dict):
-                profile = backup
-        except Exception:
-            pass
-
-    if not profile:
-        return tr("❌ Kein Profil zum Speichern vorhanden.", "❌ No profile to save.")
-
+def apply_profile_editor_values(profile, gender, skin_tone, eye_color, hair_texture, body_build, body_height_impression, hair_color_baseline, beard_pattern, beard_color, glasses_regular, glasses_desc, freckles_present, freckles_desc, piercing_table):
+    """Apply the same unsaved editor fields for preview and persistence."""
+    profile = json.loads(json.dumps(profile))
     stable = profile.setdefault("stable_identity", {})
     stable["gender"] = (gender or "").strip()
     stable["skin_tone"] = (skin_tone or "").strip()
@@ -1600,6 +1594,141 @@ def save_profile_from_editor(
             "piercing_baseline": list(markers.get("piercing_baseline", []) or []),
         },
     }
+
+    return profile
+
+
+def profile_caption_choices(trigger_word, input_folder):
+    stage = _load_caption_stage_for_profile_ui(trigger_word, input_folder)
+    rows = stage.get("all_rows") or []
+    names = [str(r.get("original_filename")) for r in rows if isinstance(r, dict)
+             and r.get("base_status") in {"keep", "review"} and r.get("arcface_flag") != "hard"]
+    return gr.update(choices=names, value=names[0] if names else None)
+
+
+def initial_caption_readiness_ui(engine):
+    if engine == "gpt-6-luna":
+        return tr("Luna nutzt den Projekt-API-Key. Neue Erstbeschreibungen senden Bilder an OpenAI und verbrauchen das eingestellte Tokenbudget.",
+                  "Luna uses the project API key. New descriptions send images to OpenAI and use the configured token budget.")
+    try:
+        from initial_captions import local_resources
+        local_resources(SCRIPT_DIR, engine)
+        return tr("Lokale Laufzeit und Modellgewichte gefunden. Die GPU muss beim Erstcaptioning ausreichend frei sein. Audit und Profilmodelle bleiben separat eingestellt.",
+                  "Local runtime and model weights found. The GPU needs enough free memory for initial captioning. Audit and profile models remain configured separately.")
+    except Exception:
+        return tr("Lokaler Provider noch nicht eingerichtet. Hinweise in CAPTION_PIPELINE.md; alternativ Luna wählen. Ein fehlender Provider wird vor dem kostenpflichtigen Audit gemeldet.",
+                  "Local provider is not installed yet. See CAPTION_PIPELINE.md or choose Luna. A missing provider is reported before paid audits.")
+
+
+def preview_profile_caption(trigger_word, input_folder, raw_profile_json, filename,
+                            target, caption_options, variable_mode, composition_mode, controlled_buckets, *editor_values):
+    """Preview unsaved editor fields without saving profile, audit or exports."""
+    try:
+        stage = _load_caption_stage_for_profile_ui(trigger_word, input_folder)
+        profile = _load_json_dict(subject_profile_path_for(input_folder, trigger_word))
+        if not profile:
+            profile = json.loads(raw_profile_json or "{}")
+        if not profile or not stage:
+            raise ValueError(tr("Erst einen Lauf vorbereiten und das Profil laden.", "Prepare a run and load its profile first."))
+        if stage.get("audit_stale_images") or profile.get("audit_stale_images"):
+            raise ValueError(tr("Rahmen wurden seit dem Audit geändert. Zuerst den normalen Lauf aktualisieren.", "Frames changed since the audit. Refresh the normal run first."))
+        profile = apply_profile_editor_values(profile, *editor_values)
+        row = next((r for r in stage.get("all_rows", []) if r.get("original_filename") == filename), None)
+        if not row:
+            raise ValueError(tr("Ein vorbereitetes Bild auswählen.", "Select a prepared image."))
+        from initial_captions import image_sha256
+        image_path = (row.get("effective_image_path") or row.get("frame_crop_path")
+                      or row.get("original_path") or row.get("source_original_path") or "")
+        if not image_path:
+            raise ValueError("Prepared image has no effective source path")
+        initial = row.get("initial_caption") or {}
+        if initial and image_sha256(image_path) != initial.get("image_sha256"):
+            raise ValueError(tr("Bild seit der Erstbeschreibung geändert. Lauf aktualisieren.", "Image changed since its description. Refresh the run."))
+        config = {"TRIGGER_WORD": trigger_word, "TRAINING_TARGET": target,
+                  "CAPTION_POLICY": {key: key in (caption_options or []) for key in CAPTION_FIELD_CHOICES},
+                  "VARIABLE_FEATURE_CAPTION_MODE": variable_mode, "CAPTION_COMPOSITION_MODE": composition_mode,
+                  "USE_CONTROLLED_BUCKETS": bool(controlled_buckets)}
+        with tempfile.TemporaryDirectory(prefix="curator_caption_preview_") as scratch:
+            request, result = os.path.join(scratch, "request.json"), os.path.join(scratch, "result.json")
+            preview_image_path = os.path.join(scratch, "export_preview.jpg")
+            core_atomic_write_json(request, {"config": config, "profile": profile, "row": row,
+                                            "global_rules": stage.get("global_rules", {}),
+                                            "cache_dir": os.path.join(output_root_for(input_folder, trigger_word), "_cache"),
+                                            "preview_image_path": preview_image_path})
+            proc = subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "caption_preview.py"), request, result],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if proc.returncode:
+                raise ValueError(proc.stderr[-1500:] or "Caption preview failed")
+            caption = _load_json_dict(result)["caption"]
+            with Image.open(preview_image_path) as opened:
+                image = opened.convert("RGB")
+        status = tr("Vorschau mit aktuellen, noch ungespeicherten Profilwerten und Caption-Schaltern. Keine Modellanfrage. Zusätzliche freie Details sind Referenz; der Satzaufbau nutzt die Audit-Merkmale.",
+                    "Preview uses current unsaved profile fields and caption switches. No model request. Additional free details are evidence; composition uses audited observations.")
+        if composition_mode == "luna_text":
+            status = tr("Vorschau aus zwischengespeicherten Luna-Textdetails und aktuellen Profilregeln. Keine neue Modellanfrage. Identität und sichtbare Piercings/Brillen werden weiterhin durch Audit und Profil geregelt.",
+                        "Preview uses cached Luna text details and current profile rules. No new model request. Audit and profile still control identity and visible piercings/glasses.")
+        return image, initial.get("caption", tr("Dieser ältere Lauf enthält noch keine separate Erstbeschreibung.", "This older run has no separate initial description.")), caption, status
+    except Exception as exc:
+        return None, "", "", str(exc)
+
+
+def save_profile_before_export(*values):
+    message = save_profile_from_editor(*values)
+    if not message.startswith("✅"):
+        raise gr.Error(message)
+    return message
+
+
+def save_profile_from_editor(
+    trigger_word: str,
+    input_folder: str,
+    raw_profile_json: str,
+    gender: str,
+    skin_tone: str,
+    eye_color: str,
+    hair_texture: str,
+    body_build: str,
+    body_height_impression: str,
+    hair_color_baseline: str,
+    beard_pattern: str,
+    beard_color: str,
+    glasses_regular: bool,
+    glasses_desc: str,
+    freckles_present: bool,
+    freckles_desc: str,
+    piercing_table: Any,
+) -> str:
+    """Speichert die Editor-Werte zurueck ins _subject_profile.json.
+
+    Wir behalten den Rest des Profils (per_image_traits, identity_markers,
+    confidence, notes) und ueberschreiben gezielt die vom User bearbeiteten
+    Felder. raw_profile_json ist der Backup-Zustand fuer den Fall, dass die
+    Datei zwischenzeitlich geloescht wurde.
+    """
+    path = subject_profile_path_for(input_folder, trigger_word)
+    profile: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                profile = json.load(f) or {}
+        except Exception:
+            profile = {}
+    if not isinstance(profile, dict):
+        profile = {}
+
+    if not profile and raw_profile_json.strip():
+        try:
+            backup = json.loads(raw_profile_json)
+            if isinstance(backup, dict):
+                profile = backup
+        except Exception:
+            pass
+
+    if not profile:
+        return tr("❌ Kein Profil zum Speichern vorhanden.", "❌ No profile to save.")
+
+    profile = apply_profile_editor_values(profile, gender, skin_tone, eye_color, hair_texture, body_build, body_height_impression, hair_color_baseline, beard_pattern, beard_color, glasses_regular, glasses_desc, freckles_present, freckles_desc, piercing_table)
 
     notes = profile.setdefault("normalizer_notes", [])
     if isinstance(notes, list):
@@ -1976,29 +2105,6 @@ def _missing_cluster_preview_image() -> Image.Image:
     """Return a neutral tile so every bucket member stays selectable."""
     return Image.new("RGB", (384, 384), (72, 72, 72))
 
-def _decorate_favorite_preview(image: Image.Image) -> Image.Image:
-    """Draw an unmistakable gold frame and star without external fonts."""
-    decorated = image.convert("RGB").copy()
-    draw = ImageDraw.Draw(decorated)
-    width, height = decorated.size
-    border = max(5, min(width, height) // 45)
-    gold = (218, 165, 32)
-    dark = (70, 48, 0)
-    for offset in range(border):
-        draw.rectangle((offset, offset, width - 1 - offset, height - 1 - offset), outline=gold)
-    radius = max(22, min(width, height) // 11)
-    cx, cy = width - radius - border * 2, radius + border * 2
-    draw.ellipse((cx-radius, cy-radius, cx+radius, cy+radius), fill=(28, 28, 28), outline=gold, width=max(2, border//2))
-    points = []
-    import math as _math
-    for i in range(10):
-        angle = -_math.pi / 2 + i * _math.pi / 5
-        r = radius * (0.72 if i % 2 == 0 else 0.32)
-        points.append((cx + r * _math.cos(angle), cy + r * _math.sin(angle)))
-    draw.polygon(points, fill=gold, outline=dark)
-    return decorated
-
-
 def _identity_cluster_preview_entries(
     profile: Dict[str, Any],
     trigger_word: str,
@@ -2203,84 +2309,6 @@ def select_identity_cluster_image_ui(
     if reject_reason:
         status += f"  \n**{tr('Reject-Grund', 'Reject reason')}:** `{reject_reason}`"
     return str(entry.get("selection_ref", "") or ""), status
-
-
-def _migrate_profile_asset_ids_ui(profile: Dict[str, Any], trigger_word: str, input_folder: str) -> Dict[str, Any]:
-    """Normalize profile board, buckets and favorites to persistent asset IDs."""
-    if not isinstance(profile, dict):
-        return profile
-    row_lookup = _stage_rows_by_profile_id(trigger_word, input_folder)
-
-    def resolve(value: Any = "", filename: Any = "", image_path: Any = "") -> int:
-        direct = core_normalize_asset_id(value)
-        if direct > 0:
-            return direct
-        candidates = [str(value or "").strip(), str(value or "").split("::", 1)[0],
-                      f"filename::{str(filename or '')}", f"path::{str(image_path or '')}"]
-        if image_path:
-            candidates.append(f"path::{os.path.normcase(os.path.abspath(str(image_path)))}")
-        for key in candidates:
-            row = row_lookup.get(key)
-            aid = asset_id_for_row(row or {})
-            if aid > 0:
-                return aid
-        return 0
-
-    traits = profile.get("per_image_traits", {}) or {}
-    if isinstance(traits, dict):
-        migrated_traits: Dict[str, Any] = {}
-        for key, value in traits.items():
-            aid = resolve(key)
-            migrated_traits[str(aid) if aid > 0 else str(key)] = value
-        profile["per_image_traits"] = migrated_traits
-
-    clusters = [c for c in (profile.get("identity_clusters", []) or []) if isinstance(c, dict)]
-    roles: Dict[str, str] = {}
-    cluster_map: Dict[str, str] = {}
-    for cluster in clusters:
-        members = list(cluster.get("asset_ids") or cluster.get("members") or [])
-        filenames = list(cluster.get("filenames") or [])
-        paths = list(cluster.get("image_paths") or [])
-        total = max(len(members), len(filenames), len(paths))
-        migrated: List[Any] = []
-        for index in range(total):
-            member = members[index] if index < len(members) else ""
-            filename = filenames[index] if index < len(filenames) else ""
-            image_path = paths[index] if index < len(paths) else ""
-            aid = resolve(member, filename, image_path)
-            migrated.append(aid if aid > 0 else member)
-        cluster["members"] = migrated
-        cluster["asset_ids"] = [int(v) for v in migrated if core_normalize_asset_id(v) > 0]
-        cluster["n"] = len(migrated)
-        cid = str(cluster.get("cluster_id", "") or "")
-        role = str(cluster.get("role", "variation") or "variation")
-        for member in migrated:
-            key = asset_id_key(member) or str(member)
-            roles[key] = role
-            cluster_map[key] = cid
-    profile["identity_clusters"] = clusters
-    profile["identity_cluster_member_roles"] = roles
-    profile["identity_cluster_member_clusters"] = cluster_map
-
-    favorites = set()
-    for raw in profile.get("favorite_asset_ids", []) or []:
-        aid = resolve(raw)
-        if aid > 0:
-            favorites.add(aid)
-    for raw in profile.get("priority_image_ids", []) or []:
-        aid = resolve(raw)
-        if aid > 0:
-            favorites.add(aid)
-    for filename in profile.get("priority_image_filenames", []) or []:
-        aid = resolve("", filename, "")
-        if aid > 0:
-            favorites.add(aid)
-    ordered = sorted(favorites)
-    profile["favorite_asset_ids"] = ordered
-    profile["priority_image_ids"] = ordered
-    profile["priority_image_filenames"] = []
-    profile["asset_identity_schema_version"] = "asset-id-v1"
-    return profile
 
 
 def _load_profile_for_bucket_edit(trigger_word: str, input_folder: str, profile_state: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
@@ -2562,6 +2590,7 @@ def set_selected_image_priority_ui(
     selected_image_id: str,
     gallery_page: Any,
     make_priority: bool,
+    confirm_hazards: bool = False,
 ) -> Tuple[Dict[str, Any], str, str, List[Tuple[Any, str]], str, str]:
     """Add/remove one asset as a visible Favorite and train-ready override."""
     profile, path = _load_profile_for_bucket_edit(trigger_word, input_folder, profile_state)
@@ -3535,6 +3564,8 @@ CURATOR_INPUT_NAMES = (
     "krea_caption_model", "krea_caption_reasoning_effort", "use_krea_caption_repair", "krea_caption_repair_model", "krea_caption_repair_reasoning_effort",
     "c_pipeline_mode", "c_profile_normalizer_model", "profile_reasoning_effort", "c_profile_sample_threshold", "c_profile_sample_size",
     "export_review", "export_reject", "export_crop_compare", "controlled_buckets",
+    "initial_caption_engine", "initial_caption_task",
+    "caption_composition_mode",
 )
 
 
@@ -3592,7 +3623,7 @@ def build_run_config_from_ui_values(values: Tuple[Any, ...], *, continue_from_pr
         "SUBJECT_MIN_TORSO_LANDMARKS": int(v["subject_min_torso"]),
         "ENABLE_IG_FRAME_CROP": bool(v["ig_frame_crop"]),
         "IG_FRAME_TWO_STAGE_BAR_DETECT": bool(v["ig_two_stage_bar"]),
-        "FRAME_CLEANUP_MODE": str(v["frame_cleanup_mode"] or "auto_high_keep_medium"),
+        "FRAME_CLEANUP_MODE": str(v["frame_cleanup_mode"] or "suggest_only"),
         "FRAME_PAUSE_ON_MEDIUM_REVIEW": bool(v["frame_pause_on_medium"]),
         "USE_EARLY_PHASH_DEDUP": bool(v["use_early_phash"]),
         "USE_EARLY_PHASH_LOOP1": bool(v["use_early_phash_loop1"]),
@@ -3632,15 +3663,18 @@ def build_run_config_from_ui_values(values: Tuple[Any, ...], *, continue_from_pr
         "CAPTION_PROFILE": caption_profile_for_training_target(target),
         "CAPTION_POLICY": caption_policy,
         "VARIABLE_FEATURE_CAPTION_MODE": str(v["variable_feature_mode"] or "canonical_deviations"),
-        "USE_KREA_AI_CAPTIONING": target == "krea2",
-        "KREA_CAPTION_MODEL": str(v["krea_caption_model"] or MODEL_AUDIT_DEFAULT).strip(),
+        "USE_KREA_AI_CAPTIONING": False,
+        "INITIAL_CAPTION_ENGINE": str(v["initial_caption_engine"] or "florence2"),
+        "INITIAL_CAPTION_FLORENCE_TASK": str(v["initial_caption_task"] or "<MORE_DETAILED_CAPTION>"),
+        "CAPTION_COMPOSITION_MODE": str(v["caption_composition_mode"] or "local"),
+        "KREA_CAPTION_MODEL": str(v["krea_caption_model"] or "gpt-6-luna").strip(),
         "KREA_CAPTION_REASONING_EFFORT": str(v["krea_caption_reasoning_effort"] or "none"),
         "USE_KREA_CAPTION_REPAIR": bool(v["use_krea_caption_repair"]),
-        "KREA_CAPTION_REPAIR_MODEL": str(v["krea_caption_repair_model"] or MODEL_BALANCED_DEFAULT).strip(),
+        "KREA_CAPTION_REPAIR_MODEL": str(v["krea_caption_repair_model"] or "gpt-6.1-sol").strip(),
         "KREA_CAPTION_REPAIR_REASONING_EFFORT": str(v["krea_caption_repair_reasoning_effort"] or "low"),
         "PIPELINE_MODE": "profile_then_caption" if continue_from_profile else str(v["c_pipeline_mode"] or "single_pass"),
         "CONTINUE_FROM_PROFILE": bool(continue_from_profile),
-        "PROFILE_NORMALIZER_MODEL": str(v["c_profile_normalizer_model"] or MODEL_BALANCED_DEFAULT).strip(),
+        "PROFILE_NORMALIZER_MODEL": str(v["c_profile_normalizer_model"] or "gpt-6.1-sol").strip(),
         "PROFILE_REASONING_EFFORT": str(v["profile_reasoning_effort"] or "low"),
         "PROFILE_SAMPLE_THRESHOLD": int(v["c_profile_sample_threshold"]),
         "PROFILE_SAMPLE_SIZE": int(v["c_profile_sample_size"]),
@@ -3668,6 +3702,50 @@ def _validate_run_values(values: Tuple[Any, ...]) -> Tuple[Optional[Dict[str, An
     if not api_key:
         return None, (tr("Bitte einen OpenAI API Key eingeben.", "Please enter an OpenAI API key."), [], 0, tr("❌ Fehler", "❌ Error"), format_openai_usage_text(0, 0, 0, 0))
     return v, None
+
+
+def audit_run_overview_ui(trigger_word, input_folder, target, model, pipeline_mode, frame_state):
+    """Read-only run preview; never load credentials or start image/model work."""
+    import html
+    escape = lambda value: html.escape(str(value)).replace("|", "&#124;")
+    workspace = load_project_workspace(input_folder, trigger_word) if input_folder and trigger_word else {}
+    preflight = workspace.get("preflight", {}) or {}
+    current = bool(preflight.get("completed")) and _workspace_preflight_is_current(input_folder, trigger_word, workspace)
+    lines = [tr("### Dein nächster Lauf", "### Your next run")]
+    if current:
+        lines.append(tr(f"**Vorprüfung bereit:** {preflight.get('survivor_count', 0)} Bilder nach Datei- und Duplikatprüfung.",
+                        f"**Preflight ready:** {preflight.get('survivor_count', 0)} images after file and duplicate checks."))
+    else:
+        lines.append(tr("**Zuerst auf Start die Vorprüfung ausführen oder aktualisieren.**", "**Run or refresh preflight on Start first.**"))
+    same_project = isinstance(frame_state, dict) and os.path.normcase(os.path.abspath(frame_state.get("output_root") or ".")) == os.path.normcase(os.path.abspath(output_root_for(input_folder or ".", trigger_word or "")))
+    if current and same_project and frame_state.get("records"):
+        records = frame_state["records"]
+        mode, allowed = frame_state.get("frame_mode", "suggest_only"), frame_state.get("auto_accept_types", [])
+        automatic = sum(r.get("user_decision", "auto") == "auto" and automatic_crop_bbox(r, mode, allowed) is not None for r in records)
+        pending = sum(frame_needs_review(r, mode, allowed, r.get("user_decision", "auto")) for r in records)
+        excluded = sum(r.get("user_decision") == "exclude" for r in records)
+        lines.append(tr(f"**Rahmen:** {automatic} automatisch · {pending} offen · {excluded} ausgeschlossen.",
+                        f"**Frames:** {automatic} automatic · {pending} pending · {excluded} excluded."))
+        if pending:
+            lines.append(tr("Offene Vorschläge in Modul 1 prüfen; die eingestellte Rahmenregel bestimmt, ob der Lauf dafür pausiert.",
+                            "Review pending proposals in module 1; the selected frame policy determines whether the run pauses for them."))
+    elif (workspace.get("frame") or {}).get("enabled"):
+        lines.append(tr("**Rahmen:** Modul 1 lokal laden, um aktuelle Entscheidungen und offene Vorschläge zu sehen.",
+                        "**Frames:** load module 1 locally to see current decisions and pending proposals."))
+    flow = tr("Audit → Profil prüfen → Captions und Export separat starten", "Audit → review profile → start captions and export separately") if pipeline_mode == "profile_then_caption" else tr("Audit → Profil → Captions → Export", "Audit → profile → captions → export")
+    lines.extend([tr(f"**Ziel:** {int(target or 0)} Bilder · **Audit-Modell:** {escape(model)}", f"**Target:** {int(target or 0)} images · **Audit model:** {escape(model)}"), f"**{tr('Ablauf', 'Flow')}:** {flow}"])
+    stage = _load_json_dict(caption_stage_path_for(input_folder or ".", trigger_word or "")) if input_folder and trigger_word else {}
+    profile = _load_json_dict(subject_profile_path_for(input_folder or ".", trigger_word or "")) if stage else {}
+    if stage:
+        if stage.get("audit_stale_images") or profile.get("audit_stale_images"):
+            lines.append(tr("**Vorhandener Audit-Stand muss aktualisiert werden:** Rahmenentscheidungen wurden nachträglich geändert.",
+                            "**Existing audit needs updating:** frame decisions changed afterwards."))
+        else:
+            lines.append(tr("**Audit-Stand vorhanden:** Im Profil-Tab prüfen, ob Captions und Export fortgesetzt werden können.",
+                            "**Audit stage available:** check the Profile tab to continue captions and export."))
+    lines.append(tr("Diese Übersicht ist lokal. Erst „Audit starten“ beginnt die Verarbeitung mit möglichen API-Kosten.",
+                    "This preview is local. Only Start audit begins processing that may incur API costs."))
+    return "\n\n".join(lines)
 
 
 def start_curator(*values):
@@ -3723,6 +3801,20 @@ def start_caption_from_profile(*values):
     config = build_run_config_from_ui_values(values, continue_from_profile=True)
     train_dir = os.path.join(output_root_for(v["input_folder"], v["trigger_word"]), "01_train_ready")
     yield from run_script(CURATOR_SCRIPT, CURATOR_CONFIG, config, train_dir)
+
+
+def start_caption_text_details(*values):
+    v = _ui_values_dict(values)
+    if not str(v.get("api_key") or "").strip():
+        yield tr("Für Luna-Textdetails einen OpenAI API-Key im Projekt setzen.", "Set a project OpenAI API key for Luna text details."), [], 0, "API key missing", ""
+        return
+    if not os.path.isfile(caption_stage_path_for(v["input_folder"], v["trigger_word"])):
+        yield tr("Zuerst Erstbeschreibungen vorbereiten.", "Prepare initial descriptions first."), [], 0, "No stage", ""
+        return
+    config = build_run_config_from_ui_values(values, continue_from_profile=True)
+    config["PREPARE_CAPTION_DETAILS_ONLY"] = True
+    yield from run_script(CURATOR_SCRIPT, CURATOR_CONFIG, config,
+                          os.path.join(output_root_for(v["input_folder"], v["trigger_word"]), "01_train_ready"))
 
 
 
@@ -3819,11 +3911,10 @@ def load_results(input_folder, trigger_word, subfolder, page=1):
 
 FRAME_REVIEW_PAGE_SIZE = 18
 FRAME_REVIEW_FILTER_CHOICES = [
-    ("uncertain", "Nicht sicher automatisch beschnitten", "Not safely auto-cropped"),
+    ("review", "Nicht sicher automatisch beschnitten", "Not safely auto-cropped"),
     ("multiple", "Mehrere Entwürfe", "More than one draft"),
     ("all", "Alle Bilder", "All images"),
 ]
-FRAME_REVIEW_DEFAULT_FILTER = "uncertain"
 
 
 def _frame_ui_paths(input_folder: str, trigger_word: str) -> Tuple[str, str]:
@@ -3869,94 +3960,34 @@ def _save_frame_hash_index_ui(cache_dir: str, payload: Dict[str, Any]) -> None:
     _atomic_write_json(os.path.join(cache_dir, "file_hash_index.json"), payload)
 
 
-def _frame_best_candidate(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    candidates = list(record.get("candidates", []) or [])
-    if not candidates:
-        return None
-    best = candidates[0]
-    bbox = best.get("bbox") if isinstance(best, dict) else None
-    if not isinstance(bbox, list) or len(bbox) != 4:
-        return None
-    return best
-
-
-def _frame_best_preview_bbox(record: Dict[str, Any]) -> Optional[List[int]]:
-    """Return the best local proposal for visible High/Medium preselection."""
-    if str(record.get("confidence_level", "low") or "low") not in {"high", "medium"}:
-        return None
-    best = _frame_best_candidate(record)
-    if not best:
-        return None
-    return [int(v) for v in best.get("bbox", [])]
-
-
-def _frame_auto_applies_best_candidate(record: Dict[str, Any], state: Any = None) -> bool:
-    """Whether project policy applies candidate 0 without a manual decision."""
-    if str(record.get("user_decision", "auto") or "auto") != "auto":
-        return False
-    best = _frame_best_candidate(record)
-    if not best:
-        return False
-    level = str(record.get("confidence_level", "low") or "low")
-    if level not in {"high", "medium"}:
-        return False
-    frame_mode = (
-        str((state or {}).get("frame_mode", "auto_high_keep_medium") or "auto_high_keep_medium")
-        if isinstance(state, dict) else "auto_high_keep_medium"
-    )
-    allowed = {
-        str(v) for v in ((state or {}).get("auto_accept_types", []) or [])
-    } if isinstance(state, dict) else set()
-    crop_type = str(best.get("crop_type", record.get("crop_type", "unknown")) or "unknown")
-    if crop_type not in allowed:
-        return False
-    if frame_mode == "auto_high_review_medium":
-        return level == "high"
-    if frame_mode == "auto_high_keep_medium":
-        return level in {"high", "medium"}
-    return False
-
-
-def _frame_current_selection_kind(record: Dict[str, Any], state: Any = None) -> str:
-    """Return saved, automatic, suggestion, or original for UI labelling."""
-    if str(record.get("user_decision", "auto") or "auto") != "auto":
-        return "saved"
-    if _frame_auto_applies_best_candidate(record, state):
-        return "automatic"
-    if _frame_best_preview_bbox(record) is not None:
-        return "suggestion"
-    return "original"
-
-
 def _frame_filter_records(state: Any, filter_value: str) -> List[Dict[str, Any]]:
-    """Return the records shown for one of the three review views.
+    """Return the records of one of the three frame views.
 
-    * ``uncertain`` – the detector proposed a crop, but project policy does
-      not apply it automatically (manual decisions stay visible for changes).
+    * ``review`` – open decisions: the detector proposed a crop that project
+      policy does not apply automatically.
     * ``multiple`` – more than one crop draft exists.
-    * ``all`` – every analysed image.
-
-    Images without any crop proposal only appear under ``all``.
+    * ``all`` – every analysed image, including excluded ones.
     """
     records = list((state or {}).get("records", []) or []) if isinstance(state, dict) else []
-    records.sort(key=lambda record: _normalize_asset_id(record.get("asset_id")))
-    value = str(filter_value or FRAME_REVIEW_DEFAULT_FILTER)
+    value = str(filter_value or "review")
     if value == "all":
         return records
-
-    def drafts(record: Dict[str, Any]) -> int:
-        return sum(
-            1 for candidate in (record.get("candidates", []) or [])
-            if isinstance(candidate.get("bbox"), list) and len(candidate.get("bbox")) == 4
-        )
-
+    if value == "excluded":  # internal view, not offered in the dropdown
+        return [r for r in records if r.get("user_decision") == "exclude"]
+    records = [r for r in records if r.get("user_decision") != "exclude"]
     if value == "multiple":
-        return [r for r in records if drafts(r) >= 2]
-    # Default: uncertain. Older saved values ("review", "suggestions", ...) land here.
-    return [
-        r for r in records
-        if drafts(r) >= 1 and not _frame_auto_applies_best_candidate(r, state)
-    ]
+        return [
+            r for r in records
+            if sum(
+                1 for c in (r.get("candidates", []) or [])
+                if isinstance(c.get("bbox"), list) and len(c.get("bbox")) == 4
+            ) >= 2
+        ]
+    # "review" and older saved values ("high", "detected", "decided", ...).
+    return [r for r in records if frame_needs_review(
+        r, state.get("frame_mode", "suggest_only"), state.get("auto_accept_types", []),
+        r.get("user_decision", "auto"),
+    )]
 
 
 def _frame_page_choices(count: int) -> List[str]:
@@ -3964,41 +3995,26 @@ def _frame_page_choices(count: int) -> List[str]:
     return [str(i) for i in range(1, pages + 1)]
 
 
-def _normalize_asset_id(value: Any) -> int:
-    try:
-        result = int(value)
-    except Exception:
-        return 0
-    return result if result > 0 else 0
-
-
 def _frame_selection_location(
     state: Any,
     filter_value: str,
-    asset_id: Any,
+    source_hash: str,
 ) -> Tuple[List[Dict[str, Any]], int]:
-    """Return filtered records and the selected asset's global index."""
+    """Return filtered records and the selected record's global index."""
     records = _frame_filter_records(state, filter_value)
-    selected = _normalize_asset_id(asset_id)
-    if selected > 0:
-        for index, record in enumerate(records):
-            if _normalize_asset_id(record.get("asset_id")) == selected:
-                return records, index
-    # Legacy fallback for an in-memory state created before asset IDs existed.
-    legacy_hash = str(asset_id or "")
-    if legacy_hash:
-        for index, record in enumerate(records):
-            if str(record.get("source_hash", "")) == legacy_hash:
-                return records, index
+    selected = str(source_hash or "")
+    for index, record in enumerate(records):
+        if str(record.get("source_hash", "")) == selected:
+            return records, index
     return records, -1
 
 
 def _frame_viewer_navigation_updates(
     state: Any,
     filter_value: str,
-    asset_id: Any,
+    source_hash: str,
 ):
-    records, index = _frame_selection_location(state, filter_value, asset_id)
+    records, index = _frame_selection_location(state, filter_value, source_hash)
     total = len(records)
     if index < 0 or total == 0:
         return (
@@ -4006,12 +4022,8 @@ def _frame_viewer_navigation_updates(
             gr.update(interactive=False),
             gr.update(interactive=False),
         )
-    selected_id = _normalize_asset_id(records[index].get("asset_id"))
     return (
-        tr(
-            f"**Bild {index + 1} von {total} · ID {selected_id}**",
-            f"**Image {index + 1} of {total} · ID {selected_id}**",
-        ),
+        tr(f"**Bild {index + 1} von {total}**", f"**Image {index + 1} of {total}**"),
         gr.update(interactive=index > 0),
         gr.update(interactive=index < total - 1),
     )
@@ -4021,15 +4033,18 @@ def _frame_review_gallery_update(
     state: Any,
     filter_value: str,
     page_value: Any,
-    asset_id: Any = 0,
+    source_hash: str = "",
 ):
-    """Refresh the overview while preserving the active asset highlight."""
-    gallery = _frame_review_gallery(state, filter_value, page_value, selected_asset_id=asset_id)
-    # Do not set Gallery.selected_index programmatically. Gradio emits a select
-    # event for that update; around a page boundary it can arrive before the new
-    # page value and resolve the same thumbnail index against the previous page.
-    # The selected asset is marked directly in the rendered card instead.
-    return gr.update(value=gallery, selected_index=None)
+    """Refresh the overview while preserving the active image highlight."""
+    gallery = _frame_review_gallery(state, filter_value, page_value)
+    records, index = _frame_selection_location(state, filter_value, source_hash)
+    try:
+        page = max(1, int(page_value or 1))
+    except Exception:
+        page = 1
+    page_start = (page - 1) * FRAME_REVIEW_PAGE_SIZE
+    selected_index = index - page_start if page_start <= index < page_start + len(gallery) else None
+    return gr.update(value=gallery, selected_index=selected_index)
 
 
 def _frame_candidate_choices(record: Dict[str, Any]) -> List[Tuple[str, str]]:
@@ -4040,6 +4055,8 @@ def _frame_candidate_choices(record: Dict[str, Any]) -> List[Tuple[str, str]]:
         confidence = float(candidate.get("confidence", 0) or 0)
         sides = ",".join(candidate.get("sides", []) or []) or "-"
         label = f"{index + 1}: {crop_type} · {confidence:.0%} · {sides} · {bbox}"
+        if crop_type == "semantic_photo":
+            label = tr(f"{index + 1}: KI-Fotobereich · bitte prüfen · {bbox}", f"{index + 1}: AI photo region · review required · {bbox}")
         choices.append((label, str(index)))
     return choices
 
@@ -4079,13 +4096,14 @@ def _frame_option_entries(record: Dict[str, Any]) -> List[Dict[str, Any]]:
             continue
         entries.append({
             "key": f"candidate:{index}",
-            "label": tr(f"Variante {index + 1}", f"Variant {index + 1}"),
+            "label": tr("KI-Fotobereich", "AI photo region") if candidate.get("crop_type") == "semantic_photo" else tr(f"Variante {index + 1}", f"Variant {index + 1}"),
             "bbox": [int(v) for v in bbox],
             "crop_type": str(candidate.get("crop_type", "unknown") or "unknown"),
             "confidence": float(candidate.get("confidence", 0) or 0),
             "candidate_index": index,
+            "reason": str(candidate.get("reason", "")),
         })
-    if str(record.get("user_decision", "")) == "manual" and isinstance(record.get("display_bbox"), list):
+    if str(record.get("user_decision", "")) in {"manual", "accept"} and isinstance(record.get("display_bbox"), list) and not any(e.get("bbox") == record["display_bbox"] for e in entries):
         entries.append({
             "key": "manual",
             "label": tr("Manueller Crop", "Manual crop"),
@@ -4098,7 +4116,7 @@ def _frame_option_entries(record: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _frame_current_option_key(record: Dict[str, Any], state: Any = None) -> str:
     decision = str(record.get("user_decision", "auto") or "auto")
-    if decision == "keep_original":
+    if decision in {"keep_original", "exclude"}:
         return "original"
     if decision == "manual":
         return "manual"
@@ -4107,27 +4125,16 @@ def _frame_current_option_key(record: Dict[str, Any], state: Any = None) -> str:
         for entry in _frame_option_entries(record):
             if entry["key"].startswith("candidate:") and entry.get("bbox") == bbox:
                 return str(entry["key"])
-        return "candidate:0" if record.get("candidates") else "original"
+        return "manual"
 
-    # High and medium findings always open on the detector's best-ranked
-    # proposal. Project mode decides only whether that proposal is applied
-    # automatically; it no longer decides which option the reviewer first sees.
-    return "candidate:0" if _frame_best_preview_bbox(record) is not None else "original"
+    frame_mode = str((state or {}).get("frame_mode", "suggest_only")) if isinstance(state, dict) else "suggest_only"
+    allowed = {str(v) for v in ((state or {}).get("auto_accept_types", []) or [])} if isinstance(state, dict) else set()
+    auto_bbox = automatic_crop_bbox(record, frame_mode, allowed)
+    for index, candidate in enumerate(record.get("candidates") or []):
+        if auto_bbox is not None and candidate.get("bbox") == auto_bbox:
+            return f"candidate:{index}"
+    return "original"
 
-
-def _frame_effective_preview_bbox(record: Dict[str, Any], state: Any = None) -> Optional[List[int]]:
-    """Return the bbox represented by the current UI selection."""
-    key = _frame_current_option_key(record, state)
-    if key == "original":
-        return None
-    if key == "manual" and isinstance(record.get("display_bbox"), list):
-        return [int(v) for v in record.get("display_bbox", [])]
-    for entry in _frame_option_entries(record):
-        if str(entry.get("key")) == key:
-            bbox = entry.get("bbox")
-            if isinstance(bbox, list) and len(bbox) == 4:
-                return [int(v) for v in bbox]
-    return None
 
 
 def _crop_option_preview(record: Dict[str, Any], bbox: Optional[List[int]]) -> Optional[Image.Image]:
@@ -4157,93 +4164,68 @@ def _frame_option_gallery_update(record: Optional[Dict[str, Any]], state: Any = 
     if not record:
         return gr.update(value=[], selected_index=None), gr.update(choices=[], value=None)
     current_key = _frame_current_option_key(record, state)
-    selection_kind = _frame_current_selection_kind(record, state)
+    confirmed = record.get("user_decision", "auto") in {"accept", "manual", "keep_original"}
+    automatic = (record.get("user_decision", "auto") == "auto" and
+                 automatic_crop_bbox(record, (state or {}).get("frame_mode", "suggest_only"),
+                                     (state or {}).get("auto_accept_types", [])) is not None)
     values: List[Tuple[Image.Image, str]] = []
     choices: List[Tuple[str, str]] = []
-    for entry in _frame_option_entries(record):
+    for index, entry in enumerate(_frame_option_entries(record)):
         image = _crop_option_preview(record, entry.get("bbox"))
         if image is None:
             image = Image.new("RGB", (480, 480), (52, 52, 52))
             drawer = ImageDraw.Draw(image)
             drawer.text((24, 220), tr("Vorschau nicht lesbar", "Preview unavailable"), fill=(235, 235, 235))
+        marker = "✓ " if (confirmed or automatic) and entry["key"] == current_key else ""
         if entry["key"] == "original":
-            base_caption = tr("Original behalten", "Keep original")
+            caption = marker + tr("Original behalten", "Keep original")
         else:
             confidence = float(entry.get("confidence", 0) or 0)
-            base_caption = f"{entry['label']} · {entry.get('crop_type','unknown')} · {confidence:.0%}"
-
-        marker = ""
-        if entry["key"] == current_key:
-            marker = {
-                "saved": tr("✓ GESPEICHERT · ", "✓ SAVED · "),
-                "automatic": tr("⚙ AUTO · ", "⚙ AUTO · "),
-                "suggestion": tr("★ VORSCHLAG · ", "★ SUGGESTION · "),
-                "original": tr("✓ ORIGINAL · ", "✓ ORIGINAL · "),
-            }.get(selection_kind, "✓ ")
-        values.append((image, marker + base_caption))
-        choices.append((base_caption, str(entry["key"])))
+            caption = marker + (tr("KI-Fotobereich · bitte prüfen", "AI photo region · review required") if entry.get("crop_type") == "semantic_photo" else f"{entry['label']} · {entry.get('crop_type','unknown')} · {confidence:.0%}")
+        values.append((image, caption))
+        choices.append((caption.replace("✓ ", ""), str(entry["key"])))
     return (
         # The comparison gallery is deliberately display-only. Selection is
         # performed exclusively by the radio control immediately underneath.
         gr.update(value=values, selected_index=None),
-        gr.update(choices=choices, value=current_key if any(v == current_key for _l, v in choices) else "original"),
+        gr.update(choices=choices, value=current_key if (confirmed or automatic) and any(v == current_key for _l, v in choices) else None),
     )
 
 
-def _frame_option_detail(record: Dict[str, Any], option_key: str, state: Any = None) -> Tuple[str, List[int]]:
-    asset_id = _normalize_asset_id(record.get("asset_id"))
-    selection_kind = _frame_current_selection_kind(record, state)
-    if selection_kind == "saved":
-        status_de = "Die Entscheidung ist gespeichert."
-        status_en = "The decision is saved."
-    elif selection_kind == "automatic":
-        status_de = "Diese lokal bestbewertete Variante wird gemäß Projektmodus automatisch angewendet."
-        status_en = "This locally best-ranked variant is applied automatically by the project mode."
-    elif selection_kind == "suggestion":
-        status_de = "Lokal beste Variante vorausgewählt – noch nicht bestätigt. Mit „Aktuelle Auswahl übernehmen“ verbindlich speichern."
-        status_en = "Locally best variant preselected — not confirmed yet. Use ‘Accept current selection’ to save it explicitly."
-    else:
-        status_de = "Kein belastbarer Rahmenfund; das Original bleibt aktiv."
-        status_en = "No reliable frame finding; the original remains active."
-
+def _frame_option_detail(record: Dict[str, Any], option_key: str) -> Tuple[str, List[int]]:
     if option_key == "original":
         width, height = record.get("original_size") or [0, 0]
         return tr(
-            f"**ID {asset_id} · {record.get('filename','')}** – Original behalten. {status_de}",
-            f"**ID {asset_id} · {record.get('filename','')}** – Keep original. {status_en}",
+            f"**{record.get('filename','')}** – Originalansicht. Zum Bestätigen „Original behalten“ wählen.",
+            f"**{record.get('filename','')}** – Original view. Choose “Keep original” to confirm.",
         ), [0, 0, int(width), int(height)]
     for entry in _frame_option_entries(record):
         if entry["key"] == option_key:
             bbox = entry.get("bbox") or [0, 0, *(record.get("original_size") or [0, 0])]
+            if entry.get("crop_type") == "semantic_photo":
+                return tr(
+                    f"**{record.get('filename','')}** – KI-Fotobereich · `{bbox}`. {entry.get('reason','')}",
+                    f"**{record.get('filename','')}** – AI photo region · `{bbox}`. {entry.get('reason','')}",
+                ), [int(v) for v in bbox]
             return tr(
-                f"**ID {asset_id} · {record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. {status_de}",
-                f"**ID {asset_id} · {record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. {status_en}",
+                f"**{record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Sofort gespeichert."
+                + (" **Fotogrenze unsicher – Bildinhalt prüfen.**" if "photo_boundary_uncertain" in record.get("layout_flags", []) else ""),
+                f"**{record.get('filename','')}** – `{entry.get('label')}` · `{entry.get('crop_type')}` · {float(entry.get('confidence',0)):.1%} · `{bbox}`. Saved immediately."
+                + (" **Photo boundary uncertain – check image content.**" if "photo_boundary_uncertain" in record.get("layout_flags", []) else ""),
             ), [int(v) for v in bbox]
     width, height = record.get("original_size") or [0, 0]
     return tr("Unbekannte Auswahl.", "Unknown selection."), [0, 0, int(width), int(height)]
 
 
-def _frame_review_caption(record: Dict[str, Any], state: Any = None) -> str:
-    asset_id = _normalize_asset_id(record.get("asset_id"))
+def _frame_review_caption(record: Dict[str, Any]) -> str:
     level = str(record.get("confidence_level", "low")).upper()
     confidence = float(record.get("confidence", 0) or 0)
-    selection_kind = _frame_current_selection_kind(record, state)
-    status = {
-        "saved": "SAVED",
-        "automatic": "AUTO",
-        "suggestion": "SUGGESTION",
-        "original": "ORIGINAL",
-    }.get(selection_kind, selection_kind.upper())
+    decision = str(record.get("user_decision", "auto") or "auto")
     sides = ", ".join(record.get("candidate_sides", []) or []) or "-"
-    return f"ID {asset_id} · {record.get('filename', '')}\n{level} {confidence:.0%} | {sides} | {status}"
+    return f"{record.get('filename', '')}\n{level} {confidence:.0%} | {sides} | {decision}"
 
 
-def _frame_review_gallery(
-    state: Any,
-    filter_value: str,
-    page_value: Any,
-    selected_asset_id: Any = 0,
-) -> List[Tuple[Image.Image, str]]:
+def _frame_review_gallery(state: Any, filter_value: str, page_value: Any) -> List[Tuple[Image.Image, str]]:
     """Build the frame-review gallery without exposing external file paths.
 
     Gradio 5/6 rejects file paths outside the application directory or the
@@ -4260,23 +4242,18 @@ def _frame_review_gallery(
     start = (page - 1) * FRAME_REVIEW_PAGE_SIZE
     selected = records[start:start + FRAME_REVIEW_PAGE_SIZE]
     gallery: List[Tuple[Image.Image, str]] = []
-    selected_id = _normalize_asset_id(selected_asset_id)
     cache_dir = str((state or {}).get("cache_dir", "")) if isinstance(state, dict) else ""
     for record in selected:
-        is_selected = selected_id > 0 and _normalize_asset_id(record.get("asset_id")) == selected_id
-        caption = _frame_review_caption(record, state)
-        if is_selected:
-            caption = "✓ " + caption
+        caption = _frame_review_caption(record)
         try:
-            bbox = _frame_effective_preview_bbox(record, state)
+            key = _frame_current_option_key(record, state)
+            _, bbox = _frame_option_detail(record, key)
             preview_path = build_review_preview(
                 record["source_path"], bbox, cache_dir, source_hash=record["source_hash"]
             )
             preview_image = load_gallery_image(preview_path, max_size=(1240, 720))
             if preview_image is None:
                 raise ValueError("generated preview could not be decoded")
-            if is_selected:
-                preview_image = ImageOps.expand(preview_image, border=8, fill=(45, 115, 230))
             gallery.append((preview_image, caption))
         except Exception as exc:
             # Never return the original external path to Gradio. Even the
@@ -4284,8 +4261,6 @@ def _frame_review_gallery(
             # trigger another InvalidPathError.
             fallback = load_gallery_image(record.get("source_path", ""), max_size=(1024, 1024))
             if fallback is not None:
-                if is_selected:
-                    fallback = ImageOps.expand(fallback, border=8, fill=(45, 115, 230))
                 gallery.append((fallback, f"{caption}\nPreview error: {exc}"))
     return gallery
 
@@ -4293,26 +4268,25 @@ def _frame_review_gallery(
 def _frame_review_summary_md(state: Any) -> str:
     if not isinstance(state, dict) or not state.get("records"):
         return tr("Noch keine Rahmenanalyse geladen.", "No frame analysis loaded yet.")
-    records = list(state.get("records", []) or [])
-    summary = frame_decision_summary(records)
-    decisions = Counter(str(r.get("user_decision", "auto")) for r in records)
-    automatic_count = sum(1 for record in records if _frame_auto_applies_best_candidate(record, state))
-    suggestion_count = sum(1 for record in records if _frame_current_selection_kind(record, state) == "suggestion")
-    uncertain_count = len(_frame_filter_records(state, "uncertain"))
-    multiple_count = len(_frame_filter_records(state, "multiple"))
+    summary = frame_decision_summary(state.get("records", []))
+    decisions = Counter(str(r.get("user_decision", "auto")) for r in state.get("records", []))
+    pending = len(_frame_filter_records(state, "review"))
+    multiple = len(_frame_filter_records(state, "multiple"))
+    automatic = sum(1 for r in state.get("records", []) if r.get("user_decision", "auto") == "auto"
+                    and automatic_crop_bbox(r, state.get("frame_mode", "suggest_only"), state.get("auto_accept_types", [])) is not None)
     return tr(
-        f"**{summary['total']} Bilder lokal geprüft:** {summary['high']} hohe Sicherheit, "
+        f"**{pending} offen · {multiple} mit mehreren Entwürfen · {automatic} automatisch · {summary['total']} Bilder lokal geprüft:** {summary['high']} hohe Sicherheit, "
         f"{summary['medium']} mittlere Sicherheit, {summary['low']} ohne belastbaren Rahmenfund.  "
-        f"Automatisch angewendet: **{automatic_count}** · unbestätigte Vorschläge: **{suggestion_count}**.  "
         f"Manuell: {decisions.get('accept',0)} übernommen, {decisions.get('manual',0)} manuell, "
-        f"{decisions.get('keep_original',0)} Original behalten. **Keine LLM-Aufrufe.**  \n"
-        f"Ansichten: nicht sicher automatisch beschnitten **{uncertain_count}** · mehrere Entwürfe **{multiple_count}** · alle **{summary['total']}**.",
-        f"**{summary['total']} images checked locally:** {summary['high']} high confidence, "
+        f"{decisions.get('keep_original',0)} Original behalten, {decisions.get('exclude',0)} ausgeschlossen. "
+        + ("**Automatik aus: nur Vorschläge.** " if state.get('frame_mode', 'suggest_only') == 'suggest_only' else "**Automatik aktiv; unsichere Fotogrenzen bleiben zur Prüfung.** ")
+        + "Die Zählung oben umfasst lokale Ergebnisse; KI-Aufrufe werden separat angezeigt.",
+        f"**{pending} pending · {multiple} with several drafts · {automatic} automatic · {summary['total']} images checked locally:** {summary['high']} high confidence, "
         f"{summary['medium']} medium confidence, {summary['low']} without a reliable frame.  "
-        f"Applied automatically: **{automatic_count}** · unconfirmed suggestions: **{suggestion_count}**.  "
         f"Manual: {decisions.get('accept',0)} accepted, {decisions.get('manual',0)} manual, "
-        f"{decisions.get('keep_original',0)} original kept. **No LLM calls.**  \n"
-        f"Views: not safely auto-cropped **{uncertain_count}** · more than one draft **{multiple_count}** · all **{summary['total']}**.",
+        f"{decisions.get('keep_original',0)} original kept, {decisions.get('exclude',0)} excluded. "
+        + ("**Automation off: suggestions only.** " if state.get('frame_mode', 'suggest_only') == 'suggest_only' else "**Automation active; uncertain photo boundaries still require review.** ")
+        + "Counts above cover local results; AI calls are reported separately.",
     )
 
 
@@ -4320,13 +4294,12 @@ def scan_frame_review_ui(
     trigger_word: str,
     input_folder: str,
     advanced_types: bool,
-    filter_value: str = FRAME_REVIEW_DEFAULT_FILTER,
     progress=gr.Progress(track_tqdm=False),
 ):
     if not trigger_word or not str(trigger_word).strip():
-        return {}, tr("Bitte zuerst ein Triggerwort eingeben.", "Please enter a trigger word first."), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Triggerwort fehlt", "❌ Trigger word missing")
+        return {}, tr("Bitte zuerst ein Triggerwort eingeben.", "Please enter a trigger word first."), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Triggerwort fehlt", "❌ Trigger word missing")
     if not input_folder or not os.path.isdir(input_folder):
-        return {}, tr("Input-Ordner nicht gefunden.", "Input folder not found."), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Input fehlt", "❌ Input missing")
+        return {}, tr("Input-Ordner nicht gefunden.", "Input folder not found."), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Input fehlt", "❌ Input missing")
 
     output_root, cache_dir = _frame_ui_paths(input_folder, trigger_word)
     workspace = load_project_workspace(input_folder, trigger_word)
@@ -4334,24 +4307,14 @@ def scan_frame_review_ui(
         return {}, tr(
             "Bitte zuerst die pHash-/Datei-Vorprüfung auf der Startseite ausführen.",
             "Please run the pHash/file preflight on the start page first.",
-        ), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfung fehlt", "❌ Preflight missing")
+        ), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfung fehlt", "❌ Preflight missing")
     if not _workspace_preflight_is_current(input_folder, trigger_word, workspace):
         return {}, tr(
             "Der Input-Ordner hat sich seit der Vorprüfung geändert. Bitte die Vorprüfung auf der Startseite erneut ausführen.",
             "The input folder changed after preflight. Please rerun preflight on the start page.",
-        ), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfung veraltet", "❌ Preflight stale")
+        ), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfung veraltet", "❌ Preflight stale")
 
     all_paths = scan_frame_source_images(input_folder, output_root)
-    workspace, asset_id_by_path = ensure_project_asset_registry(
-        input_folder,
-        trigger_word,
-        image_paths=all_paths,
-        workspace=workspace,
-    )
-
-    def asset_id_for(path: str) -> int:
-        return int(asset_id_by_path.get(os.path.normcase(os.path.abspath(path)), 0) or 0)
-
     early_cache_path = os.path.join(cache_dir, "early_results.json")
     try:
         with open(early_cache_path, "r", encoding="utf-8") as handle:
@@ -4367,7 +4330,7 @@ def scan_frame_review_ui(
         return {}, tr(
             "Die Vorprüfungsdaten fehlen oder sind leer. Bitte die Vorprüfung auf der Startseite erneut ausführen.",
             "Preflight data is missing or empty. Please rerun preflight on the start page.",
-        ), gr.update(choices=["1"], value="1"), [], 0, tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfungsdaten fehlen", "❌ Preflight data missing")
+        ), gr.update(choices=["1"], value="1"), [], "", tr("Kein Bild ausgewählt.", "No image selected."), gr.update(value=[], selected_index=None), gr.update(choices=[], value=None), tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0, tr("❌ Vorprüfungsdaten fehlen", "❌ Preflight data missing")
     paths = [
         path for path in all_paths
         if os.path.normcase(os.path.abspath(path)) in survivor_paths
@@ -4378,11 +4341,9 @@ def scan_frame_review_ui(
     hash_index = _load_frame_hash_index_ui(cache_dir)
     hash_index_dirty = False
     workspace_frame = dict(workspace.get("frame") or {})
-    frame_mode = str(workspace_frame.get("mode", "auto_high_keep_medium") or "auto_high_keep_medium")
-    auto_accept_types = list(workspace_frame.get("auto_accept_types") or [])
     settings = SmartFrameDetectorSettings(
         advanced_types=bool(advanced_types),
-        auto_accept_types=tuple(str(v) for v in auto_accept_types),
+        auto_accept_types=tuple(str(v) for v in (workspace_frame.get("auto_accept_types") or [])),
     )
     records: List[Dict[str, Any]] = []
     total = max(1, len(paths))
@@ -4392,20 +4353,9 @@ def scan_frame_review_ui(
             source_hash, hash_changed = _frame_hash_with_index_ui(path, hash_index)
             hash_index_dirty = hash_index_dirty or hash_changed
             analysis = analyze_frame_cleanup(path, cache_dir, source_hash=source_hash, settings=settings, use_cache=True)
-            current_asset_id = asset_id_for(path)
-            user = user_map.get(f"asset:{current_asset_id}", {}) if current_asset_id > 0 else {}
-            user = user or user_map.get(source_hash, {}) or {}
+            user = user_map.get(source_hash, {}) or {}
             user_decision = str(user.get("decision", "auto") or "auto")
-            analysis_candidates = list(analysis.get("candidates", []) or [])
-            if user_decision in {"manual", "accept"}:
-                display_bbox = user.get("bbox")
-            elif user_decision == "keep_original":
-                display_bbox = None
-            elif str(analysis.get("confidence_level", "low") or "low") in {"high", "medium"} and analysis_candidates:
-                # Visual preselection is independent of automatic-acceptance policy.
-                display_bbox = analysis_candidates[0].get("bbox")
-            else:
-                display_bbox = None
+            display_bbox = user.get("bbox") if user_decision in {"manual", "accept"} else analysis.get("candidate_bbox")
             selected_candidate_index = 0
             if user_decision == "accept" and isinstance(user.get("bbox"), list):
                 for candidate_index, candidate in enumerate(analysis.get("candidates", []) or []):
@@ -4413,7 +4363,6 @@ def scan_frame_review_ui(
                         selected_candidate_index = candidate_index
                         break
             records.append({
-                "asset_id": asset_id_for(path),
                 "source_hash": source_hash,
                 "source_path": path,
                 "filename": os.path.basename(path),
@@ -4427,15 +4376,17 @@ def scan_frame_review_ui(
                 "layout_flags": analysis.get("layout_flags", []),
                 "recommendation": analysis.get("recommendation", "keep_original"),
                 "crop_type": analysis.get("crop_type", "unknown"),
-                "candidates": analysis_candidates,
+                "candidates": list(analysis.get("candidates", []) or []),
                 "selected_candidate_index": selected_candidate_index,
                 "user_decision": user_decision,
                 "display_bbox": display_bbox,
                 "cache_hit": bool(analysis.get("cache_hit")),
             })
+            semantic = load_photo_proposal(cache_dir, source_hash)
+            if semantic:
+                attach_photo_proposal(records[-1], semantic)
         except Exception as exc:
             records.append({
-                "asset_id": asset_id_for(path),
                 "source_hash": "",
                 "source_path": path,
                 "filename": os.path.basename(path),
@@ -4450,7 +4401,6 @@ def scan_frame_review_ui(
                 "display_bbox": None,
                 "cache_hit": False,
             })
-    records.sort(key=lambda record: _normalize_asset_id(record.get("asset_id")))
     if hash_index_dirty:
         try:
             _save_frame_hash_index_ui(cache_dir, hash_index)
@@ -4468,7 +4418,7 @@ def scan_frame_review_ui(
     workspace["frame"] = frame_state
     workspace.setdefault("preflight", {})
     workspace.update({
-        "schema_version": "workspace-v2-asset-ids",
+        "schema_version": "workspace-v1",
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "input_folder": os.path.abspath(input_folder),
         "trigger_word": str(trigger_word).strip(),
@@ -4483,51 +4433,24 @@ def scan_frame_review_ui(
         "advanced_types": bool(advanced_types),
         "preflight_survivor_count": len(paths),
         "preflight_skipped_count": max(0, len(all_paths) - len(paths)),
-        "frame_mode": frame_mode,
-        "auto_accept_types": auto_accept_types,
+        "frame_mode": str(workspace_frame.get("mode", "suggest_only") or "suggest_only"),
+        "auto_accept_types": list(workspace_frame.get("auto_accept_types") or []),
     }
-    view = str(filter_value or FRAME_REVIEW_DEFAULT_FILTER)
-    filtered = _frame_filter_records(state, view)
+    confirmed_crops = [r for r in records if r.get("user_decision") in {"accept", "manual"} and r.get("display_bbox")]
+    if confirmed_crops:
+        state["last_confirmed_crop_hash"] = max(
+            confirmed_crops, key=lambda r: str(user_map.get(r["source_hash"], {}).get("updated_at", ""))
+        )["source_hash"]
+    filtered = _frame_filter_records(state, "review")
     pages = _frame_page_choices(len(filtered))
-    if filtered:
-        record = filtered[0]
-        asset_id = _normalize_asset_id(record.get("asset_id"))
-        current_key = _frame_current_option_key(record, state)
-        detail, bbox = _frame_option_detail(record, current_key, state)
-        detail += tr(
-            f"  \nDetektor: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · Layout `{record.get('layout_class','plain_photo')}` · Vorschläge `{len(record.get('candidates',[]) or [])}`. "
-            "Die erste sichtbare Aufnahme wurde automatisch für den Vergleich ausgewählt.",
-            f"  \nDetector: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · layout `{record.get('layout_class','plain_photo')}` · suggestions `{len(record.get('candidates',[]) or [])}`. "
-            "The first visible image was selected automatically for comparison.",
-        )
-        option_gallery, option_radio = _frame_option_gallery_update(record, state)
-        position, previous_update, next_update = _frame_viewer_navigation_updates(
-            state, view, asset_id
-        )
-        gallery = _frame_review_gallery_update(state, view, "1", asset_id)
-        return (
-            state,
-            _frame_review_summary_md(state),
-            gr.update(choices=pages, value="1"),
-            gallery,
-            asset_id,
-            detail,
-            option_gallery,
-            option_radio,
-            position,
-            previous_update,
-            next_update,
-            int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]),
-            tr(f"✅ {len(records)} Bilder lokal geprüft", f"✅ {len(records)} images checked locally"),
-        )
-
+    gallery = _frame_review_gallery(state, "review", "1")
     return (
         state,
         _frame_review_summary_md(state),
         gr.update(choices=pages, value="1"),
-        gr.update(value=[], selected_index=None),
-        0,
-        tr("_Keine Bilder in diesem Filter._", "_No images in this filter._"),
+        gallery,
+        "",
+        tr("_Kein Bild ausgewählt._", "_No image selected._"),
         gr.update(value=[], selected_index=None),
         gr.update(choices=[], value=None),
         tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"),
@@ -4545,41 +4468,10 @@ def refresh_frame_review_page_ui(state: Any, filter_value: str, page_value: Any)
         page = str(min(max(1, int(page_value or 1)), len(choices)))
     except Exception:
         page = "1"
-
-    try:
-        page_start = (int(page) - 1) * FRAME_REVIEW_PAGE_SIZE
-    except Exception:
-        page_start = 0
-    record = records[page_start] if 0 <= page_start < len(records) else None
-    if record:
-        asset_id = _normalize_asset_id(record.get("asset_id"))
-        current_key = _frame_current_option_key(record, state)
-        detail, bbox = _frame_option_detail(record, current_key, state)
-        detail += tr(
-            "  \nDas erste Bild der gewählten Ansicht wurde automatisch geladen.",
-            "  \nThe first image in the selected view was loaded automatically.",
-        )
-        option_gallery, option_radio = _frame_option_gallery_update(record, state)
-        position, previous_update, next_update = _frame_viewer_navigation_updates(
-            state, filter_value, asset_id
-        )
-        return (
-            gr.update(choices=choices, value=page),
-            _frame_review_gallery_update(state, filter_value, page, asset_id),
-            asset_id,
-            detail,
-            option_gallery,
-            option_radio,
-            position,
-            previous_update,
-            next_update,
-            int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]),
-        )
-
     option_gallery, option_radio = _frame_option_gallery_update(None, state)
     return (
-        gr.update(choices=choices, value=page), gr.update(value=[], selected_index=None),
-        0, tr("_Keine Bilder in dieser Ansicht._", "_No images in this view._"),
+        gr.update(choices=choices, value=page), _frame_review_gallery(state, filter_value, page),
+        "", tr("_Kein Bild ausgewählt._", "_No image selected._"),
         option_gallery, option_radio,
         tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"),
         gr.update(interactive=False), gr.update(interactive=False),
@@ -4587,66 +4479,44 @@ def refresh_frame_review_page_ui(state: Any, filter_value: str, page_value: Any)
     )
 
 
-def _event_index(evt: Any) -> Any:
-    """Read a Gradio selection index without requiring a ``value`` field.
-
-    Gradio 6 may emit programmatic Gallery/Image select events containing only
-    ``index``. Annotating the callback as ``gr.SelectData`` makes Gradio access
-    a missing ``value`` before our callback can run, producing ``KeyError:
-    'value'``. Raw ``gr.EventData`` remains compatible with both automatic and
-    user-triggered events.
-    """
-    index = getattr(evt, "index", None)
-    if index is not None:
-        return index
-    data = getattr(evt, "_data", None)
-    if isinstance(data, dict):
-        return data.get("index")
-    return None
-
-
-def select_frame_review_image_ui(state: Any, filter_value: str, page_value: Any, evt: gr.EventData):
+def select_frame_review_image_ui(state: Any, filter_value: str, page_value: Any, evt: gr.SelectData):
     records = _frame_filter_records(state, filter_value)
     try:
         page = max(1, int(page_value or 1))
-        event_index = _event_index(evt)
-        if isinstance(event_index, (list, tuple)):
-            event_index = event_index[0]
-        index = (page - 1) * FRAME_REVIEW_PAGE_SIZE + int(event_index)
+        index = (page - 1) * FRAME_REVIEW_PAGE_SIZE + int(evt.index)
         record = records[index]
     except Exception:
         empty_gallery, empty_radio = _frame_option_gallery_update(None, state)
-        return 0, tr("Auswahl konnte nicht aufgelöst werden.", "Could not resolve selection."), empty_gallery, empty_radio, tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0
+        return "", tr("Auswahl konnte nicht aufgelöst werden.", "Could not resolve selection."), empty_gallery, empty_radio, tr("_Kein Bild im Vergleichsviewer._", "_No image in the comparison viewer._"), gr.update(interactive=False), gr.update(interactive=False), 0, 0, 0, 0
     current_key = _frame_current_option_key(record, state)
-    detail, bbox = _frame_option_detail(record, current_key, state)
+    detail, bbox = _frame_option_detail(record, current_key)
     detail += tr(
         f"  \\nDetektor: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · Layout `{record.get('layout_class','plain_photo')}` · Vorschläge `{len(record.get('candidates',[]) or [])}`. "
-        "Die Vorschaubilder sind nur zum Vergleichen. Änderungen an der Auswahl werden sofort gespeichert; eine bereits markierte unbestätigte Vorauswahl kannst du mit „Aktuelle Auswahl übernehmen“ bestätigen.",
+        "Die Vorschaubilder sind nur zum Vergleichen. Wähle direkt darunter genau eine Option; sie wird ohne zusätzlichen Speichern-Schritt übernommen.",
         f"  \\nDetector: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · layout `{record.get('layout_class','plain_photo')}` · suggestions `{len(record.get('candidates',[]) or [])}`. "
         "The previews are comparison-only. Choose exactly one option directly underneath; it is applied without a separate save step.",
     )
     option_gallery, option_radio = _frame_option_gallery_update(record, state)
-    asset_id = _normalize_asset_id(record.get("asset_id"))
     position, previous_update, next_update = _frame_viewer_navigation_updates(
-        state, filter_value, asset_id
+        state, filter_value, record.get("source_hash", "")
     )
-    return asset_id, detail, option_gallery, option_radio, position, previous_update, next_update, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+    return record.get("source_hash", ""), detail, option_gallery, option_radio, position, previous_update, next_update, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
 
 
 def navigate_frame_review_image_ui(
     state: Any,
     filter_value: str,
-    asset_id: Any,
+    source_hash: str,
     direction: int,
 ):
-    """Move the comparison viewer by persistent integer asset ID."""
-    records, current_index = _frame_selection_location(state, filter_value, asset_id)
+    """Move the comparison viewer to the previous or next filtered image."""
+    records, current_index = _frame_selection_location(state, filter_value, source_hash)
     if not records:
         empty_gallery, empty_radio = _frame_option_gallery_update(None, state)
         return (
             gr.update(choices=["1"], value="1"),
             gr.update(value=[], selected_index=None),
-            0,
+            "",
             tr("_Kein Bild ausgewählt._", "_No image selected._"),
             empty_gallery,
             empty_radio,
@@ -4663,22 +4533,21 @@ def navigate_frame_review_image_ui(
     page = str((target_index // FRAME_REVIEW_PAGE_SIZE) + 1)
     pages = _frame_page_choices(len(records))
     current_key = _frame_current_option_key(record, state)
-    detail, bbox = _frame_option_detail(record, current_key, state)
+    detail, bbox = _frame_option_detail(record, current_key)
     detail += tr(
         f"  \\nDetektor: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · Layout `{record.get('layout_class','plain_photo')}` · Vorschläge `{len(record.get('candidates',[]) or [])}`. "
-        "Die Vorschaubilder sind nur zum Vergleichen. Änderungen werden sofort gespeichert; eine bereits markierte Vorauswahl wird über „Aktuelle Auswahl übernehmen“ bestätigt.",
+        "Die Vorschaubilder sind nur zum Vergleichen. Wähle direkt darunter genau eine Option.",
         f"  \\nDetector: `{record.get('confidence_level')}` ({float(record.get('confidence',0)):.1%}) · layout `{record.get('layout_class','plain_photo')}` · suggestions `{len(record.get('candidates',[]) or [])}`. "
         "The previews are comparison-only. Choose exactly one option directly underneath.",
     )
     option_gallery, option_radio = _frame_option_gallery_update(record, state)
-    target_asset_id = _normalize_asset_id(record.get("asset_id"))
     position, previous_update, next_update = _frame_viewer_navigation_updates(
-        state, filter_value, target_asset_id
+        state, filter_value, record.get("source_hash", "")
     )
     return (
         gr.update(choices=pages, value=page),
-        _frame_review_gallery_update(state, filter_value, page, target_asset_id),
-        target_asset_id,
+        _frame_review_gallery_update(state, filter_value, page, record.get("source_hash", "")),
+        record.get("source_hash", ""),
         detail,
         option_gallery,
         option_radio,
@@ -4688,11 +4557,11 @@ def navigate_frame_review_image_ui(
         int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]),
     )
 
-def select_frame_candidate_ui(state: Any, filter_value: str, page_value: Any, asset_id: Any, candidate_value: Any):
+def select_frame_candidate_ui(state: Any, filter_value: str, page_value: Any, source_hash: str, candidate_value: Any):
     if isinstance(state, dict):
         state = dict(state)
         state["records"] = [dict(r) for r in (state.get("records", []) or [])]
-    record = _find_frame_record(state, asset_id)
+    record = _find_frame_record(state, source_hash)
     if not record:
         return state, _frame_review_gallery(state, filter_value, page_value), tr("Kein Bild ausgewählt.", "No image selected."), 0, 0, 0, 0
     try:
@@ -4706,7 +4575,7 @@ def select_frame_candidate_ui(state: Any, filter_value: str, page_value: Any, as
         f"**{record.get('filename','')}** – Variante `{int(record['selected_candidate_index']) + 1}` · `{candidate.get('crop_type','unknown')}` · {float(candidate.get('confidence',0)):.1%} · `{bbox}`",
         f"**{record.get('filename','')}** – Variant `{int(record['selected_candidate_index']) + 1}` · `{candidate.get('crop_type','unknown')}` · {float(candidate.get('confidence',0)):.1%} · `{bbox}`",
     )
-    return state, _frame_review_gallery(state, filter_value, page_value, asset_id), detail, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+    return state, _frame_review_gallery(state, filter_value, page_value), detail, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
 
 
 
@@ -4714,12 +4583,12 @@ def apply_frame_option_ui(
     state: Any,
     filter_value: str,
     page_value: Any,
-    asset_id: Any,
+    source_hash: str,
     option_key: Any,
 ):
     """Persist one option immediately and refresh both galleries."""
     option_key = str(option_key or "original")
-    record = _find_frame_record(state, asset_id)
+    record = _find_frame_record(state, source_hash)
     if not record:
         empty_gallery, empty_radio = _frame_option_gallery_update(None, state)
         return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value), tr("Kein Bild ausgewählt.", "No image selected."), empty_gallery, empty_radio, 0, 0, 0, 0, tr("❌ Keine Auswahl", "❌ No selection")
@@ -4727,54 +4596,159 @@ def apply_frame_option_ui(
         decision, candidate_value = "keep_original", None
     elif option_key == "manual":
         # Existing manual choice remains selected; no re-save is needed.
-        detail, bbox = _frame_option_detail(record, option_key, state)
+        detail, bbox = _frame_option_detail(record, option_key)
         option_gallery, option_radio = _frame_option_gallery_update(record, state)
-        return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, asset_id), detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), tr("✅ Manueller Crop bleibt aktiv", "✅ Manual crop remains active")
+        return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, source_hash), detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), tr("✅ Manueller Crop bleibt aktiv", "✅ Manual crop remains active")
     elif option_key.startswith("candidate:"):
         decision, candidate_value = "accept", option_key.split(":", 1)[1]
     else:
         decision, candidate_value = "keep_original", None
 
     updated = set_frame_review_decision_ui(
-        state, filter_value, page_value, asset_id, decision, candidate_value,
+        state, filter_value, page_value, source_hash, decision, candidate_value,
         0, 0, 0, 0,
     )
     new_state, summary, main_gallery, _message, status = updated
-    record = _find_frame_record(new_state, asset_id)
-    detail, bbox = _frame_option_detail(record, option_key, new_state) if record else (tr("Auswahl gespeichert.", "Selection saved."), [0, 0, 0, 0])
+    record = _find_frame_record(new_state, source_hash)
+    detail, bbox = _frame_option_detail(record, option_key) if record else (tr("Auswahl gespeichert.", "Selection saved."), [0, 0, 0, 0])
     option_gallery, option_radio = _frame_option_gallery_update(record, new_state)
     return new_state, summary, main_gallery, detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), status
 
 
-def restore_frame_auto_ui(state: Any, filter_value: str, page_value: Any, asset_id: Any):
-    record = _find_frame_record(state, asset_id)
+def restore_frame_auto_ui(state: Any, filter_value: str, page_value: Any, source_hash: str):
+    record = _find_frame_record(state, source_hash)
     if not record:
         empty_gallery, empty_radio = _frame_option_gallery_update(None, state)
         return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value), tr("Kein Bild ausgewählt.", "No image selected."), empty_gallery, empty_radio, 0, 0, 0, 0, tr("❌ Keine Auswahl", "❌ No selection")
     width, height = record.get("original_size") or [0, 0]
-    updated = set_frame_review_decision_ui(state, filter_value, page_value, asset_id, "auto", None, 0, 0, width, height)
+    updated = set_frame_review_decision_ui(state, filter_value, page_value, source_hash, "auto", None, 0, 0, width, height)
     new_state, summary, main_gallery, _message, status = updated
-    record = _find_frame_record(new_state, asset_id)
+    record = _find_frame_record(new_state, source_hash)
     key = _frame_current_option_key(record or {}, new_state)
-    detail, bbox = _frame_option_detail(record or {}, key, new_state)
+    detail, bbox = _frame_option_detail(record or {}, key)
     option_gallery, option_radio = _frame_option_gallery_update(record, new_state)
     return new_state, summary, main_gallery, detail, option_gallery, option_radio, int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3]), status
 
 
-def _find_frame_record(state: Any, asset_id: Any) -> Optional[Dict[str, Any]]:
-    if not isinstance(state, dict):
+def save_frame_and_navigate_ui(state, filter_value, page_value, source_hash, option_key, advance):
+    """Save and select the next pending item without skipping a removed row."""
+    _, previous_index = _frame_selection_location(state, filter_value, source_hash)
+    saved = apply_frame_option_ui(state, filter_value, page_value, source_hash, option_key)
+    new_state, summary, *_, status = saved
+    records = _frame_filter_records(new_state, filter_value)
+    selected_hash = source_hash
+    if advance and not str(status).startswith("❌") and records:
+        remaining_index = next((i for i, r in enumerate(records) if r.get("source_hash") == source_hash), -1)
+        target = remaining_index + 1 if remaining_index >= 0 else max(0, previous_index)
+        selected_hash = records[min(target, len(records) - 1)].get("source_hash", "")
+    navigation = navigate_frame_review_image_ui(new_state, filter_value, selected_hash, 0)
+    return (new_state, summary, *navigation, status)
+
+
+def save_manual_frame_and_navigate_ui(state, filter_value, page_value, source_hash, x1, y1, x2, y2, advance):
+    _, previous_index = _frame_selection_location(state, filter_value, source_hash)
+    new_state, summary, _, _, status = set_frame_review_decision_ui(
+        state, filter_value, page_value, source_hash, "manual", None, x1, y1, x2, y2,
+    )
+    records = _frame_filter_records(new_state, filter_value)
+    selected_hash = source_hash
+    if advance and not str(status).startswith("❌") and records:
+        remaining_index = next((i for i, r in enumerate(records) if r.get("source_hash") == source_hash), -1)
+        target = remaining_index + 1 if remaining_index >= 0 else max(0, previous_index)
+        selected_hash = records[min(target, len(records) - 1)].get("source_hash", "")
+    return (new_state, summary, *navigate_frame_review_image_ui(new_state, filter_value, selected_hash, 0), status)
+
+
+def exclude_frame_and_navigate_ui(state, filter_value, page_value, source_hash, advance):
+    _, previous_index = _frame_selection_location(state, filter_value, source_hash)
+    updated, summary, _, _, status = set_frame_review_decision_ui(
+        state, filter_value, page_value, source_hash, "exclude", None, 0, 0, 0, 0,
+    )
+    records = _frame_filter_records(updated, filter_value)
+    target_hash = source_hash
+    if advance and not str(status).startswith("❌") and records:
+        remaining = next((i for i, r in enumerate(records) if r.get("source_hash") == source_hash), -1)
+        index = remaining + 1 if remaining >= 0 else max(0, previous_index)
+        target_hash = records[min(index, len(records)-1)]["source_hash"]
+    return (updated, summary, *navigate_frame_review_image_ui(updated, filter_value, target_hash, 0), status)
+
+
+def set_frame_automation_ui(state, mode, allowed_types, filter_value):
+    if not isinstance(state, dict) or not state.get("records"):
+        return (state, _frame_review_summary_md(state), tr("Zuerst Rahmen lokal analysieren.", "Analyze frames locally first."))
+    if mode not in {"suggest_only", "auto_high_review_medium", "auto_high_keep_medium"}:
+        raise ValueError("unsupported frame automation mode")
+    allowed = [value for value, _de, _en in FRAME_AUTO_ACCEPT_TYPE_CHOICES if value in (allowed_types or [])]
+    if mode != "suggest_only" and not allowed:
+        return state, _frame_review_summary_md(state), tr("Mindestens eine Zuschnittart auswählen oder die empfohlene Automatik verwenden.",
+                                                        "Select at least one crop type or use recommended automation.")
+    updated = dict(state, frame_mode=mode, auto_accept_types=allowed)
+    for record in state["records"]:
+        if record.get("user_decision", "auto") != "auto":
+            continue
+        before = automatic_crop_bbox(record, state.get("frame_mode", "suggest_only"), state.get("auto_accept_types", []))
+        after = automatic_crop_bbox(record, mode, allowed)
+        if before != after:
+            _mark_frame_audit_dependency_stale(state["output_root"], record, "auto", after)
+    path = os.path.join(state["output_root"], "_project_workspace.json")
+    workspace = _load_json_dict(path)
+    workspace["frame"] = {**workspace.get("frame", {}), "mode": mode, "auto_accept_types": allowed}
+    core_atomic_write_json(path, workspace)
+    settings = load_settings()
+    settings.update(c_frame_cleanup_mode=mode, c_frame_auto_accept_types=allowed)
+    core_atomic_write_json(SETTINGS_PATH, settings)
+    count = sum(r.get("user_decision", "auto") == "auto" and automatic_crop_bbox(r, mode, allowed) is not None for r in state["records"])
+    message = tr(f"{count} Zuschnitte automatisch aktiv. Manuelle Entscheidungen bleiben bestehen; unsichere Grenzen brauchen Prüfung.",
+                 f"{count} automatic crops active. Manual decisions are preserved; uncertain boundaries need review.")
+    return updated, _frame_review_summary_md(updated), message
+
+
+def scan_frames_after_preflight_ui(trigger_word, input_folder, advanced_types, enabled, ready, progress=gr.Progress()):
+    if not enabled or not ready:
+        return tuple(gr.skip() for _ in range(16))
+    return scan_frame_review_ui(trigger_word, input_folder, advanced_types, progress=progress)
+
+
+def semantic_frame_review_ui(state, filter_value, page_value, source_hash, scope, api_key, model, progress=gr.Progress()):
+    """Explicit paid analysis of one image or at most one visible page."""
+    state = dict(state or {})
+    state["records"] = [dict(r) for r in state.get("records", [])]
+    selected = _find_frame_record(state, source_hash)
+    if scope == "selected":
+        targets = [selected] if selected else []
+    else:
+        records = _frame_filter_records(state, filter_value)
+        page = max(1, int(page_value or 1))
+        targets = records[(page-1)*FRAME_REVIEW_PAGE_SIZE:page*FRAME_REVIEW_PAGE_SIZE]
+    targets = [r for r in targets if r.get("source_hash") and r.get("user_decision", "auto") == "auto"]
+    if not targets:
+        yield (state, _frame_review_summary_md(state), *navigate_frame_review_image_ui(state, filter_value, source_hash, 0),
+               tr("Kein unentschiedenes Bild ausgewählt.", "No undecided image selected."))
+        return
+    tokens = 0
+    for index, record in enumerate(targets):
+        progress(index / len(targets), desc=tr("KI erkennt Fotobereiche", "AI identifies photo regions"))
+        try:
+            proposal = propose_photo_region(record["source_path"], record["source_hash"], state["cache_dir"],
+                                            api_key or os.environ.get("OPENAI_API_KEY", ""), model)
+            attach_photo_proposal(record, proposal)
+            if not proposal.get("cache_hit"):
+                tokens += int((proposal.get("usage") or {}).get("total_tokens", 0))
+            message = tr(f"KI {index+1}/{len(targets)} · {tokens:,} Tokens · ", f"AI {index+1}/{len(targets)} · {tokens:,} tokens · ") + proposal.get("reason", "")
+        except Exception as exc:
+            # Do not surface external exception text, which could include credentials.
+            message = tr(f"KI {index+1}/{len(targets)} fehlgeschlagen ({type(exc).__name__}); bisherige Vorschläge bleiben erhalten.",
+                         f"AI {index+1}/{len(targets)} failed ({type(exc).__name__}); existing suggestions are preserved.")
+        yield (state, _frame_review_summary_md(state), *navigate_frame_review_image_ui(state, filter_value, record["source_hash"], 0), message)
+    progress(1.0, desc=tr("KI-Vorschläge bereit", "AI proposals ready"))
+
+
+def _find_frame_record(state: Any, source_hash: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(state, dict) or not source_hash:
         return None
-    selected = _normalize_asset_id(asset_id)
-    if selected > 0:
-        for record in state.get("records", []) or []:
-            if _normalize_asset_id(record.get("asset_id")) == selected:
-                return record
-    # Migration fallback only; newly built frame states always use asset_id.
-    legacy_hash = str(asset_id or "")
-    if legacy_hash:
-        for record in state.get("records", []) or []:
-            if str(record.get("source_hash", "")) == legacy_hash:
-                return record
+    for record in state.get("records", []) or []:
+        if str(record.get("source_hash", "")) == str(source_hash or ""):
+            return record
     return None
 
 
@@ -4795,7 +4769,6 @@ def _mark_frame_audit_dependency_stale(output_root: str, record: Dict[str, Any],
     from profile is blocked until that targeted re-audit has happened.
     """
     marker = {
-        "source_asset_id": _normalize_asset_id(record.get("asset_id")),
         "source_hash": str(record.get("source_hash", "")),
         "source_path": os.path.abspath(str(record.get("source_path", ""))),
         "filename": str(record.get("filename", "")),
@@ -4812,9 +4785,9 @@ def _mark_frame_audit_dependency_stale(output_root: str, record: Dict[str, Any],
         existing = payload.get("audit_stale_images", [])
         if not isinstance(existing, list):
             existing = []
-        key = str(marker["source_asset_id"] or marker["source_hash"] or marker["source_path"] or marker["filename"])
+        key = marker["source_hash"] or marker["source_path"] or marker["filename"]
         by_key = {
-            str(item.get("source_asset_id") or item.get("source_hash") or item.get("source_path") or item.get("filename") or ""): item
+            str(item.get("source_hash") or item.get("source_path") or item.get("filename") or ""): item
             for item in existing if isinstance(item, dict)
         }
         by_key[key] = marker
@@ -4829,7 +4802,7 @@ def set_frame_review_decision_ui(
     state: Any,
     filter_value: str,
     page_value: Any,
-    asset_id: Any,
+    source_hash: str,
     decision: str,
     candidate_value: Any,
     x1: Any, y1: Any, x2: Any, y2: Any,
@@ -4837,7 +4810,7 @@ def set_frame_review_decision_ui(
     if isinstance(state, dict):
         state = dict(state)
         state["records"] = [dict(r) for r in (state.get("records", []) or [])]
-    record = _find_frame_record(state, asset_id)
+    record = _find_frame_record(state, source_hash)
     if not record:
         return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value), tr("Kein Bild ausgewählt.", "No image selected."), tr("❌ Keine Auswahl", "❌ No selection")
     bbox = None
@@ -4845,17 +4818,16 @@ def set_frame_review_decision_ui(
         bbox = [int(x1), int(y1), int(x2), int(y2)]
         width, height = record.get("original_size") or frame_image_dimensions(record["source_path"])
         if not (0 <= bbox[0] < bbox[2] <= int(width) and 0 <= bbox[1] < bbox[3] <= int(height)):
-            return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, asset_id), tr("Ungültige Crop-Koordinaten.", "Invalid crop coordinates."), tr("❌ Ungültiger Crop", "❌ Invalid crop")
+            return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, source_hash), tr("Ungültige Crop-Koordinaten.", "Invalid crop coordinates."), tr("❌ Ungültiger Crop", "❌ Invalid crop")
     elif decision == "accept":
         bbox = _frame_candidate_bbox(record, candidate_value)
         if not isinstance(bbox, list) or len(bbox) != 4:
-            return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, asset_id), tr("Kein Crop-Vorschlag vorhanden.", "No crop suggestion available."), tr("❌ Kein Vorschlag", "❌ No suggestion")
+            return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, source_hash), tr("Kein Crop-Vorschlag vorhanden.", "No crop suggestion available."), tr("❌ Kein Vorschlag", "❌ No suggestion")
 
     old_decision = str(record.get("user_decision", "auto") or "auto")
     old_bbox = record.get("display_bbox") if old_decision in {"accept", "manual"} else None
     save_frame_user_decision(
-        state["output_root"], record["source_hash"], record["source_path"], decision,
-        bbox=bbox, asset_id=_normalize_asset_id(record.get("asset_id"))
+        state["output_root"], record["source_hash"], record["source_path"], decision, bbox=bbox
     )
     new_effective_bbox = bbox if decision in {"accept", "manual"} else None
     if old_decision != decision or old_bbox != new_effective_bbox:
@@ -4863,26 +4835,88 @@ def set_frame_review_decision_ui(
     record["user_decision"] = decision
     if decision in {"manual", "accept"}:
         record["display_bbox"] = bbox
+        state["last_confirmed_crop_hash"] = source_hash
         if decision == "accept":
             try:
                 record["selected_candidate_index"] = int(candidate_value)
             except Exception:
                 pass
-    elif decision == "keep_original":
+    elif decision in {"keep_original", "exclude"}:
         record["display_bbox"] = None
     else:
-        record["display_bbox"] = _frame_best_preview_bbox(record)
+        record["display_bbox"] = record.get("candidate_bbox")
     message = {
         "accept": tr("Crop-Vorschlag übernommen.", "Crop suggestion accepted."),
         "manual": tr("Manueller Crop gespeichert.", "Manual crop saved."),
         "keep_original": tr("Original wird beibehalten.", "Original will be kept."),
+        "exclude": tr("Bild aus dem Datensatz ausgeschlossen. Die Quelldatei bleibt erhalten.", "Image excluded from the dataset. The source file is preserved."),
         "auto": tr("Manuelle Entscheidung entfernt; Automatik gilt wieder.", "Manual decision removed; automatic behavior restored."),
     }.get(decision, decision)
-    return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, asset_id), message, f"✅ {message}"
+    return state, _frame_review_summary_md(state), _frame_review_gallery_update(state, filter_value, page_value, source_hash), message, f"✅ {message}"
 
 
-def preview_manual_frame_crop_ui(state: Any, asset_id: Any, x1: Any, y1: Any, x2: Any, y2: Any):
-    record = _find_frame_record(state, asset_id)
+def preview_frame_group_ui(state, source_hash):
+    source = _find_frame_record(state, source_hash)
+    if not source or source.get("user_decision") not in {"manual", "accept"}:
+        source_hash = (state or {}).get("last_confirmed_crop_hash", "")
+        source = _find_frame_record(state, source_hash)
+    plan = build_group_plan((state or {}).get("records", []), source_hash)
+    gallery, choices, valid = [], [], []
+    try:
+        for target in plan.get("targets", []):
+            record = _find_frame_record(state, target["source_hash"])
+            preview = build_review_preview(record["source_path"], target["bbox"], state["cache_dir"],
+                                           source_hash=record["source_hash"])
+            image = load_gallery_image(preview, max_size=(1240, 720))
+            if image is None:
+                raise ValueError("preview unavailable")
+            gallery.append((image, record["filename"]))
+            choices.append((record["filename"], record["source_hash"]))
+            valid.append(record["source_hash"])
+    except Exception:
+        return {}, [], gr.update(choices=[], value=[]), tr("Vorschau fehlgeschlagen. Bitte Rahmenanalyse neu laden.", "Preview failed. Please reload frame analysis."), gr.update(interactive=False)
+    message = (tr(f"Vorlage: **{source['filename']}** · {len(valid)} ähnliche Bilder. Original links, Vorlagenzuschnitt rechts. Alle ausgewählten Bilder vor dem Speichern prüfen.",
+                  f"Template: **{source['filename']}** · {len(valid)} similar images. Original on the left, template crop on the right. Review every selected image before saving.")
+               if valid else tr("Zuerst einen Zuschnitt bestätigen. Es werden nur offene Bilder mit ähnlichen Grenzen, Seitenverhältnis und Layout angeboten.",
+                                "Confirm a crop first. Only undecided images with similar bounds, aspect ratio and layout are offered."))
+    return plan, gallery, gr.update(choices=choices, value=valid), message, gr.update(interactive=bool(valid))
+
+
+def apply_frame_group_ui(state, plan, selected, filter_value, page_value):
+    new_state = dict(state or {})
+    new_state["records"] = [dict(r) for r in new_state.get("records", [])]
+    count = 0
+    try:
+        targets = validate_group_selection(new_state["records"], plan, selected)
+        # Check every source before persisting any decision. Preview caches are
+        # keyed by hash, so changed files must never receive stale coordinates.
+        for key in [plan["source_hash"], *(t["source_hash"] for t in targets)]:
+            record = _find_frame_record(new_state, key)
+            if frame_file_sha1(record["source_path"]) != key:
+                raise ValueError("source changed")
+        persisted = load_frame_user_decisions(new_state["output_root"]).get("decisions", {})
+        if persisted.get(plan["source_hash"], {}).get("bbox") != plan["source_bbox"]:
+            raise ValueError("template decision changed")
+        for target in targets:
+            if persisted.get(target["source_hash"], {}).get("decision", "auto") != "auto":
+                raise ValueError("decision changed")
+        for target in targets:
+            record = _find_frame_record(new_state, target["source_hash"])
+            save_frame_user_decision(new_state["output_root"], record["source_hash"], record["source_path"], "manual", target["bbox"])
+            record.update(user_decision="manual", display_bbox=target["bbox"])
+            count += 1
+            _mark_frame_audit_dependency_stale(new_state["output_root"], record, "manual", target["bbox"])
+        message = tr(f"Vorlagenzuschnitt für {count} Bilder gespeichert.", f"Template crop saved for {count} images.")
+    except Exception:
+        message = tr(f"{count} Bilder gespeichert. Die übrigen wurden nicht übernommen; Vorschau bitte erneut laden.",
+                     f"{count} images saved. Remaining images were not applied; please reload the preview.")
+    return (new_state, _frame_review_summary_md(new_state),
+            _frame_review_gallery_update(new_state, filter_value, page_value), message,
+            {}, gr.update(value=[], choices=[]), [], gr.update(interactive=False))
+
+
+def preview_manual_frame_crop_ui(state: Any, source_hash: str, x1: Any, y1: Any, x2: Any, y2: Any):
+    record = _find_frame_record(state, source_hash)
     if not record:
         return None, tr("Kein Bild ausgewählt.", "No image selected.")
     try:
@@ -4901,143 +4935,34 @@ def preview_manual_frame_crop_ui(state: Any, asset_id: Any, x1: Any, y1: Any, x2
         return None, tr(f"Ungültige Vorschau: {exc}", f"Invalid preview: {exc}")
 
 
-def _manual_crop_marker_base(record: Optional[Dict[str, Any]]) -> Tuple[Optional[Image.Image], Dict[str, Any]]:
+def load_click_crop_ui(state, source_hash):
+    record = _find_frame_record(state, source_hash)
+    preview = load_gallery_image(record["source_path"], max_size=(1200, 1200)) if record else None
+    return preview, None
+
+
+def select_crop_corner_ui(state, source_hash, first_corner, evt: gr.SelectData):
+    record = _find_frame_record(state, source_hash)
     if not record:
-        return None, {}
-    preview = load_gallery_image(str(record.get("source_path", "")), max_size=(1600, 1000))
+        return None, None, 0, 0, 0, 0, tr("Kein Bild ausgewählt.", "No image selected.")
+    preview = load_gallery_image(record["source_path"], max_size=(1200, 1200))
     if preview is None:
-        return None, {}
-    original_width, original_height = record.get("original_size") or frame_image_dimensions(record["source_path"])
-    return preview, {
-        "asset_id": _normalize_asset_id(record.get("asset_id")),
-        "source_hash": str(record.get("source_hash", "")),
-        "preview_size": [int(preview.width), int(preview.height)],
-        "original_size": [int(original_width), int(original_height)],
-        "points": [],
-    }
-
-
-def load_manual_crop_marker_ui(state: Any, asset_id: Any):
-    """Load a bounded original preview for the two-click crop marker."""
-    record = _find_frame_record(state, asset_id)
-    preview, marker_state = _manual_crop_marker_base(record)
-    if preview is None:
-        return None, {}, tr(
-            "Wähle zuerst oben ein Bild aus.",
-            "Select an image above first.",
-        )
-    return preview, marker_state, tr(
-        "Klick 1 setzt die erste Ecke, Klick 2 die diagonal gegenüberliegende Ecke.",
-        "Click 1 sets the first corner; click 2 sets the diagonally opposite corner.",
-    )
-
-
-def reset_manual_crop_marker_ui(state: Any, asset_id: Any):
-    preview, marker_state, status = load_manual_crop_marker_ui(state, asset_id)
-    return preview, marker_state, 0, 0, 0, 0, None, status
-
-
-def mark_manual_crop_point_ui(
-    state: Any,
-    asset_id: Any,
-    marker_state: Any,
-    evt: gr.EventData,
-):
-    """Convert two clicks on a bounded preview into original-image crop bounds."""
-    record = _find_frame_record(state, asset_id)
-    if not record:
-        return None, {}, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), tr(
-            "Kein Bild ausgewählt.", "No image selected."
-        )
-
-    preview, fresh_state = _manual_crop_marker_base(record)
-    if preview is None:
-        return None, {}, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), tr(
-            "Das Originalbild konnte nicht für die Klickauswahl geladen werden.",
-            "The original image could not be loaded for click selection.",
-        )
-
-    current = dict(marker_state or {}) if isinstance(marker_state, dict) else {}
-    if current.get("asset_id") != _normalize_asset_id(asset_id):
-        current = fresh_state
-    points = list(current.get("points") or [])
-    if len(points) >= 2:
-        points = []
-
-    try:
-        event_index = _event_index(evt)
-        if not isinstance(event_index, (list, tuple)) or len(event_index) < 2:
-            raise ValueError("missing image click coordinates")
-        click_x, click_y = event_index[:2]
-        click_x = max(0, min(int(click_x), preview.width - 1))
-        click_y = max(0, min(int(click_y), preview.height - 1))
-    except Exception:
-        return preview, fresh_state, gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), tr(
-            "Klickposition konnte nicht gelesen werden.",
-            "The click position could not be read.",
-        )
-
-    points.append([click_x, click_y])
-    current = fresh_state
-    current["points"] = points
-    draw = ImageDraw.Draw(preview)
-    marker_radius = max(5, round(min(preview.size) * 0.008))
-    line_width = max(3, round(min(preview.size) * 0.005))
-
-    def original_pixel(px: int, py: int) -> Tuple[int, int]:
-        original_width, original_height = current["original_size"]
-        mapped_x = round(px * max(0, original_width - 1) / max(1, preview.width - 1))
-        mapped_y = round(py * max(0, original_height - 1) / max(1, preview.height - 1))
-        return int(mapped_x), int(mapped_y)
-
-    for px, py in points:
-        draw.ellipse(
-            [px - marker_radius, py - marker_radius, px + marker_radius, py + marker_radius],
-            outline=(255, 255, 255),
-            fill=(220, 30, 30),
-            width=max(2, line_width // 2),
-        )
-
-    first_x, first_y = original_pixel(*points[0])
-    if len(points) == 1:
-        return preview, current, first_x, first_y, 0, 0, None, tr(
-            "Erste Ecke gesetzt. Klicke jetzt auf die diagonal gegenüberliegende Ecke.",
-            "First corner set. Now click the diagonally opposite corner.",
-        )
-
-    (px1, py1), (px2, py2) = points
-    draw.rectangle(
-        [min(px1, px2), min(py1, py2), max(px1, px2), max(py1, py2)],
-        outline=(220, 30, 30),
-        width=line_width,
-    )
-    second_x, second_y = original_pixel(px2, py2)
-    original_width, original_height = current["original_size"]
-    x1 = min(first_x, second_x)
-    y1 = min(first_y, second_y)
-    x2 = min(int(original_width), max(first_x, second_x) + 1)
-    y2 = min(int(original_height), max(first_y, second_y) + 1)
-    if x2 <= x1 or y2 <= y1:
-        return preview, current, x1, y1, x2, y2, gr.update(), tr(
-            "Die beiden Punkte liegen zu nah beieinander. Klicke erneut, um eine neue Auswahl zu beginnen.",
-            "The two points are too close together. Click again to start a new selection.",
-        )
-
-    compare_preview: Any = gr.update()
-    try:
-        preview_path = build_review_preview(
-            record["source_path"], [x1, y1, x2, y2], state["cache_dir"], source_hash=record["source_hash"]
-        )
-        loaded = load_gallery_image(preview_path, max_size=(1240, 720))
-        if loaded is not None:
-            compare_preview = loaded
-    except Exception:
-        pass
-
-    return preview, current, x1, y1, x2, y2, compare_preview, tr(
-        f"Rechteck gesetzt: `{x1}, {y1}, {x2}, {y2}`. Mit **Manuellen Crop übernehmen** speichern.",
-        f"Rectangle set: `{x1}, {y1}, {x2}, {y2}`. Save it with **Accept manual crop**.",
-    )
+        return None, None, 0, 0, 0, 0, tr("Vorschau nicht lesbar.", "Preview unavailable.")
+    x, y = [int(v) for v in evt.index[:2]]
+    width, height = record["original_size"]
+    point = [max(0, min(width, round(x * width / preview.width))),
+             max(0, min(height, round(y * height / preview.height)))]
+    drawer = ImageDraw.Draw(preview)
+    if first_corner is None:
+        drawer.ellipse((x-5, y-5, x+5, y+5), fill="#2563eb")
+        return preview, point, point[0], point[1], width, height, tr("Jetzt die gegenüberliegende Ecke anklicken.", "Now click the opposite corner.")
+    bbox = [min(first_corner[0], point[0]), min(first_corner[1], point[1]),
+            max(first_corner[0], point[0]), max(first_corner[1], point[1])]
+    if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+        return preview, first_corner, *bbox, tr("Bitte zwei unterschiedliche Ecken wählen.", "Please choose two distinct corners.")
+    drawer.rectangle((round(bbox[0]*preview.width/width), round(bbox[1]*preview.height/height),
+                      round(bbox[2]*preview.width/width), round(bbox[3]*preview.height/height)), outline="#2563eb", width=4)
+    return preview, None, *bbox, tr("Zuschnitt markiert. Mit 'Manuellen Crop übernehmen' speichern.", "Crop marked. Save with 'Accept manual crop'.")
 
 
 def reset_frame_detector_cache_ui(trigger_word: str, input_folder: str):
@@ -5069,7 +4994,6 @@ FRAME_AUTO_ACCEPT_TYPE_CHOICES = [
     ("side_canvas", "Beidseitige Canvas-Ränder", "Paired side canvas"),
     ("multi_side_border", "Mehrseitiger rechteckiger Rahmen", "Multi-side rectangular border"),
     ("single_side_border", "Einseitiger Rand", "Single-side border"),
-    ("nested_inner_image", "Innenbild in Foto, Collage oder Rahmen", "Inner photo inside a photo, collage or frame"),
 ]
 
 
@@ -5271,9 +5195,10 @@ def _workspace_sync_payload(
     frame_pause: bool,
 ):
     # The main tabs stay permanently mounted and interactive. Readiness is
-    # carried only in workspace_ready_state and checked by each action. This
-    # avoids Gradio rebuilding TabItems after long callbacks and resetting the
-    # active tab to Start / Project.
+    # carried only in workspace_ready_state and checked by each action. A real
+    # interactivity update made Gradio rebuild the TabItems after long
+    # callbacks and jump back to Start / Project; keep the outputs as no-ops.
+    tab_update = gr.update()
     return (
         status, summary, bool(ready),
         trigger_word, input_folder, api_key,
@@ -5283,6 +5208,7 @@ def _workspace_sync_payload(
         frame_enabled, frame_advanced, frame_mode, frame_pause,
         trigger_word, input_folder,
         trigger_word, input_folder,
+        tab_update, tab_update, tab_update, tab_update,
     )
 
 
@@ -5348,6 +5274,115 @@ def run_workspace_preflight_and_sync_ui(
 # ============================================================
 # GRADIO LAYOUT
 # ============================================================
+
+def _decorate_favorite_preview(image: Image.Image) -> Image.Image:
+    """Draw an unmistakable gold frame and star without external fonts."""
+    decorated = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(decorated)
+    width, height = decorated.size
+    border = max(5, min(width, height) // 45)
+    gold = (218, 165, 32)
+    dark = (70, 48, 0)
+    for offset in range(border):
+        draw.rectangle((offset, offset, width - 1 - offset, height - 1 - offset), outline=gold)
+    radius = max(22, min(width, height) // 11)
+    cx, cy = width - radius - border * 2, radius + border * 2
+    draw.ellipse((cx-radius, cy-radius, cx+radius, cy+radius), fill=(28, 28, 28), outline=gold, width=max(2, border//2))
+    points = []
+    import math as _math
+    for i in range(10):
+        angle = -_math.pi / 2 + i * _math.pi / 5
+        r = radius * (0.72 if i % 2 == 0 else 0.32)
+        points.append((cx + r * _math.cos(angle), cy + r * _math.sin(angle)))
+    draw.polygon(points, fill=gold, outline=dark)
+    return decorated
+
+
+def _migrate_profile_asset_ids_ui(profile: Dict[str, Any], trigger_word: str, input_folder: str) -> Dict[str, Any]:
+    """Normalize profile board, buckets and favorites to persistent asset IDs."""
+    if not isinstance(profile, dict):
+        return profile
+    row_lookup = _stage_rows_by_profile_id(trigger_word, input_folder)
+
+    def resolve(value: Any = "", filename: Any = "", image_path: Any = "") -> int:
+        direct = core_normalize_asset_id(value)
+        if direct > 0:
+            return direct
+        candidates = [str(value or "").strip(), str(value or "").split("::", 1)[0],
+                      f"filename::{str(filename or '')}", f"path::{str(image_path or '')}"]
+        if image_path:
+            candidates.append(f"path::{os.path.normcase(os.path.abspath(str(image_path)))}")
+        for key in candidates:
+            row = row_lookup.get(key)
+            aid = asset_id_for_row(row or {})
+            if aid > 0:
+                return aid
+        return 0
+
+    traits = profile.get("per_image_traits", {}) or {}
+    if isinstance(traits, dict):
+        migrated_traits: Dict[str, Any] = {}
+        for key, value in traits.items():
+            aid = resolve(key)
+            migrated_traits[str(aid) if aid > 0 else str(key)] = value
+        profile["per_image_traits"] = migrated_traits
+
+    clusters = [c for c in (profile.get("identity_clusters", []) or []) if isinstance(c, dict)]
+    roles: Dict[str, str] = {}
+    cluster_map: Dict[str, str] = {}
+    for cluster in clusters:
+        members = list(cluster.get("asset_ids") or cluster.get("members") or [])
+        filenames = list(cluster.get("filenames") or [])
+        paths = list(cluster.get("image_paths") or [])
+        total = max(len(members), len(filenames), len(paths))
+        migrated: List[Any] = []
+        for index in range(total):
+            member = members[index] if index < len(members) else ""
+            filename = filenames[index] if index < len(filenames) else ""
+            image_path = paths[index] if index < len(paths) else ""
+            aid = resolve(member, filename, image_path)
+            migrated.append(aid if aid > 0 else member)
+        cluster["members"] = migrated
+        cluster["asset_ids"] = [int(v) for v in migrated if core_normalize_asset_id(v) > 0]
+        cluster["n"] = len(migrated)
+        cid = str(cluster.get("cluster_id", "") or "")
+        role = str(cluster.get("role", "variation") or "variation")
+        for member in migrated:
+            key = asset_id_key(member) or str(member)
+            roles[key] = role
+            cluster_map[key] = cid
+    profile["identity_clusters"] = clusters
+    profile["identity_cluster_member_roles"] = roles
+    profile["identity_cluster_member_clusters"] = cluster_map
+
+    favorites = set()
+    for raw in profile.get("favorite_asset_ids", []) or []:
+        aid = resolve(raw)
+        if aid > 0:
+            favorites.add(aid)
+    for raw in profile.get("priority_image_ids", []) or []:
+        aid = resolve(raw)
+        if aid > 0:
+            favorites.add(aid)
+    for filename in profile.get("priority_image_filenames", []) or []:
+        aid = resolve("", filename, "")
+        if aid > 0:
+            favorites.add(aid)
+    ordered = sorted(favorites)
+    profile["favorite_asset_ids"] = ordered
+    profile["priority_image_ids"] = ordered
+    profile["priority_image_filenames"] = []
+    profile["asset_identity_schema_version"] = "asset-id-v1"
+    return profile
+
+
+def _normalize_asset_id(value: Any) -> int:
+    try:
+        result = int(value)
+    except Exception:
+        return 0
+    return result if result > 0 else 0
+
 
 def build_ui() -> gr.Blocks:
 
@@ -5424,12 +5459,6 @@ def build_ui() -> gr.Blocks:
             )
         )
 
-        # Keep the main tabs structurally stable for the whole UI lifetime.
-        # Dynamically updating TabItem.interactive or forcing Tabs.selected can
-        # make some Gradio 5/6 clients jump back to the first tab after a child
-        # callback and may even restore the constructor's old disabled state.
-        # Workflow prerequisites are therefore validated by the actions inside
-        # each tab instead of disabling/rebuilding the tabs themselves.
         with gr.Tabs() as main_tabs:
 
             # ==============================================================
@@ -5444,24 +5473,24 @@ def build_ui() -> gr.Blocks:
                     "The local pHash preflight runs first. If enabled, frame preparation follows before audit, profile and captioning.",
                 ))
                 gr.Markdown(tr(
-                    "<details open>"
+                    "<details>"
                     "<summary><b>ℹ️ Empfohlener Ablauf und wichtige Hinweise</b></summary>"
                     "\n\n"
                     "1. **Projektangaben festlegen:** Eingabeordner, Triggerwort und API-Key gelten anschließend in allen Modulen.\n"
                     "2. **Lokale Vorprüfung starten:** Dateigröße, Mindestseitenlänge und pHash-Duplikate werden ohne API-Kosten geprüft.\n"
                     "3. **Rahmen vorbereiten:** Falls aktiviert, werden ausschließlich die nach der Vorprüfung verbliebenen Bilder untersucht. Jede Crop-Entscheidung wird sofort gespeichert.\n"
-                    "4. **Audit & Auswahl:** Erst danach beginnen kostenpflichtige OpenAI-Aufrufe.\n"
+                    "4. **Audit & Auswahl:** Hier beginnen kostenpflichtige Audits. Der zusätzliche KI-Rahmenfinder ist ebenfalls kostenpflichtig und wird gesondert gestartet.\n"
                     "5. **Profil und Captioning:** Krea 2 nutzt standardmäßig den profilbasierten Weg; Single Pass erstellt dasselbe vollständige Profil automatisch im Hintergrund.\n\n"
                     "**Originaldateien werden nie verändert.** Crops, Caches, Profile und Ergebnisse liegen ausschließlich im Unterordner `curated_<Triggerwort>`. "
                     "Ändert sich der Eingabeordner, wird die Vorprüfung als veraltet markiert. Nach einer späteren Crop-Änderung wird nur das betroffene Bild für den Audit als veraltet markiert."
                     "</details>",
-                    "<details open>"
+                    "<details>"
                     "<summary><b>ℹ️ Recommended workflow and important notes</b></summary>"
                     "\n\n"
                     "1. **Set project values:** input folder, trigger word and API key then apply to every module.\n"
                     "2. **Run local preflight:** file size, minimum side length and pHash duplicates are checked without API cost.\n"
                     "3. **Prepare frames:** when enabled, only images surviving preflight are analyzed. Every crop choice is saved immediately.\n"
-                    "4. **Audit & selection:** paid OpenAI calls start only after this point.\n"
+                    "4. **Audit & selection:** paid audits start here. The additional AI frame finder also incurs costs and is started separately.\n"
                     "5. **Profile and captioning:** Krea 2 defaults to the profile-based route; Single Pass builds the same complete profile automatically in the background.\n\n"
                     "**Original files are never modified.** Crops, caches, profiles and results remain inside `curated_<TriggerWord>`. "
                     "If the input folder changes, preflight is marked stale. If a crop is changed later, only the affected image is marked stale for audit."
@@ -5477,7 +5506,11 @@ def build_ui() -> gr.Blocks:
                         workspace_summary = gr.Markdown(_workspace_summary_md(S.get("c_input", ""), S.get("c_trigger", ""), initial_workspace))
                         workspace_status = gr.Textbox(label=tr("Projektstatus", "Project status"), interactive=False, max_lines=3)
 
-                with gr.Accordion(tr("1️⃣ pHash-Duplikat-Vorprüfung", "1️⃣ pHash duplicate preflight"), open=True):
+                with gr.Row():
+                    w_init_btn = gr.Button(tr("💾 Projekt initialisieren", "💾 Initialize project"), variant="secondary")
+                    w_preflight_btn = gr.Button(tr("▶ Vorprüfungen starten", "▶ Run preflight"), variant="primary")
+
+                with gr.Accordion(tr("1️⃣ Einstellungen der Vorprüfung", "1️⃣ Preflight settings"), open=False):
                     gr.Markdown(tr(
                         "Die erste Prüfung läuft vollständig lokal und vor der Rahmenanalyse. Frühe Duplikate werden nur im Projektstatus markiert; die Quelldateien bleiben unverändert.\n\n"
                         "<details><summary><b>ℹ️ Was machen die beiden pHash-Schleifen?</b></summary>\n\n"
@@ -5520,7 +5553,7 @@ def build_ui() -> gr.Blocks:
                             minimum=0, maximum=1000, step=10, value=S["c_min_filesize"],
                         )
 
-                with gr.Accordion(tr("2️⃣ Rahmenvorbereitung", "2️⃣ Frame preparation"), open=True):
+                with gr.Accordion(tr("2️⃣ Einstellungen der Rahmenvorbereitung", "2️⃣ Frame preparation settings"), open=False):
                     w_frame_enabled = gr.Checkbox(
                         label=tr("Rahmenmodul für dieses Dataset verwenden", "Use frame module for this dataset"),
                         value=S["c_ig_frame_crop"],
@@ -5532,15 +5565,11 @@ def build_ui() -> gr.Blocks:
                     w_frame_mode = gr.Dropdown(
                         label=tr("Automatische Übernahme", "Automatic acceptance"),
                         choices=[
-                            (tr("Nur vorauswählen – nichts automatisch anwenden", "Preselect only – never apply automatically"), "suggest_only"),
-                            (tr("Hohe Sicherheit automatisch; Medium vorauswählen", "Auto-apply high confidence; preselect medium"), "auto_high_review_medium"),
-                            (tr("Hohe und mittlere Sicherheit automatisch", "Auto-apply high and medium confidence"), "auto_high_keep_medium"),
+                            (tr("Nur Vorschläge – nichts automatisch", "Suggestions only – never automatic"), "suggest_only"),
+                            (tr("Nur hohe Sicherheit automatisch", "Auto-accept high confidence only"), "auto_high_review_medium"),
+                            (tr("Hohe und mittlere Sicherheit automatisch", "Auto-accept high and medium confidence"), "auto_high_keep_medium"),
                         ],
-                        value=S.get("c_frame_cleanup_mode", "auto_high_keep_medium"),
-                        info=tr(
-                            "High und Medium zeigen immer zuerst die lokal bestbewertete Variante. Diese Auswahl steuert nur, ob sie automatisch angewendet oder zunächst als unbestätigter Vorschlag angezeigt wird.",
-                            "High and medium findings always show the locally best-ranked variant first. This setting only controls whether it is applied automatically or shown as an unconfirmed suggestion.",
-                        ),
+                        value=S.get("c_frame_cleanup_mode", "suggest_only"),
                     )
                     w_frame_auto_types = gr.CheckboxGroup(
                         label=tr("Crop-Typen, die automatisch akzeptiert werden dürfen", "Crop types eligible for automatic acceptance"),
@@ -5561,10 +5590,6 @@ def build_ui() -> gr.Blocks:
                             value=S.get("c_post_frame_phash_refresh", True),
                         )
 
-                with gr.Row():
-                    w_init_btn = gr.Button(tr("💾 Projekt initialisieren", "💾 Initialize project"), variant="secondary")
-                    w_preflight_btn = gr.Button(tr("▶ Vorprüfungen starten", "▶ Run preflight"), variant="primary")
-
             # ==============================================================
             # TAB 1: FRAME PREPARATION
             # ==============================================================
@@ -5577,39 +5602,75 @@ def build_ui() -> gr.Blocks:
                 ))
                 with gr.Row():
                     fr_scan_btn = gr.Button(tr("🔎 Rahmen lokal analysieren", "🔎 Analyze frames locally"), variant="primary", scale=2)
+                with gr.Accordion(tr("Erkennung & Entscheidungen zurücksetzen", "Reset detection & decisions"), open=False):
                     fr_reset_cache_btn = gr.Button(tr("♻ Erkennung neu berechnen", "♻ Recompute detection"), variant="secondary", scale=1)
                     fr_reset_manual_btn = gr.Button(tr("↩ Manuelle Entscheidungen löschen", "↩ Clear manual decisions"), variant="secondary", scale=1)
                 fr_status = gr.Textbox(label=tr("Status", "Status"), interactive=False, max_lines=1)
                 fr_summary = gr.Markdown(tr("Noch keine Rahmenanalyse geladen.", "No frame analysis loaded yet."))
                 fr_state = gr.State({})
-                fr_selected_asset_id = gr.State(0)
+                fr_selected_hash = gr.State("")
+                with gr.Accordion(tr("Ähnliche Bilder gemeinsam prüfen", "Similar images · review together"), open=True):
+                    gr.Markdown(tr("Der ausgewählte oder zuletzt bestätigte Zuschnitt dient als Vorlage. Vorschauen prüfen und unpassende Bilder abwählen; erst der Speichern-Knopf übernimmt die Auswahl.",
+                                   "The selected or last confirmed crop serves as a template. Review previews and deselect unsuitable images; only the save button applies the selection."))
+                    fr_group_plan = gr.State({})
+                    fr_group_preview_btn = gr.Button(tr("Ähnliche Bilder mit diesem Zuschnitt zeigen", "Show similar images with this crop"))
+                    fr_group_status = gr.Markdown("")
+                    fr_group_gallery = gr.Gallery(label=tr("Original links · Vorlagenzuschnitt rechts", "Original left · template crop right"),
+                                                  columns=1, rows=1, height=520, object_fit="contain", interactive=False, fit_columns=False, visible=False)
+                    fr_group_selection = gr.CheckboxGroup(label=tr("Zuschnitt für diese Bilder übernehmen", "Apply crop to these images"), choices=[], visible=False)
+                    fr_group_apply_btn = gr.Button(tr("Ausgewählte Zuschnitte speichern", "Save selected crops"), variant="primary", interactive=False, visible=False)
+                with gr.Accordion(tr("Automatik für lokale Zuschnitte", "Automatic local crop decisions"), open=True):
+                    fr_automation_mode = gr.Dropdown(
+                        label=tr("Automatische Übernahme", "Automatic acceptance"),
+                        choices=[(tr("Nur Vorschläge", "Suggestions only"), "suggest_only"),
+                                 (tr("Hohe Sicherheit automatisch", "Automatically apply high confidence"), "auto_high_review_medium"),
+                                 (tr("Hohe und mittlere Sicherheit automatisch", "Automatically apply high and medium confidence"), "auto_high_keep_medium")],
+                        value=S.get("c_frame_cleanup_mode", "suggest_only"),
+                    )
+                    fr_automation_types = gr.CheckboxGroup(
+                        label=tr("Zulässige Zuschnittarten", "Eligible crop types"),
+                        choices=[(tr(de, en), value) for value, de, en in FRAME_AUTO_ACCEPT_TYPE_CHOICES],
+                        value=S.get("c_frame_auto_accept_types", ["uniform_canvas", "story_bars"]),
+                    )
+                    with gr.Row():
+                        fr_recommended_auto_btn = gr.Button(tr("Hohe Sicherheit übernehmen (empfohlen)", "Apply high confidence (recommended)"), variant="primary")
+                        fr_automation_btn = gr.Button(tr("Eigene Automatik anwenden", "Apply custom automatic decisions"), variant="secondary")
+                    gr.Markdown(tr("Übernimmt passende offene Vorschläge und aktualisiert die Anzeige sofort. Unsichere Fotogrenzen, verschachtelte Screenshots, KI-Vorschläge und bestehende manuelle Entscheidungen bleiben zur Prüfung bzw. unverändert.",
+                                   "Applies eligible pending suggestions and immediately updates the view. Uncertain photo boundaries, nested screenshots and AI suggestions still require review; existing manual decisions are preserved."))
+                with gr.Accordion(tr("Neuer Rahmenfinder: Fotobereich mit KI erkennen", "New frame finder: identify photo region with AI"), open=False):
+                    gr.Markdown(tr(
+                        "Die KI sucht das eigentliche Foto auch in verschachtelten Screenshots. Lokale Kanten verfeinern den Zuschnitt. Vorschläge werden zur Prüfung ergänzt. **Diese Aktion sendet Bilder an OpenAI und kostet API-Tokens.** Cache-Treffer sind kostenlos.",
+                        "AI locates the actual photo, including nested screenshots. Local edges refine the crop. Proposals are added for review. **This action sends images to OpenAI and uses paid API tokens.** Cached results are free.",
+                    ))
+                    with gr.Row():
+                        fr_ai_model = gr.Dropdown(label=tr("Modell", "Model"), choices=OPENAI_MODEL_PRESET_CHOICES, value=FRAME_VISION_MODEL,
+                                                 info=tr("GPT-6 Luna: sparsame Voreinstellung. Sol bleibt für schwierige Fälle wählbar. Luna ist noch nicht an deinen Rahmenreferenzen getestet.",
+                                                         "GPT-6 Luna: economical default. Sol remains available for difficult cases. Luna has not yet been tested on your frame references."), **openai_model_dropdown_kwargs())
+                        fr_ai_scope = gr.Radio(label=tr("Umfang", "Scope"), choices=[(tr("Ausgewähltes Bild", "Selected image"), "selected"), (tr("Aktuelle Seite (max. 18 Bilder)", "Current page (up to 18 images)"), "page")], value="selected")
+                    with gr.Row():
+                        fr_ai_btn = gr.Button(tr("Fotobereiche mit KI finden", "Find photo regions with AI"), variant="primary")
+                        fr_ai_stop = gr.Button(tr("KI-Analyse stoppen", "Stop AI analysis"), variant="stop")
                 with gr.Row():
                     fr_filter = gr.Dropdown(
                         label=tr("Anzeige", "View"),
                         choices=[(tr(de, en), value) for value, de, en in FRAME_REVIEW_FILTER_CHOICES],
-                        value=FRAME_REVIEW_DEFAULT_FILTER,
+                        value="review",
                         allow_custom_value=False,
                     )
                     fr_page = gr.Dropdown(label=tr("Seite", "Page"), choices=["1"], value="1", allow_custom_value=False)
                 fr_gallery = gr.Gallery(
-                    label=tr(
-                        "Bildauswahl nach eindeutiger ID – Original links, gewählter Crop rechts",
-                        "Image selection by unique ID – original left, selected crop right",
-                    ),
-                    columns=6,
-                    rows=3,
-                    height=620,
+                    label=tr("Original links – gewählter Crop rechts", "Original left – selected crop right"),
+                    columns=3,
+                    rows=2,
+                    height=360,
                     object_fit="contain",
                     allow_preview=False,
-                    selected_index=None,
                 )
                 fr_selected_info = gr.Markdown(tr("_Kein Bild ausgewählt._", "_No image selected._"))
                 gr.Markdown(tr(
                     "### Vergleichsansicht für das markierte Bild\nAlle lokal gefundenen Varianten stehen dauerhaft nebeneinander. **Original behalten** ist immer die erste Option. "
-                    "Bei hoher und mittlerer Sicherheit ist die lokal bestbewertete Variante bereits vorausgewählt. **AUTO** bedeutet, dass der Projektmodus sie direkt anwendet; **VORSCHLAG** bedeutet, dass sie noch bestätigt werden muss. "
                     "Die Bilder in dieser Ansicht sind nicht anklickbar; die Entscheidung erfolgt ausschließlich direkt darunter. Mit **Vorheriges/Nächstes Bild** kannst du hier durch die aktuelle gefilterte Bilderliste wechseln.",
                     "### Comparison viewer for the selected image\nAll locally found variants remain visible side by side. **Keep original** is always the first option. "
-                    "For high- and medium-confidence findings, the locally best-ranked variant is already preselected. **AUTO** means the project mode applies it directly; **SUGGESTION** means it still needs confirmation. "
                     "Images in this viewer are not clickable; the decision is made only with the selector directly underneath. Use **Previous/Next image** to move through the current filtered image list here.",
                 ))
                 with gr.Row(equal_height=True):
@@ -5642,31 +5703,25 @@ def build_ui() -> gr.Blocks:
                     elem_classes=["frame-comparison-gallery"],
                 )
                 fr_option_radio = gr.Radio(
-                    label=tr("Auswahl für dieses Bild – Änderungen werden sofort gespeichert", "Choice for this image – changes are saved immediately"),
+                    label=tr("Auswahl für dieses Bild – wird sofort gespeichert", "Choice for this image – saved immediately"),
                     choices=[],
                     value=None,
                     interactive=True,
                     elem_classes=["frame-option-selector"],
                 )
+                fr_advance = gr.Checkbox(
+                    label=tr("Nach dem Speichern automatisch zum nächsten Bild", "Automatically move to the next image after saving"),
+                    value=True,
+                )
                 with gr.Row():
-                    fr_accept_current_btn = gr.Button(tr("✓ Aktuelle Auswahl übernehmen", "✓ Accept current selection"), variant="primary")
+                    fr_confirm_selected_btn = gr.Button(tr("Auswahl bestätigen", "Confirm selected option"), variant="primary", interactive=False)
                     fr_auto_btn = gr.Button(tr("Automatische Entscheidung wiederherstellen", "Restore automatic decision"), variant="secondary")
-                with gr.Accordion(tr("✂ Manueller Crop – zwei Klicks oder Koordinaten", "✂ Manual crop – two clicks or coordinates"), open=True):
-                    gr.Markdown(tr(
-                        "Setze im Originalbild zwei diagonal gegenüberliegende Eckpunkte. Ein dritter Klick beginnt automatisch eine neue Auswahl.",
-                        "Set two diagonally opposite corner points in the original image. A third click automatically starts a new selection.",
-                    ))
-                    fr_manual_click_state = gr.State({})
-                    fr_manual_click_image = gr.Image(
-                        label=tr("Crop im Original markieren", "Mark crop in original"),
-                        type="pil",
-                        interactive=False,
-                        height=700,
-                        buttons=["fullscreen"],
-                        elem_classes=["manual-crop-marker"],
-                    )
-                    with gr.Row():
-                        fr_reset_manual_click_btn = gr.Button(tr("Klickauswahl zurücksetzen", "Reset click selection"), variant="secondary")
+                    fr_exclude_btn = gr.Button(tr("Bild aus Datensatz ausschließen", "Exclude image from dataset"), variant="stop")
+                with gr.Accordion(tr("Manuelle Crop-Grenzen", "Manual crop bounds"), open=False):
+                    gr.Markdown(tr("Klicke zwei gegenüberliegende Ecken des Fotobereichs an. Die Koordinaten werden automatisch gesetzt.",
+                                   "Click two opposite corners of the photo region. Coordinates are filled automatically."))
+                    fr_crop_corner = gr.State(None)
+                    fr_click_crop = gr.Image(label=tr("Fotobereich mit zwei Klicks markieren", "Mark photo region with two clicks"), type="pil", interactive=False, height=480)
                     with gr.Row():
                         fr_x1 = gr.Number(label="X1 / links", value=0, precision=0)
                         fr_y1 = gr.Number(label="Y1 / oben", value=0, precision=0)
@@ -5688,26 +5743,65 @@ def build_ui() -> gr.Blocks:
                     choices=training_target_choices(),
                     value=normalize_training_target(S.get("c_training_target")),
                     info=tr(
-                        "Legt die Prompt-Familie, Caption-Engine und empfohlenen Standardwerte fest. Änderungen an einzelnen Caption-Regeln ändern dieses Trainingsziel nicht.",
-                        "Selects the prompt family, caption engine and recommended defaults. Editing individual caption rules never changes this training target.",
+                        "Bestimmt Caption-Format und Exportprofil. Bildaudit und Identitätsprofil sind unabhängig davon. Eigene Caption-Regeln bleiben innerhalb des gewählten Ziels möglich.",
+                        "Selects caption format and export profile. Image audit and identity profile are independent. Caption rules remain customizable within the selected target.",
                     ),
                 )
-                gr.Markdown(tr(
-                    "**Pipeline-Auswahl:** ERNIE und Z-Image verwenden strukturierte lokale Captions; Krea 2 verwendet nach der Auswahl natürliche GPT-Captions.",
-                    "**Pipeline selection:** ERNIE and Z-Image use structured local captions; Krea 2 uses natural GPT captions after selection.",
-                ))
+                c_training_target_details = gr.Markdown(training_target_details_ui(S.get("c_training_target")))
+                c_training_target.change(fn=training_target_details_ui, inputs=c_training_target, outputs=c_training_target_details, queue=False)
+                with gr.Row():
+                    c_initial_caption_engine = gr.Dropdown(
+                        label=tr("1 · Erstbeschreibung", "1 · Initial image description"),
+                        choices=[("Florence 2 · lokal", "florence2"), ("JoyCaption · lokal", "joycaption"), ("GPT-6 Luna · API", "gpt-6-luna")],
+                        value=S["c_initial_caption_engine"],
+                        info=tr("Unabhängig vom Trainingsziel. Die Rohbeschreibung bleibt erhalten. Lokale Modelle benötigen den eingerichteten GPU-Laufzeitordner; Luna sendet Bilder an OpenAI.",
+                                "Independent of training target. Raw descriptions are preserved. Local models need a configured GPU runtime; Luna sends images to OpenAI."),
+                    )
+                    c_initial_caption_task = gr.Dropdown(
+                        label=tr("Florence · Detailgrad", "Florence · Caption detail"),
+                        choices=[("Caption", "<CAPTION>"), ("Detailed Caption", "<DETAILED_CAPTION>"), ("Very Detailed Caption", "<MORE_DETAILED_CAPTION>")],
+                        value=S["c_initial_caption_task"],
+                        visible=S["c_initial_caption_engine"] == "florence2",
+                        info=tr("Wirkt nur bei Florence. Very Detailed ist voreingestellt.", "Only affects Florence. Very Detailed is the default."),
+                    )
+                gr.Markdown(tr("**2 · Trainingscaption:** Das Personenprofil und die Caption-Felder regeln die Zusammensetzung. Lokal nutzt sie die Audit-Merkmale; optional lassen sich Szenendetails aus der Erstbeschreibung ergänzen.",
+                               "**2 · Training caption:** The person profile and caption fields control composition. Local composition uses audited observations; optionally add scene details from the first description."))
+                c_initial_caption_status = gr.Markdown(initial_caption_readiness_ui(S["c_initial_caption_engine"]))
+                c_initial_caption_engine.change(fn=initial_caption_readiness_ui, inputs=c_initial_caption_engine,
+                                                outputs=c_initial_caption_status, queue=False)
+                c_initial_caption_engine.change(fn=lambda engine: gr.update(visible=engine == "florence2"),
+                                                inputs=c_initial_caption_engine, outputs=c_initial_caption_task, queue=False)
+                c_caption_composition_mode = gr.Dropdown(
+                    label=tr("2 · Zusammensetzung der Trainingscaption", "2 · Training caption composition"),
+                    choices=[(tr("Lokal · Audit und Personenprofil", "Local · audit and person profile"), "local"),
+                             (tr("Luna-Textdetails + lokale Profilregeln", "Luna text details + local profile rules"), "luna_text")],
+                    value=S["c_caption_composition_mode"],
+                    info=tr("Lokal ist ohne weitere KI-Anfrage. Optional extrahiert Luna einmal Szenendetails aus dem gespeicherten Rohtext: keine erneute Bildübertragung, zusätzliche API-Kosten. Profiländerungen bleiben danach lokal.",
+                            "Local uses no additional AI request. Optionally Luna extracts scene details once from saved descriptions: no image retransmission, additional API costs. Profile changes stay local afterwards."))
                 c_pipeline_mode = gr.Radio(
-                    label=tr("Subject Profile: automatisch oder selbst prüfen?", "Subject profile: automatic or review it yourself?"),
-                    choices=[
-                        (tr("Automatisch – Profil erstellen und direkt captionen (Single Pass)", "Automatic – build the profile and caption right away (single pass)"), "single_pass"),
-                        (tr("Selbst prüfen – nach dem Profil anhalten, dann im Tab „3 · Subject Profile“ bearbeiten und Captioning starten", "Review it yourself – pause after the profile, then edit it in the “3 · Subject Profile” tab and start captioning there"), "profile_then_caption"),
-                    ],
+                    label=tr("Ablauf nach dem Audit", "After the audit"),
+                    choices=[(tr("Profil automatisch nutzen und exportieren", "Use profile automatically and export"), "single_pass"),
+                             (tr("Profil zuerst selbst prüfen", "Review profile first"), "profile_then_caption")],
                     value=S["c_pipeline_mode"],
-                    info=tr(
-                        "Das Trainingsziel Krea 2 stellt beim Auswählen auf „Selbst prüfen“. Die Einstellung lässt sich danach frei ändern.",
-                        "Selecting the Krea 2 training target switches to “review it yourself”. You can change it freely afterwards.",
-                    ),
+                    info=tr("Bei eigener Prüfung entstehen Erstbeschreibungen und Profil; der Lauf pausiert vor finaler Caption und Export. Vorschau und Fortsetzung in Modul 3 · Subject Profile.",
+                            "Review first prepares descriptions and profile, then pauses before final captions and export. Preview and continue in module 3 · Subject Profile."),
                 )
+
+                with gr.Row():
+                    c_model_preset = gr.Dropdown(
+                        label=tr("Modell-Voreinstellung", "Model preset"),
+                        choices=[(tr("Aktuelles ChatGPT", "Latest ChatGPT"), "chatgpt"),
+                                 (tr("Sparsam · GPT-6 Luna", "Economical · GPT-6 Luna"), "economical"),
+                                 (tr("Hohe Qualität · GPT-6 Astra", "High quality · GPT-6 Astra"), "quality")],
+                        value="economical",
+                        info=tr("Übernehmen aktualisiert alle sechs Modellrollen. Danach kannst du jede Rolle einzeln ändern.",
+                                "Apply updates all six model roles. You can then customize each role."),
+                    )
+                    c_apply_models = gr.Button(tr("Modelle übernehmen", "Apply models"), variant="secondary")
+                gr.Markdown(tr(
+                    "`chat-latest` folgt dem aktuellen ChatGPT-Modell. GPT-6 Luna ist die sparsame Voreinstellung für neue Projekte; gespeicherte Modelle bleiben erhalten.",
+                    "`chat-latest` follows the current ChatGPT model. GPT-6 Luna is the economical default for new projects; saved models are preserved.",
+                ))
 
                 with gr.Row():
                     with gr.Column(scale=2):
@@ -5764,1741 +5858,1754 @@ def build_ui() -> gr.Blocks:
                             ),
                             **openai_model_dropdown_kwargs(),
                         )
-                        c_audit_reasoning_effort = gr.Dropdown(
-                            label=tr("Reasoning Effort – Bildaudit", "Reasoning effort – image audit"),
-                            choices=REASONING_EFFORT_CHOICES,
-                            value=S["c_audit_reasoning_effort"],
-                            info=tr(
-                                "Reasoning-Aufwand für jeden normalen Bildaudit-Call. Für Luna und klar strukturierte Extraktion ist `none` der empfohlene schnelle Standard; `low` kann bei schwierigen visuellen Grenzfällen helfen.",
-                                "Reasoning effort for every regular image-audit call. For Luna and structured extraction, `none` is the recommended fast default; `low` may help with difficult visual edge cases.",
-                            ),
-                        )
-                        c_openai_token_limit = gr.Number(
-                            label=tr("OpenAI Token-Limit pro Lauf", "OpenAI token limit per run"),
-                            value=S["c_openai_token_limit"],
-                            precision=0,
-                            info=tr(
-                                "0 = kein Limit. Wenn das Limit erreicht ist, stoppt der Curator vor weiteren OpenAI-API-Calls. Tipp: bei 2.500.000 Tageslimit lieber etwas Reserve lassen, z. B. 2.400.000.",
-                                "0 = no limit. Once the limit is reached, the curator stops before any further OpenAI API calls. Tip: if your daily cap is 2,500,000, leave some headroom, e.g. 2,400,000."
-                            ),
-                        )
-                        c_use_trigger_check = gr.Checkbox(
-                            label=tr("Trigger-Check aktivieren", "Enable trigger check"),
-                            value=S["c_use_trigger_check"],
-                            info=tr(
-                                "Prüft das Triggerwort per KI auf Kollisionen oder problematische Ähnlichkeiten. Wenn deaktiviert, wird die Prüfung komplett übersprungen.",
-                                "Checks the trigger word via AI for collisions or problematic similarities. If disabled, the check is skipped entirely.",
-                            ),
-                        )
-                        c_trigger_model = gr.Dropdown(
-                            label=tr("Trigger-Check-Modell", "Trigger-check model"),
-                            choices=[""] + OPENAI_MODEL_PRESET_CHOICES,
-                            value=S["c_trigger_model"],
-                            info=tr(
-                                "Optional separates Modell für die Triggerwort-Prüfung. Leer = primäres Modell verwenden. Wird nur genutzt, wenn der Trigger-Check aktiviert ist.",
-                                "Optional separate model for trigger-word checks. Empty = use primary model. Only used when trigger check is enabled.",
-                            ),
-                            **openai_model_dropdown_kwargs(),
-                        )
-                        c_trigger_reasoning_effort = gr.Dropdown(
-                            label=tr("Reasoning Effort – Trigger-Check", "Reasoning effort – trigger check"),
-                            choices=REASONING_EFFORT_CHOICES,
-                            value=S["c_trigger_reasoning_effort"],
-                            info=tr(
-                                "Wird nur verwendet, wenn der Trigger-Check aktiv ist. `none` reicht normalerweise aus.",
-                                "Used only when trigger checking is enabled. `none` is normally sufficient.",
-                            ),
-                        )
-
-                with gr.Accordion(tr("🧠 Modellstrategie & Eskalation", "🧠 Model strategy & escalation"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Was bedeutet Eskalation und wann brauche ich das?</b></summary>"
-                        "\n\n"
-                        "Standardmäßig bewertet ein einziges Modell (`gpt-6-luna` empfohlen) "
-                        "alle Bilder. Frühere Nano-Modelle haben sich bei schwierigen visuellen Grenzfällen als zu "
-                        "ungenau für die Erkennung von Filter-Hauttextur und extremen "
-                        "Kamerawinkeln erwiesen – diese Bilder rutschten regelmäßig fälschlich "
-                        "in 'train_ready'. Bei **Grenzfällen** – also Bildern, die das "
-                        "Hauptmodell nicht klar als "
-                        "'gut genug' oder 'rauswerfen' einordnen kann – kann der Curator diese "
-                        "Bilder optional an ein **stärkeres zweites Modell** weiterleiten "
-                        "(z. B. `gpt-6.1-sol` oder `gpt-6-astra`).\n\n"
-                        "**Drei Auslöser für Eskalation:**\n\n"
-                        "**1. Bei Review:** Das Hauptmodell hat das Bild auf 'review' gesetzt "
-                        "(also: 'ich kann mich nicht entscheiden') oder die Bewertung liegt im "
-                        "konfigurierten Score-Fenster. Das stärkere Modell entscheidet dann.\n\n"
-                        "**2. Bei Konflikt:** Wenn lokale Filter (z. B. Unschärfe-Erkennung) und "
-                        "Hauptmodell unterschiedlicher Meinung sind. Vermeidet, dass ein "
-                        "technisch unscharfes aber inhaltlich gutes Bild verloren geht.\n\n"
-                        "**3. Bei knappem Smart-Crop-Duell:** Wenn Original und Crop weniger "
-                        "Punkte auseinander liegen als die Eskalations-Differenz, entscheidet "
-                        "das stärkere Modell, welcher Schnitt besser passt.\n\n"
-                        "**Kosten:** Pro eskaliertem Bild ein zusätzlicher API-Call zum teureren "
-                        "Modell. Bei normalem Setup landen 5–15 % der Bilder in der Eskalation."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ What is escalation and when do I need it?</b></summary>"
-                        "\n\n"
-                        "By default, a single model (`gpt-6-luna` recommended) scores all "
-                        "images. Earlier nano-class models proved too inaccurate at "
-                        "spotting filter-smoothed skin and extreme camera angles - those "
-                        "images regularly slipped into 'train_ready' incorrectly. For "
-                        "**borderline cases** - "
-                        "images the main model can't clearly classify as 'keep' or 'reject' - "
-                        "the curator can optionally forward these images to a **stronger second "
-                        "model** (e.g. `gpt-6.1-sol` or `gpt-6-astra`).\n\n"
-                        "**Three escalation triggers:**\n\n"
-                        "**1. On review:** Main model marked the image as 'review' (i.e. "
-                        "'undecided') or the score falls inside the configured window. The "
-                        "stronger model then decides.\n\n"
-                        "**2. On conflict:** When local filters (e.g. blur detection) disagree "
-                        "with the main model. Prevents losing a technically blurry but "
-                        "content-wise good image.\n\n"
-                        "**3. On close smart-crop duel:** If original and crop are within the "
-                        "escalation delta, the stronger model decides which framing is better.\n\n"
-                        "**Cost:** One extra API call to the more expensive model per escalated "
-                        "image. With a normal setup, 5–15 % of images end up escalated."
-                        "</details>",
-                    ))
-                    c_use_review_escalation = gr.Checkbox(
-                        label=tr("Eskalation für schwierige Fälle aktivieren", "Enable escalation for difficult cases"),
-                        value=S["c_use_review_escalation"],
-                        info=tr(
-                            "Empfohlen: zunächst aus. `gpt-6-luna` übernimmt den Routine-Audit. "
-                            "Aktiviere die Eskalation, wenn schwierige Grenzfälle gezielt durch "
-                            "`gpt-6.1-sol` oder `gpt-6-astra` nachgeprüft werden sollen. Zusätzliche "
-                            "Kosten entstehen nur für tatsächlich eskalierte Bilder.",
-                            "Recommended: off initially. `gpt-6-luna` handles routine audits. "
-                            "Enable escalation when difficult borderline cases should be rechecked "
-                            "by `gpt-6.1-sol` or `gpt-6-astra`. Extra cost applies only to images "
-                            "that are actually escalated.",
-                        ),
-                    )
-                    with gr.Row():
-                        c_review_escalation_model = gr.Dropdown(
-                            label=tr("Eskalationsmodell", "Escalation model"),
-                            choices=[""] + OPENAI_MODEL_PRESET_CHOICES,
-                            value=S["c_review_escalation_model"],
-                            info=tr(
-                                "Stärkeres Modell für die Eskalation. Leer = Eskalation effektiv aus, auch wenn der Schalter oben an ist. Für Luna als Hauptmodell empfohlen: `gpt-6.1-sol`.",
-                                "Stronger model for escalation. Empty = escalation effectively off, even if the switch above is on. Recommended with Luna as the main model: `gpt-6.1-sol`.",
-                            ),
-                            **openai_model_dropdown_kwargs(),
-                        )
-                        c_review_escalation_reasoning_effort = gr.Dropdown(
-                            label=tr("Reasoning Effort – Eskalation", "Reasoning effort – escalation"),
-                            choices=REASONING_EFFORT_CHOICES,
-                            value=S["c_review_escalation_reasoning_effort"],
-                            info=tr(
-                                "Reasoning nur für tatsächlich eskalierte Grenzfälle. `low` ist der empfohlene Ausgangspunkt mit Sol; höhere Stufen erhöhen Laufzeit und Tokenverbrauch.",
-                                "Reasoning only for cases that are actually escalated. `low` is the recommended starting point with Sol; higher levels increase latency and token usage.",
-                            ),
-                        )
-                    with gr.Row():
-                        c_review_escalation_score_min = gr.Slider(
-                            label=tr("Score-Fenster: Minimum", "Score window: minimum"),
-                            minimum=0,
-                            maximum=100,
-                            step=1,
-                            value=S["c_review_escalation_score_min"],
-                            info=tr(
-                                "Untere Grenze des Score-Fensters für Eskalation. Bilder mit Score zwischen Minimum und Maximum werden eskaliert. Empfohlen: 35.",
-                                "Lower bound of the escalation score window. Images scoring between min and max are escalated. Recommended: 35.",
-                            ),
-                        )
-                        c_review_escalation_score_max = gr.Slider(
-                            label=tr("Score-Fenster: Maximum", "Score window: maximum"),
-                            minimum=0,
-                            maximum=100,
-                            step=1,
-                            value=S["c_review_escalation_score_max"],
-                            info=tr(
-                                "Obere Grenze des Score-Fensters. Bilder über diesem Wert sind 'eindeutig gut' und werden nicht eskaliert. Empfohlen: 58.",
-                                "Upper bound of the score window. Images above this are 'clearly good' and won't be escalated. Recommended: 58.",
-                            ),
-                        )
-                    with gr.Row():
-                        c_escalate_on_review = gr.Checkbox(
-                            label=tr("Bei Review eskalieren", "Escalate on review"),
-                            value=S["c_escalate_on_review"],
-                            info=tr(
-                                "Eskaliert Bilder, die das Hauptmodell als 'unentschieden' markiert hat. Empfohlen: an.",
-                                "Escalates images flagged as 'undecided' by the main model. Recommended: on.",
-                            ),
-                        )
-                        c_escalate_on_conflict = gr.Checkbox(
-                            label=tr("Bei Konflikt eskalieren", "Escalate on conflict"),
-                            value=S["c_escalate_on_conflict"],
-                            info=tr(
-                                "Eskaliert, wenn lokale Filter und Hauptmodell unterschiedlicher Meinung sind (z. B. lokal als unscharf erkannt, KI sagt: scharf). Empfohlen: an.",
-                                "Escalates when local filters and main model disagree (e.g. flagged as blurry locally, AI says sharp). Recommended: on.",
-                            ),
-                        )
-                        c_escalate_smart_crop = gr.Checkbox(
-                            label=tr("Knappes Smart-Crop-Duell eskalieren", "Escalate close smart-crop duel"),
-                            value=S["c_escalate_smart_crop"],
-                            info=tr(
-                                "Eskaliert, wenn Original und Smart-Crop fast gleich gut bewertet werden. Empfohlen: an, wenn dir die Smart-Crop-Auswahl wichtig ist.",
-                                "Escalates when original and smart crop score almost equally. Recommended: on if smart crop selection matters to you.",
-                            ),
-                        )
-                    c_smart_crop_escalation_delta = gr.Slider(
-                        label=tr("Max. Punktdifferenz für Crop-Eskalation", "Max point delta for crop escalation"),
-                        minimum=0,
-                        maximum=30,
-                        step=1,
-                        value=S["c_smart_crop_escalation_delta"],
-                        info=tr(
-                            "Wenn Original und Crop weniger als so viele Punkte auseinanderliegen, entscheidet das stärkere Modell. Empfohlen: 8. Höher (15+) eskaliert mehr Crop-Duelle, niedriger (4) nur die wirklich knappen.",
-                            "If original and crop are within this many points of each other, the stronger model decides. Recommended: 8. Higher (15+) escalates more duels, lower (4) only the very close ones.",
-                        ),
-                    )
-
-                    with gr.Column(scale=1):
-                        gr.Markdown(tr(
-                            "<details>"
-                            "<summary><b>ℹ️ Wie funktioniert die Shot-Verteilung?</b></summary>"
-                            "\n\n"
-                            "Bestimmt, mit welchem Verhältnis die drei Aufnahmetypen (Nahaufnahme, "
-                            "Oberkörper, Ganzkörper) im finalen Trainings-Set landen sollen.\n\n"
-                            "**Headshot (Nahaufnahme):** Gesicht füllt einen Großteil des Bildes. "
-                            "Wichtigste Kategorie für Identitätslernen – das Modell lernt hier, "
-                            "wie das Gesicht aussieht.\n\n"
-                            "**Medium (Oberkörper):** Gesicht plus Schultern und Oberkörper. "
-                            "Hilft dem Modell, Körperbau, Haltung und typische Outfit-Schnitte "
-                            "zu lernen.\n\n"
-                            "**Full Body (Ganzkörper):** Komplette Person inklusive Beine. Damit "
-                            "das LoRA später nicht nur Brustportraits, sondern auch Ganzkörper-"
-                            "Generierungen sauber hinbekommt.\n\n"
-                            "**Empfohlen für Person-LoRAs:** 0.45 / 0.30 / 0.25 (Headshot-lastig). "
-                            "Wenn dein Material überwiegend Selfies enthält, kannst du Full Body "
-                            "auf 0.10 senken; wenn du Mode/Outfit lernen willst, eher 0.30 / 0.40 / 0.30.\n\n"
-                            "**Wichtig:** Die drei Werte sollten zusammen 1.0 ergeben. Wenn nicht, "
-                            "normalisiert der Curator sie automatisch."
-                            "</details>",
-                            "<details>"
-                            "<summary><b>ℹ️ How does shot distribution work?</b></summary>"
-                            "\n\n"
-                            "Defines what ratio of the three shot types (close-up, upper body, "
-                            "full body) the final training set should aim for.\n\n"
-                            "**Headshot (close-up):** Face fills most of the frame. Most "
-                            "important category for identity learning – this is where the model "
-                            "learns what the face looks like.\n\n"
-                            "**Medium (upper body):** Face plus shoulders and torso. Helps the "
-                            "model learn body type, posture and typical outfit cuts.\n\n"
-                            "**Full Body:** Entire person including legs. So the LoRA can later "
-                            "generate full-body shots cleanly, not just bust portraits.\n\n"
-                            "**Recommended for person LoRAs:** 0.45 / 0.30 / 0.25 (headshot-"
-                            "heavy). If your material is mostly selfies, you can drop full body "
-                            "to 0.10; if you want to learn fashion/outfits, try 0.30 / 0.40 / 0.30.\n\n"
-                            "**Important:** The three values should add up to 1.0. If they "
-                            "don't, the curator normalizes them automatically."
-                            "</details>",
-                        ))
-                        gr.Markdown(tr("### Shot-Verteilung", "### Shot distribution"))
-                        c_ratio_h = gr.Slider(
-                            label=tr("Headshot (Nahaufnahme)", "Headshot (close-up)"),
-                            minimum=0,
-                            maximum=1,
-                            step=0.05,
-                            value=S["c_ratio_h"],
-                            info=tr(
-                                "Anteil enger Gesichts-Aufnahmen. Wichtigste Kategorie für Identitätslernen. Empfohlen: 0.45.",
-                                "Share of tight face shots. Most important category for identity learning. Recommended: 0.45.",
-                            ),
-                        )
-                        c_ratio_m = gr.Slider(
-                            label=tr("Medium (Oberkörper)", "Medium (upper body)"),
-                            minimum=0,
-                            maximum=1,
-                            step=0.05,
-                            value=S["c_ratio_m"],
-                            info=tr(
-                                "Anteil Oberkörper-Aufnahmen. Hilft beim Lernen von Körperbau, Haltung und Outfit-Schnitten. Empfohlen: 0.30.",
-                                "Share of upper-body shots. Helps learn body type, posture and outfit cuts. Recommended: 0.30.",
-                            ),
-                        )
-                        c_ratio_f = gr.Slider(
-                            label=tr("Full Body (Ganzkörper)", "Full Body"),
-                            minimum=0,
-                            maximum=1,
-                            step=0.05,
-                            value=S["c_ratio_f"],
-                            info=tr(
-                                "Anteil Ganzkörper-Aufnahmen. Weniger nötig, aber wichtig damit das LoRA später vollständige Personen generieren kann. Empfohlen: 0.25.",
-                                "Share of full-body shots. Less needed, but important so the LoRA can generate complete persons. Recommended: 0.25.",
-                            ),
-                        )
-                        gr.Markdown(tr("*⚠️ Summe sollte 1.0 ergeben*", "*⚠️ Sum should be 1.0*"))
-
-                with gr.Accordion(tr("⚙️ Qualität & Schwellwerte", "⚙️ Quality & thresholds"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Wie funktionieren die Score-Schwellen?</b></summary>"
-                        "\n\n"
-                        "Jedes Bild bekommt nach der KI-Analyse einen Gesamtscore von 0 bis 100, "
-                        "der sich aus Schärfe, Beleuchtung, Komposition und Identitäts-"
-                        "Nützlichkeit zusammensetzt. Anhand zweier Schwellen wird das Bild dann "
-                        "klassifiziert:\n\n"
-                        "**Keep-Schwelle (oben):** Ab diesem Score zählt ein Bild als 'gut "
-                        "genug' und kommt in den Pool für die Endauswahl. Bilder darunter (aber "
-                        "über der Reject-Schwelle) landen als 'review' im Ordner "
-                        "`02_keep_unused` – sie sind nicht aussortiert, gehen aber nur ins "
-                        "Trainings-Set, wenn sonst nicht genug Material da ist.\n\n"
-                        "**Reject-Schwelle (unten):** Unter diesem Score wird das Bild "
-                        "**direkt verworfen** und landet in `05_reject` (wenn Reject-Export aktiv ist). Keine zweite Chance.\n\n"
-                        "**Faustregel:** Lass zwischen Reject und Keep einen Abstand von "
-                        "mindestens 20 Punkten. Sonst gibt es kaum Bilder im Review-Bereich, "
-                        "und wenn dein Material knapp wird, hast du keinen Puffer.\n\n"
-                        "**Mindestseitenlänge:** Wirkt vor allem als Schutz gegen Thumbnails "
-                        "und versehentlich kleine Bilder. Für Training auf Auflösung 1024 "
-                        "reicht 768 als Mindestmaß; für 512 entsprechend 512."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ How do score thresholds work?</b></summary>"
-                        "\n\n"
-                        "Each image gets an overall score from 0 to 100 after AI analysis, "
-                        "composed of sharpness, lighting, composition and identity usefulness. "
-                        "Two thresholds then classify the image:\n\n"
-                        "**Keep threshold (upper):** Above this score, an image counts as "
-                        "'good enough' and goes into the final-selection pool. Images below "
-                        "this (but above reject) land as 'review' in `02_keep_unused` – not "
-                        "rejected, but only used in the training set if there's a shortage of "
-                        "better material.\n\n"
-                        "**Reject threshold (lower):** Below this score, the image is "
-                        "**immediately rejected** and lands in `05_reject` (if reject export is enabled). No second chance.\n\n"
-                        "**Rule of thumb:** Leave at least 20 points between reject and keep. "
-                        "Otherwise you'll have almost no images in the review range, and if "
-                        "you run short on material later, you'll have no buffer.\n\n"
-                        "**Minimum side length:** Mainly a safety net against thumbnails and "
-                        "accidentally tiny images. For training at resolution 1024, 768 is a "
-                        "good minimum; for 512, use 512 accordingly."
-                        "</details>",
-                    ))
-                    with gr.Row():
-                        c_keep_min = gr.Slider(
-                            label=tr("Keep-Schwelle", "Keep threshold"),
-                            minimum=0,
-                            maximum=100,
-                            step=5,
-                            value=S["c_keep_min"],
-                            info=tr(
-                                "Mindest-Score (0–100) damit ein Bild direkt als 'keep' gilt. Empfohlen: 55. Darunter (aber über Reject) landet das Bild im Review-Bereich.",
-                                "Minimum score (0–100) for an image to count as 'keep' directly. Recommended: 55. Below that (but above reject) the image goes into the review area.",
-                            ),
-                        )
-                        c_reject = gr.Slider(
-                            label=tr("Reject-Schwelle", "Reject threshold"),
-                            minimum=0,
-                            maximum=100,
-                            step=5,
-                            value=S["c_reject"],
-                            info=tr(
-                                "Unter diesem Score wird ein Bild sofort verworfen, ohne Review-Chance. Empfohlen: 30. Höher = strenger (bei guter Materiallage). Niedriger = mehr Bilder durchlassen (bei knappem Material).",
-                                "Below this score, an image is rejected immediately, no review chance. Recommended: 30. Higher = stricter (when material is plentiful). Lower = let more through (when short).",
-                            ),
-                        )
-                        c_min_side = gr.Slider(
-                            label=tr("Min. Seitenlänge (px)", "Min side length (px)"),
-                            minimum=256,
-                            maximum=2048,
-                            step=64,
-                            value=S["c_min_side"],
-                            info=tr(
-                                "Kürzeste Bildseite in Pixeln. Bilder darunter werden sofort verworfen. Empfohlen: 768 für Training auf 1024, 512 für Training auf 512.",
-                                "Shortest image side in pixels. Images below are rejected immediately. Recommended: 768 for training at 1024, 512 for training at 512.",
-                            ),
-                        )
-
-                with gr.Accordion(tr("🔍 Vorfilter (lokal, ohne API-Kosten)", "🔍 Pre-filters (local, no API cost)"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Wozu Vorfilter?</b></summary>"
-                        "\n\n"
-                        "Bevor irgendein Bild zur kostenpflichtigen KI-Bewertung geschickt wird, "
-                        "laufen mehrere lokale Filter rein auf deinem Rechner – ohne API-Kosten. "
-                        "Sie killen offensichtliche Ausschuss-Bilder (verwackelt, zu klein, "
-                        "Duplikate), bevor du dafür bezahlst.\n\n"
-                        "**Bei einem Dataset von 100 Bildern** sind die Ersparnisse marginal. "
-                        "**Bei 3000 Bildern** macht das den Unterschied zwischen 5 € und 50 € "
-                        "API-Kosten. Lass die Filter im Zweifel an – sie sind so konfiguriert, "
-                        "dass sie nur klare Fälle aussortieren und im Grenzfall lieber das "
-                        "Bild durchlassen als zu strikt sein.\n\n"
-                        "**Unschärfe-Filter (zweistufig):**\n\n"
-                        "**Stufe 1** prüft das ganze Bild *vor* der API – nur eine "
-                        "Totalausfall-Erkennung für komplett verwackelte oder verwaschene "
-                        "Bilder. Bewusst lax, weil bei Stufe 1 das Gesicht noch nicht lokalisiert "
-                        "ist und ein scharfer Hintergrund mit unscharfem Gesicht durchrutschen "
-                        "könnte.\n\n"
-                        "**Stufe 2** prüft *gezielt die Gesichtsregion* nach der "
-                        "Gesichtserkennung. Hier kann die Schwelle deutlich strenger sein, "
-                        "weil wir wissen wo wir hinschauen. **Achtung:** Beauty-Filter-Selfies "
-                        "(starkes Hautglätten) können hier fälschlich als 'unscharf' gelten – "
-                        "siehe Erklärung im Hauptmodell-Eskalations-Bereich.\n\n"
-                        "**Frühe pHash-Vorfilterung:** Erkennt offensichtliche Duplikate "
-                        "(gleiches Foto mehrfach hochgeladen, identische Re-Uploads) schon "
-                        "*vor* der API-Bewertung und behält pro Duplikatsgruppe nur ein paar "
-                        "Bilder zur Bewertung. Sehr effektiv bei Bulk-Datasets aus Social Media."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ Why pre-filters?</b></summary>"
-                        "\n\n"
-                        "Before any image is sent to the paid AI scoring, several local "
-                        "filters run on your machine – at no API cost. They kill obvious junk "
-                        "images (blurry, too small, duplicates) before you pay for them.\n\n"
-                        "**For a 100-image dataset** the savings are marginal. **For a 3000-"
-                        "image dataset** this is the difference between $5 and $50 in API "
-                        "costs. When in doubt, leave the filters on – they're tuned to only "
-                        "reject clear cases and to err toward letting an image through rather "
-                        "than being too strict.\n\n"
-                        "**Blur filter (two-stage):**\n\n"
-                        "**Stage 1** checks the whole image *before* the API – pure total-"
-                        "failure detection for completely blurry or smeared images. "
-                        "Intentionally lax, because at stage 1 the face hasn't been located "
-                        "yet, and a sharp background with a blurry face could slip through.\n\n"
-                        "**Stage 2** targets the *face region* after face detection. Here the "
-                        "threshold can be much stricter because we know where to look. "
-                        "**Caveat:** Beauty-filter selfies (heavy skin smoothing) can falsely "
-                        "register as 'blurry' here.\n\n"
-                        "**Early pHash pre-filter:** Detects obvious duplicates (same photo "
-                        "uploaded multiple times, identical re-uploads) *before* AI scoring "
-                        "and keeps only a few images per duplicate group for scoring. Very "
-                        "effective on bulk social-media datasets."
-                        "</details>",
-                    ))
-                    with gr.Row():
-                        c_use_filesize = gr.Checkbox(
-                            label=tr("Dateigröße-Filter", "File size filter"),
-                            value=S["c_use_filesize"],
-                            info=tr(
-                                "Verwirft sehr kleine Dateien, die meist stark komprimiert und für Training unbrauchbar sind. Empfohlen: an.",
-                                "Rejects very small files that are usually heavily compressed and unusable for training. Recommended: on.",
-                            ),
-                        )
-                        c_min_filesize = gr.Slider(
-                            label=tr("Min. Dateigröße (KB)", "Min file size (KB)"),
-                            minimum=10,
-                            maximum=500,
-                            step=10,
-                            value=S["c_min_filesize"],
-                            info=tr(
-                                "Dateien unter dieser Größe werden direkt verworfen. Empfohlen: 50 KB. Höher (100+) bei reinen Foto-Datasets, niedriger (20) wenn auch kleinere Bilder erlaubt sein sollen.",
-                                "Files below this size are rejected immediately. Recommended: 50 KB. Higher (100+) for pure photo datasets, lower (20) if smaller images should pass.",
-                            ),
-                        )
-                    with gr.Row():
-                        c_use_blur = gr.Checkbox(
-                            label=tr("Unschärfe-Filter (zweistufig)", "Blur filter (two-stage)"),
-                            value=S["c_use_blur"],
-                            info=tr(
-                                "Erkennt unscharfe Bilder in zwei Stufen. Empfohlen: an. Details siehe Erklärung oben.",
-                                "Detects blurry images in two stages. Recommended: on. See explanation above for details.",
-                            ),
-                        )
-                        c_min_blur = gr.Slider(
-                            label=tr("Stufe 1: Min. Varianz (Gesamtbild)", "Stage 1: min variance (full image)"),
-                            minimum=5,
-                            maximum=200,
-                            step=5,
-                            value=S["c_min_blur"],
-                            info=tr(
-                                "Totalausfall-Schwelle auf dem ganzen Bild. Empfohlen: 25 (nur komplett verwackelte Bilder fliegen raus). Höher = strenger, kann aber Bilder mit unscharfem Hintergrund fälschlich treffen.",
-                                "Total-failure threshold on the full image. Recommended: 25 (only completely blurry images get rejected). Higher = stricter, but may falsely reject images with intentionally blurred backgrounds.",
-                            ),
-                        )
-                    with gr.Row():
-                        c_face_min_blur = gr.Slider(
-                            label=tr("Stufe 2: Min. Schärfe (Gesicht, Fallback)", "Stage 2: min sharpness (face, fallback)"),
-                            minimum=10,
-                            maximum=200,
-                            step=5,
-                            value=S["c_face_min_blur"],
-                            info=tr(
-                                "Globaler Fallback-Wert. Wird nur verwendet, wenn die shot-type-spezifischen Werte unten alle 0 sind. Empfohlen: 45.",
-                                "Global fallback value. Only used when all shot-type-specific values below are 0. Recommended: 45.",
-                            ),
-                        )
-                    with gr.Accordion(
-                        tr(
-                            "Schärfe-Schwellen pro Shot-Typ (empfohlen)",
-                            "Sharpness thresholds per shot type (recommended)",
-                        ),
-                        open=True,
-                    ):
-                        gr.Markdown(tr(
-                            "Bei Closeups (Headshots) ist die Gesichts-Bbox sehr groß. "
-                            "Glatte Wangen-/Stirnflächen drücken die Schärfemessung statistisch nach unten, "
-                            "selbst wenn das Bild scharf ist. Daher braucht headshot eine niedrigere Schwelle "
-                            "als full_body (kleines Gesicht, hohe Detail-Dichte). "
-                            "Werte 0 deaktivieren den shot-type-spezifischen Pfad und nutzen den globalen Fallback oben.",
-                            "Closeups (headshots) have a very large face bbox. Smooth cheek/forehead areas "
-                            "statistically drag the sharpness measurement down even when the image is sharp. "
-                            "So headshot needs a lower threshold than full_body (small face, high detail density). "
-                            "Values of 0 disable the shot-type-specific path and fall back to the global value above.",
-                        ))
-                        with gr.Row():
-                            c_face_min_blur_headshot = gr.Slider(
-                                label=tr("Headshot", "Headshot"),
-                                minimum=0,
-                                maximum=200,
-                                step=5,
-                                value=S["c_face_min_blur_headshot"],
+                        with gr.Accordion(tr("Reasoning, Budget & Trigger-Check", "Reasoning, budget & trigger check"), open=False):
+                            c_audit_reasoning_effort = gr.Dropdown(
+                                label=tr("Reasoning Effort – Bildaudit", "Reasoning effort – image audit"),
+                                choices=REASONING_EFFORT_CHOICES,
+                                value=S["c_audit_reasoning_effort"],
                                 info=tr(
-                                    "Empfohlen: 25. Closeups vertragen weniger Variance.",
-                                    "Recommended: 25. Closeups tolerate less variance.",
+                                    "Reasoning-Aufwand für jeden normalen Bildaudit-Call. Für Luna und klar strukturierte Extraktion ist `none` der empfohlene schnelle Standard; `low` kann bei schwierigen visuellen Grenzfällen helfen.",
+                                    "Reasoning effort for every regular image-audit call. For Luna and structured extraction, `none` is the recommended fast default; `low` may help with difficult visual edge cases.",
                                 ),
                             )
-                            c_face_min_blur_medium = gr.Slider(
-                                label=tr("Medium", "Medium"),
-                                minimum=0,
-                                maximum=200,
-                                step=5,
-                                value=S["c_face_min_blur_medium"],
+                            c_openai_token_limit = gr.Number(
+                                label=tr("OpenAI Token-Limit pro Lauf", "OpenAI token limit per run"),
+                                value=S["c_openai_token_limit"],
+                                precision=0,
                                 info=tr(
-                                    "Empfohlen: 35. Mittlere Schwelle für Halbfiguren.",
-                                    "Recommended: 35. Middle threshold for medium shots.",
+                                    "0 = kein Limit. Wenn das Limit erreicht ist, stoppt der Curator vor weiteren OpenAI-API-Calls. Tipp: bei 2.500.000 Tageslimit lieber etwas Reserve lassen, z. B. 2.400.000.",
+                                    "0 = no limit. Once the limit is reached, the curator stops before any further OpenAI API calls. Tip: if your daily cap is 2,500,000, leave some headroom, e.g. 2,400,000."
                                 ),
                             )
-                            c_face_min_blur_full_body = gr.Slider(
-                                label=tr("Full-Body", "Full-body"),
-                                minimum=0,
-                                maximum=200,
-                                step=5,
-                                value=S["c_face_min_blur_full_body"],
+                            c_use_trigger_check = gr.Checkbox(
+                                label=tr("Trigger-Check aktivieren", "Enable trigger check"),
+                                value=S["c_use_trigger_check"],
                                 info=tr(
-                                    "Empfohlen: 45. Kleines Gesicht im Frame braucht höhere Schwelle.",
-                                    "Recommended: 45. Small face in frame needs higher threshold.",
+                                    "Prüft das Triggerwort per KI auf Kollisionen oder problematische Ähnlichkeiten. Wenn deaktiviert, wird die Prüfung komplett übersprungen.",
+                                    "Checks the trigger word via AI for collisions or problematic similarities. If disabled, the check is skipped entirely.",
                                 ),
                             )
-                    with gr.Row():
-                        c_blur_norm_edge = gr.Slider(
-                            label=tr("Normierungs-Kantenlänge (px)", "Normalization edge size (px)"),
-                            minimum=256,
-                            maximum=1024,
-                            step=64,
-                            value=S["c_blur_norm_edge"],
-                            info=tr(
-                                "Vor der Schärfe-Messung werden alle Bilder auf diese längste Kante skaliert. Macht die Schwellen unabhängig von der Original-Auflösung. Empfohlen: 512 (Standard, in Bezug zu den Schwellen oben kalibriert).",
-                                "Before sharpness measurement, all images get resized to this longest edge. Makes thresholds independent of the original resolution. Recommended: 512 (default, calibrated against the thresholds above).",
-                            ),
-                        )
-                    with gr.Group(visible=False):
-                        c_use_early_phash = gr.Checkbox(
-                            label=tr("Frühe Duplikat-Vorfilterung (vor API)", "Early duplicate pre-filter (pre-API)"),
-                            value=S["c_use_early_phash"],
-                            info=tr(
-                                "Master-Schalter für die zwei pHash-Schleifen unten. Wenn aus, werden beide Schleifen übersprungen. Empfohlen: an, besonders bei großen Datasets aus Social Media oder Video-Frame-Extraktionen.",
-                                "Master switch for the two pHash loops below. When off, both loops are skipped. Recommended: on, especially for large social-media datasets or video frame extractions.",
-                            ),
-                        )
-                        gr.Markdown(tr(
-                            "<details>"
-                            "<summary><b>ℹ️ Wie funktionieren die zwei Schleifen?</b></summary>"
-                            "\n\n"
-                            "Zwei aufeinanderfolgende pHash-Vorfilter-Durchgänge mit "
-                            "unterschiedlichen Schwellen, weil ein einzelner Durchgang nie "
-                            "beide Anwendungsfälle gleichzeitig gut bedienen kann.\n\n"
-                            "**Schleife 1 (exakte Duplikate):**\n\n"
-                            "Sehr strenge Schwelle (Hamming 1, 1 pro Gruppe behalten). "
-                            "Findet praktisch nur bit-identische Re-Uploads, Screenshots "
-                            "vom selben Foto und identische Kompressions-Varianten. Bei "
-                            "Datasets aus Story-Highlights, wo dieselben Bilder mehrmals "
-                            "in unterschiedlichen Reposts auftauchen, räumt das massiv auf.\n\n"
-                            "**Schleife 2 (Bulk-Filter):**\n\n"
-                            "Lockerere Schwelle (Hamming 4, 2 pro Gruppe behalten). "
-                            "Greift Bulk-Aufnahmen ab, bei denen aus einem Video oder "
-                            "einer Burst-Aufnahme viele fast-identische Frames extrahiert "
-                            "wurden. Pro Bulk-Gruppe bleiben zwei Bilder durch, damit du "
-                            "noch leichte Varianz behältst.\n\n"
-                            "**Reihenfolge:** Schleife 1 läuft zuerst auf allen Bildern, "
-                            "Schleife 2 dann auf den Überlebenden. Die pHashes werden "
-                            "zwischen den Schleifen wiederverwendet, kein doppeltes Hashen.\n\n"
-                            "**Empfohlen:** Beide an. Wer kein Video-Material und keine "
-                            "Bulk-Aufnahmen hat, kann Schleife 2 ausschalten – Schleife 1 "
-                            "alleine bringt schon einen großen Teil der Ersparnis."
-                            "</details>",
-                            "<details>"
-                            "<summary><b>ℹ️ How do the two loops work?</b></summary>"
-                            "\n\n"
-                            "Two sequential pHash pre-filter passes with different "
-                            "thresholds, because no single pass can serve both use cases "
-                            "well at the same time.\n\n"
-                            "**Loop 1 (exact duplicates):**\n\n"
-                            "Very strict threshold (hamming 1, keep 1 per group). Finds "
-                            "essentially only bit-identical re-uploads, screenshots of "
-                            "the same photo and identical compression variants. For "
-                            "datasets from story highlights, where the same images appear "
-                            "in multiple reposts, this clears massive amounts.\n\n"
-                            "**Loop 2 (bulk filter):**\n\n"
-                            "Looser threshold (hamming 4, keep 2 per group). Catches "
-                            "bulk shots where many near-identical frames were extracted "
-                            "from a video or burst capture. Two images per bulk group "
-                            "survive, so you keep some slight variation.\n\n"
-                            "**Order:** Loop 1 runs first on all images, loop 2 then on "
-                            "the survivors. pHashes are reused between loops – no double "
-                            "hashing.\n\n"
-                            "**Recommended:** Both on. Without video material or burst "
-                            "shots you can turn loop 2 off – loop 1 alone already brings "
-                            "a big part of the savings."
-                            "</details>",
-                        ))
-                        with gr.Row():
-                            c_use_early_phash_loop1 = gr.Checkbox(
-                                label=tr("Schleife 1 aktivieren (exakte Duplikate)", "Enable loop 1 (exact duplicates)"),
-                                value=S["c_use_early_phash_loop1"],
+                            c_trigger_model = gr.Dropdown(
+                                label=tr("Trigger-Check-Modell", "Trigger-check model"),
+                                choices=[""] + OPENAI_MODEL_PRESET_CHOICES,
+                                value=S["c_trigger_model"],
                                 info=tr(
-                                    "Empfohlen: an. Sehr günstig (kostet praktisch nichts) und filtert garantierte Duplikate.",
-                                    "Recommended: on. Very cheap (practically no cost) and filters guaranteed duplicates.",
+                                    "Optional separates Modell für die Triggerwort-Prüfung. Leer = primäres Modell verwenden. Wird nur genutzt, wenn der Trigger-Check aktiviert ist.",
+                                    "Optional separate model for trigger-word checks. Empty = use primary model. Only used when trigger check is enabled.",
                                 ),
+                                **openai_model_dropdown_kwargs(),
                             )
-                            c_early_phash_thresh_1 = gr.Slider(
-                                label=tr("Schleife 1: Hamming-Schwelle", "Loop 1: hamming threshold"),
-                                minimum=0,
-                                maximum=4,
-                                step=1,
-                                value=S["c_early_phash_thresh_1"],
+                            c_trigger_reasoning_effort = gr.Dropdown(
+                                label=tr("Reasoning Effort – Trigger-Check", "Reasoning effort – trigger check"),
+                                choices=REASONING_EFFORT_CHOICES,
+                                value=S["c_trigger_reasoning_effort"],
                                 info=tr(
-                                    "Wie ähnlich Bilder sein müssen, um als exaktes Duplikat zu gelten. Empfohlen: 1 (nur bit-identische plus minimale Kompressions-Unterschiede). 0 = wirklich nur exakt identisch. 2–3 = lockerer.",
-                                    "How similar images must be to count as exact duplicates. Recommended: 1 (only bit-identical plus minor compression differences). 0 = truly only identical. 2–3 = looser.",
-                                ),
-                            )
-                            c_early_phash_keep_1 = gr.Slider(
-                                label=tr("Schleife 1: pro Gruppe behalten", "Loop 1: keep per group"),
-                                minimum=1,
-                                maximum=3,
-                                step=1,
-                                value=S["c_early_phash_keep_1"],
-                                info=tr(
-                                    "Wie viele Bilder pro Duplikat-Gruppe überleben. Empfohlen: 1 (bei exakten Duplikaten reicht eins). Höhere Werte sind hier eher sinnlos, weil die Bilder ohnehin praktisch identisch sind.",
-                                    "How many images per duplicate group survive. Recommended: 1 (with exact duplicates one is enough). Higher values are pointless here since the images are practically identical anyway.",
-                                ),
-                            )
-                        with gr.Row():
-                            c_use_early_phash_loop2 = gr.Checkbox(
-                                label=tr("Schleife 2 aktivieren (Bulk-Filter)", "Enable loop 2 (bulk filter)"),
-                                value=S["c_use_early_phash_loop2"],
-                                info=tr(
-                                    "Empfohlen: an bei Datasets mit Video-Frames oder Burst-Aufnahmen. Bei reinen Foto-Datasets aus Studio/DSLR kannst du es ausschalten.",
-                                    "Recommended: on for datasets with video frames or burst shots. For pure photo datasets from studio/DSLR you can turn it off.",
-                                ),
-                            )
-                            c_early_phash_thresh_2 = gr.Slider(
-                                label=tr("Schleife 2: Hamming-Schwelle", "Loop 2: hamming threshold"),
-                                minimum=2,
-                                maximum=12,
-                                step=1,
-                                value=S["c_early_phash_thresh_2"],
-                                info=tr(
-                                    "Wie ähnlich Bilder sein müssen, um als Bulk-Duplikat zu gelten. Empfohlen: 4 (typische Video-Frame-Ähnlichkeit). 6–8 für aggressiveres Aufräumen, kann aber leichte Pose-Varianten verlieren.",
-                                    "How similar images must be to count as bulk duplicates. Recommended: 4 (typical video-frame similarity). 6–8 for more aggressive cleanup, but may lose minor pose variants.",
-                                ),
-                            )
-                            c_early_phash_keep_2 = gr.Slider(
-                                label=tr("Schleife 2: pro Gruppe behalten", "Loop 2: keep per group"),
-                                minimum=1,
-                                maximum=5,
-                                step=1,
-                                value=S["c_early_phash_keep_2"],
-                                info=tr(
-                                    "Wie viele Bilder pro Bulk-Gruppe überleben und zur API kommen. Empfohlen: 2 (lässt zwei Varianten als Sicherheit durch). 1 = streng (spart maximal Kosten), 3+ = locker (mehr API-Kosten, mehr Vielfalt).",
-                                    "How many images per bulk group survive and get sent to the API. Recommended: 2 (lets two variants through for safety). 1 = strict (max cost savings), 3+ = loose (more API cost, more variety).",
+                                    "Wird nur verwendet, wenn der Trigger-Check aktiv ist. `none` reicht normalerweise aus.",
+                                    "Used only when trigger checking is enabled. `none` is normally sufficient.",
                                 ),
                             )
 
-                with gr.Accordion(tr("🖼️ Smart-Rahmenbereinigung", "🖼️ Smart frame cleanup"), open=False, visible=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Was wird hier entfernt?</b></summary>"
-                        "\n\n"
-                        "Viele Bilder aus Social Media – besonders Instagram-Stories und "
-                        "Screenshots vom Handy – haben **künstliche Ränder, die nicht zum "
-                        "eigentlichen Bild gehören**:\n\n"
-                        "**Instagram-Story-Frames:** Weiße oder farbige Balken oben und unten, "
-                        "die das eigentliche Foto zentrieren. Beim LoRA-Training würde das "
-                        "Modell lernen, dass solche Ränder zur Person gehören.\n\n"
-                        "**Drop-Shadow-Gradienten:** Halb-transparente dunkle Verläufe am "
-                        "oberen oder unteren Rand für lesbaren UI-Text.\n\n"
-                        "**Android-Nav-Bars:** Schwarze Leisten mit Statusbar-Icons (Akku, "
-                        "Uhrzeit) oder System-Buttons.\n\n"
-                        "Der Curator erkennt diese Ränder und schneidet sie *vor* der KI-"
-                        "Bewertung weg. Damit wird das Bild auf dem bereinigten Inhalt "
-                        "bewertet, und das spätere LoRA lernt nicht versehentlich Telefon-"
-                        "Interfaces als Teil der Person.\n\n"
-                        "**Konservativ kalibriert:** Die Erkennung ist so eingestellt, dass "
-                        "sie bei Unsicherheit lieber nichts wegschneidet, statt einen echten "
-                        "dunklen Hintergrund (schwarze Wand, Haare) als Nav-Bar misszuver-"
-                        "stehen."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ What gets removed here?</b></summary>"
-                        "\n\n"
-                        "Many social-media images – especially Instagram stories and phone "
-                        "screenshots – have **artificial borders that don't belong to the "
-                        "actual photo**:\n\n"
-                        "**Instagram story frames:** White or colored bars top and bottom that "
-                        "center the actual photo. During LoRA training, the model would learn "
-                        "that such borders are part of the person.\n\n"
-                        "**Drop-shadow gradients:** Semi-transparent dark gradients at the top "
-                        "or bottom for readable UI text.\n\n"
-                        "**Android nav bars:** Black bars with status icons (battery, clock) "
-                        "or system buttons.\n\n"
-                        "The curator detects these borders and crops them out *before* AI "
-                        "scoring. The image is then evaluated on cleaned content, and the "
-                        "later LoRA doesn't accidentally learn phone UI as part of the "
-                        "person.\n\n"
-                        "**Conservatively calibrated:** Detection is set up to err on not "
-                        "cutting anything if uncertain, rather than mistaking a real dark "
-                        "background (black wall, hair) for a nav bar."
-                        "</details>",
-                    ))
-                    with gr.Row():
-                        c_ig_frame_crop = gr.Checkbox(
-                            label=tr("Lokale Rahmenbereinigung aktivieren", "Enable local frame cleanup"),
-                            value=S["c_ig_frame_crop"],
-                            info=tr(
-                                "Hauptschalter für die Rand-Erkennung und das Wegschneiden. Empfohlen: an, sobald deine Bilder aus Social Media stammen. Bei reinen DSLR-/Studio-Fotos kannst du es ausschalten.",
-                                "Main switch for border detection and cropping. Recommended: on as soon as your images come from social media. For pure DSLR/studio photos you can turn it off.",
-                            ),
-                        )
-                        c_ig_two_stage_bar = gr.Checkbox(
-                            label=tr("Erweiterte Rahmentypen erkennen", "Detect advanced frame types"),
-                            value=S["c_ig_two_stage_bar"],
-                            info=tr(
-                                "Erkennt zusätzlich asymmetrische Canvas-Ränder, Status-/Navigationsleisten, Polaroid-Unterkanten und verlaufende Social-Media-Flächen. Die vier Seiten werden unabhängig geprüft.",
-                                "Also detects asymmetric canvas borders, status/navigation bars, Polaroid-style bottom borders and gradient social-media canvases. All four sides are analysed independently.",
-                            ),
-                        )
-                    c_frame_cleanup_mode = gr.Dropdown(
-                        label=tr("Verhalten bei Rahmenfunden", "Frame-cleanup behavior"),
-                        choices=[
-                            (tr("Hohe Sicherheit automatisch; Medium vorauswählen", "Auto-apply high confidence; preselect medium"), "auto_high_review_medium"),
-                            (tr("Hohe und mittlere Sicherheit automatisch anwenden", "Auto-apply high and medium confidence"), "auto_high_keep_medium"),
-                            (tr("Nur vorauswählen; nichts automatisch anwenden", "Preselect only; never apply automatically"), "suggest_only"),
-                        ],
-                        value=S.get("c_frame_cleanup_mode", "auto_high_keep_medium"),
-                        allow_custom_value=False,
-                        info=tr(
-                            "High und Medium öffnen immer mit der lokal bestbewerteten Variante. Standardmäßig werden beide automatisch angewendet. Nicht freigegebene komplexe Crop-Typen bleiben als vorausgewählter Review-Vorschlag sichtbar. Es entstehen keine LLM-Aufrufe.",
-                            "High and medium findings always open with the locally best-ranked variant. By default both are applied automatically. Complex crop types that are not eligible remain visible as preselected review suggestions. No LLM calls are made.",
-                        ),
-                    )
-                    c_frame_pause_on_medium = gr.Checkbox(
-                        label=tr("Vor dem Audit bei mittleren Rahmenfällen anhalten", "Pause before audit for medium-confidence frame cases"),
-                        value=S.get("c_frame_pause_on_medium", False),
-                        info=tr(
-                            "Optional. Prüft die lokalen Rahmen-Caches zuerst. Gibt es ungeklärte mittlere Fälle, endet der Lauf vor kostenpflichtigen Audits. Nach der Entscheidung im Tab Rahmenprüfung erneut starten; unveränderte Analysen kommen aus dem Cache.",
-                            "Optional. Checks local frame caches first. If unresolved medium cases exist, the run stops before paid audits. Review them in the Frame Review tab and restart; unchanged analysis is loaded from cache.",
-                        ),
-                    )
+                with gr.Accordion(tr("Weitere Einstellungen", "More settings"), open=False):
+                    with gr.Tabs():
+                        with gr.TabItem(tr("Modelle", "Models")):
+                            with gr.Accordion(tr("🧠 Modellstrategie & Eskalation", "🧠 Model strategy & escalation"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Was bedeutet Eskalation und wann brauche ich das?</b></summary>"
+                                    "\n\n"
+                                    "Standardmäßig bewertet ein einziges Modell (`gpt-6-luna` empfohlen) "
+                                    "alle Bilder. Frühere Nano-Modelle haben sich bei schwierigen visuellen Grenzfällen als zu "
+                                    "ungenau für die Erkennung von Filter-Hauttextur und extremen "
+                                    "Kamerawinkeln erwiesen – diese Bilder rutschten regelmäßig fälschlich "
+                                    "in 'train_ready'. Bei **Grenzfällen** – also Bildern, die das "
+                                    "Hauptmodell nicht klar als "
+                                    "'gut genug' oder 'rauswerfen' einordnen kann – kann der Curator diese "
+                                    "Bilder optional an ein **stärkeres zweites Modell** weiterleiten "
+                                    "(z. B. `gpt-6.1-sol` oder `gpt-6-astra`).\n\n"
+                                    "**Drei Auslöser für Eskalation:**\n\n"
+                                    "**1. Bei Review:** Das Hauptmodell hat das Bild auf 'review' gesetzt "
+                                    "(also: 'ich kann mich nicht entscheiden') oder die Bewertung liegt im "
+                                    "konfigurierten Score-Fenster. Das stärkere Modell entscheidet dann.\n\n"
+                                    "**2. Bei Konflikt:** Wenn lokale Filter (z. B. Unschärfe-Erkennung) und "
+                                    "Hauptmodell unterschiedlicher Meinung sind. Vermeidet, dass ein "
+                                    "technisch unscharfes aber inhaltlich gutes Bild verloren geht.\n\n"
+                                    "**3. Bei knappem Smart-Crop-Duell:** Wenn Original und Crop weniger "
+                                    "Punkte auseinander liegen als die Eskalations-Differenz, entscheidet "
+                                    "das stärkere Modell, welcher Schnitt besser passt.\n\n"
+                                    "**Kosten:** Pro eskaliertem Bild ein zusätzlicher API-Call zum teureren "
+                                    "Modell. Bei normalem Setup landen 5–15 % der Bilder in der Eskalation."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ What is escalation and when do I need it?</b></summary>"
+                                    "\n\n"
+                                    "By default, a single model (`gpt-6-luna` recommended) scores all "
+                                    "images. Earlier nano-class models proved too inaccurate at "
+                                    "spotting filter-smoothed skin and extreme camera angles - those "
+                                    "images regularly slipped into 'train_ready' incorrectly. For "
+                                    "**borderline cases** - "
+                                    "images the main model can't clearly classify as 'keep' or 'reject' - "
+                                    "the curator can optionally forward these images to a **stronger second "
+                                    "model** (e.g. `gpt-6.1-sol` or `gpt-6-astra`).\n\n"
+                                    "**Three escalation triggers:**\n\n"
+                                    "**1. On review:** Main model marked the image as 'review' (i.e. "
+                                    "'undecided') or the score falls inside the configured window. The "
+                                    "stronger model then decides.\n\n"
+                                    "**2. On conflict:** When local filters (e.g. blur detection) disagree "
+                                    "with the main model. Prevents losing a technically blurry but "
+                                    "content-wise good image.\n\n"
+                                    "**3. On close smart-crop duel:** If original and crop are within the "
+                                    "escalation delta, the stronger model decides which framing is better.\n\n"
+                                    "**Cost:** One extra API call to the more expensive model per escalated "
+                                    "image. With a normal setup, 5–15 % of images end up escalated."
+                                    "</details>",
+                                ))
+                                c_use_review_escalation = gr.Checkbox(
+                                    label=tr("Eskalation für schwierige Fälle aktivieren", "Enable escalation for difficult cases"),
+                                    value=S["c_use_review_escalation"],
+                                    info=tr(
+                                        "Empfohlen: zunächst aus. `gpt-6-luna` übernimmt den Routine-Audit. "
+                                        "Aktiviere die Eskalation, wenn schwierige Grenzfälle gezielt durch "
+                                        "`gpt-6.1-sol` oder `gpt-6-astra` nachgeprüft werden sollen. Zusätzliche "
+                                        "Kosten entstehen nur für tatsächlich eskalierte Bilder.",
+                                        "Recommended: off initially. `gpt-6-luna` handles routine audits. "
+                                        "Enable escalation when difficult borderline cases should be rechecked "
+                                        "by `gpt-6.1-sol` or `gpt-6-astra`. Extra cost applies only to images "
+                                        "that are actually escalated.",
+                                    ),
+                                )
+                                with gr.Row():
+                                    c_review_escalation_model = gr.Dropdown(
+                                        label=tr("Eskalationsmodell", "Escalation model"),
+                                        choices=[""] + OPENAI_MODEL_PRESET_CHOICES,
+                                        value=S["c_review_escalation_model"],
+                                        info=tr(
+                                            "Stärkeres Modell für die Eskalation. Leer = Eskalation effektiv aus, auch wenn der Schalter oben an ist. Für Luna als Hauptmodell empfohlen: `gpt-6.1-sol`.",
+                                            "Stronger model for escalation. Empty = escalation effectively off, even if the switch above is on. Recommended with Luna as the main model: `gpt-6.1-sol`.",
+                                        ),
+                                        **openai_model_dropdown_kwargs(),
+                                    )
+                                    c_review_escalation_reasoning_effort = gr.Dropdown(
+                                        label=tr("Reasoning Effort – Eskalation", "Reasoning effort – escalation"),
+                                        choices=REASONING_EFFORT_CHOICES,
+                                        value=S["c_review_escalation_reasoning_effort"],
+                                        info=tr(
+                                            "Reasoning nur für tatsächlich eskalierte Grenzfälle. `low` ist der empfohlene Ausgangspunkt mit Sol; höhere Stufen erhöhen Laufzeit und Tokenverbrauch.",
+                                            "Reasoning only for cases that are actually escalated. `low` is the recommended starting point with Sol; higher levels increase latency and token usage.",
+                                        ),
+                                    )
+                                with gr.Row():
+                                    c_review_escalation_score_min = gr.Slider(
+                                        label=tr("Score-Fenster: Minimum", "Score window: minimum"),
+                                        minimum=0,
+                                        maximum=100,
+                                        step=1,
+                                        value=S["c_review_escalation_score_min"],
+                                        info=tr(
+                                            "Untere Grenze des Score-Fensters für Eskalation. Bilder mit Score zwischen Minimum und Maximum werden eskaliert. Empfohlen: 35.",
+                                            "Lower bound of the escalation score window. Images scoring between min and max are escalated. Recommended: 35.",
+                                        ),
+                                    )
+                                    c_review_escalation_score_max = gr.Slider(
+                                        label=tr("Score-Fenster: Maximum", "Score window: maximum"),
+                                        minimum=0,
+                                        maximum=100,
+                                        step=1,
+                                        value=S["c_review_escalation_score_max"],
+                                        info=tr(
+                                            "Obere Grenze des Score-Fensters. Bilder über diesem Wert sind 'eindeutig gut' und werden nicht eskaliert. Empfohlen: 58.",
+                                            "Upper bound of the score window. Images above this are 'clearly good' and won't be escalated. Recommended: 58.",
+                                        ),
+                                    )
+                                with gr.Row():
+                                    c_escalate_on_review = gr.Checkbox(
+                                        label=tr("Bei Review eskalieren", "Escalate on review"),
+                                        value=S["c_escalate_on_review"],
+                                        info=tr(
+                                            "Eskaliert Bilder, die das Hauptmodell als 'unentschieden' markiert hat. Empfohlen: an.",
+                                            "Escalates images flagged as 'undecided' by the main model. Recommended: on.",
+                                        ),
+                                    )
+                                    c_escalate_on_conflict = gr.Checkbox(
+                                        label=tr("Bei Konflikt eskalieren", "Escalate on conflict"),
+                                        value=S["c_escalate_on_conflict"],
+                                        info=tr(
+                                            "Eskaliert, wenn lokale Filter und Hauptmodell unterschiedlicher Meinung sind (z. B. lokal als unscharf erkannt, KI sagt: scharf). Empfohlen: an.",
+                                            "Escalates when local filters and main model disagree (e.g. flagged as blurry locally, AI says sharp). Recommended: on.",
+                                        ),
+                                    )
+                                    c_escalate_smart_crop = gr.Checkbox(
+                                        label=tr("Knappes Smart-Crop-Duell eskalieren", "Escalate close smart-crop duel"),
+                                        value=S["c_escalate_smart_crop"],
+                                        info=tr(
+                                            "Eskaliert, wenn Original und Smart-Crop fast gleich gut bewertet werden. Empfohlen: an, wenn dir die Smart-Crop-Auswahl wichtig ist.",
+                                            "Escalates when original and smart crop score almost equally. Recommended: on if smart crop selection matters to you.",
+                                        ),
+                                    )
+                                c_smart_crop_escalation_delta = gr.Slider(
+                                    label=tr("Max. Punktdifferenz für Crop-Eskalation", "Max point delta for crop escalation"),
+                                    minimum=0,
+                                    maximum=30,
+                                    step=1,
+                                    value=S["c_smart_crop_escalation_delta"],
+                                    info=tr(
+                                        "Wenn Original und Crop weniger als so viele Punkte auseinanderliegen, entscheidet das stärkere Modell. Empfohlen: 8. Höher (15+) eskaliert mehr Crop-Duelle, niedriger (4) nur die wirklich knappen.",
+                                        "If original and crop are within this many points of each other, the stronger model decides. Recommended: 8. Higher (15+) escalates more duels, lower (4) only the very close ones.",
+                                    ),
+                                )
 
-                with gr.Accordion(tr("🧍 Subject-Sanity-Check (Gliedmaßen-Filter)", "🧍 Subject sanity check (limb filter)"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Wann fliegen Bilder hier raus?</b></summary>"
-                        "\n\n"
-                        "Manche Bilder zeigen zwar *etwas Menschliches*, aber nicht die "
-                        "Person, um die es geht: nur Füße auf einem Strand-Foto, nur Hände "
-                        "beim Kochen, ein Detail-Shot vom Schmuck. Die Gesichtserkennung "
-                        "findet kein Gesicht, also würde das Bild ohne diesen Filter trotzdem "
-                        "weiterlaufen und am Ende ggf. die KI fragen.\n\n"
-                        "Der Sanity-Check verwirft solche Bilder direkt: Wenn weder ein "
-                        "Gesicht erkannt wird, noch ein Torso (Schultern + Hüften), ist das "
-                        "Bild für ein Person-LoRA wertlos.\n\n"
-                        "**Wichtig:** Rückenansichten mit klar erkennbarem Torso (Schultern "
-                        "sichtbar) bleiben erhalten – die sind für Pose-Diversität wertvoll. "
-                        "Es geht wirklich nur um Bilder *ohne erkennbare Person als Ganzes*."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ When do images get rejected here?</b></summary>"
-                        "\n\n"
-                        "Some images show *something human* but not the actual person: just "
-                        "feet on a beach photo, just hands while cooking, a jewelry detail "
-                        "shot. Face detection finds no face, so without this filter the "
-                        "image would still proceed and possibly be sent to the AI.\n\n"
-                        "The sanity check rejects such images directly: if neither a face "
-                        "nor a torso (shoulders + hips) is detected, the image is worthless "
-                        "for a person LoRA.\n\n"
-                        "**Important:** Back views with a clearly visible torso (shoulders "
-                        "visible) are kept – they're valuable for pose diversity. This is "
-                        "really only about images *without a recognizable person as a whole*."
-                        "</details>",
-                    ))
-                    with gr.Row():
-                        c_subject_sanity = gr.Checkbox(
-                            label=tr("Sanity-Check aktivieren", "Enable sanity check"),
-                            value=S["c_subject_sanity"],
-                            info=tr(
-                                "Empfohlen: an. Fängt 'fehlgeschlagene' Bilder (nur Hände/Füße) ab, bevor sie API-Kosten verursachen.",
-                                "Recommended: on. Catches 'failed' images (hands/feet only) before they cause API costs.",
-                            ),
-                        )
-                        c_subject_min_torso = gr.Slider(
-                            label=tr("Min. Torso-Punkte (von 4)", "Min torso landmarks (of 4)"),
-                            minimum=1,
-                            maximum=4,
-                            step=1,
-                            value=S["c_subject_min_torso"],
-                            info=tr(
-                                "Wie viele der 4 Körperpunkte (2 Schultern, 2 Hüften) sichtbar sein müssen, damit ein Bild ohne Gesicht trotzdem bleibt. Empfohlen: 2 (halber Torso reicht). 4 = sehr streng, nur frontale Standards. 1 = sehr locker.",
-                                "How many of the 4 body landmarks (2 shoulders, 2 hips) must be visible for an image without a face to be kept. Recommended: 2 (half torso is enough). 4 = very strict, only frontal standards. 1 = very loose.",
-                            ),
-                        )
+                        with gr.TabItem(tr("Qualität & Zuschnitt", "Quality & crops")):
+                            with gr.Accordion(tr("⚙️ Qualität & Schwellwerte", "⚙️ Quality & thresholds"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Wie funktionieren die Score-Schwellen?</b></summary>"
+                                    "\n\n"
+                                    "Jedes Bild bekommt nach der KI-Analyse einen Gesamtscore von 0 bis 100, "
+                                    "der sich aus Schärfe, Beleuchtung, Komposition und Identitäts-"
+                                    "Nützlichkeit zusammensetzt. Anhand zweier Schwellen wird das Bild dann "
+                                    "klassifiziert:\n\n"
+                                    "**Keep-Schwelle (oben):** Ab diesem Score zählt ein Bild als 'gut "
+                                    "genug' und kommt in den Pool für die Endauswahl. Bilder darunter (aber "
+                                    "über der Reject-Schwelle) landen als 'review' im Ordner "
+                                    "`02_keep_unused` – sie sind nicht aussortiert, gehen aber nur ins "
+                                    "Trainings-Set, wenn sonst nicht genug Material da ist.\n\n"
+                                    "**Reject-Schwelle (unten):** Unter diesem Score wird das Bild "
+                                    "**direkt verworfen** und landet in `05_reject` (wenn Reject-Export aktiv ist). Keine zweite Chance.\n\n"
+                                    "**Faustregel:** Lass zwischen Reject und Keep einen Abstand von "
+                                    "mindestens 20 Punkten. Sonst gibt es kaum Bilder im Review-Bereich, "
+                                    "und wenn dein Material knapp wird, hast du keinen Puffer.\n\n"
+                                    "**Mindestseitenlänge:** Wirkt vor allem als Schutz gegen Thumbnails "
+                                    "und versehentlich kleine Bilder. Für Training auf Auflösung 1024 "
+                                    "reicht 768 als Mindestmaß; für 512 entsprechend 512."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ How do score thresholds work?</b></summary>"
+                                    "\n\n"
+                                    "Each image gets an overall score from 0 to 100 after AI analysis, "
+                                    "composed of sharpness, lighting, composition and identity usefulness. "
+                                    "Two thresholds then classify the image:\n\n"
+                                    "**Keep threshold (upper):** Above this score, an image counts as "
+                                    "'good enough' and goes into the final-selection pool. Images below "
+                                    "this (but above reject) land as 'review' in `02_keep_unused` – not "
+                                    "rejected, but only used in the training set if there's a shortage of "
+                                    "better material.\n\n"
+                                    "**Reject threshold (lower):** Below this score, the image is "
+                                    "**immediately rejected** and lands in `05_reject` (if reject export is enabled). No second chance.\n\n"
+                                    "**Rule of thumb:** Leave at least 20 points between reject and keep. "
+                                    "Otherwise you'll have almost no images in the review range, and if "
+                                    "you run short on material later, you'll have no buffer.\n\n"
+                                    "**Minimum side length:** Mainly a safety net against thumbnails and "
+                                    "accidentally tiny images. For training at resolution 1024, 768 is a "
+                                    "good minimum; for 512, use 512 accordingly."
+                                    "</details>",
+                                ))
+                                with gr.Row():
+                                    c_keep_min = gr.Slider(
+                                        label=tr("Keep-Schwelle", "Keep threshold"),
+                                        minimum=0,
+                                        maximum=100,
+                                        step=5,
+                                        value=S["c_keep_min"],
+                                        info=tr(
+                                            "Mindest-Score (0–100) damit ein Bild direkt als 'keep' gilt. Empfohlen: 55. Darunter (aber über Reject) landet das Bild im Review-Bereich.",
+                                            "Minimum score (0–100) for an image to count as 'keep' directly. Recommended: 55. Below that (but above reject) the image goes into the review area.",
+                                        ),
+                                    )
+                                    c_reject = gr.Slider(
+                                        label=tr("Reject-Schwelle", "Reject threshold"),
+                                        minimum=0,
+                                        maximum=100,
+                                        step=5,
+                                        value=S["c_reject"],
+                                        info=tr(
+                                            "Unter diesem Score wird ein Bild sofort verworfen, ohne Review-Chance. Empfohlen: 30. Höher = strenger (bei guter Materiallage). Niedriger = mehr Bilder durchlassen (bei knappem Material).",
+                                            "Below this score, an image is rejected immediately, no review chance. Recommended: 30. Higher = stricter (when material is plentiful). Lower = let more through (when short).",
+                                        ),
+                                    )
+                                    c_min_side = gr.Slider(
+                                        label=tr("Min. Seitenlänge (px)", "Min side length (px)"),
+                                        minimum=256,
+                                        maximum=2048,
+                                        step=64,
+                                        value=S["c_min_side"],
+                                        info=tr(
+                                            "Kürzeste Bildseite in Pixeln. Bilder darunter werden sofort verworfen. Empfohlen: 768 für Training auf 1024, 512 für Training auf 512.",
+                                            "Shortest image side in pixels. Images below are rejected immediately. Recommended: 768 for training at 1024, 512 for training at 512.",
+                                        ),
+                                    )
 
-                with gr.Accordion(tr("🔗 Duplikaterkennung (nach Bewertung)", "🔗 Duplicate detection (post-API)"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Wozu zwei verschiedene Methoden zur Duplikat-Erkennung?</b></summary>"
-                        "\n\n"
-                        "Die zwei Verfahren erkennen unterschiedliche Arten von Duplikaten – "
-                        "und kein einzelnes Verfahren fängt beide ab. Deshalb arbeiten sie "
-                        "parallel.\n\n"
-                        "**pHash (Pixel-Vergleich):**\n\n"
-                        "Vergleicht Bilder als Pixel-Strukturen. Berechnet einen kompakten "
-                        "'Fingerabdruck' und vergleicht, wie viele Bits sich zwischen zwei "
-                        "Fingerabdrücken unterscheiden (Hamming-Distanz). Erkennt Bilder, die "
-                        "sich nur durch Kompression, leichte Crops oder Helligkeit unter-"
-                        "scheiden – also klassische Duplikate, Re-Uploads, Screenshots vom "
-                        "selben Foto.\n\n"
-                        "**CLIP (Bedeutungs-Vergleich):**\n\n"
-                        "Vergleicht Bilder semantisch. CLIP ist ein KI-Modell, das Bilder als "
-                        "Vektor-Bedeutung darstellt. Erkennt Bilder mit gleichem Motiv, "
-                        "Outfit, Setting – auch wenn sie aus unterschiedlichen Winkeln "
-                        "stammen oder leichte Pose-Variationen haben. Für pHash sind solche "
-                        "Bilder schon zu unterschiedlich, semantisch sind sie aber redundant.\n\n"
-                        "**Beide zusammen:** Bei nur pHash bleiben semantische Duplikate "
-                        "übrig (z. B. drei Selfies vom selben Outfit, leicht andere Köpfe). "
-                        "Bei nur CLIP rutschen Pixel-Duplikate durch (z. B. dasselbe Foto "
-                        "in verschiedenen Auflösungen). Empfohlen ist immer beide laufen "
-                        "zu lassen.\n\n"
-                        "**Hinweis zur frühen pHash-Vorfilterung:** Im Vorfilter-Bereich "
-                        "läuft schon vor der API-Bewertung eine erste pHash-Runde, die nur "
-                        "*offensichtliche* Duplikate aussortiert. Diese hier ist die "
-                        "*finale* Runde nach der Bewertung, die mit Score-Information "
-                        "entscheiden kann, welches der ähnlichen Bilder behalten wird."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ Why two different duplicate-detection methods?</b></summary>"
-                        "\n\n"
-                        "The two methods detect different kinds of duplicates – and no single "
-                        "method catches both. That's why they run in parallel.\n\n"
-                        "**pHash (pixel comparison):**\n\n"
-                        "Compares images as pixel structures. Computes a compact "
-                        "'fingerprint' and counts how many bits differ between two "
-                        "fingerprints (hamming distance). Detects images that only differ in "
-                        "compression, slight crops or brightness – classic duplicates, "
-                        "re-uploads, screenshots of the same photo.\n\n"
-                        "**CLIP (semantic comparison):**\n\n"
-                        "Compares images by meaning. CLIP is an AI model that represents "
-                        "images as a meaning vector. Detects images with the same subject, "
-                        "outfit, setting – even from different angles or with slight pose "
-                        "variations. To pHash these images are already too different, "
-                        "semantically they're redundant.\n\n"
-                        "**Both together:** With pHash only, semantic duplicates remain "
-                        "(e.g. three selfies of the same outfit with slight head tilts). "
-                        "With CLIP only, pixel duplicates slip through (e.g. the same photo "
-                        "at different resolutions). Recommended is to run both.\n\n"
-                        "**Note on early pHash:** In the pre-filter section there's an "
-                        "earlier pHash round before AI scoring that only removes *obvious* "
-                        "duplicates. This here is the *final* round after scoring, which "
-                        "can use score information to decide which of the similar images "
-                        "to keep."
-                        "</details>",
-                    ))
-                    with gr.Row():
-                        c_use_clip = gr.Checkbox(
-                            label=tr("Bedeutungs-Vergleich (CLIP)", "Meaning-based (CLIP)"),
-                            value=S["c_use_clip"],
-                            info=tr(
-                                "Erkennt Bilder mit gleichem Inhalt (Outfit, Pose, Setting), auch wenn sie aus leicht anderen Winkeln aufgenommen wurden. Empfohlen: an. Braucht CLIP (Modellwahl unten; wird beim ersten Lauf heruntergeladen).",
-                                "Detects images with the same content (outfit, pose, setting), even from slightly different angles. Recommended: on. Requires CLIP (model choice below; auto-downloaded on first run).",
-                            ),
-                        )
-                        c_use_phash = gr.Checkbox(
-                            label=tr("Pixel-Vergleich (pHash)", "Pixel-based (pHash)"),
-                            value=S["c_use_phash"],
-                            info=tr(
-                                "Erkennt visuell fast identische Bilder (Re-Uploads, gleiches Foto in verschiedenen Auflösungen). Empfohlen: an. Kostet praktisch keine Rechenzeit.",
-                                "Detects visually near-identical images (re-uploads, same photo in different resolutions). Recommended: on. Costs practically no compute.",
-                            ),
-                        )
-                    with gr.Row():
-                        c_phash_thresh = gr.Slider(
-                            label=tr("pHash-Schwelle (Hamming)", "pHash threshold (hamming)"),
-                            minimum=2,
-                            maximum=20,
-                            step=1,
-                            value=S["c_phash_thresh"],
-                            info=tr(
-                                "Wie ähnlich Bilder sein müssen, um als Duplikat zu gelten. Niedriger = strenger. Empfohlen: 8 (guter Kompromiss). Bei vielen Re-Uploads/Screenshots: 12. Bei knappem Material wo nichts verloren gehen darf: 4–6.",
-                                "How similar images must be to count as duplicates. Lower = stricter. Recommended: 8 (good compromise). With many re-uploads/screenshots: 12. With scarce material where nothing should be lost: 4–6.",
-                            ),
-                        )
-                        c_clip_thresh = gr.Slider(
-                            label=tr("CLIP-Ähnlichkeits-Schwelle", "CLIP similarity threshold"),
-                            minimum=0.90,
-                            maximum=1.0,
-                            step=0.005,
-                            value=S["c_clip_thresh"],
-                            info=tr(
-                                "Ab welcher Ähnlichkeit (0–1) zwei Bilder als inhaltlich gleich gelten. Empfohlen: 0.985 (konservativ, nur wirklich ähnliche werden gefiltert). Niedriger als 0.97 wird aggressiv und kann unterschiedliche Bilder derselben Person zusammenwerfen.",
-                                "At what similarity (0–1) two images count as the same content. Recommended: 0.985 (conservative, only truly similar images get filtered). Below 0.97 becomes aggressive and may merge different images of the same person.",
-                            ),
-                        )
+                            with gr.Accordion(tr("🔍 Vorfilter (lokal, ohne API-Kosten)", "🔍 Pre-filters (local, no API cost)"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Wozu Vorfilter?</b></summary>"
+                                    "\n\n"
+                                    "Bevor irgendein Bild zur kostenpflichtigen KI-Bewertung geschickt wird, "
+                                    "laufen mehrere lokale Filter rein auf deinem Rechner – ohne API-Kosten. "
+                                    "Sie killen offensichtliche Ausschuss-Bilder (verwackelt, zu klein, "
+                                    "Duplikate), bevor du dafür bezahlst.\n\n"
+                                    "**Bei einem Dataset von 100 Bildern** sind die Ersparnisse marginal. "
+                                    "**Bei 3000 Bildern** macht das den Unterschied zwischen 5 € und 50 € "
+                                    "API-Kosten. Lass die Filter im Zweifel an – sie sind so konfiguriert, "
+                                    "dass sie nur klare Fälle aussortieren und im Grenzfall lieber das "
+                                    "Bild durchlassen als zu strikt sein.\n\n"
+                                    "**Unschärfe-Filter (zweistufig):**\n\n"
+                                    "**Stufe 1** prüft das ganze Bild *vor* der API – nur eine "
+                                    "Totalausfall-Erkennung für komplett verwackelte oder verwaschene "
+                                    "Bilder. Bewusst lax, weil bei Stufe 1 das Gesicht noch nicht lokalisiert "
+                                    "ist und ein scharfer Hintergrund mit unscharfem Gesicht durchrutschen "
+                                    "könnte.\n\n"
+                                    "**Stufe 2** prüft *gezielt die Gesichtsregion* nach der "
+                                    "Gesichtserkennung. Hier kann die Schwelle deutlich strenger sein, "
+                                    "weil wir wissen wo wir hinschauen. **Achtung:** Beauty-Filter-Selfies "
+                                    "(starkes Hautglätten) können hier fälschlich als 'unscharf' gelten – "
+                                    "siehe Erklärung im Hauptmodell-Eskalations-Bereich.\n\n"
+                                    "**Frühe pHash-Vorfilterung:** Erkennt offensichtliche Duplikate "
+                                    "(gleiches Foto mehrfach hochgeladen, identische Re-Uploads) schon "
+                                    "*vor* der API-Bewertung und behält pro Duplikatsgruppe nur ein paar "
+                                    "Bilder zur Bewertung. Sehr effektiv bei Bulk-Datasets aus Social Media."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ Why pre-filters?</b></summary>"
+                                    "\n\n"
+                                    "Before any image is sent to the paid AI scoring, several local "
+                                    "filters run on your machine – at no API cost. They kill obvious junk "
+                                    "images (blurry, too small, duplicates) before you pay for them.\n\n"
+                                    "**For a 100-image dataset** the savings are marginal. **For a 3000-"
+                                    "image dataset** this is the difference between $5 and $50 in API "
+                                    "costs. When in doubt, leave the filters on – they're tuned to only "
+                                    "reject clear cases and to err toward letting an image through rather "
+                                    "than being too strict.\n\n"
+                                    "**Blur filter (two-stage):**\n\n"
+                                    "**Stage 1** checks the whole image *before* the API – pure total-"
+                                    "failure detection for completely blurry or smeared images. "
+                                    "Intentionally lax, because at stage 1 the face hasn't been located "
+                                    "yet, and a sharp background with a blurry face could slip through.\n\n"
+                                    "**Stage 2** targets the *face region* after face detection. Here the "
+                                    "threshold can be much stricter because we know where to look. "
+                                    "**Caveat:** Beauty-filter selfies (heavy skin smoothing) can falsely "
+                                    "register as 'blurry' here.\n\n"
+                                    "**Early pHash pre-filter:** Detects obvious duplicates (same photo "
+                                    "uploaded multiple times, identical re-uploads) *before* AI scoring "
+                                    "and keeps only a few images per duplicate group for scoring. Very "
+                                    "effective on bulk social-media datasets."
+                                    "</details>",
+                                ))
+                                with gr.Row():
+                                    c_use_filesize = gr.Checkbox(
+                                        label=tr("Dateigröße-Filter", "File size filter"),
+                                        value=S["c_use_filesize"],
+                                        info=tr(
+                                            "Verwirft sehr kleine Dateien, die meist stark komprimiert und für Training unbrauchbar sind. Empfohlen: an.",
+                                            "Rejects very small files that are usually heavily compressed and unusable for training. Recommended: on.",
+                                        ),
+                                    )
+                                    c_min_filesize = gr.Slider(
+                                        label=tr("Min. Dateigröße (KB)", "Min file size (KB)"),
+                                        minimum=10,
+                                        maximum=500,
+                                        step=10,
+                                        value=S["c_min_filesize"],
+                                        info=tr(
+                                            "Dateien unter dieser Größe werden direkt verworfen. Empfohlen: 50 KB. Höher (100+) bei reinen Foto-Datasets, niedriger (20) wenn auch kleinere Bilder erlaubt sein sollen.",
+                                            "Files below this size are rejected immediately. Recommended: 50 KB. Higher (100+) for pure photo datasets, lower (20) if smaller images should pass.",
+                                        ),
+                                    )
+                                with gr.Row():
+                                    c_use_blur = gr.Checkbox(
+                                        label=tr("Unschärfe-Filter (zweistufig)", "Blur filter (two-stage)"),
+                                        value=S["c_use_blur"],
+                                        info=tr(
+                                            "Erkennt unscharfe Bilder in zwei Stufen. Empfohlen: an. Details siehe Erklärung oben.",
+                                            "Detects blurry images in two stages. Recommended: on. See explanation above for details.",
+                                        ),
+                                    )
+                                    c_min_blur = gr.Slider(
+                                        label=tr("Stufe 1: Min. Varianz (Gesamtbild)", "Stage 1: min variance (full image)"),
+                                        minimum=5,
+                                        maximum=200,
+                                        step=5,
+                                        value=S["c_min_blur"],
+                                        info=tr(
+                                            "Totalausfall-Schwelle auf dem ganzen Bild. Empfohlen: 25 (nur komplett verwackelte Bilder fliegen raus). Höher = strenger, kann aber Bilder mit unscharfem Hintergrund fälschlich treffen.",
+                                            "Total-failure threshold on the full image. Recommended: 25 (only completely blurry images get rejected). Higher = stricter, but may falsely reject images with intentionally blurred backgrounds.",
+                                        ),
+                                    )
+                                with gr.Row():
+                                    c_face_min_blur = gr.Slider(
+                                        label=tr("Stufe 2: Min. Schärfe (Gesicht, Fallback)", "Stage 2: min sharpness (face, fallback)"),
+                                        minimum=10,
+                                        maximum=200,
+                                        step=5,
+                                        value=S["c_face_min_blur"],
+                                        info=tr(
+                                            "Globaler Fallback-Wert. Wird nur verwendet, wenn die shot-type-spezifischen Werte unten alle 0 sind. Empfohlen: 45.",
+                                            "Global fallback value. Only used when all shot-type-specific values below are 0. Recommended: 45.",
+                                        ),
+                                    )
+                                with gr.Accordion(
+                                    tr(
+                                        "Schärfe-Schwellen pro Shot-Typ (empfohlen)",
+                                        "Sharpness thresholds per shot type (recommended)",
+                                    ),
+                                    open=True,
+                                ):
+                                    gr.Markdown(tr(
+                                        "Bei Closeups (Headshots) ist die Gesichts-Bbox sehr groß. "
+                                        "Glatte Wangen-/Stirnflächen drücken die Schärfemessung statistisch nach unten, "
+                                        "selbst wenn das Bild scharf ist. Daher braucht headshot eine niedrigere Schwelle "
+                                        "als full_body (kleines Gesicht, hohe Detail-Dichte). "
+                                        "Werte 0 deaktivieren den shot-type-spezifischen Pfad und nutzen den globalen Fallback oben.",
+                                        "Closeups (headshots) have a very large face bbox. Smooth cheek/forehead areas "
+                                        "statistically drag the sharpness measurement down even when the image is sharp. "
+                                        "So headshot needs a lower threshold than full_body (small face, high detail density). "
+                                        "Values of 0 disable the shot-type-specific path and fall back to the global value above.",
+                                    ))
+                                    with gr.Row():
+                                        c_face_min_blur_headshot = gr.Slider(
+                                            label=tr("Headshot", "Headshot"),
+                                            minimum=0,
+                                            maximum=200,
+                                            step=5,
+                                            value=S["c_face_min_blur_headshot"],
+                                            info=tr(
+                                                "Empfohlen: 25. Closeups vertragen weniger Variance.",
+                                                "Recommended: 25. Closeups tolerate less variance.",
+                                            ),
+                                        )
+                                        c_face_min_blur_medium = gr.Slider(
+                                            label=tr("Medium", "Medium"),
+                                            minimum=0,
+                                            maximum=200,
+                                            step=5,
+                                            value=S["c_face_min_blur_medium"],
+                                            info=tr(
+                                                "Empfohlen: 35. Mittlere Schwelle für Halbfiguren.",
+                                                "Recommended: 35. Middle threshold for medium shots.",
+                                            ),
+                                        )
+                                        c_face_min_blur_full_body = gr.Slider(
+                                            label=tr("Full-Body", "Full-body"),
+                                            minimum=0,
+                                            maximum=200,
+                                            step=5,
+                                            value=S["c_face_min_blur_full_body"],
+                                            info=tr(
+                                                "Empfohlen: 45. Kleines Gesicht im Frame braucht höhere Schwelle.",
+                                                "Recommended: 45. Small face in frame needs higher threshold.",
+                                            ),
+                                        )
+                                with gr.Row():
+                                    c_blur_norm_edge = gr.Slider(
+                                        label=tr("Normierungs-Kantenlänge (px)", "Normalization edge size (px)"),
+                                        minimum=256,
+                                        maximum=1024,
+                                        step=64,
+                                        value=S["c_blur_norm_edge"],
+                                        info=tr(
+                                            "Vor der Schärfe-Messung werden alle Bilder auf diese längste Kante skaliert. Macht die Schwellen unabhängig von der Original-Auflösung. Empfohlen: 512 (Standard, in Bezug zu den Schwellen oben kalibriert).",
+                                            "Before sharpness measurement, all images get resized to this longest edge. Makes thresholds independent of the original resolution. Recommended: 512 (default, calibrated against the thresholds above).",
+                                        ),
+                                    )
+                                with gr.Group(visible=False):
+                                    c_use_early_phash = gr.Checkbox(
+                                        label=tr("Frühe Duplikat-Vorfilterung (vor API)", "Early duplicate pre-filter (pre-API)"),
+                                        value=S["c_use_early_phash"],
+                                        info=tr(
+                                            "Master-Schalter für die zwei pHash-Schleifen unten. Wenn aus, werden beide Schleifen übersprungen. Empfohlen: an, besonders bei großen Datasets aus Social Media oder Video-Frame-Extraktionen.",
+                                            "Master switch for the two pHash loops below. When off, both loops are skipped. Recommended: on, especially for large social-media datasets or video frame extractions.",
+                                        ),
+                                    )
+                                    gr.Markdown(tr(
+                                        "<details>"
+                                        "<summary><b>ℹ️ Wie funktionieren die zwei Schleifen?</b></summary>"
+                                        "\n\n"
+                                        "Zwei aufeinanderfolgende pHash-Vorfilter-Durchgänge mit "
+                                        "unterschiedlichen Schwellen, weil ein einzelner Durchgang nie "
+                                        "beide Anwendungsfälle gleichzeitig gut bedienen kann.\n\n"
+                                        "**Schleife 1 (exakte Duplikate):**\n\n"
+                                        "Sehr strenge Schwelle (Hamming 1, 1 pro Gruppe behalten). "
+                                        "Findet praktisch nur bit-identische Re-Uploads, Screenshots "
+                                        "vom selben Foto und identische Kompressions-Varianten. Bei "
+                                        "Datasets aus Story-Highlights, wo dieselben Bilder mehrmals "
+                                        "in unterschiedlichen Reposts auftauchen, räumt das massiv auf.\n\n"
+                                        "**Schleife 2 (Bulk-Filter):**\n\n"
+                                        "Lockerere Schwelle (Hamming 4, 2 pro Gruppe behalten). "
+                                        "Greift Bulk-Aufnahmen ab, bei denen aus einem Video oder "
+                                        "einer Burst-Aufnahme viele fast-identische Frames extrahiert "
+                                        "wurden. Pro Bulk-Gruppe bleiben zwei Bilder durch, damit du "
+                                        "noch leichte Varianz behältst.\n\n"
+                                        "**Reihenfolge:** Schleife 1 läuft zuerst auf allen Bildern, "
+                                        "Schleife 2 dann auf den Überlebenden. Die pHashes werden "
+                                        "zwischen den Schleifen wiederverwendet, kein doppeltes Hashen.\n\n"
+                                        "**Empfohlen:** Beide an. Wer kein Video-Material und keine "
+                                        "Bulk-Aufnahmen hat, kann Schleife 2 ausschalten – Schleife 1 "
+                                        "alleine bringt schon einen großen Teil der Ersparnis."
+                                        "</details>",
+                                        "<details>"
+                                        "<summary><b>ℹ️ How do the two loops work?</b></summary>"
+                                        "\n\n"
+                                        "Two sequential pHash pre-filter passes with different "
+                                        "thresholds, because no single pass can serve both use cases "
+                                        "well at the same time.\n\n"
+                                        "**Loop 1 (exact duplicates):**\n\n"
+                                        "Very strict threshold (hamming 1, keep 1 per group). Finds "
+                                        "essentially only bit-identical re-uploads, screenshots of "
+                                        "the same photo and identical compression variants. For "
+                                        "datasets from story highlights, where the same images appear "
+                                        "in multiple reposts, this clears massive amounts.\n\n"
+                                        "**Loop 2 (bulk filter):**\n\n"
+                                        "Looser threshold (hamming 4, keep 2 per group). Catches "
+                                        "bulk shots where many near-identical frames were extracted "
+                                        "from a video or burst capture. Two images per bulk group "
+                                        "survive, so you keep some slight variation.\n\n"
+                                        "**Order:** Loop 1 runs first on all images, loop 2 then on "
+                                        "the survivors. pHashes are reused between loops – no double "
+                                        "hashing.\n\n"
+                                        "**Recommended:** Both on. Without video material or burst "
+                                        "shots you can turn loop 2 off – loop 1 alone already brings "
+                                        "a big part of the savings."
+                                        "</details>",
+                                    ))
+                                    with gr.Row():
+                                        c_use_early_phash_loop1 = gr.Checkbox(
+                                            label=tr("Schleife 1 aktivieren (exakte Duplikate)", "Enable loop 1 (exact duplicates)"),
+                                            value=S["c_use_early_phash_loop1"],
+                                            info=tr(
+                                                "Empfohlen: an. Sehr günstig (kostet praktisch nichts) und filtert garantierte Duplikate.",
+                                                "Recommended: on. Very cheap (practically no cost) and filters guaranteed duplicates.",
+                                            ),
+                                        )
+                                        c_early_phash_thresh_1 = gr.Slider(
+                                            label=tr("Schleife 1: Hamming-Schwelle", "Loop 1: hamming threshold"),
+                                            minimum=0,
+                                            maximum=4,
+                                            step=1,
+                                            value=S["c_early_phash_thresh_1"],
+                                            info=tr(
+                                                "Wie ähnlich Bilder sein müssen, um als exaktes Duplikat zu gelten. Empfohlen: 1 (nur bit-identische plus minimale Kompressions-Unterschiede). 0 = wirklich nur exakt identisch. 2–3 = lockerer.",
+                                                "How similar images must be to count as exact duplicates. Recommended: 1 (only bit-identical plus minor compression differences). 0 = truly only identical. 2–3 = looser.",
+                                            ),
+                                        )
+                                        c_early_phash_keep_1 = gr.Slider(
+                                            label=tr("Schleife 1: pro Gruppe behalten", "Loop 1: keep per group"),
+                                            minimum=1,
+                                            maximum=3,
+                                            step=1,
+                                            value=S["c_early_phash_keep_1"],
+                                            info=tr(
+                                                "Wie viele Bilder pro Duplikat-Gruppe überleben. Empfohlen: 1 (bei exakten Duplikaten reicht eins). Höhere Werte sind hier eher sinnlos, weil die Bilder ohnehin praktisch identisch sind.",
+                                                "How many images per duplicate group survive. Recommended: 1 (with exact duplicates one is enough). Higher values are pointless here since the images are practically identical anyway.",
+                                            ),
+                                        )
+                                    with gr.Row():
+                                        c_use_early_phash_loop2 = gr.Checkbox(
+                                            label=tr("Schleife 2 aktivieren (Bulk-Filter)", "Enable loop 2 (bulk filter)"),
+                                            value=S["c_use_early_phash_loop2"],
+                                            info=tr(
+                                                "Empfohlen: an bei Datasets mit Video-Frames oder Burst-Aufnahmen. Bei reinen Foto-Datasets aus Studio/DSLR kannst du es ausschalten.",
+                                                "Recommended: on for datasets with video frames or burst shots. For pure photo datasets from studio/DSLR you can turn it off.",
+                                            ),
+                                        )
+                                        c_early_phash_thresh_2 = gr.Slider(
+                                            label=tr("Schleife 2: Hamming-Schwelle", "Loop 2: hamming threshold"),
+                                            minimum=2,
+                                            maximum=12,
+                                            step=1,
+                                            value=S["c_early_phash_thresh_2"],
+                                            info=tr(
+                                                "Wie ähnlich Bilder sein müssen, um als Bulk-Duplikat zu gelten. Empfohlen: 4 (typische Video-Frame-Ähnlichkeit). 6–8 für aggressiveres Aufräumen, kann aber leichte Pose-Varianten verlieren.",
+                                                "How similar images must be to count as bulk duplicates. Recommended: 4 (typical video-frame similarity). 6–8 for more aggressive cleanup, but may lose minor pose variants.",
+                                            ),
+                                        )
+                                        c_early_phash_keep_2 = gr.Slider(
+                                            label=tr("Schleife 2: pro Gruppe behalten", "Loop 2: keep per group"),
+                                            minimum=1,
+                                            maximum=5,
+                                            step=1,
+                                            value=S["c_early_phash_keep_2"],
+                                            info=tr(
+                                                "Wie viele Bilder pro Bulk-Gruppe überleben und zur API kommen. Empfohlen: 2 (lässt zwei Varianten als Sicherheit durch). 1 = streng (spart maximal Kosten), 3+ = locker (mehr API-Kosten, mehr Vielfalt).",
+                                                "How many images per bulk group survive and get sent to the API. Recommended: 2 (lets two variants through for safety). 1 = strict (max cost savings), 3+ = loose (more API cost, more variety).",
+                                            ),
+                                        )
 
-                    c_clip_model = gr.Dropdown(
-                        label=tr("CLIP-Modell", "CLIP model"),
-                        choices=[
-                            (tr("Automatisch – ViT-L-14 mit NVIDIA-GPU, ViT-B-32 ohne", "Automatic – ViT-L-14 with NVIDIA GPU, ViT-B-32 without"), "auto"),
-                            (tr("ViT-B-32 – schnell, gut für Laptops ohne GPU", "ViT-B-32 – fast, good for laptops without GPU"), "ViT-B-32"),
-                            (tr("ViT-L-14 – genauer, auf der CPU mehrere Sekunden pro Bild", "ViT-L-14 – more accurate, several seconds per image on CPU"), "ViT-L-14"),
-                        ],
-                        value=S.get("c_clip_model", "auto"),
-                        info=tr(
-                            "Jedes Modell hat einen eigenen Cache. Ein Wechsel berechnet die CLIP-Werte einmal neu.",
-                            "Each model has its own cache. Switching recomputes the CLIP values once.",
-                        ),
-                    )
+                            with gr.Accordion(tr("🖼️ Smart-Rahmenbereinigung", "🖼️ Smart frame cleanup"), open=False, visible=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Was wird hier entfernt?</b></summary>"
+                                    "\n\n"
+                                    "Viele Bilder aus Social Media – besonders Instagram-Stories und "
+                                    "Screenshots vom Handy – haben **künstliche Ränder, die nicht zum "
+                                    "eigentlichen Bild gehören**:\n\n"
+                                    "**Instagram-Story-Frames:** Weiße oder farbige Balken oben und unten, "
+                                    "die das eigentliche Foto zentrieren. Beim LoRA-Training würde das "
+                                    "Modell lernen, dass solche Ränder zur Person gehören.\n\n"
+                                    "**Drop-Shadow-Gradienten:** Halb-transparente dunkle Verläufe am "
+                                    "oberen oder unteren Rand für lesbaren UI-Text.\n\n"
+                                    "**Android-Nav-Bars:** Schwarze Leisten mit Statusbar-Icons (Akku, "
+                                    "Uhrzeit) oder System-Buttons.\n\n"
+                                    "Der Curator erkennt diese Ränder und schneidet sie *vor* der KI-"
+                                    "Bewertung weg. Damit wird das Bild auf dem bereinigten Inhalt "
+                                    "bewertet, und das spätere LoRA lernt nicht versehentlich Telefon-"
+                                    "Interfaces als Teil der Person.\n\n"
+                                    "**Konservativ kalibriert:** Die Erkennung ist so eingestellt, dass "
+                                    "sie bei Unsicherheit lieber nichts wegschneidet, statt einen echten "
+                                    "dunklen Hintergrund (schwarze Wand, Haare) als Nav-Bar misszuver-"
+                                    "stehen."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ What gets removed here?</b></summary>"
+                                    "\n\n"
+                                    "Many social-media images – especially Instagram stories and phone "
+                                    "screenshots – have **artificial borders that don't belong to the "
+                                    "actual photo**:\n\n"
+                                    "**Instagram story frames:** White or colored bars top and bottom that "
+                                    "center the actual photo. During LoRA training, the model would learn "
+                                    "that such borders are part of the person.\n\n"
+                                    "**Drop-shadow gradients:** Semi-transparent dark gradients at the top "
+                                    "or bottom for readable UI text.\n\n"
+                                    "**Android nav bars:** Black bars with status icons (battery, clock) "
+                                    "or system buttons.\n\n"
+                                    "The curator detects these borders and crops them out *before* AI "
+                                    "scoring. The image is then evaluated on cleaned content, and the "
+                                    "later LoRA doesn't accidentally learn phone UI as part of the "
+                                    "person.\n\n"
+                                    "**Conservatively calibrated:** Detection is set up to err on not "
+                                    "cutting anything if uncertain, rather than mistaking a real dark "
+                                    "background (black wall, hair) for a nav bar."
+                                    "</details>",
+                                ))
+                                with gr.Row():
+                                    c_ig_frame_crop = gr.Checkbox(
+                                        label=tr("Lokale Rahmenbereinigung aktivieren", "Enable local frame cleanup"),
+                                        value=S["c_ig_frame_crop"],
+                                        info=tr(
+                                            "Hauptschalter für die Rand-Erkennung und das Wegschneiden. Empfohlen: an, sobald deine Bilder aus Social Media stammen. Bei reinen DSLR-/Studio-Fotos kannst du es ausschalten.",
+                                            "Main switch for border detection and cropping. Recommended: on as soon as your images come from social media. For pure DSLR/studio photos you can turn it off.",
+                                        ),
+                                    )
+                                    c_ig_two_stage_bar = gr.Checkbox(
+                                        label=tr("Erweiterte Rahmentypen erkennen", "Detect advanced frame types"),
+                                        value=S["c_ig_two_stage_bar"],
+                                        info=tr(
+                                            "Erkennt zusätzlich asymmetrische Canvas-Ränder, Status-/Navigationsleisten, Polaroid-Unterkanten und verlaufende Social-Media-Flächen. Die vier Seiten werden unabhängig geprüft.",
+                                            "Also detects asymmetric canvas borders, status/navigation bars, Polaroid-style bottom borders and gradient social-media canvases. All four sides are analysed independently.",
+                                        ),
+                                    )
+                                c_frame_cleanup_mode = gr.Dropdown(
+                                    label=tr("Verhalten bei Rahmenfunden", "Frame-cleanup behavior"),
+                                    choices=[
+                                        (tr("Hohe Sicherheit automatisch; mittlere Fälle prüfen", "Auto-apply high confidence; review medium cases"), "auto_high_review_medium"),
+                                        (tr("Hohe und mittlere Sicherheit automatisch anwenden", "Auto-apply high and medium confidence"), "auto_high_keep_medium"),
+                                        (tr("Nur Vorschläge; nichts automatisch beschneiden", "Suggestions only; never auto-crop"), "suggest_only"),
+                                    ],
+                                    value=S.get("c_frame_cleanup_mode", "suggest_only"),
+                                    allow_custom_value=False,
+                                    info=tr(
+                                        "Sicherer Standard: Nur Vorschläge. Nach bestandenem Regressionstest kann der automatische Modus bewusst aktiviert werden. Mittlere Fälle erscheinen im Tab Rahmenprüfung. Es entstehen keine LLM-Aufrufe.",
+                                        "Safe default: suggestions only. Automatic mode can be enabled deliberately after regression validation. Medium cases appear in the Frame Review tab. No LLM calls are made.",
+                                    ),
+                                )
+                                c_frame_pause_on_medium = gr.Checkbox(
+                                    label=tr("Vor dem Audit bei mittleren Rahmenfällen anhalten", "Pause before audit for medium-confidence frame cases"),
+                                    value=S.get("c_frame_pause_on_medium", False),
+                                    info=tr(
+                                        "Optional. Prüft die lokalen Rahmen-Caches zuerst. Gibt es ungeklärte mittlere Fälle, endet der Lauf vor kostenpflichtigen Audits. Nach der Entscheidung im Tab Rahmenprüfung erneut starten; unveränderte Analysen kommen aus dem Cache.",
+                                        "Optional. Checks local frame caches first. If unresolved medium cases exist, the run stops before paid audits. Review them in the Frame Review tab and restart; unchanged analysis is loaded from cache.",
+                                    ),
+                                )
 
-                with gr.Accordion(tr("✂️ Smart Pre-Crop", "✂️ Smart pre-crop"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Was macht Smart Pre-Crop und wann brauche ich das?</b></summary>"
-                        "\n\n"
-                        "Bei großen Bildern (4K-Fotos, DSLR-Aufnahmen), auf denen die Person "
-                        "klein im Bild ist – z. B. Ganzkörper-Aufnahmen mit viel Hintergrund – "
-                        "erzeugt der Curator automatisch einen engen Headshot-Ausschnitt rund um "
-                        "das Gesicht und schickt diesen *zusätzlich* zur KI-Bewertung. Beide "
-                        "Versionen (Original und Crop) konkurrieren dann um den Platz im "
-                        "Trainings-Set; die besser bewertete gewinnt.\n\n"
-                        "**Wozu das gut ist:** Aus einem Foto, das als Ganzkörper-Aufnahme nur "
-                        "mittelmäßig ist (unruhiger Hintergrund, ungünstige Pose), kannst du so "
-                        "trotzdem ein gutes Identitäts-Bild fürs Training herausziehen – ohne "
-                        "ein zweites Foto-Set zu brauchen.\n\n"
-                        "**Wann es ausgelöst wird:** Nur bei Bildern, die groß genug sind "
-                        "(mindestens 2 Megapixel) und bei denen das Gesicht weniger als 7 % "
-                        "der Bildfläche einnimmt. Bei reinen Headshots oder Selfies passiert "
-                        "nichts – da gibt es nichts zu zoomen.\n\n"
-                        "**Kosten:** Pro ausgelöstem Pre-Crop ein zusätzlicher API-Call. Bei "
-                        "den meisten Datasets sind das nur 10–30 % der Bilder."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ What does Smart Pre-Crop do and when do I need it?</b></summary>"
-                        "\n\n"
-                        "For large images (4K photos, DSLR shots) where the person is small in "
-                        "the frame – e.g. full-body shots with a lot of background – the curator "
-                        "automatically generates a tight headshot crop around the face and sends "
-                        "it *additionally* to the AI for scoring. Both versions (original and "
-                        "crop) then compete for a spot in the training set; the better-scored "
-                        "one wins.\n\n"
-                        "**Why it matters:** From a photo that's only mediocre as a full-body "
-                        "shot (busy background, awkward pose), you can still extract a good "
-                        "identity image for training – without needing a second photo set.\n\n"
-                        "**When it triggers:** Only on images that are large enough (at least "
-                        "2 megapixels) and where the face takes up less than 7 % of the image "
-                        "area. Pure headshots or selfies are skipped – nothing to zoom into.\n\n"
-                        "**Cost:** One additional API call per triggered pre-crop. For most "
-                        "datasets that's only 10–30 % of the images."
-                        "</details>",
-                    ))
-                    c_smart_crop = gr.Checkbox(
-                        label=tr("Smart Pre-Crop aktivieren", "Enable smart pre-crop"),
-                        value=S["c_smart_crop"],
-                        info=tr(
-                            "Empfohlen: an. Wird ohnehin nur bei großen Bildern mit kleinem Gesicht ausgelöst – kostet bei kleinen Datasets fast nichts extra.",
-                            "Recommended: on. Only triggers for large images with a small face – costs almost nothing extra on small datasets.",
-                        ),
-                    )
-                    with gr.Row():
-                        c_crop_gain = gr.Slider(
-                            label=tr("Mindestvorsprung des Crops", "Min crop score gain"),
-                            minimum=0,
-                            maximum=30,
-                            step=1,
-                            value=S["c_crop_gain"],
-                            info=tr(
-                                "Wie viele Punkte besser der Crop bewertet sein muss als das Original, damit er übernommen wird. Empfohlen: 8. Niedriger (4–6) lässt mehr Crops gewinnen, gut wenn du Headshots brauchst und deine Originale meist Full-Body sind. Höher (12+) ist konservativ.",
-                                "How many points the crop must score above the original to be accepted. Recommended: 8. Lower (4–6) lets more crops win — good if you need headshots and your originals are mostly full-body. Higher (12+) is conservative.",
-                            ),
-                        )
-                        c_crop_pad = gr.Slider(
-                            label=tr("Padding um das Gesicht", "Padding around the face"),
-                            minimum=0.3,
-                            maximum=1.5,
-                            step=0.05,
-                            value=S["c_crop_pad"],
-                            info=tr(
-                                "Rand pro Seite um das Gesicht, gemessen in Vielfachen der Gesichtsgröße. Empfohlen: 0.6 (ergibt Gesicht + Haare + obere Schultern, klassischer Headshot). 0.4 = enger Gesichts-Crop. 0.8+ = lockerer mit Schulter-Anteil.",
-                                "Padding per side around the face, measured in multiples of face size. Recommended: 0.6 (face + hair + upper shoulders, classic headshot). 0.4 = tight face crop. 0.8+ = looser with shoulder area.",
-                            ),
-                        )
-                    gr.Markdown(tr(
-                        "**Getrennte Rettungsmechanik:** Ein schwaches Full-Body-Bild kann zusätzlich als Medium-Crop geprüft werden. Das Original bleibt ein Full Body; der Crop ist ein eigener Kandidat.",
-                        "**Separate rescue mechanism:** A weak full-body image can additionally be tested as a medium crop. The original remains full body; the crop is a separate candidate.",
-                    ))
-                    with gr.Row():
-                        c_medium_rescue_crop = gr.Checkbox(
-                            label=tr("Medium-Rettungs-Crop aktivieren", "Enable medium rescue crop"),
-                            value=S["c_medium_rescue_crop"],
-                            info=tr(
-                                "Empfohlen: an. Versucht bei schwachen Ganzkörperbildern Gesicht, Schultern, Torso und möglichst Hüfte als brauchbaren Medium Shot zu retten. Verändert das Original nicht.",
-                                "Recommended: on. Tries to rescue face, shoulders, torso and preferably hips from weak full-body images as a usable medium shot. Does not alter the original.",
-                            ),
-                        )
-                        c_medium_rescue_gain = gr.Slider(
-                            label=tr("Mindestvorsprung des Medium-Crops", "Min medium-crop score gain"),
-                            minimum=0,
-                            maximum=20,
-                            step=1,
-                            value=S["c_medium_rescue_gain"],
-                            info=tr(
-                                "Wie viele Punkte besser der Medium-Rettungs-Crop sein muss. Empfohlen: 4, da er zusätzlich eine fehlende Shot-Kategorie abdecken kann.",
-                                "How many points better the medium rescue crop must score. Recommended: 4 because it may also fill a missing shot category.",
-                            ),
-                        )
+                            with gr.Accordion(tr("🧍 Subject-Sanity-Check (Gliedmaßen-Filter)", "🧍 Subject sanity check (limb filter)"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Wann fliegen Bilder hier raus?</b></summary>"
+                                    "\n\n"
+                                    "Manche Bilder zeigen zwar *etwas Menschliches*, aber nicht die "
+                                    "Person, um die es geht: nur Füße auf einem Strand-Foto, nur Hände "
+                                    "beim Kochen, ein Detail-Shot vom Schmuck. Die Gesichtserkennung "
+                                    "findet kein Gesicht, also würde das Bild ohne diesen Filter trotzdem "
+                                    "weiterlaufen und am Ende ggf. die KI fragen.\n\n"
+                                    "Der Sanity-Check verwirft solche Bilder direkt: Wenn weder ein "
+                                    "Gesicht erkannt wird, noch ein Torso (Schultern + Hüften), ist das "
+                                    "Bild für ein Person-LoRA wertlos.\n\n"
+                                    "**Wichtig:** Rückenansichten mit klar erkennbarem Torso (Schultern "
+                                    "sichtbar) bleiben erhalten – die sind für Pose-Diversität wertvoll. "
+                                    "Es geht wirklich nur um Bilder *ohne erkennbare Person als Ganzes*."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ When do images get rejected here?</b></summary>"
+                                    "\n\n"
+                                    "Some images show *something human* but not the actual person: just "
+                                    "feet on a beach photo, just hands while cooking, a jewelry detail "
+                                    "shot. Face detection finds no face, so without this filter the "
+                                    "image would still proceed and possibly be sent to the AI.\n\n"
+                                    "The sanity check rejects such images directly: if neither a face "
+                                    "nor a torso (shoulders + hips) is detected, the image is worthless "
+                                    "for a person LoRA.\n\n"
+                                    "**Important:** Back views with a clearly visible torso (shoulders "
+                                    "visible) are kept – they're valuable for pose diversity. This is "
+                                    "really only about images *without a recognizable person as a whole*."
+                                    "</details>",
+                                ))
+                                with gr.Row():
+                                    c_subject_sanity = gr.Checkbox(
+                                        label=tr("Sanity-Check aktivieren", "Enable sanity check"),
+                                        value=S["c_subject_sanity"],
+                                        info=tr(
+                                            "Empfohlen: an. Fängt 'fehlgeschlagene' Bilder (nur Hände/Füße) ab, bevor sie API-Kosten verursachen.",
+                                            "Recommended: on. Catches 'failed' images (hands/feet only) before they cause API costs.",
+                                        ),
+                                    )
+                                    c_subject_min_torso = gr.Slider(
+                                        label=tr("Min. Torso-Punkte (von 4)", "Min torso landmarks (of 4)"),
+                                        minimum=1,
+                                        maximum=4,
+                                        step=1,
+                                        value=S["c_subject_min_torso"],
+                                        info=tr(
+                                            "Wie viele der 4 Körperpunkte (2 Schultern, 2 Hüften) sichtbar sein müssen, damit ein Bild ohne Gesicht trotzdem bleibt. Empfohlen: 2 (halber Torso reicht). 4 = sehr streng, nur frontale Standards. 1 = sehr locker.",
+                                            "How many of the 4 body landmarks (2 shoulders, 2 hips) must be visible for an image without a face to be kept. Recommended: 2 (half torso is enough). 4 = very strict, only frontal standards. 1 = very loose.",
+                                        ),
+                                    )
 
-                with gr.Accordion(tr("📊 Clustering & Diversität", "📊 Clustering & diversity"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Was machen Clustering und Diversitäts-Penalty?</b></summary>"
-                        "\n\n"
-                        "Wenn deine Quellbilder typisch aus Social Media kommen, hast du oft "
-                        "10–30 Fotos aus *derselben Foto-Session* (gleiche Kleidung, gleicher "
-                        "Ort, alle in 2 Minuten geschossen). Ohne Begrenzung würde dein "
-                        "Trainings-Set hauptsächlich aus dieser einen Session bestehen, und "
-                        "das LoRA lernt dann sehr engmaschig genau dieses eine Outfit – "
-                        "schlecht für die spätere Generierungs-Vielfalt.\n\n"
-                        "**Clustering:**\n\n"
-                        "Der Curator gruppiert Bilder anhand von Kleidung, Hintergrund und "
-                        "Aufnahmezeitpunkt zu **Outfit-Clustern** und **Session-Clustern**. "
-                        "Du kannst pro Cluster ein Maximum festlegen – z. B. 'höchstens 4 "
-                        "Bilder mit demselben Outfit'.\n\n"
-                        "**Diversitäts-Penalty:**\n\n"
-                        "Zusätzlich gibt es bei der Endauswahl Punktabzug, wenn ähnliche "
-                        "Bilder bereits ausgewählt wurden – betrifft Outfit, Hintergrund, "
-                        "Beleuchtung, Gesichtsausdruck und (wenn die Kopfpose-Diversität "
-                        "aktiv ist) auch Kopfposen. Bei zwei ähnlich guten Bildern gewinnt "
-                        "dann das mit den selteneren Eigenschaften.\n\n"
-                        "**Empfohlen:** Beide an. Das Clustering verhindert harte "
-                        "Überrepräsentationen, die Penalty sorgt für feine Vielfalt zwischen "
-                        "den Bildern, die durch das Clustering schon gefiltert sind."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ What do clustering and diversity penalty do?</b></summary>"
-                        "\n\n"
-                        "Source images from social media often include 10–30 photos from the "
-                        "*same photo session* (same outfit, same location, all shot within 2 "
-                        "minutes). Without limits, your training set would mostly come from "
-                        "this one session, and the LoRA would learn this one outfit very "
-                        "tightly – bad for later generation variety.\n\n"
-                        "**Clustering:**\n\n"
-                        "The curator groups images by clothing, background and capture time "
-                        "into **outfit clusters** and **session clusters**. You can set a "
-                        "max per cluster – e.g. 'at most 4 images with the same outfit'.\n\n"
-                        "**Diversity penalty:**\n\n"
-                        "Additionally, during final selection, similar images get a score "
-                        "deduction if similar ones are already picked – covers outfit, "
-                        "background, lighting, facial expression and (when head pose "
-                        "diversity is on) also head pose. Between two similarly-good images, "
-                        "the one with rarer attributes wins.\n\n"
-                        "**Recommended:** Both on. Clustering prevents hard over-"
-                        "representation, the penalty creates fine variety between the "
-                        "images already filtered through clustering."
-                        "</details>",
-                    ))
-                    c_use_cluster = gr.Checkbox(
-                        label=tr("Outfit-/Session-Clustering aktivieren", "Enable outfit/session clustering"),
-                        value=S["c_use_cluster"],
-                        info=tr(
-                            "Gruppiert ähnliche Bilder nach Kleidung, Hintergrund und Aufnahmezeit. Empfohlen: an. Verhindert dass eine einzelne Foto-Session den Trainings-Set dominiert.",
-                            "Groups similar images by clothing, background and capture time. Recommended: on. Prevents a single photo session from dominating the training set.",
-                        ),
-                    )
-                    with gr.Row():
-                        c_max_outfit = gr.Slider(
-                            label=tr("Max. Bilder pro Outfit", "Max images per outfit"),
-                            minimum=1,
-                            maximum=10,
-                            step=1,
-                            value=S["c_max_outfit"],
-                            info=tr(
-                                "Höchstens so viele Bilder mit demselben Outfit landen im Final-Set. Empfohlen: 4. Niedriger (2–3) zwingt mehr Outfit-Vielfalt, höher (6+) ist locker (für Datasets mit ohnehin viel Outfit-Wechsel).",
-                                "At most this many images with the same outfit end up in the final set. Recommended: 4. Lower (2–3) forces more outfit variety, higher (6+) is loose (for datasets with lots of outfit changes anyway).",
-                            ),
-                        )
-                        c_max_session = gr.Slider(
-                            label=tr("Max. Bilder pro Foto-Session", "Max images per photo session"),
-                            minimum=1,
-                            maximum=10,
-                            step=1,
-                            value=S["c_max_session"],
-                            info=tr(
-                                "Höchstens so viele Bilder aus derselben Aufnahme-Session (gleicher Ort, gleicher Tag). Empfohlen: 5. Etwas höher als das Outfit-Limit, weil Sessions oft mehrere Outfits enthalten.",
-                                "At most this many images from the same shoot session (same location, same day). Recommended: 5. Slightly higher than the outfit limit because sessions often contain multiple outfits.",
-                            ),
-                        )
-                    c_use_diversity = gr.Checkbox(
-                        label=tr("Diversitäts-Punktabzug bei Endauswahl", "Diversity penalty during final selection"),
-                        value=S["c_use_diversity"],
-                        info=tr(
-                            "Bei der finalen Endauswahl bekommen Bilder mit häufiger Kombination aus Outfit/Hintergrund/Licht/Gesichtsausdruck Punktabzug. Empfohlen: an.",
-                            "During final selection, images with frequent combinations of outfit/background/lighting/expression get a score deduction. Recommended: on.",
-                        ),
-                    )
+                            with gr.Accordion(tr("🔗 Duplikaterkennung (nach Bewertung)", "🔗 Duplicate detection (post-API)"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Wozu zwei verschiedene Methoden zur Duplikat-Erkennung?</b></summary>"
+                                    "\n\n"
+                                    "Die zwei Verfahren erkennen unterschiedliche Arten von Duplikaten – "
+                                    "und kein einzelnes Verfahren fängt beide ab. Deshalb arbeiten sie "
+                                    "parallel.\n\n"
+                                    "**pHash (Pixel-Vergleich):**\n\n"
+                                    "Vergleicht Bilder als Pixel-Strukturen. Berechnet einen kompakten "
+                                    "'Fingerabdruck' und vergleicht, wie viele Bits sich zwischen zwei "
+                                    "Fingerabdrücken unterscheiden (Hamming-Distanz). Erkennt Bilder, die "
+                                    "sich nur durch Kompression, leichte Crops oder Helligkeit unter-"
+                                    "scheiden – also klassische Duplikate, Re-Uploads, Screenshots vom "
+                                    "selben Foto.\n\n"
+                                    "**CLIP (Bedeutungs-Vergleich):**\n\n"
+                                    "Vergleicht Bilder semantisch. CLIP ist ein KI-Modell, das Bilder als "
+                                    "Vektor-Bedeutung darstellt. Erkennt Bilder mit gleichem Motiv, "
+                                    "Outfit, Setting – auch wenn sie aus unterschiedlichen Winkeln "
+                                    "stammen oder leichte Pose-Variationen haben. Für pHash sind solche "
+                                    "Bilder schon zu unterschiedlich, semantisch sind sie aber redundant.\n\n"
+                                    "**Beide zusammen:** Bei nur pHash bleiben semantische Duplikate "
+                                    "übrig (z. B. drei Selfies vom selben Outfit, leicht andere Köpfe). "
+                                    "Bei nur CLIP rutschen Pixel-Duplikate durch (z. B. dasselbe Foto "
+                                    "in verschiedenen Auflösungen). Empfohlen ist immer beide laufen "
+                                    "zu lassen.\n\n"
+                                    "**Hinweis zur frühen pHash-Vorfilterung:** Im Vorfilter-Bereich "
+                                    "läuft schon vor der API-Bewertung eine erste pHash-Runde, die nur "
+                                    "*offensichtliche* Duplikate aussortiert. Diese hier ist die "
+                                    "*finale* Runde nach der Bewertung, die mit Score-Information "
+                                    "entscheiden kann, welches der ähnlichen Bilder behalten wird."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ Why two different duplicate-detection methods?</b></summary>"
+                                    "\n\n"
+                                    "The two methods detect different kinds of duplicates – and no single "
+                                    "method catches both. That's why they run in parallel.\n\n"
+                                    "**pHash (pixel comparison):**\n\n"
+                                    "Compares images as pixel structures. Computes a compact "
+                                    "'fingerprint' and counts how many bits differ between two "
+                                    "fingerprints (hamming distance). Detects images that only differ in "
+                                    "compression, slight crops or brightness – classic duplicates, "
+                                    "re-uploads, screenshots of the same photo.\n\n"
+                                    "**CLIP (semantic comparison):**\n\n"
+                                    "Compares images by meaning. CLIP is an AI model that represents "
+                                    "images as a meaning vector. Detects images with the same subject, "
+                                    "outfit, setting – even from different angles or with slight pose "
+                                    "variations. To pHash these images are already too different, "
+                                    "semantically they're redundant.\n\n"
+                                    "**Both together:** With pHash only, semantic duplicates remain "
+                                    "(e.g. three selfies of the same outfit with slight head tilts). "
+                                    "With CLIP only, pixel duplicates slip through (e.g. the same photo "
+                                    "at different resolutions). Recommended is to run both.\n\n"
+                                    "**Note on early pHash:** In the pre-filter section there's an "
+                                    "earlier pHash round before AI scoring that only removes *obvious* "
+                                    "duplicates. This here is the *final* round after scoring, which "
+                                    "can use score information to decide which of the similar images "
+                                    "to keep."
+                                    "</details>",
+                                ))
+                                with gr.Row():
+                                    c_use_clip = gr.Checkbox(
+                                        label=tr("Bedeutungs-Vergleich (CLIP)", "Meaning-based (CLIP)"),
+                                        value=S["c_use_clip"],
+                                        info=tr(
+                                            "Erkennt Bilder mit gleichem Inhalt (Outfit, Pose, Setting), auch wenn sie aus leicht anderen Winkeln aufgenommen wurden. Empfohlen: an. Braucht CLIP (Modellwahl unten; wird beim ersten Lauf heruntergeladen).",
+                                            "Detects images with the same content (outfit, pose, setting), even from slightly different angles. Recommended: on. Requires CLIP (model choice below; auto-downloaded on first run).",
+                                        ),
+                                    )
+                                    c_use_phash = gr.Checkbox(
+                                        label=tr("Pixel-Vergleich (pHash)", "Pixel-based (pHash)"),
+                                        value=S["c_use_phash"],
+                                        info=tr(
+                                            "Erkennt visuell fast identische Bilder (Re-Uploads, gleiches Foto in verschiedenen Auflösungen). Empfohlen: an. Kostet praktisch keine Rechenzeit.",
+                                            "Detects visually near-identical images (re-uploads, same photo in different resolutions). Recommended: on. Costs practically no compute.",
+                                        ),
+                                    )
+                                with gr.Row():
+                                    c_phash_thresh = gr.Slider(
+                                        label=tr("pHash-Schwelle (Hamming)", "pHash threshold (hamming)"),
+                                        minimum=2,
+                                        maximum=20,
+                                        step=1,
+                                        value=S["c_phash_thresh"],
+                                        info=tr(
+                                            "Wie ähnlich Bilder sein müssen, um als Duplikat zu gelten. Niedriger = strenger. Empfohlen: 8 (guter Kompromiss). Bei vielen Re-Uploads/Screenshots: 12. Bei knappem Material wo nichts verloren gehen darf: 4–6.",
+                                            "How similar images must be to count as duplicates. Lower = stricter. Recommended: 8 (good compromise). With many re-uploads/screenshots: 12. With scarce material where nothing should be lost: 4–6.",
+                                        ),
+                                    )
+                                    c_clip_thresh = gr.Slider(
+                                        label=tr("CLIP-Ähnlichkeits-Schwelle", "CLIP similarity threshold"),
+                                        minimum=0.90,
+                                        maximum=1.0,
+                                        step=0.005,
+                                        value=S["c_clip_thresh"],
+                                        info=tr(
+                                            "Ab welcher Ähnlichkeit (0–1) zwei Bilder als inhaltlich gleich gelten. Empfohlen: 0.985 (konservativ, nur wirklich ähnliche werden gefiltert). Niedriger als 0.97 wird aggressiv und kann unterschiedliche Bilder derselben Person zusammenwerfen.",
+                                            "At what similarity (0–1) two images count as the same content. Recommended: 0.985 (conservative, only truly similar images get filtered). Below 0.97 becomes aggressive and may merge different images of the same person.",
+                                        ),
+                                    )
 
-                    gr.Markdown(tr(
-                        "**Weiche Canon-Repräsentation:** Nach Bestätigung des Subject Profiles erhält die gewählte kanonische Haarfarbe einen abnehmenden Auswahlbonus. Die Headshot-/Medium-/Full-Body-Quoten bleiben unverändert. Review- und Reject-Bilder werden durch den Canon-Bonus niemals automatisch hochgesetzt; eine ausdrückliche Favoriten-Markierung bleibt davon unberührt.",
-                        "**Soft canon representation:** After the Subject Profile is confirmed, the selected canonical hair color receives a diminishing selection bonus. Headshot/medium/full-body quotas remain unchanged. Review and reject images are never promoted automatically by the canon bonus; an explicit Favorite override remains unaffected.",
-                    ))
-                    c_use_canon_representation = gr.Checkbox(
-                        label=tr("Canon-Repräsentation bei der Auswahl fördern", "Promote canon representation during selection"),
-                        value=S["c_use_canon_representation"],
-                        info=tr(
-                            "Wirkt erst beim Captioning aus dem bestätigten Profil. Der Bonus gilt nur für bereits geeignete Keep-Kandidaten innerhalb der jeweiligen Shot-Kategorie.",
-                            "Takes effect when continuing from the confirmed profile. The bonus only applies to already eligible keep candidates within the current shot category.",
-                        ),
-                    )
-                    with gr.Row():
-                        c_canon_representation_target = gr.Slider(
-                            label=tr("Weiches Canon-Ziel", "Soft canon target"),
-                            minimum=0,
-                            maximum=5,
-                            step=1,
-                            value=S["c_canon_representation_target"],
-                            info=tr(
-                                "Gewünschte Mindestanzahl guter Bilder mit der bestätigten Canon-Haarfarbe. Standard bei 20 Bildern: 3. Kein hartes Minimum.",
-                                "Desired minimum number of good images with the confirmed canonical hair color. Default for 20 images: 3. Not a hard minimum.",
-                            ),
-                        )
-                        c_canon_max_quality_gap = gr.Slider(
-                            label=tr("Max. Qualitätsabstand für Canon-Bonus", "Max quality gap for canon bonus"),
-                            minimum=0,
-                            maximum=15,
-                            step=0.5,
-                            value=S["c_canon_max_quality_gap"],
-                            info=tr(
-                                "Ein Canon-Kandidat erhält nur dann den Bonus, wenn er höchstens so viele Quality-Total-Punkte hinter der besten Alternative liegt. Standard: 5.",
-                                "A canon candidate only receives the bonus if it is no more than this many quality-total points behind the best alternative. Default: 5.",
-                            ),
-                        )
+                                c_clip_model = gr.Dropdown(
+                                    label=tr("CLIP-Modell", "CLIP model"),
+                                    choices=[
+                                        (tr("Automatisch – ViT-L-14 mit NVIDIA-GPU, ViT-B-32 ohne", "Automatic – ViT-L-14 with NVIDIA GPU, ViT-B-32 without"), "auto"),
+                                        (tr("ViT-B-32 – schnell, gut für Laptops ohne GPU", "ViT-B-32 – fast, good for laptops without GPU"), "ViT-B-32"),
+                                        (tr("ViT-L-14 – genauer, auf der CPU mehrere Sekunden pro Bild", "ViT-L-14 – more accurate, several seconds per image on CPU"), "ViT-L-14"),
+                                    ],
+                                    value=S.get("c_clip_model", "auto"),
+                                    info=tr(
+                                        "Jedes Modell hat einen eigenen Cache. Ein Wechsel berechnet die CLIP-Werte einmal neu.",
+                                        "Each model has its own cache. Switching recomputes the CLIP values once.",
+                                    ),
+                                )
 
-                with gr.Accordion(tr("🧭 Kopfpose-Diversität", "🧭 Head pose diversity"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Wozu Kopfpose-Diversität?</b></summary>"
-                        "\n\n"
-                        "Wenn dein Trainings-Set aus 25 Frontal-Aufnahmen und nur 5 anderen "
-                        "Posen besteht, lernt das LoRA Frontalansichten hervorragend, aber "
-                        "3/4-Profile schlecht. Bei späteren Generierungen siehst du das oft "
-                        "als 'Identitätsbruch' – sobald die Pose vom Frontalen abweicht, "
-                        "passt das Gesicht nicht mehr ganz.\n\n"
-                        "Die Kopfpose-Diversität sorgt dafür, dass bei der Endauswahl Bilder "
-                        "mit gleicher Kopfpose (frontal, 3/4-Profil-links, 3/4-Profil-rechts, "
-                        "Profil, von oben, von unten, von hinten) Punktabzug bekommen, sobald "
-                        "schon genug von dieser Pose im Set sind. Bei zwei ähnlich guten "
-                        "Bildern gewinnt dann das mit der unterrepräsentierten Pose.\n\n"
-                        "**Wichtig:** Kein Hard-Reject – qualitativ deutlich schlechtere "
-                        "Bilder mit seltener Pose werden nicht stur bevorzugt. Der Abzug "
-                        "wirkt nur, wenn die Bilder ähnlich gut sind.\n\n"
-                        "**Empfohlen:** an. Die KI bewertet die Kopfpose ohnehin im normalen "
-                        "Bewertungs-Schritt mit – also keine zusätzlichen API-Kosten."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ Why head pose diversity?</b></summary>"
-                        "\n\n"
-                        "If your training set is 25 frontal shots and only 5 other poses, "
-                        "the LoRA learns frontal views excellently but three-quarter views "
-                        "poorly. In later generation you see this as 'identity break' – as "
-                        "soon as the pose deviates from frontal, the face doesn't quite "
-                        "match.\n\n"
-                        "Head pose diversity ensures that during final selection, images "
-                        "with the same head pose (frontal, three-quarter-left, three-"
-                        "quarter-right, profile, looking up, looking down, back) get a "
-                        "score deduction once enough of that pose is already in the set. "
-                        "Between two similarly-good images, the one with the under-"
-                        "represented pose wins.\n\n"
-                        "**Important:** Not a hard reject – clearly worse images with rare "
-                        "poses aren't blindly preferred. The penalty only matters when "
-                        "images are similarly good.\n\n"
-                        "**Recommended:** on. The AI scores head pose anyway during normal "
-                        "scoring – so no additional API costs."
-                        "</details>",
-                    ))
-                    c_use_pose_diversity = gr.Checkbox(
-                        label=tr("Pose-Diversität aktivieren", "Enable pose diversity"),
-                        value=S["c_use_pose_diversity"],
-                        info=tr(
-                            "Empfohlen: an. Nutzt die KI-Klassifikation der Kopfpose – kostet keine zusätzlichen API-Calls.",
-                            "Recommended: on. Uses the AI's head pose classification – no extra API calls.",
-                        ),
-                    )
-                    with gr.Row():
-                        c_pose_soft_limit = gr.Slider(
-                            label=tr("Erlaubte Anzahl pro Pose (ohne Abzug)", "Allowed per pose (without penalty)"),
-                            minimum=1,
-                            maximum=8,
-                            step=1,
-                            value=S["c_pose_soft_limit"],
-                            info=tr(
-                                "Bis zu wie vielen Bildern pro Pose es noch keinen Punktabzug gibt. Empfohlen: 2. Bei kleinen Datasets (<20 Bilder) macht 1 mehr Druck Richtung Vielfalt; bei großen (>50) eher 3.",
-                                "Up to how many images per pose receive no penalty. Recommended: 2. For small datasets (<20 images), 1 pushes harder toward variety; for large ones (>50), 3.",
-                            ),
-                        )
-                        c_pose_penalty_weight = gr.Slider(
-                            label=tr("Stärke des Punktabzugs", "Penalty strength"),
-                            minimum=0.0,
-                            maximum=10.0,
-                            step=0.5,
-                            value=S["c_pose_penalty_weight"],
-                            info=tr(
-                                "Wie deutlich überzählige Posen abgewertet werden. Empfohlen: 4.0. Höher (6.0+) bevorzugt Pose-Vielfalt fast um jeden Preis – gut bei sehr selfie-lastigem Material. Niedriger (2.0) macht den Effekt subtil.",
-                                "How strongly excess poses get penalized. Recommended: 4.0. Higher (6.0+) prefers pose variety almost at any cost – good for very selfie-heavy material. Lower (2.0) makes the effect subtle.",
-                            ),
-                        )
+                            with gr.Accordion(tr("✂️ Smart Pre-Crop", "✂️ Smart pre-crop"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Was macht Smart Pre-Crop und wann brauche ich das?</b></summary>"
+                                    "\n\n"
+                                    "Bei großen Bildern (4K-Fotos, DSLR-Aufnahmen), auf denen die Person "
+                                    "klein im Bild ist – z. B. Ganzkörper-Aufnahmen mit viel Hintergrund – "
+                                    "erzeugt der Curator automatisch einen engen Headshot-Ausschnitt rund um "
+                                    "das Gesicht und schickt diesen *zusätzlich* zur KI-Bewertung. Beide "
+                                    "Versionen (Original und Crop) konkurrieren dann um den Platz im "
+                                    "Trainings-Set; die besser bewertete gewinnt.\n\n"
+                                    "**Wozu das gut ist:** Aus einem Foto, das als Ganzkörper-Aufnahme nur "
+                                    "mittelmäßig ist (unruhiger Hintergrund, ungünstige Pose), kannst du so "
+                                    "trotzdem ein gutes Identitäts-Bild fürs Training herausziehen – ohne "
+                                    "ein zweites Foto-Set zu brauchen.\n\n"
+                                    "**Wann es ausgelöst wird:** Nur bei Bildern, die groß genug sind "
+                                    "(mindestens 2 Megapixel) und bei denen das Gesicht weniger als 7 % "
+                                    "der Bildfläche einnimmt. Bei reinen Headshots oder Selfies passiert "
+                                    "nichts – da gibt es nichts zu zoomen.\n\n"
+                                    "**Kosten:** Pro ausgelöstem Pre-Crop ein zusätzlicher API-Call. Bei "
+                                    "den meisten Datasets sind das nur 10–30 % der Bilder."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ What does Smart Pre-Crop do and when do I need it?</b></summary>"
+                                    "\n\n"
+                                    "For large images (4K photos, DSLR shots) where the person is small in "
+                                    "the frame – e.g. full-body shots with a lot of background – the curator "
+                                    "automatically generates a tight headshot crop around the face and sends "
+                                    "it *additionally* to the AI for scoring. Both versions (original and "
+                                    "crop) then compete for a spot in the training set; the better-scored "
+                                    "one wins.\n\n"
+                                    "**Why it matters:** From a photo that's only mediocre as a full-body "
+                                    "shot (busy background, awkward pose), you can still extract a good "
+                                    "identity image for training – without needing a second photo set.\n\n"
+                                    "**When it triggers:** Only on images that are large enough (at least "
+                                    "2 megapixels) and where the face takes up less than 7 % of the image "
+                                    "area. Pure headshots or selfies are skipped – nothing to zoom into.\n\n"
+                                    "**Cost:** One additional API call per triggered pre-crop. For most "
+                                    "datasets that's only 10–30 % of the images."
+                                    "</details>",
+                                ))
+                                c_smart_crop = gr.Checkbox(
+                                    label=tr("Smart Pre-Crop aktivieren", "Enable smart pre-crop"),
+                                    value=S["c_smart_crop"],
+                                    info=tr(
+                                        "Empfohlen: an. Wird ohnehin nur bei großen Bildern mit kleinem Gesicht ausgelöst – kostet bei kleinen Datasets fast nichts extra.",
+                                        "Recommended: on. Only triggers for large images with a small face – costs almost nothing extra on small datasets.",
+                                    ),
+                                )
+                                with gr.Row():
+                                    c_crop_gain = gr.Slider(
+                                        label=tr("Mindestvorsprung des Crops", "Min crop score gain"),
+                                        minimum=0,
+                                        maximum=30,
+                                        step=1,
+                                        value=S["c_crop_gain"],
+                                        info=tr(
+                                            "Wie viele Punkte besser der Crop bewertet sein muss als das Original, damit er übernommen wird. Empfohlen: 8. Niedriger (4–6) lässt mehr Crops gewinnen, gut wenn du Headshots brauchst und deine Originale meist Full-Body sind. Höher (12+) ist konservativ.",
+                                            "How many points the crop must score above the original to be accepted. Recommended: 8. Lower (4–6) lets more crops win — good if you need headshots and your originals are mostly full-body. Higher (12+) is conservative.",
+                                        ),
+                                    )
+                                    c_crop_pad = gr.Slider(
+                                        label=tr("Padding um das Gesicht", "Padding around the face"),
+                                        minimum=0.3,
+                                        maximum=1.5,
+                                        step=0.05,
+                                        value=S["c_crop_pad"],
+                                        info=tr(
+                                            "Rand pro Seite um das Gesicht, gemessen in Vielfachen der Gesichtsgröße. Empfohlen: 0.6 (ergibt Gesicht + Haare + obere Schultern, klassischer Headshot). 0.4 = enger Gesichts-Crop. 0.8+ = lockerer mit Schulter-Anteil.",
+                                            "Padding per side around the face, measured in multiples of face size. Recommended: 0.6 (face + hair + upper shoulders, classic headshot). 0.4 = tight face crop. 0.8+ = looser with shoulder area.",
+                                        ),
+                                    )
+                                gr.Markdown(tr(
+                                    "**Getrennte Rettungsmechanik:** Ein schwaches Full-Body-Bild kann zusätzlich als Medium-Crop geprüft werden. Das Original bleibt ein Full Body; der Crop ist ein eigener Kandidat.",
+                                    "**Separate rescue mechanism:** A weak full-body image can additionally be tested as a medium crop. The original remains full body; the crop is a separate candidate.",
+                                ))
+                                with gr.Row():
+                                    c_medium_rescue_crop = gr.Checkbox(
+                                        label=tr("Medium-Rettungs-Crop aktivieren", "Enable medium rescue crop"),
+                                        value=S["c_medium_rescue_crop"],
+                                        info=tr(
+                                            "Empfohlen: an. Versucht bei schwachen Ganzkörperbildern Gesicht, Schultern, Torso und möglichst Hüfte als brauchbaren Medium Shot zu retten. Verändert das Original nicht.",
+                                            "Recommended: on. Tries to rescue face, shoulders, torso and preferably hips from weak full-body images as a usable medium shot. Does not alter the original.",
+                                        ),
+                                    )
+                                    c_medium_rescue_gain = gr.Slider(
+                                        label=tr("Mindestvorsprung des Medium-Crops", "Min medium-crop score gain"),
+                                        minimum=0,
+                                        maximum=20,
+                                        step=1,
+                                        value=S["c_medium_rescue_gain"],
+                                        info=tr(
+                                            "Wie viele Punkte besser der Medium-Rettungs-Crop sein muss. Empfohlen: 4, da er zusätzlich eine fehlende Shot-Kategorie abdecken kann.",
+                                            "How many points better the medium rescue crop must score. Recommended: 4 because it may also fill a missing shot category.",
+                                        ),
+                                    )
 
-                with gr.Accordion(tr("🪪 Identitäts-Konsistenz-Check (ArcFace)", "🪪 Identity consistency check (ArcFace)"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Was macht der Identitäts-Konsistenz-Check?</b></summary>"
-                        "\n\n"
-                        "Bei Person-LoRAs gibt es eine Klasse von Bug, die unsichtbar bleibt "
-                        "und das Training trotzdem ruiniert: **Ein einzelnes Bild der falschen "
-                        "Person mischt sich in dein Dataset.** Das passiert leichter als man "
-                        "denkt – die Schwester sieht ähnlich aus, ein altes Foto stammt noch "
-                        "aus der Pubertät, oder Smart Pre-Crop hat versehentlich die Bekannte "
-                        "im Hintergrund gezoomt.\n\n"
-                        "29 von 30 Bildern korrekt, 1 falsche Person dabei → das LoRA "
-                        "produziert visuell oft 'fast richtige' Gesichter, die irgendwie nicht "
-                        "ganz die Person treffen. Du siehst auf den ersten Blick nicht, woran "
-                        "es liegt.\n\n"
-                        "**Wie der Check funktioniert:**\n\n"
-                        "ArcFace ist ein KI-Modell, das speziell auf Gesichts-Identität "
-                        "trainiert ist. Es berechnet pro Bild einen Identitäts-Vektor, der "
-                        "bei Bildern *derselben Person* sehr ähnlich ist – auch bei anderen "
-                        "Posen, Beleuchtung oder Alter. Der Curator berechnet diese Vektoren "
-                        "für alle Bilder im Final-Set, mittelt sie zu einer 'Set-Identität' "
-                        "und vergleicht jedes einzelne Bild damit.\n\n"
-                        "**Outlier-Trimming:** Vor der Mittelung werden die schlechtesten "
-                        "Vektoren verworfen. Das verhindert, dass 2–3 falsche Bilder den "
-                        "Mittelwert in ihre Richtung ziehen und der Check dann unzuverlässig "
-                        "wird.\n\n"
-                        "**Drei Klassifikationen pro Bild:**\n\n"
-                        "**Hard-Flag** (Ähnlichkeit unter Hard-Schwelle): Wahrscheinlich eine "
-                        "andere Person. Das Bild wird **aus 01_train_ready entfernt** und mit "
-                        "Präfix `IDCHECK_` nach 06_needs_manual_review kopiert. Captions "
-                        "bleiben unangetastet.\n\n"
-                        "**Soft-Flag** (Ähnlichkeit zwischen Hard und Soft): Grenzfall, "
-                        "könnte dieselbe Person mit Beauty-Filter / extremem Makeup / Brille "
-                        "sein. Das Bild **bleibt** im Train-Set, wird aber im Markdown-Report "
-                        "markiert für deinen visuellen Check.\n\n"
-                        "**OK** (Ähnlichkeit über Soft-Schwelle): Klar dieselbe Person.\n\n"
-                        "**Voraussetzung:** Mindestens 5 Gesichter im Set müssen erkennbar "
-                        "sein, sonst ist der Mittelwert nicht aussagekräftig und der Check "
-                        "wird übersprungen.\n\n"
-                        "**Installation:** `pip install insightface onnxruntime-gpu` (oder "
-                        "`onnxruntime` ohne GPU). Beim ersten Lauf werden ~250 MB Modell-"
-                        "Daten nach `~/.insightface/models/` heruntergeladen. Wenn du "
-                        "ComfyUI mit FaceID/ReActor benutzt, sind die Modelle wahrscheinlich "
-                        "schon da.\n\n"
-                        "**Lizenz-Hinweis:** Die ArcFace-Modelle (`buffalo_l` etc.) sind nur "
-                        "für nicht-kommerzielle Forschung freigegeben. Für private LoRA-"
-                        "Erstellung ist das unproblematisch."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ What does the identity consistency check do?</b></summary>"
-                        "\n\n"
-                        "Person LoRAs have a class of bug that stays invisible but ruins "
-                        "training anyway: **a single image of the wrong person sneaking into "
-                        "your dataset.** It happens more easily than you'd think – a sister "
-                        "looks similar, an old photo is from puberty, or smart pre-crop "
-                        "accidentally zoomed in on the friend in the background.\n\n"
-                        "29 out of 30 images correct, 1 wrong person → the LoRA often "
-                        "produces 'almost right' faces that somehow don't quite hit the "
-                        "person. At first glance, you can't tell why.\n\n"
-                        "**How the check works:**\n\n"
-                        "ArcFace is an AI model trained specifically on face identity. It "
-                        "computes one identity vector per image that's very similar for "
-                        "*the same person* across different poses, lighting or ages. The "
-                        "curator computes these vectors for all final-set images, averages "
-                        "them into a 'set identity' and compares each image against it.\n\n"
-                        "**Outlier trimming:** Before averaging, the worst vectors are "
-                        "dropped. This prevents 2–3 wrong images from pulling the average "
-                        "toward their identity and making the check unreliable.\n\n"
-                        "**Three classifications per image:**\n\n"
-                        "**Hard flag** (similarity below hard threshold): Likely a different "
-                        "person. The image is **removed from 01_train_ready** and copied to "
-                        "06_needs_manual_review with prefix `IDCHECK_`. Captions stay "
-                        "untouched.\n\n"
-                        "**Soft flag** (similarity between hard and soft): Borderline, could "
-                        "be the same person with a beauty filter / heavy makeup / glasses. "
-                        "The image **stays** in the train set but gets marked in the "
-                        "markdown report for your visual check.\n\n"
-                        "**OK** (similarity above soft threshold): Clearly the same person.\n\n"
-                        "**Requirement:** At least 5 detected faces in the set, otherwise "
-                        "the average is not meaningful and the check gets skipped.\n\n"
-                        "**Installation:** `pip install insightface onnxruntime-gpu` (or "
-                        "`onnxruntime` without GPU). On first run, ~250 MB of model data "
-                        "auto-download to `~/.insightface/models/`. If you use ComfyUI with "
-                        "FaceID/ReActor, the models are probably already there.\n\n"
-                        "**License note:** The ArcFace models (`buffalo_l` etc.) are "
-                        "licensed for non-commercial research only. For private LoRA "
-                        "creation that's not an issue."
-                        "</details>",
-                    ))
-                    c_use_arcface = gr.Checkbox(
-                        label=tr("Identitäts-Check aktivieren", "Enable identity check"),
-                        value=S["c_use_arcface"],
-                        info=tr(
-                            "Empfohlen: an. Wird automatisch übersprungen, wenn insightface nicht installiert ist – also kein Problem, wenn du das erst später nachinstallierst.",
-                            "Recommended: on. Automatically skipped if insightface isn't installed – no problem if you install it later.",
-                        ),
-                    )
-                    with gr.Row():
-                        c_arcface_hard = gr.Slider(
-                            label=tr("Hard-Schwelle (Bild fliegt raus)", "Hard threshold (image gets removed)"),
-                            minimum=0.20,
-                            maximum=0.80,
-                            step=0.01,
-                            value=S["c_arcface_hard"],
-                            info=tr(
-                                "Unter diesem Ähnlichkeits-Wert wird das Bild aus dem Train-Set entfernt. Empfohlen: 0.50 (konservativ – nur klare Mismatches). 0.40 = sehr tolerant. 0.60 = streng (kann auch echte Treffer mit starkem Beauty-Filter rauswerfen).",
-                                "Below this similarity, the image is removed from the train set. Recommended: 0.50 (conservative – only clear mismatches). 0.40 = very tolerant. 0.60 = strict (may also reject real matches with heavy beauty filters).",
-                            ),
-                        )
-                        c_arcface_soft = gr.Slider(
-                            label=tr("Soft-Schwelle (Bild bleibt, wird markiert)", "Soft threshold (image stays, gets marked)"),
-                            minimum=0.30,
-                            maximum=0.90,
-                            step=0.01,
-                            value=S["c_arcface_soft"],
-                            info=tr(
-                                "Zwischen Hard und Soft gilt ein Bild als Grenzfall. Empfohlen: 0.65. Niedriger = nur deutliche Grenzfälle werden markiert. Höher = mehr Bilder bekommen den Soft-Flag (gut wenn du genauer hinschauen willst).",
-                                "Between hard and soft, an image counts as borderline. Recommended: 0.65. Lower = only clear borderline cases get marked. Higher = more images get a soft flag (good if you want to inspect more carefully).",
-                            ),
-                        )
-                    with gr.Row():
-                        c_arcface_trim = gr.Slider(
-                            label=tr("Anteil verworfener Ausreißer", "Outlier-trim fraction"),
-                            minimum=0.0,
-                            maximum=0.30,
-                            step=0.01,
-                            value=S["c_arcface_trim"],
-                            info=tr(
-                                "Welcher Anteil der schlechtesten Identitäts-Vektoren vor der Mittelwert-Berechnung verworfen wird. Empfohlen: 0.10 (10 %, fängt 1–2 falsche Bilder im 30er-Set ab). 0 = kein Trimming. 0.20 = bei Datasets, in denen du mehrere falsche Bilder vermutest.",
-                                "Fraction of worst identity vectors dropped before centroid calculation. Recommended: 0.10 (10 %, catches 1–2 wrong images in a 30-image set). 0 = no trimming. 0.20 = for datasets where you suspect several wrong images.",
-                            ),
-                        )
-                        c_arcface_min_faces = gr.Slider(
-                            label=tr("Min. erkannte Gesichter im Set", "Min detected faces in set"),
-                            minimum=3,
-                            maximum=15,
-                            step=1,
-                            value=S["c_arcface_min_faces"],
-                            info=tr(
-                                "Wenn weniger Gesichter im Final-Set erkannt werden, wird der Check übersprungen (zu unzuverlässig). Empfohlen: 5. Bei sehr kleinen Datasets (Ziel <15 Bilder) kannst du auf 3 senken.",
-                                "If fewer faces are detected in the final set, the check is skipped (not reliable enough). Recommended: 5. For very small datasets (target <15 images) you can lower to 3.",
-                            ),
-                        )
-                    with gr.Row():
-                        c_arcface_model = gr.Dropdown(
-                            label=tr("ArcFace-Modell", "ArcFace model"),
-                            choices=["buffalo_l", "buffalo_s", "buffalo_m", "antelopev2"],
-                            value=S["c_arcface_model"],
-                            info=tr(
-                                "Empfohlen: buffalo_l (höchste Genauigkeit). buffalo_s ist schneller und kleiner, aber weniger genau – nur wählen wenn du auf CPU läufst und Geschwindigkeit zählt.",
-                                "Recommended: buffalo_l (highest accuracy). buffalo_s is faster and smaller but less accurate – only pick if you run on CPU and speed matters.",
-                            ),
-                        )
-                        c_arcface_det_size = gr.Slider(
-                            label=tr("Auflösung der Gesichtserkennung (px)", "Face detection resolution (px)"),
-                            minimum=320,
-                            maximum=1024,
-                            step=32,
-                            value=S["c_arcface_det_size"],
-                            info=tr(
-                                "Auf welche Größe Bilder vor der Gesichtserkennung skaliert werden. Empfohlen: 640 (balanciert). 320 = schneller, kann aber kleine Gesichter verpassen. 1024 = genauer, aber deutlich langsamer.",
-                                "Resolution images get scaled to before face detection. Recommended: 640 (balanced). 320 = faster but may miss small faces. 1024 = more accurate but noticeably slower.",
-                            ),
-                        )
+                        with gr.TabItem(tr("Auswahl & Vielfalt", "Selection & diversity")):
+                            with gr.Accordion(tr("Aufnahme-Verteilung", "Shot distribution"), open=False):
+                                with gr.Column(scale=1):
+                                    gr.Markdown(tr(
+                                        "<details>"
+                                        "<summary><b>ℹ️ Wie funktioniert die Shot-Verteilung?</b></summary>"
+                                        "\n\n"
+                                        "Bestimmt, mit welchem Verhältnis die drei Aufnahmetypen (Nahaufnahme, "
+                                        "Oberkörper, Ganzkörper) im finalen Trainings-Set landen sollen.\n\n"
+                                        "**Headshot (Nahaufnahme):** Gesicht füllt einen Großteil des Bildes. "
+                                        "Wichtigste Kategorie für Identitätslernen – das Modell lernt hier, "
+                                        "wie das Gesicht aussieht.\n\n"
+                                        "**Medium (Oberkörper):** Gesicht plus Schultern und Oberkörper. "
+                                        "Hilft dem Modell, Körperbau, Haltung und typische Outfit-Schnitte "
+                                        "zu lernen.\n\n"
+                                        "**Full Body (Ganzkörper):** Komplette Person inklusive Beine. Damit "
+                                        "das LoRA später nicht nur Brustportraits, sondern auch Ganzkörper-"
+                                        "Generierungen sauber hinbekommt.\n\n"
+                                        "**Empfohlen für Person-LoRAs:** 0.45 / 0.30 / 0.25 (Headshot-lastig). "
+                                        "Wenn dein Material überwiegend Selfies enthält, kannst du Full Body "
+                                        "auf 0.10 senken; wenn du Mode/Outfit lernen willst, eher 0.30 / 0.40 / 0.30.\n\n"
+                                        "**Wichtig:** Die drei Werte sollten zusammen 1.0 ergeben. Wenn nicht, "
+                                        "normalisiert der Curator sie automatisch."
+                                        "</details>",
+                                        "<details>"
+                                        "<summary><b>ℹ️ How does shot distribution work?</b></summary>"
+                                        "\n\n"
+                                        "Defines what ratio of the three shot types (close-up, upper body, "
+                                        "full body) the final training set should aim for.\n\n"
+                                        "**Headshot (close-up):** Face fills most of the frame. Most "
+                                        "important category for identity learning – this is where the model "
+                                        "learns what the face looks like.\n\n"
+                                        "**Medium (upper body):** Face plus shoulders and torso. Helps the "
+                                        "model learn body type, posture and typical outfit cuts.\n\n"
+                                        "**Full Body:** Entire person including legs. So the LoRA can later "
+                                        "generate full-body shots cleanly, not just bust portraits.\n\n"
+                                        "**Recommended for person LoRAs:** 0.45 / 0.30 / 0.25 (headshot-"
+                                        "heavy). If your material is mostly selfies, you can drop full body "
+                                        "to 0.10; if you want to learn fashion/outfits, try 0.30 / 0.40 / 0.30.\n\n"
+                                        "**Important:** The three values should add up to 1.0. If they "
+                                        "don't, the curator normalizes them automatically."
+                                        "</details>",
+                                    ))
+                                    gr.Markdown(tr("### Shot-Verteilung", "### Shot distribution"))
+                                    c_ratio_h = gr.Slider(
+                                        label=tr("Headshot (Nahaufnahme)", "Headshot (close-up)"),
+                                        minimum=0,
+                                        maximum=1,
+                                        step=0.05,
+                                        value=S["c_ratio_h"],
+                                        info=tr(
+                                            "Anteil enger Gesichts-Aufnahmen. Wichtigste Kategorie für Identitätslernen. Empfohlen: 0.45.",
+                                            "Share of tight face shots. Most important category for identity learning. Recommended: 0.45.",
+                                        ),
+                                    )
+                                    c_ratio_m = gr.Slider(
+                                        label=tr("Medium (Oberkörper)", "Medium (upper body)"),
+                                        minimum=0,
+                                        maximum=1,
+                                        step=0.05,
+                                        value=S["c_ratio_m"],
+                                        info=tr(
+                                            "Anteil Oberkörper-Aufnahmen. Hilft beim Lernen von Körperbau, Haltung und Outfit-Schnitten. Empfohlen: 0.30.",
+                                            "Share of upper-body shots. Helps learn body type, posture and outfit cuts. Recommended: 0.30.",
+                                        ),
+                                    )
+                                    c_ratio_f = gr.Slider(
+                                        label=tr("Full Body (Ganzkörper)", "Full Body"),
+                                        minimum=0,
+                                        maximum=1,
+                                        step=0.05,
+                                        value=S["c_ratio_f"],
+                                        info=tr(
+                                            "Anteil Ganzkörper-Aufnahmen. Weniger nötig, aber wichtig damit das LoRA später vollständige Personen generieren kann. Empfohlen: 0.25.",
+                                            "Share of full-body shots. Less needed, but important so the LoRA can generate complete persons. Recommended: 0.25.",
+                                        ),
+                                    )
+                                    gr.Markdown(tr("*⚠️ Summe sollte 1.0 ergeben*", "*⚠️ Sum should be 1.0*"))
 
-                with gr.Accordion(tr("🧬 Subject Profile – Modell und Sampling", "🧬 Subject profile – model and sampling"), open=False):
-                    gr.Markdown(tr(
-                        "Phase 2 baut nach dem Bild-Audit ein zentrales Profil des Models. "
-                        "Reject- und Review-Bilder werden dafür ausgeschlossen. Bei großen Datasets "
-                        "wird ein stratifiziertes Sample an den Normalizer geschickt und die Regeln "
-                        "werden lokal auf alle verwertbaren Bilder angewendet. Marker wie Brille, "
-                        "Tattoos und Piercings bleiben strikt force-only-when-visible.\n\n"
-                        "👉 **Automatisch oder selbst prüfen** wählst du ganz oben in diesem Tab, direkt unter dem Trainingsziel.\n\n"
-                        "👉 **Profil bearbeiten** und das anschließende Captioning aus dem Profil "
-                        "starten findest du im eigenen Tab `🧬 Subject Profile`.",
-                        "Phase 2 builds a central subject profile after image audit. Reject and review "
-                        "images are excluded. For large datasets, a stratified sample is sent to the "
-                        "normalizer and the rules are applied locally to all usable images. Markers "
-                        "such as glasses, tattoos and piercings remain strictly force-only-when-visible.\n\n"
-                        "👉 **Automatic or review it yourself** is chosen at the very top of this tab, directly below the training target.\n\n"
-                        "👉 **Editing the profile** and starting captioning from the profile is done "
-                        "in the dedicated `🧬 Subject Profile` tab.",
-                    ))
-                    c_profile_normalizer_model = gr.Dropdown(
-                        label=tr("Profile-Normalizer-Modell", "Profile normalizer model"),
-                        choices=OPENAI_MODEL_PRESET_CHOICES,
-                        value=S["c_profile_normalizer_model"],
-                        info=tr(
-                            "Modell für den einen zusätzlichen Profil-Call pro Lauf. Für Krea 2 empfohlen: gpt-6.1-sol mit niedrigem Reasoning.",
-                            "Model for the single additional profile call per run. Recommended for Krea 2: gpt-6.1-sol with low reasoning.",
-                        ),
-                        **openai_model_dropdown_kwargs(),
-                    )
-                    c_profile_reasoning_effort = gr.Dropdown(
-                        label=tr("Reasoning Effort – Subject Profile", "Reasoning effort – subject profile"),
-                        choices=REASONING_EFFORT_CHOICES,
-                        value=S["c_profile_reasoning_effort"],
-                        info=tr(
-                            "Der Profil-Call muss stabile und variable Merkmale über viele Bilder abgleichen. `low` ist der empfohlene Standard; `medium` kann bei widersprüchlichen Datensätzen sinnvoll sein.",
-                            "The profile call reconciles stable and variable traits across many images. `low` is the recommended default; `medium` can help with contradictory datasets.",
-                        ),
-                    )
-                    with gr.Row():
-                        c_profile_sample_threshold = gr.Slider(
-                            label=tr("Sampling ab N Bildern", "Sample when above N images"),
-                            minimum=20,
-                            maximum=2000,
-                            step=10,
-                            value=S["c_profile_sample_threshold"],
-                            info=tr(
-                                "Bis zu dieser Anzahl gehen alle verwertbaren Bilder in den Profil-Normalizer. Darüber wird gesampelt.",
-                                "Up to this number, all usable images go into the profile normalizer. Above this, stratified sampling is used.",
-                            ),
-                        )
-                        c_profile_sample_size = gr.Slider(
-                            label=tr("Profil-Sample-Größe", "Profile sample size"),
-                            minimum=20,
-                            maximum=300,
-                            step=5,
-                            value=S["c_profile_sample_size"],
-                            info=tr(
-                                "Wie viele Bilder bei großen Datasets maximal für den Normalizer ausgewählt werden. Empfehlung: 80.",
-                                "Maximum number of images selected for the normalizer on large datasets. Recommended: 80.",
-                            ),
-                        )
+                            with gr.Accordion(tr("📊 Clustering & Diversität", "📊 Clustering & diversity"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Was machen Clustering und Diversitäts-Penalty?</b></summary>"
+                                    "\n\n"
+                                    "Wenn deine Quellbilder typisch aus Social Media kommen, hast du oft "
+                                    "10–30 Fotos aus *derselben Foto-Session* (gleiche Kleidung, gleicher "
+                                    "Ort, alle in 2 Minuten geschossen). Ohne Begrenzung würde dein "
+                                    "Trainings-Set hauptsächlich aus dieser einen Session bestehen, und "
+                                    "das LoRA lernt dann sehr engmaschig genau dieses eine Outfit – "
+                                    "schlecht für die spätere Generierungs-Vielfalt.\n\n"
+                                    "**Clustering:**\n\n"
+                                    "Der Curator gruppiert Bilder anhand von Kleidung, Hintergrund und "
+                                    "Aufnahmezeitpunkt zu **Outfit-Clustern** und **Session-Clustern**. "
+                                    "Du kannst pro Cluster ein Maximum festlegen – z. B. 'höchstens 4 "
+                                    "Bilder mit demselben Outfit'.\n\n"
+                                    "**Diversitäts-Penalty:**\n\n"
+                                    "Zusätzlich gibt es bei der Endauswahl Punktabzug, wenn ähnliche "
+                                    "Bilder bereits ausgewählt wurden – betrifft Outfit, Hintergrund, "
+                                    "Beleuchtung, Gesichtsausdruck und (wenn die Kopfpose-Diversität "
+                                    "aktiv ist) auch Kopfposen. Bei zwei ähnlich guten Bildern gewinnt "
+                                    "dann das mit den selteneren Eigenschaften.\n\n"
+                                    "**Empfohlen:** Beide an. Das Clustering verhindert harte "
+                                    "Überrepräsentationen, die Penalty sorgt für feine Vielfalt zwischen "
+                                    "den Bildern, die durch das Clustering schon gefiltert sind."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ What do clustering and diversity penalty do?</b></summary>"
+                                    "\n\n"
+                                    "Source images from social media often include 10–30 photos from the "
+                                    "*same photo session* (same outfit, same location, all shot within 2 "
+                                    "minutes). Without limits, your training set would mostly come from "
+                                    "this one session, and the LoRA would learn this one outfit very "
+                                    "tightly – bad for later generation variety.\n\n"
+                                    "**Clustering:**\n\n"
+                                    "The curator groups images by clothing, background and capture time "
+                                    "into **outfit clusters** and **session clusters**. You can set a "
+                                    "max per cluster – e.g. 'at most 4 images with the same outfit'.\n\n"
+                                    "**Diversity penalty:**\n\n"
+                                    "Additionally, during final selection, similar images get a score "
+                                    "deduction if similar ones are already picked – covers outfit, "
+                                    "background, lighting, facial expression and (when head pose "
+                                    "diversity is on) also head pose. Between two similarly-good images, "
+                                    "the one with rarer attributes wins.\n\n"
+                                    "**Recommended:** Both on. Clustering prevents hard over-"
+                                    "representation, the penalty creates fine variety between the "
+                                    "images already filtered through clustering."
+                                    "</details>",
+                                ))
+                                c_use_cluster = gr.Checkbox(
+                                    label=tr("Outfit-/Session-Clustering aktivieren", "Enable outfit/session clustering"),
+                                    value=S["c_use_cluster"],
+                                    info=tr(
+                                        "Gruppiert ähnliche Bilder nach Kleidung, Hintergrund und Aufnahmezeit. Empfohlen: an. Verhindert dass eine einzelne Foto-Session den Trainings-Set dominiert.",
+                                        "Groups similar images by clothing, background and capture time. Recommended: on. Prevents a single photo session from dominating the training set.",
+                                    ),
+                                )
+                                with gr.Row():
+                                    c_max_outfit = gr.Slider(
+                                        label=tr("Max. Bilder pro Outfit", "Max images per outfit"),
+                                        minimum=1,
+                                        maximum=10,
+                                        step=1,
+                                        value=S["c_max_outfit"],
+                                        info=tr(
+                                            "Höchstens so viele Bilder mit demselben Outfit landen im Final-Set. Empfohlen: 4. Niedriger (2–3) zwingt mehr Outfit-Vielfalt, höher (6+) ist locker (für Datasets mit ohnehin viel Outfit-Wechsel).",
+                                            "At most this many images with the same outfit end up in the final set. Recommended: 4. Lower (2–3) forces more outfit variety, higher (6+) is loose (for datasets with lots of outfit changes anyway).",
+                                        ),
+                                    )
+                                    c_max_session = gr.Slider(
+                                        label=tr("Max. Bilder pro Foto-Session", "Max images per photo session"),
+                                        minimum=1,
+                                        maximum=10,
+                                        step=1,
+                                        value=S["c_max_session"],
+                                        info=tr(
+                                            "Höchstens so viele Bilder aus derselben Aufnahme-Session (gleicher Ort, gleicher Tag). Empfohlen: 5. Etwas höher als das Outfit-Limit, weil Sessions oft mehrere Outfits enthalten.",
+                                            "At most this many images from the same shoot session (same location, same day). Recommended: 5. Slightly higher than the outfit limit because sessions often contain multiple outfits.",
+                                        ),
+                                    )
+                                c_use_diversity = gr.Checkbox(
+                                    label=tr("Diversitäts-Punktabzug bei Endauswahl", "Diversity penalty during final selection"),
+                                    value=S["c_use_diversity"],
+                                    info=tr(
+                                        "Bei der finalen Endauswahl bekommen Bilder mit häufiger Kombination aus Outfit/Hintergrund/Licht/Gesichtsausdruck Punktabzug. Empfohlen: an.",
+                                        "During final selection, images with frequent combinations of outfit/background/lighting/expression get a score deduction. Recommended: on.",
+                                    ),
+                                )
 
-                with gr.Accordion(tr("📝 Caption-Regeln", "📝 Caption rules"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Wie funktionieren die Captions?</b></summary>"
-                        "\n\n"
-                        "Beim LoRA-Training bekommt das Modell pro Bild eine Text-"
-                        "Beschreibung (Caption) mitgeliefert. Daran lernt es, was zur Person "
-                        "gehört (intrinsisch, immer gleich) und was austauschbar ist "
-                        "(situativ, ändert sich).\n\n"
-                        "Der Curator generiert die Captions automatisch aus der KI-Analyse "
-                        "der Bilder. Du kannst auswählen, welche Merkmale in die Captions "
-                        "aufgenommen werden – das beeinflusst, wie das LoRA später auf "
-                        "Prompts reagiert.\n\n"
-                        "**Trainingsziel und Caption-Policy:**\n\n"
-                        "Das oben gewählte Trainingsziel bestimmt Workflow, Promptfamilie und Caption-Engine. "
-                        "Die Einzelfelder hier steuern nur, welche Merkmale diese Engine verwenden darf.\n\n"
-                        "**Aktive Caption-Felder:**\n\n"
-                        "Welche Eigenschaften gehen in die Beschreibung? Die "
-                        "Antwort hängt am Basismodell:\n\n"
-                        "**ERNIE** – alle Felder einschließen. ERNIE-Image hat im "
-                        "Default einen asiatischen Bias, der durch redundante Anker "
-                        "(blonde hair, blue eyes, fair skin) ausgeglichen wird. "
-                        "Auch permanente Eigenschaften gehören in jede Caption.\n\n"
-                        "**Z-Image Base** – nur veränderliche Felder. Z-Image hat "
-                        "ein starkes Sprachverständnis und kennt Standardkonzepte "
-                        "schon. Permanente Identitätsmerkmale (Hautton, Augenfarbe, "
-                        "Körperbau, konstante Frisur) werden weggelassen, damit das "
-                        "Trigger-Wort die Person-Identität sauber absorbiert. Nur "
-                        "variable Sachen (Kleidung, Pose, Hintergrund, Brille wenn "
-                        "wechselnd, Hair-when-variable, variable Piercings/Ohrschmuck, Make-up, Bildstil) "
-                        "kommen rein. Vorteil: bessere Steuerbarkeit bei Inferenz "
-                        "('Kathi mit roten Haaren' funktioniert sauber, weil der "
-                        "Trigger 'blonde' nicht in der Caption mitfährt).\n\n"
-                        "**Regel für variable Identitätsmerkmale:** Das Subject Profile "
-                        "normalisiert Haarfarbe/-form, Augenfarbe, Bart und Brille und "
-                        "legt eine kanonische Baseline fest. Im Standardmodus wird nur "
-                        "eine Abweichung captioniert (z. B. 'red hair' bei canon blond). "
-                        "Alternativ kann bei echter Variation jeder sichtbare Wert "
-                        "captioniert werden. Brillenbegriffe werden dabei auf eine "
-                        "kanonische Beschreibung vereinheitlicht.\n\n"
-                        "**Wenn du unsicher bist:** ERNIE ist der robustere Default, "
-                        "Z-Image Base ist die saubere Wahl wenn du gezielt auf "
-                        "Z-Image_Base trainierst und maximale Inferenz-Flexibilität "
-                        "willst."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ How do captions work?</b></summary>"
-                        "\n\n"
-                        "During LoRA training, each image gets a text description (caption) "
-                        "alongside it. From this the model learns what's intrinsic to the "
-                        "person (always the same) and what's swappable (situational, "
-                        "changes).\n\n"
-                        "The curator generates captions automatically from the AI image "
-                        "analysis. You pick which attributes go into the captions – this "
-                        "affects how the LoRA later reacts to prompts.\n\n"
-                        "**Training target and caption policy:**\n\n"
-                        "The training target selected above chooses the workflow, prompt family and caption engine. "
-                        "The fields here only control which facts that engine may use.\n\n"
-                        "**Active caption fields:**\n\n"
-                        "Which attributes go into the description? The answer "
-                        "depends on the base model:\n\n"
-                        "**ERNIE** – include all fields. ERNIE-Image has an "
-                        "Asia-leaning default bias that's compensated by redundant "
-                        "anchors (blonde hair, blue eyes, fair skin). Even "
-                        "persistent attributes belong in every caption.\n\n"
-                        "**Z-Image Base** – only variable fields. Z-Image has "
-                        "strong language understanding and already knows standard "
-                        "concepts. Persistent identity features (skin tone, eye "
-                        "color, body build, consistent hair) are omitted so the "
-                        "trigger word cleanly absorbs the person identity. Only "
-                        "variable things (clothing, pose, background, glasses if "
-                        "they vary, hair-when-variable, variable piercings or ear jewelry, makeup, visual "
-                        "style) go in. Benefit: better inference steerability "
-                        "('Kathi with red hair' works cleanly because the trigger "
-                        "doesn't drag 'blonde' along in every caption).\n\n"
-                        "**Variable identity feature rule:** The Subject Profile "
-                        "normalizes hair color/form, eye color, beard and glasses and "
-                        "stores a canonical baseline. In the default mode only a "
-                        "deviation is captioned (for example 'red hair' when blonde "
-                        "is canonical). Alternatively, every visible value can be "
-                        "captioned once genuine variation is detected. Glasses terms "
-                        "are consolidated into one canonical description.\n\n"
-                        "**Krea 2** – natural-language captions are generated after selection. "
-                        "Stable identity and body traits such as tattoos are stored in the subject profile "
-                        "and omitted from captions; scene-specific details remain captioned. Selecting this "
-                        "training target also applies the recommended 20-image, 40/35/25 distribution and Luna/Sol "
-                        "model defaults.\n\n"
-                        "**If unsure:** Choose the training target matching the base model."
-                        "</details>",
-                    ))
-                    gr.Markdown(tr(
-                        "Das Trainingsziel wird oben gewählt. Die folgenden Felder passen nur die Caption-Policy an; die gewählte Prompt-Familie und Caption-Engine bleiben aktiv.",
-                        "Choose the training target at the top. The fields below only customize caption policy; the selected prompt family and caption engine remain active.",
-                    ))
-                    c_captions = gr.CheckboxGroup(
-                        label=tr("Aktive Caption-Felder", "Active caption fields"),
-                        choices=CAPTION_FIELD_CHOICES,
-                        value=S["c_captions"],
-                        info=tr(
-                            "Welche Merkmale in die Trainings-Captions aufgenommen "
-                            "werden. Empfehlung pro Basismodell: bei ERNIE "
-                            "alle Felder einschließen, bei Z-Image Base nur "
-                            "variable Felder (Kleidung, Pose, Hintergrund, "
-                            "Brille-wenn-variabel, Hair-when-variable, variable Piercings/"
-                            "Ohrschmuck, Make-up, Visual-Style). Permanente Merkmale "
-                            "(Hautton, Augenfarbe, Körperbau, konstante Haare) "
-                            "lässt man bei Z-Image Base weg, damit das Trigger-Wort "
-                            "die Identität sauber absorbiert. Im Zweifel auf das "
-                            "Preset oben verlassen.",
-                            "Which attributes go into the training captions. "
-                            "Recommendation per base model: for ERNIE include "
-                            "all fields; for Z-Image Base only variable fields "
-                            "(clothing, pose, background, glasses-when-variable, "
-                            "hair-when-variable, variable piercings/ear jewelry, makeup, "
-                            "visual style). Persistent features (skin tone, eye "
-                            "color, body build, constant hair) are omitted with "
-                            "Z-Image Base so the trigger word cleanly absorbs "
-                            "identity. When in doubt trust the preset above.",
-                        ),
-                    )
-                    c_caption_policy_status = gr.Markdown(
-                        caption_policy_adjustment_note(S.get("c_training_target"), S.get("c_captions"))
-                    )
-                    c_variable_feature_mode = gr.Dropdown(
-                        label=tr("Regel für variable Identitätsmerkmale", "Variable identity feature rule"),
-                        choices=[
-                            (
-                                tr("Nur Abweichungen von der kanonischen Erscheinung", "Only deviations from the canonical appearance"),
-                                "canonical_deviations",
-                            ),
-                            (
-                                tr("Bei echter Variation jeden sichtbaren Wert captionieren", "Caption every visible value when genuine variation exists"),
-                                "all_visible_when_variable",
-                            ),
-                        ],
-                        value=S.get("c_variable_feature_mode", "canonical_deviations"),
-                        info=tr(
-                            "Standard: Die im Subject Profile festgelegte Grunderscheinung gehört zum Triggerwort; nur Abweichungen werden genannt. Alternative: Sobald echte Variation erkannt ist, wird der jeweilige sichtbare Wert in allen Bildern genannt. Gilt für Haarfarbe/-form, Augenfarbe, Bart und Brillenstatus.",
-                            "Default: the canonical appearance stored in the Subject Profile belongs to the trigger; only deviations are captioned. Alternative: once genuine variation is detected, every visible value is captioned. Applies to hair color/form, eye color, beard and glasses state.",
-                        ),
-                    )
-                    c_krea_caption_model = gr.Dropdown(
-                        label=tr("Krea-2-Caption-Modell", "Krea 2 caption model"),
-                        choices=OPENAI_MODEL_PRESET_CHOICES,
-                        value=S["c_krea_caption_model"],
-                        info=tr(
-                            "Nur beim Trainingsziel `Krea 2`: Erstellt nach der finalen Bildauswahl natürliche englische Captions aus Originalbild, Audit und bestätigtem Subject Profile. Empfehlung: gpt-6-luna.",
-                            "Only for the `Krea 2` training target: creates natural English captions after final image selection using the original image, audit and confirmed subject profile. Recommended: gpt-6-luna.",
-                        ),
-                        **openai_model_dropdown_kwargs(),
-                    )
-                    c_krea_caption_reasoning_effort = gr.Dropdown(
-                        label=tr("Reasoning Effort – Krea-Caption", "Reasoning effort – Krea caption"),
-                        choices=REASONING_EFFORT_CHOICES,
-                        value=S["c_krea_caption_reasoning_effort"],
-                        info=tr(
-                            "Reasoning für die finale natürliche Caption jedes ausgewählten Bildes. `none` ist der empfohlene Standard; `low` kann bei komplexen Szenen getestet werden.",
-                            "Reasoning for the final natural caption of each selected image. `none` is the recommended default; `low` can be tested for complex scenes.",
-                        ),
-                    )
-                    c_use_krea_caption_repair = gr.Checkbox(
-                        label=tr("Automatischen Caption-Reparaturversuch verwenden", "Use automatic caption repair attempt"),
-                        value=S["c_use_krea_caption_repair"],
-                        info=tr(
-                            "Wenn die erste Krea-Caption leer ist oder gegen Profil-/Caption-Regeln verstößt, wird nur dieses Bild einmal mit dem Reparaturmodell neu captioniert. Audit, Profil und Auswahl werden nicht wiederholt.",
-                            "If the first Krea caption is empty or violates profile/caption rules, only that image is captioned once more with the repair model. Audit, profile and selection are not repeated.",
-                        ),
-                    )
-                    with gr.Row():
-                        c_krea_caption_repair_model = gr.Dropdown(
-                            label=tr("Krea-2-Caption-Reparaturmodell", "Krea 2 caption repair model"),
-                            choices=OPENAI_MODEL_PRESET_CHOICES,
-                            value=S["c_krea_caption_repair_model"],
-                            info=tr(
-                                "Wird ausschließlich nach einem fehlgeschlagenen oder regelwidrigen ersten Caption-Versuch aufgerufen. Empfehlung: gpt-6.1-sol.",
-                                "Called only after a failed or policy-invalid first caption attempt. Recommended: gpt-6.1-sol.",
-                            ),
-                            **openai_model_dropdown_kwargs(),
-                        )
-                        c_krea_caption_repair_reasoning_effort = gr.Dropdown(
-                            label=tr("Reasoning Effort – Caption-Reparatur", "Reasoning effort – caption repair"),
-                            choices=REASONING_EFFORT_CHOICES,
-                            value=S["c_krea_caption_repair_reasoning_effort"],
-                            info=tr(
-                                "Der Reparaturversuch erhält die konkrete Validierungsfehlermeldung und die erste Caption. `low` ist der empfohlene Standard.",
-                                "The repair attempt receives the exact validation error and first caption. `low` is the recommended default.",
-                            ),
-                        )
-                    c_target_defaults_event = c_training_target.change(
-                        fn=apply_training_target_defaults,
-                        inputs=[
-                            c_training_target, c_captions, c_target,
-                            c_ratio_h, c_ratio_m, c_ratio_f,
-                            c_model, c_audit_reasoning_effort,
-                            c_trigger_reasoning_effort, c_review_escalation_reasoning_effort,
-                            c_profile_normalizer_model, c_profile_reasoning_effort,
-                            c_krea_caption_model, c_krea_caption_reasoning_effort,
-                            c_pipeline_mode,
-                        ],
-                        outputs=[
-                            c_captions, c_target,
-                            c_ratio_h, c_ratio_m, c_ratio_f,
-                            c_model, c_audit_reasoning_effort,
-                            c_trigger_reasoning_effort, c_review_escalation_reasoning_effort,
-                            c_profile_normalizer_model, c_profile_reasoning_effort,
-                            c_krea_caption_model, c_krea_caption_reasoning_effort,
-                            c_pipeline_mode,
-                        ],
-                    )
+                                gr.Markdown(tr(
+                                    "**Weiche Canon-Repräsentation:** Nach Bestätigung des Subject Profiles erhält die gewählte kanonische Haarfarbe einen abnehmenden Auswahlbonus. Die Headshot-/Medium-/Full-Body-Quoten bleiben unverändert. Review- und Reject-Bilder werden durch den Canon-Bonus niemals automatisch hochgesetzt; eine ausdrückliche Priority-Markierung bleibt davon unberührt.",
+                                    "**Soft canon representation:** After the Subject Profile is confirmed, the selected canonical hair color receives a diminishing selection bonus. Headshot/medium/full-body quotas remain unchanged. Review and reject images are never promoted automatically by the canon bonus; an explicit Priority override remains unaffected.",
+                                ))
+                                c_use_canon_representation = gr.Checkbox(
+                                    label=tr("Canon-Repräsentation bei der Auswahl fördern", "Promote canon representation during selection"),
+                                    value=S["c_use_canon_representation"],
+                                    info=tr(
+                                        "Wirkt erst beim Captioning aus dem bestätigten Profil. Der Bonus gilt nur für bereits geeignete Keep-Kandidaten innerhalb der jeweiligen Shot-Kategorie.",
+                                        "Takes effect when continuing from the confirmed profile. The bonus only applies to already eligible keep candidates within the current shot category.",
+                                    ),
+                                )
+                                with gr.Row():
+                                    c_canon_representation_target = gr.Slider(
+                                        label=tr("Weiches Canon-Ziel", "Soft canon target"),
+                                        minimum=0,
+                                        maximum=5,
+                                        step=1,
+                                        value=S["c_canon_representation_target"],
+                                        info=tr(
+                                            "Gewünschte Mindestanzahl guter Bilder mit der bestätigten Canon-Haarfarbe. Standard bei 20 Bildern: 3. Kein hartes Minimum.",
+                                            "Desired minimum number of good images with the confirmed canonical hair color. Default for 20 images: 3. Not a hard minimum.",
+                                        ),
+                                    )
+                                    c_canon_max_quality_gap = gr.Slider(
+                                        label=tr("Max. Qualitätsabstand für Canon-Bonus", "Max quality gap for canon bonus"),
+                                        minimum=0,
+                                        maximum=15,
+                                        step=0.5,
+                                        value=S["c_canon_max_quality_gap"],
+                                        info=tr(
+                                            "Ein Canon-Kandidat erhält nur dann den Bonus, wenn er höchstens so viele Quality-Total-Punkte hinter der besten Alternative liegt. Standard: 5.",
+                                            "A canon candidate only receives the bonus if it is no more than this many quality-total points behind the best alternative. Default: 5.",
+                                        ),
+                                    )
 
-                    c_target_defaults_event.then(
-                        fn=caption_policy_adjustment_note,
-                        inputs=[c_training_target, c_captions],
-                        outputs=[c_caption_policy_status],
-                    )
-                    c_captions.change(
-                        fn=caption_policy_adjustment_note,
-                        inputs=[c_training_target, c_captions],
-                        outputs=[c_caption_policy_status],
-                    )
+                            with gr.Accordion(tr("🧭 Kopfpose-Diversität", "🧭 Head pose diversity"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Wozu Kopfpose-Diversität?</b></summary>"
+                                    "\n\n"
+                                    "Wenn dein Trainings-Set aus 25 Frontal-Aufnahmen und nur 5 anderen "
+                                    "Posen besteht, lernt das LoRA Frontalansichten hervorragend, aber "
+                                    "3/4-Profile schlecht. Bei späteren Generierungen siehst du das oft "
+                                    "als 'Identitätsbruch' – sobald die Pose vom Frontalen abweicht, "
+                                    "passt das Gesicht nicht mehr ganz.\n\n"
+                                    "Die Kopfpose-Diversität sorgt dafür, dass bei der Endauswahl Bilder "
+                                    "mit gleicher Kopfpose (frontal, 3/4-Profil-links, 3/4-Profil-rechts, "
+                                    "Profil, von oben, von unten, von hinten) Punktabzug bekommen, sobald "
+                                    "schon genug von dieser Pose im Set sind. Bei zwei ähnlich guten "
+                                    "Bildern gewinnt dann das mit der unterrepräsentierten Pose.\n\n"
+                                    "**Wichtig:** Kein Hard-Reject – qualitativ deutlich schlechtere "
+                                    "Bilder mit seltener Pose werden nicht stur bevorzugt. Der Abzug "
+                                    "wirkt nur, wenn die Bilder ähnlich gut sind.\n\n"
+                                    "**Empfohlen:** an. Die KI bewertet die Kopfpose ohnehin im normalen "
+                                    "Bewertungs-Schritt mit – also keine zusätzlichen API-Kosten."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ Why head pose diversity?</b></summary>"
+                                    "\n\n"
+                                    "If your training set is 25 frontal shots and only 5 other poses, "
+                                    "the LoRA learns frontal views excellently but three-quarter views "
+                                    "poorly. In later generation you see this as 'identity break' – as "
+                                    "soon as the pose deviates from frontal, the face doesn't quite "
+                                    "match.\n\n"
+                                    "Head pose diversity ensures that during final selection, images "
+                                    "with the same head pose (frontal, three-quarter-left, three-"
+                                    "quarter-right, profile, looking up, looking down, back) get a "
+                                    "score deduction once enough of that pose is already in the set. "
+                                    "Between two similarly-good images, the one with the under-"
+                                    "represented pose wins.\n\n"
+                                    "**Important:** Not a hard reject – clearly worse images with rare "
+                                    "poses aren't blindly preferred. The penalty only matters when "
+                                    "images are similarly good.\n\n"
+                                    "**Recommended:** on. The AI scores head pose anyway during normal "
+                                    "scoring – so no additional API costs."
+                                    "</details>",
+                                ))
+                                c_use_pose_diversity = gr.Checkbox(
+                                    label=tr("Pose-Diversität aktivieren", "Enable pose diversity"),
+                                    value=S["c_use_pose_diversity"],
+                                    info=tr(
+                                        "Empfohlen: an. Nutzt die KI-Klassifikation der Kopfpose – kostet keine zusätzlichen API-Calls.",
+                                        "Recommended: on. Uses the AI's head pose classification – no extra API calls.",
+                                    ),
+                                )
+                                with gr.Row():
+                                    c_pose_soft_limit = gr.Slider(
+                                        label=tr("Erlaubte Anzahl pro Pose (ohne Abzug)", "Allowed per pose (without penalty)"),
+                                        minimum=1,
+                                        maximum=8,
+                                        step=1,
+                                        value=S["c_pose_soft_limit"],
+                                        info=tr(
+                                            "Bis zu wie vielen Bildern pro Pose es noch keinen Punktabzug gibt. Empfohlen: 2. Bei kleinen Datasets (<20 Bilder) macht 1 mehr Druck Richtung Vielfalt; bei großen (>50) eher 3.",
+                                            "Up to how many images per pose receive no penalty. Recommended: 2. For small datasets (<20 images), 1 pushes harder toward variety; for large ones (>50), 3.",
+                                        ),
+                                    )
+                                    c_pose_penalty_weight = gr.Slider(
+                                        label=tr("Stärke des Punktabzugs", "Penalty strength"),
+                                        minimum=0.0,
+                                        maximum=10.0,
+                                        step=0.5,
+                                        value=S["c_pose_penalty_weight"],
+                                        info=tr(
+                                            "Wie deutlich überzählige Posen abgewertet werden. Empfohlen: 4.0. Höher (6.0+) bevorzugt Pose-Vielfalt fast um jeden Preis – gut bei sehr selfie-lastigem Material. Niedriger (2.0) macht den Effekt subtil.",
+                                            "How strongly excess poses get penalized. Recommended: 4.0. Higher (6.0+) prefers pose variety almost at any cost – good for very selfie-heavy material. Lower (2.0) makes the effect subtle.",
+                                        ),
+                                    )
 
-                with gr.Accordion(tr("💾 Export-Optionen", "💾 Export options"), open=False):
-                    gr.Markdown(tr(
-                        "<details>"
-                        "<summary><b>ℹ️ Welche Ordner und Exporte gibt es?</b></summary>"
-                        "\n\n"
-                        "Der Curator legt im Ausgabeverzeichnis mehrere Unterordner an, "
-                        "abhängig von den hier ausgewählten Optionen:\n\n"
-                        "**01_train_ready** (immer): Die finalen Bilder mit Captions, "
-                        "fertig fürs LoRA-Training. Das ist das eigentliche Ergebnis.\n\n"
-                        "**02_keep_unused** (immer): Bilder, die qualitativ gut genug "
-                        "wären, aber wegen der Cluster-Limits oder Diversitäts-Regeln nicht "
-                        "ins finale Set kamen. Falls dir später Material fehlt, kannst du "
-                        "von hier nachschöpfen.\n\n"
-                        "**05_reject** (optional): Verworfene Bilder mit Begründung in "
-                        "der Caption-Datei (z. B. 'rejected: face_blur_too_low'). Nützlich "
-                        "zum Debuggen, ob deine Schwellen zu streng sind. Bei großen "
-                        "Datasets kann das viele MB werden.\n\n"
-                        "**04_review** (optional): Bilder die das Hauptmodell "
-                        "als 'review' markiert hat – Grenzfälle, die du visuell prüfen "
-                        "kannst. Wenn die Eskalation an ist, sind das die Bilder, die "
-                        "zusätzlich vom stärkeren Modell entschieden wurden.\n\n"
-                        "**06_needs_manual_review** (immer, wenn nötig): Sammelt alles, "
-                        "was menschliche Prüfung braucht – z. B. technische Audit-Ausfälle (Präfix "
-                        "`AUDITTECH_`) und Hard-Flag-Identitätsmismatches (Präfix `IDCHECK_`).\n\n"
-                        "**08_smart_crop_pairs** (optional): Pärchen aus Original und "
-                        "Smart-Pre-Crop-Variante mit beiden Scores im Dateinamen. Wertvoll "
-                        "zum Debuggen, ob deine Smart-Crop-Einstellungen sinnvoll sind. "
-                        "Kostet Speicherplatz, aber bei Bedarf sehr aufschlussreich."
-                        "</details>",
-                        "<details>"
-                        "<summary><b>ℹ️ What folders and exports exist?</b></summary>"
-                        "\n\n"
-                        "The curator creates several subfolders in the output directory, "
-                        "depending on the options selected here:\n\n"
-                        "**01_train_ready** (always): The final images with captions, "
-                        "ready for LoRA training. This is the actual deliverable.\n\n"
-                        "**02_keep_unused** (always): Images that would be quality-wise "
-                        "good enough but didn't make the final set due to cluster limits "
-                        "or diversity rules. If you later need more material, you can pull "
-                        "from here.\n\n"
-                        "**05_reject** (optional): Rejected images with reason in the "
-                        "caption file (e.g. 'rejected: face_blur_too_low'). Useful for "
-                        "debugging whether your thresholds are too strict. For large "
-                        "datasets this can grow to many MB.\n\n"
-                        "**04_review** (optional): Images the main model "
-                        "flagged as 'review' – borderline cases for visual inspection. "
-                        "When escalation is on, these are the images additionally "
-                        "decided by the stronger model.\n\n"
-                        "**06_needs_manual_review** (always, when needed): Collects "
-                        "everything that needs human review – e.g. technical audit failures (prefix "
-                        "`AUDITTECH_`) and hard-flagged identity mismatches (prefix "
-                        "`IDCHECK_`).\n\n"
-                        "**08_smart_crop_pairs** (optional): Pairs of original and "
-                        "smart-pre-crop variant with both scores in the filename. "
-                        "Valuable for debugging whether your smart-crop settings make "
-                        "sense. Costs disk space, but very informative when needed."
-                        "</details>",
-                    ))
-                    with gr.Row():
-                        c_exp_review = gr.Checkbox(
-                            label=tr("Review-Kandidaten exportieren", "Export review candidates"),
-                            value=S["c_exp_review"],
-                            info=tr(
-                                "Speichert Bilder im Grenzbereich in `04_review` zur manuellen Sichtung. Empfohlen: an, besonders wenn dir der Curator gerade neue Schwellen lernt.",
-                                "Saves borderline images to `04_review` for manual review. Recommended: on, especially while you're tuning the curator's thresholds.",
-                            ),
-                        )
-                        c_exp_reject = gr.Checkbox(
-                            label=tr("Verworfene Bilder exportieren", "Export rejected images"),
-                            value=S["c_exp_reject"],
-                            info=tr(
-                                "Speichert verworfene Bilder mit Reject-Grund in `05_reject`. Empfohlen: an für die ersten Läufe (zum Debuggen). Bei großen Produktions-Datasets kannst du es ausschalten, um Platz zu sparen.",
-                                "Saves rejected images with reject reason to `05_reject`. Recommended: on for initial runs (for debugging). For large production datasets you can turn it off to save space.",
-                            ),
-                        )
-                        c_exp_compare = gr.Checkbox(
-                            label=tr("Smart-Crop-Vergleichspaare exportieren", "Export smart-crop comparison pairs"),
-                            value=S["c_exp_compare"],
-                            info=tr(
-                                "Speichert Original und Smart-Crop nebeneinander in `08_smart_crop_pairs`, mit beiden Bewertungen im Dateinamen. Empfohlen: an, wenn du Smart Pre-Crop nutzt – essentiell zum Debuggen, falls die Crops nicht so aussehen wie erwartet.",
-                                "Saves original and smart crop side-by-side in `08_smart_crop_pairs`, with both scores in the filename. Recommended: on if you use smart pre-crop – essential for debugging when crops don't look as expected.",
-                            ),
-                        )
-                    c_controlled_buckets = gr.Checkbox(
-                        label=tr("Kontrollierte Buckets verwenden", "Use controlled buckets"),
-                        value=S["c_controlled_buckets"],
-                        info=tr(
-                            "Standard: aus. Aus behält die natürliche Komposition der ausgewählten Bilder bei. An normalisiert erst beim finalen Export: Headshots 1024×1024, Medium und Full Body 832×1216. IG-Rahmenentfernung und Rettungs-Crops bleiben davon unabhängig.",
-                            "Default: off. Off preserves the natural composition of selected images. On normalizes only during final export: headshots 1024×1024, medium and full body 832×1216. IG-frame removal and rescue crops remain independent.",
-                        ),
-                    )
+                            with gr.Accordion(tr("🪪 Identitäts-Konsistenz-Check (ArcFace)", "🪪 Identity consistency check (ArcFace)"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Was macht der Identitäts-Konsistenz-Check?</b></summary>"
+                                    "\n\n"
+                                    "Bei Person-LoRAs gibt es eine Klasse von Bug, die unsichtbar bleibt "
+                                    "und das Training trotzdem ruiniert: **Ein einzelnes Bild der falschen "
+                                    "Person mischt sich in dein Dataset.** Das passiert leichter als man "
+                                    "denkt – die Schwester sieht ähnlich aus, ein altes Foto stammt noch "
+                                    "aus der Pubertät, oder Smart Pre-Crop hat versehentlich die Bekannte "
+                                    "im Hintergrund gezoomt.\n\n"
+                                    "29 von 30 Bildern korrekt, 1 falsche Person dabei → das LoRA "
+                                    "produziert visuell oft 'fast richtige' Gesichter, die irgendwie nicht "
+                                    "ganz die Person treffen. Du siehst auf den ersten Blick nicht, woran "
+                                    "es liegt.\n\n"
+                                    "**Wie der Check funktioniert:**\n\n"
+                                    "ArcFace ist ein KI-Modell, das speziell auf Gesichts-Identität "
+                                    "trainiert ist. Es berechnet pro Bild einen Identitäts-Vektor, der "
+                                    "bei Bildern *derselben Person* sehr ähnlich ist – auch bei anderen "
+                                    "Posen, Beleuchtung oder Alter. Der Curator berechnet diese Vektoren "
+                                    "für alle Bilder im Final-Set, mittelt sie zu einer 'Set-Identität' "
+                                    "und vergleicht jedes einzelne Bild damit.\n\n"
+                                    "**Outlier-Trimming:** Vor der Mittelung werden die schlechtesten "
+                                    "Vektoren verworfen. Das verhindert, dass 2–3 falsche Bilder den "
+                                    "Mittelwert in ihre Richtung ziehen und der Check dann unzuverlässig "
+                                    "wird.\n\n"
+                                    "**Drei Klassifikationen pro Bild:**\n\n"
+                                    "**Hard-Flag** (Ähnlichkeit unter Hard-Schwelle): Wahrscheinlich eine "
+                                    "andere Person. Das Bild wird **aus 01_train_ready entfernt** und mit "
+                                    "Präfix `IDCHECK_` nach 06_needs_manual_review kopiert. Captions "
+                                    "bleiben unangetastet.\n\n"
+                                    "**Soft-Flag** (Ähnlichkeit zwischen Hard und Soft): Grenzfall, "
+                                    "könnte dieselbe Person mit Beauty-Filter / extremem Makeup / Brille "
+                                    "sein. Das Bild **bleibt** im Train-Set, wird aber im Markdown-Report "
+                                    "markiert für deinen visuellen Check.\n\n"
+                                    "**OK** (Ähnlichkeit über Soft-Schwelle): Klar dieselbe Person.\n\n"
+                                    "**Voraussetzung:** Mindestens 5 Gesichter im Set müssen erkennbar "
+                                    "sein, sonst ist der Mittelwert nicht aussagekräftig und der Check "
+                                    "wird übersprungen.\n\n"
+                                    "**Installation:** `pip install insightface onnxruntime-gpu` (oder "
+                                    "`onnxruntime` ohne GPU). Beim ersten Lauf werden ~250 MB Modell-"
+                                    "Daten nach `~/.insightface/models/` heruntergeladen. Wenn du "
+                                    "ComfyUI mit FaceID/ReActor benutzt, sind die Modelle wahrscheinlich "
+                                    "schon da.\n\n"
+                                    "**Lizenz-Hinweis:** Die ArcFace-Modelle (`buffalo_l` etc.) sind nur "
+                                    "für nicht-kommerzielle Forschung freigegeben. Für private LoRA-"
+                                    "Erstellung ist das unproblematisch."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ What does the identity consistency check do?</b></summary>"
+                                    "\n\n"
+                                    "Person LoRAs have a class of bug that stays invisible but ruins "
+                                    "training anyway: **a single image of the wrong person sneaking into "
+                                    "your dataset.** It happens more easily than you'd think – a sister "
+                                    "looks similar, an old photo is from puberty, or smart pre-crop "
+                                    "accidentally zoomed in on the friend in the background.\n\n"
+                                    "29 out of 30 images correct, 1 wrong person → the LoRA often "
+                                    "produces 'almost right' faces that somehow don't quite hit the "
+                                    "person. At first glance, you can't tell why.\n\n"
+                                    "**How the check works:**\n\n"
+                                    "ArcFace is an AI model trained specifically on face identity. It "
+                                    "computes one identity vector per image that's very similar for "
+                                    "*the same person* across different poses, lighting or ages. The "
+                                    "curator computes these vectors for all final-set images, averages "
+                                    "them into a 'set identity' and compares each image against it.\n\n"
+                                    "**Outlier trimming:** Before averaging, the worst vectors are "
+                                    "dropped. This prevents 2–3 wrong images from pulling the average "
+                                    "toward their identity and making the check unreliable.\n\n"
+                                    "**Three classifications per image:**\n\n"
+                                    "**Hard flag** (similarity below hard threshold): Likely a different "
+                                    "person. The image is **removed from 01_train_ready** and copied to "
+                                    "06_needs_manual_review with prefix `IDCHECK_`. Captions stay "
+                                    "untouched.\n\n"
+                                    "**Soft flag** (similarity between hard and soft): Borderline, could "
+                                    "be the same person with a beauty filter / heavy makeup / glasses. "
+                                    "The image **stays** in the train set but gets marked in the "
+                                    "markdown report for your visual check.\n\n"
+                                    "**OK** (similarity above soft threshold): Clearly the same person.\n\n"
+                                    "**Requirement:** At least 5 detected faces in the set, otherwise "
+                                    "the average is not meaningful and the check gets skipped.\n\n"
+                                    "**Installation:** `pip install insightface onnxruntime-gpu` (or "
+                                    "`onnxruntime` without GPU). On first run, ~250 MB of model data "
+                                    "auto-download to `~/.insightface/models/`. If you use ComfyUI with "
+                                    "FaceID/ReActor, the models are probably already there.\n\n"
+                                    "**License note:** The ArcFace models (`buffalo_l` etc.) are "
+                                    "licensed for non-commercial research only. For private LoRA "
+                                    "creation that's not an issue."
+                                    "</details>",
+                                ))
+                                c_use_arcface = gr.Checkbox(
+                                    label=tr("Identitäts-Check aktivieren", "Enable identity check"),
+                                    value=S["c_use_arcface"],
+                                    info=tr(
+                                        "Empfohlen: an. Wird automatisch übersprungen, wenn insightface nicht installiert ist – also kein Problem, wenn du das erst später nachinstallierst.",
+                                        "Recommended: on. Automatically skipped if insightface isn't installed – no problem if you install it later.",
+                                    ),
+                                )
+                                with gr.Row():
+                                    c_arcface_hard = gr.Slider(
+                                        label=tr("Hard-Schwelle (Bild fliegt raus)", "Hard threshold (image gets removed)"),
+                                        minimum=0.20,
+                                        maximum=0.80,
+                                        step=0.01,
+                                        value=S["c_arcface_hard"],
+                                        info=tr(
+                                            "Unter diesem Ähnlichkeits-Wert wird das Bild aus dem Train-Set entfernt. Empfohlen: 0.50 (konservativ – nur klare Mismatches). 0.40 = sehr tolerant. 0.60 = streng (kann auch echte Treffer mit starkem Beauty-Filter rauswerfen).",
+                                            "Below this similarity, the image is removed from the train set. Recommended: 0.50 (conservative – only clear mismatches). 0.40 = very tolerant. 0.60 = strict (may also reject real matches with heavy beauty filters).",
+                                        ),
+                                    )
+                                    c_arcface_soft = gr.Slider(
+                                        label=tr("Soft-Schwelle (Bild bleibt, wird markiert)", "Soft threshold (image stays, gets marked)"),
+                                        minimum=0.30,
+                                        maximum=0.90,
+                                        step=0.01,
+                                        value=S["c_arcface_soft"],
+                                        info=tr(
+                                            "Zwischen Hard und Soft gilt ein Bild als Grenzfall. Empfohlen: 0.65. Niedriger = nur deutliche Grenzfälle werden markiert. Höher = mehr Bilder bekommen den Soft-Flag (gut wenn du genauer hinschauen willst).",
+                                            "Between hard and soft, an image counts as borderline. Recommended: 0.65. Lower = only clear borderline cases get marked. Higher = more images get a soft flag (good if you want to inspect more carefully).",
+                                        ),
+                                    )
+                                with gr.Row():
+                                    c_arcface_trim = gr.Slider(
+                                        label=tr("Anteil verworfener Ausreißer", "Outlier-trim fraction"),
+                                        minimum=0.0,
+                                        maximum=0.30,
+                                        step=0.01,
+                                        value=S["c_arcface_trim"],
+                                        info=tr(
+                                            "Welcher Anteil der schlechtesten Identitäts-Vektoren vor der Mittelwert-Berechnung verworfen wird. Empfohlen: 0.10 (10 %, fängt 1–2 falsche Bilder im 30er-Set ab). 0 = kein Trimming. 0.20 = bei Datasets, in denen du mehrere falsche Bilder vermutest.",
+                                            "Fraction of worst identity vectors dropped before centroid calculation. Recommended: 0.10 (10 %, catches 1–2 wrong images in a 30-image set). 0 = no trimming. 0.20 = for datasets where you suspect several wrong images.",
+                                        ),
+                                    )
+                                    c_arcface_min_faces = gr.Slider(
+                                        label=tr("Min. erkannte Gesichter im Set", "Min detected faces in set"),
+                                        minimum=3,
+                                        maximum=15,
+                                        step=1,
+                                        value=S["c_arcface_min_faces"],
+                                        info=tr(
+                                            "Wenn weniger Gesichter im Final-Set erkannt werden, wird der Check übersprungen (zu unzuverlässig). Empfohlen: 5. Bei sehr kleinen Datasets (Ziel <15 Bilder) kannst du auf 3 senken.",
+                                            "If fewer faces are detected in the final set, the check is skipped (not reliable enough). Recommended: 5. For very small datasets (target <15 images) you can lower to 3.",
+                                        ),
+                                    )
+                                with gr.Row():
+                                    c_arcface_model = gr.Dropdown(
+                                        label=tr("ArcFace-Modell", "ArcFace model"),
+                                        choices=["buffalo_l", "buffalo_s", "buffalo_m", "antelopev2"],
+                                        value=S["c_arcface_model"],
+                                        info=tr(
+                                            "Empfohlen: buffalo_l (höchste Genauigkeit). buffalo_s ist schneller und kleiner, aber weniger genau – nur wählen wenn du auf CPU läufst und Geschwindigkeit zählt.",
+                                            "Recommended: buffalo_l (highest accuracy). buffalo_s is faster and smaller but less accurate – only pick if you run on CPU and speed matters.",
+                                        ),
+                                    )
+                                    c_arcface_det_size = gr.Slider(
+                                        label=tr("Auflösung der Gesichtserkennung (px)", "Face detection resolution (px)"),
+                                        minimum=320,
+                                        maximum=1024,
+                                        step=32,
+                                        value=S["c_arcface_det_size"],
+                                        info=tr(
+                                            "Auf welche Größe Bilder vor der Gesichtserkennung skaliert werden. Empfohlen: 640 (balanciert). 320 = schneller, kann aber kleine Gesichter verpassen. 1024 = genauer, aber deutlich langsamer.",
+                                            "Resolution images get scaled to before face detection. Recommended: 640 (balanced). 320 = faster but may miss small faces. 1024 = more accurate but noticeably slower.",
+                                        ),
+                                    )
+
+                        with gr.TabItem(tr("Captions & Export", "Captions & export")):
+                            with gr.Accordion(tr("🧬 Subject Profile / Pipeline-Modus", "🧬 Subject Profile / pipeline mode"), open=False):
+                                gr.Markdown(tr(
+                                    "Phase 2 baut nach dem Bild-Audit ein zentrales Profil des Models. "
+                                    "Reject- und Review-Bilder werden dafür ausgeschlossen. Bei großen Datasets "
+                                    "wird ein stratifiziertes Sample an den Normalizer geschickt und die Regeln "
+                                    "werden lokal auf alle verwertbaren Bilder angewendet. Marker wie Brille, "
+                                    "Tattoos und Piercings bleiben strikt force-only-when-visible.\n\n"
+                                    "👉 **Profil bearbeiten** und das anschließende Captioning aus dem Profil "
+                                    "starten findest du im eigenen Tab `🧬 Subject Profile`.",
+                                    "Phase 2 builds a central subject profile after image audit. Reject and review "
+                                    "images are excluded. For large datasets, a stratified sample is sent to the "
+                                    "normalizer and the rules are applied locally to all usable images. Markers "
+                                    "such as glasses, tattoos and piercings remain strictly force-only-when-visible.\n\n"
+                                    "👉 **Editing the profile** and starting captioning from the profile is done "
+                                    "in the dedicated `🧬 Subject Profile` tab.",
+                                ))
+                                c_profile_normalizer_model = gr.Dropdown(
+                                    label=tr("Profile-Normalizer-Modell", "Profile normalizer model"),
+                                    choices=OPENAI_MODEL_PRESET_CHOICES,
+                                    value=S["c_profile_normalizer_model"],
+                                    info=tr(
+                                        "Modell für den einen zusätzlichen Profil-Call pro Lauf. Für Krea 2 empfohlen: gpt-6.1-sol mit niedrigem Reasoning.",
+                                        "Model for the single additional profile call per run. Recommended for Krea 2: gpt-6.1-sol with low reasoning.",
+                                    ),
+                                    **openai_model_dropdown_kwargs(),
+                                )
+                                c_profile_reasoning_effort = gr.Dropdown(
+                                    label=tr("Reasoning Effort – Subject Profile", "Reasoning effort – subject profile"),
+                                    choices=REASONING_EFFORT_CHOICES,
+                                    value=S["c_profile_reasoning_effort"],
+                                    info=tr(
+                                        "Der Profil-Call muss stabile und variable Merkmale über viele Bilder abgleichen. `low` ist der empfohlene Standard; `medium` kann bei widersprüchlichen Datensätzen sinnvoll sein.",
+                                        "The profile call reconciles stable and variable traits across many images. `low` is the recommended default; `medium` can help with contradictory datasets.",
+                                    ),
+                                )
+                                with gr.Row():
+                                    c_profile_sample_threshold = gr.Slider(
+                                        label=tr("Sampling ab N Bildern", "Sample when above N images"),
+                                        minimum=20,
+                                        maximum=2000,
+                                        step=10,
+                                        value=S["c_profile_sample_threshold"],
+                                        info=tr(
+                                            "Bis zu dieser Anzahl gehen alle verwertbaren Bilder in den Profil-Normalizer. Darüber wird gesampelt.",
+                                            "Up to this number, all usable images go into the profile normalizer. Above this, stratified sampling is used.",
+                                        ),
+                                    )
+                                    c_profile_sample_size = gr.Slider(
+                                        label=tr("Profil-Sample-Größe", "Profile sample size"),
+                                        minimum=20,
+                                        maximum=300,
+                                        step=5,
+                                        value=S["c_profile_sample_size"],
+                                        info=tr(
+                                            "Wie viele Bilder bei großen Datasets maximal für den Normalizer ausgewählt werden. Empfehlung: 80.",
+                                            "Maximum number of images selected for the normalizer on large datasets. Recommended: 80.",
+                                        ),
+                                    )
+
+                            with gr.Accordion(tr("📝 Caption-Regeln", "📝 Caption rules"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Wie funktionieren die Captions?</b></summary>"
+                                    "\n\n"
+                                    "Beim LoRA-Training bekommt das Modell pro Bild eine Text-"
+                                    "Beschreibung (Caption) mitgeliefert. Daran lernt es, was zur Person "
+                                    "gehört (intrinsisch, immer gleich) und was austauschbar ist "
+                                    "(situativ, ändert sich).\n\n"
+                                    "Der Curator generiert die Captions automatisch aus der KI-Analyse "
+                                    "der Bilder. Du kannst auswählen, welche Merkmale in die Captions "
+                                    "aufgenommen werden – das beeinflusst, wie das LoRA später auf "
+                                    "Prompts reagiert.\n\n"
+                                    "**Trainingsziel und Caption-Policy:**\n\n"
+                                    "Das oben gewählte Trainingsziel bestimmt Caption-Format und Feldvorgaben; der Erstbeschreibungs-Provider wird separat gewählt. "
+                                    "Die Einzelfelder hier steuern, welche Merkmale in die finale Caption aufgenommen werden.\n\n"
+                                    "**Aktive Caption-Felder:**\n\n"
+                                    "Welche Eigenschaften gehen in die Beschreibung? Die "
+                                    "Antwort hängt am Basismodell:\n\n"
+                                    "**ERNIE** – alle Felder einschließen. ERNIE-Image hat im "
+                                    "Default einen asiatischen Bias, der durch redundante Anker "
+                                    "(blonde hair, blue eyes, fair skin) ausgeglichen wird. "
+                                    "Auch permanente Eigenschaften gehören in jede Caption.\n\n"
+                                    "**Z-Image Base** – nur veränderliche Felder. Z-Image hat "
+                                    "ein starkes Sprachverständnis und kennt Standardkonzepte "
+                                    "schon. Permanente Identitätsmerkmale (Hautton, Augenfarbe, "
+                                    "Körperbau, konstante Frisur) werden weggelassen, damit das "
+                                    "Trigger-Wort die Person-Identität sauber absorbiert. Nur "
+                                    "variable Sachen (Kleidung, Pose, Hintergrund, Brille wenn "
+                                    "wechselnd, Hair-when-variable, variable Piercings/Ohrschmuck, Make-up, Bildstil) "
+                                    "kommen rein. Vorteil: bessere Steuerbarkeit bei Inferenz "
+                                    "('Kathi mit roten Haaren' funktioniert sauber, weil der "
+                                    "Trigger 'blonde' nicht in der Caption mitfährt).\n\n"
+                                    "**Regel für variable Identitätsmerkmale:** Das Subject Profile "
+                                    "normalisiert Haarfarbe/-form, Augenfarbe, Bart und Brille und "
+                                    "legt eine kanonische Baseline fest. Im Standardmodus wird nur "
+                                    "eine Abweichung captioniert (z. B. 'red hair' bei canon blond). "
+                                    "Alternativ kann bei echter Variation jeder sichtbare Wert "
+                                    "captioniert werden. Brillenbegriffe werden dabei auf eine "
+                                    "kanonische Beschreibung vereinheitlicht.\n\n"
+                                    "**Wenn du unsicher bist:** ERNIE ist der robustere Default, "
+                                    "Z-Image Base ist die saubere Wahl wenn du gezielt auf "
+                                    "Z-Image_Base trainierst und maximale Inferenz-Flexibilität "
+                                    "willst."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ How do captions work?</b></summary>"
+                                    "\n\n"
+                                    "During LoRA training, each image gets a text description (caption) "
+                                    "alongside it. From this the model learns what's intrinsic to the "
+                                    "person (always the same) and what's swappable (situational, "
+                                    "changes).\n\n"
+                                    "The curator generates captions automatically from the AI image "
+                                    "analysis. You pick which attributes go into the captions – this "
+                                    "affects how the LoRA later reacts to prompts.\n\n"
+                                    "**Training target and caption policy:**\n\n"
+                                    "The training target selected above chooses caption format and field defaults. "
+                                    "The initial description provider is selected independently; the fields here control final composition.\n\n"
+                                    "**Active caption fields:**\n\n"
+                                    "Which attributes go into the description? The answer "
+                                    "depends on the base model:\n\n"
+                                    "**ERNIE** – include all fields. ERNIE-Image has an "
+                                    "Asia-leaning default bias that's compensated by redundant "
+                                    "anchors (blonde hair, blue eyes, fair skin). Even "
+                                    "persistent attributes belong in every caption.\n\n"
+                                    "**Z-Image Base** – only variable fields. Z-Image has "
+                                    "strong language understanding and already knows standard "
+                                    "concepts. Persistent identity features (skin tone, eye "
+                                    "color, body build, consistent hair) are omitted so the "
+                                    "trigger word cleanly absorbs the person identity. Only "
+                                    "variable things (clothing, pose, background, glasses if "
+                                    "they vary, hair-when-variable, variable piercings or ear jewelry, makeup, visual "
+                                    "style) go in. Benefit: better inference steerability "
+                                    "('Kathi with red hair' works cleanly because the trigger "
+                                    "doesn't drag 'blonde' along in every caption).\n\n"
+                                    "**Variable identity feature rule:** The Subject Profile "
+                                    "normalizes hair color/form, eye color, beard and glasses and "
+                                    "stores a canonical baseline. In the default mode only a "
+                                    "deviation is captioned (for example 'red hair' when blonde "
+                                    "is canonical). Alternatively, every visible value can be "
+                                    "captioned once genuine variation is detected. Glasses terms "
+                                    "are consolidated into one canonical description.\n\n"
+                                    "**Krea 2** – natural-language captions are generated after selection. "
+                                    "Stable identity and body traits such as tattoos are stored in the subject profile "
+                                    "and omitted from captions; scene-specific details remain captioned. Selecting this "
+                                    "training target also applies the recommended 20-image, 40/35/25 distribution and Luna/Sol "
+                                    "model defaults.\n\n"
+                                    "**If unsure:** Choose the training target matching the base model."
+                                    "</details>",
+                                ))
+                                gr.Markdown(tr(
+                                    "Das Trainingsziel wird oben gewählt. Die folgenden Felder passen nur die Caption-Policy an; der Erstbeschreibungs-Provider wird separat oben gewählt.",
+                                    "Choose the training target at the top. The fields below only customize caption policy; choose the initial description provider separately at the top.",
+                                ))
+                                c_captions = gr.CheckboxGroup(
+                                    label=tr("Aktive Caption-Felder", "Active caption fields"),
+                                    choices=CAPTION_FIELD_CHOICES,
+                                    value=S["c_captions"],
+                                    info=tr(
+                                        "Welche Merkmale in die Trainings-Captions aufgenommen "
+                                        "werden. Empfehlung pro Basismodell: bei ERNIE "
+                                        "alle Felder einschließen, bei Z-Image Base nur "
+                                        "variable Felder (Kleidung, Pose, Hintergrund, "
+                                        "Brille-wenn-variabel, Hair-when-variable, variable Piercings/"
+                                        "Ohrschmuck, Make-up, Visual-Style). Permanente Merkmale "
+                                        "(Hautton, Augenfarbe, Körperbau, konstante Haare) "
+                                        "lässt man bei Z-Image Base weg, damit das Trigger-Wort "
+                                        "die Identität sauber absorbiert. Im Zweifel auf das "
+                                        "Preset oben verlassen.",
+                                        "Which attributes go into the training captions. "
+                                        "Recommendation per base model: for ERNIE include "
+                                        "all fields; for Z-Image Base only variable fields "
+                                        "(clothing, pose, background, glasses-when-variable, "
+                                        "hair-when-variable, variable piercings/ear jewelry, makeup, "
+                                        "visual style). Persistent features (skin tone, eye "
+                                        "color, body build, constant hair) are omitted with "
+                                        "Z-Image Base so the trigger word cleanly absorbs "
+                                        "identity. When in doubt trust the preset above.",
+                                    ),
+                                )
+                                c_caption_policy_status = gr.Markdown(
+                                    caption_policy_adjustment_note(S.get("c_training_target"), S.get("c_captions"))
+                                )
+                                c_variable_feature_mode = gr.Dropdown(
+                                    label=tr("Regel für variable Identitätsmerkmale", "Variable identity feature rule"),
+                                    choices=[
+                                        (
+                                            tr("Nur Abweichungen von der kanonischen Erscheinung", "Only deviations from the canonical appearance"),
+                                            "canonical_deviations",
+                                        ),
+                                        (
+                                            tr("Bei echter Variation jeden sichtbaren Wert captionieren", "Caption every visible value when genuine variation exists"),
+                                            "all_visible_when_variable",
+                                        ),
+                                    ],
+                                    value=S.get("c_variable_feature_mode", "canonical_deviations"),
+                                    info=tr(
+                                        "Standard: Die im Subject Profile festgelegte Grunderscheinung gehört zum Triggerwort; nur Abweichungen werden genannt. Alternative: Sobald echte Variation erkannt ist, wird der jeweilige sichtbare Wert in allen Bildern genannt. Gilt für Haarfarbe/-form, Augenfarbe, Bart und Brillenstatus.",
+                                        "Default: the canonical appearance stored in the Subject Profile belongs to the trigger; only deviations are captioned. Alternative: once genuine variation is detected, every visible value is captioned. Applies to hair color/form, eye color, beard and glasses state.",
+                                    ),
+                                )
+                                c_krea_caption_model = gr.Dropdown(
+                                    visible=False,
+                                    label=tr("Krea-2-Caption-Modell", "Krea 2 caption model"),
+                                    choices=OPENAI_MODEL_PRESET_CHOICES,
+                                    value=S["c_krea_caption_model"],
+                                    info=tr(
+                                        "Nur beim Trainingsziel `Krea 2`: Erstellt nach der finalen Bildauswahl natürliche englische Captions aus Originalbild, Audit und bestätigtem Subject Profile. Empfehlung: gpt-6-luna.",
+                                        "Only for the `Krea 2` training target: creates natural English captions after final image selection using the original image, audit and confirmed subject profile. Recommended: gpt-6-luna.",
+                                    ),
+                                    **openai_model_dropdown_kwargs(),
+                                )
+                                c_krea_caption_reasoning_effort = gr.Dropdown(
+                                    visible=False,
+                                    label=tr("Reasoning Effort – Krea-Caption", "Reasoning effort – Krea caption"),
+                                    choices=REASONING_EFFORT_CHOICES,
+                                    value=S["c_krea_caption_reasoning_effort"],
+                                    info=tr(
+                                        "Reasoning für die finale natürliche Caption jedes ausgewählten Bildes. `none` ist der empfohlene Standard; `low` kann bei komplexen Szenen getestet werden.",
+                                        "Reasoning for the final natural caption of each selected image. `none` is the recommended default; `low` can be tested for complex scenes.",
+                                    ),
+                                )
+                                c_use_krea_caption_repair = gr.Checkbox(
+                                    visible=False,
+                                    label=tr("Automatischen Caption-Reparaturversuch verwenden", "Use automatic caption repair attempt"),
+                                    value=S["c_use_krea_caption_repair"],
+                                    info=tr(
+                                        "Wenn die erste Krea-Caption leer ist oder gegen Profil-/Caption-Regeln verstößt, wird nur dieses Bild einmal mit dem Reparaturmodell neu captioniert. Audit, Profil und Auswahl werden nicht wiederholt.",
+                                        "If the first Krea caption is empty or violates profile/caption rules, only that image is captioned once more with the repair model. Audit, profile and selection are not repeated.",
+                                    ),
+                                )
+                                with gr.Row():
+                                    c_krea_caption_repair_model = gr.Dropdown(
+                                    visible=False,
+                                        label=tr("Krea-2-Caption-Reparaturmodell", "Krea 2 caption repair model"),
+                                        choices=OPENAI_MODEL_PRESET_CHOICES,
+                                        value=S["c_krea_caption_repair_model"],
+                                        info=tr(
+                                            "Wird ausschließlich nach einem fehlgeschlagenen oder regelwidrigen ersten Caption-Versuch aufgerufen. Empfehlung: gpt-6.1-sol.",
+                                            "Called only after a failed or policy-invalid first caption attempt. Recommended: gpt-6.1-sol.",
+                                        ),
+                                        **openai_model_dropdown_kwargs(),
+                                    )
+                                    c_krea_caption_repair_reasoning_effort = gr.Dropdown(
+                                    visible=False,
+                                        label=tr("Reasoning Effort – Caption-Reparatur", "Reasoning effort – caption repair"),
+                                        choices=REASONING_EFFORT_CHOICES,
+                                        value=S["c_krea_caption_repair_reasoning_effort"],
+                                        info=tr(
+                                            "Der Reparaturversuch erhält die konkrete Validierungsfehlermeldung und die erste Caption. `low` ist der empfohlene Standard.",
+                                            "The repair attempt receives the exact validation error and first caption. `low` is the recommended default.",
+                                        ),
+                                    )
+                                c_target_defaults_event = c_training_target.change(
+                                    fn=apply_training_target_defaults,
+                                    inputs=[
+                                        c_training_target, c_captions, c_target,
+                                        c_ratio_h, c_ratio_m, c_ratio_f,
+                                        c_model, c_audit_reasoning_effort,
+                                        c_trigger_reasoning_effort, c_review_escalation_reasoning_effort,
+                                        c_profile_normalizer_model, c_profile_reasoning_effort,
+                                        c_krea_caption_model, c_krea_caption_reasoning_effort,
+                                        c_pipeline_mode,
+                                    ],
+                                    outputs=[
+                                        c_captions, c_target,
+                                        c_ratio_h, c_ratio_m, c_ratio_f,
+                                        c_model, c_audit_reasoning_effort,
+                                        c_trigger_reasoning_effort, c_review_escalation_reasoning_effort,
+                                        c_profile_normalizer_model, c_profile_reasoning_effort,
+                                        c_krea_caption_model, c_krea_caption_reasoning_effort,
+                                        c_pipeline_mode,
+                                    ],
+                                )
+
+                                c_target_defaults_event.then(
+                                    fn=caption_policy_adjustment_note,
+                                    inputs=[c_training_target, c_captions],
+                                    outputs=[c_caption_policy_status],
+                                )
+                                c_captions.change(
+                                    fn=caption_policy_adjustment_note,
+                                    inputs=[c_training_target, c_captions],
+                                    outputs=[c_caption_policy_status],
+                                )
+
+                            with gr.Accordion(tr("💾 Export-Optionen", "💾 Export options"), open=False):
+                                gr.Markdown(tr(
+                                    "<details>"
+                                    "<summary><b>ℹ️ Welche Ordner und Exporte gibt es?</b></summary>"
+                                    "\n\n"
+                                    "Der Curator legt im Ausgabeverzeichnis mehrere Unterordner an, "
+                                    "abhängig von den hier ausgewählten Optionen:\n\n"
+                                    "**01_train_ready** (immer): Die finalen Bilder mit Captions, "
+                                    "fertig fürs LoRA-Training. Das ist das eigentliche Ergebnis.\n\n"
+                                    "**02_keep_unused** (immer): Bilder, die qualitativ gut genug "
+                                    "wären, aber wegen der Cluster-Limits oder Diversitäts-Regeln nicht "
+                                    "ins finale Set kamen. Falls dir später Material fehlt, kannst du "
+                                    "von hier nachschöpfen.\n\n"
+                                    "**05_reject** (optional): Verworfene Bilder mit Begründung in "
+                                    "der Caption-Datei (z. B. 'rejected: face_blur_too_low'). Nützlich "
+                                    "zum Debuggen, ob deine Schwellen zu streng sind. Bei großen "
+                                    "Datasets kann das viele MB werden.\n\n"
+                                    "**04_review** (optional): Bilder die das Hauptmodell "
+                                    "als 'review' markiert hat – Grenzfälle, die du visuell prüfen "
+                                    "kannst. Wenn die Eskalation an ist, sind das die Bilder, die "
+                                    "zusätzlich vom stärkeren Modell entschieden wurden.\n\n"
+                                    "**06_needs_manual_review** (immer, wenn nötig): Sammelt alles, "
+                                    "was menschliche Prüfung braucht – z. B. technische Audit-Ausfälle (Präfix "
+                                    "`AUDITTECH_`) und Hard-Flag-Identitätsmismatches (Präfix `IDCHECK_`).\n\n"
+                                    "**08_smart_crop_pairs** (optional): Pärchen aus Original und "
+                                    "Smart-Pre-Crop-Variante mit beiden Scores im Dateinamen. Wertvoll "
+                                    "zum Debuggen, ob deine Smart-Crop-Einstellungen sinnvoll sind. "
+                                    "Kostet Speicherplatz, aber bei Bedarf sehr aufschlussreich."
+                                    "</details>",
+                                    "<details>"
+                                    "<summary><b>ℹ️ What folders and exports exist?</b></summary>"
+                                    "\n\n"
+                                    "The curator creates several subfolders in the output directory, "
+                                    "depending on the options selected here:\n\n"
+                                    "**01_train_ready** (always): The final images with captions, "
+                                    "ready for LoRA training. This is the actual deliverable.\n\n"
+                                    "**02_keep_unused** (always): Images that would be quality-wise "
+                                    "good enough but didn't make the final set due to cluster limits "
+                                    "or diversity rules. If you later need more material, you can pull "
+                                    "from here.\n\n"
+                                    "**05_reject** (optional): Rejected images with reason in the "
+                                    "caption file (e.g. 'rejected: face_blur_too_low'). Useful for "
+                                    "debugging whether your thresholds are too strict. For large "
+                                    "datasets this can grow to many MB.\n\n"
+                                    "**04_review** (optional): Images the main model "
+                                    "flagged as 'review' – borderline cases for visual inspection. "
+                                    "When escalation is on, these are the images additionally "
+                                    "decided by the stronger model.\n\n"
+                                    "**06_needs_manual_review** (always, when needed): Collects "
+                                    "everything that needs human review – e.g. technical audit failures (prefix "
+                                    "`AUDITTECH_`) and hard-flagged identity mismatches (prefix "
+                                    "`IDCHECK_`).\n\n"
+                                    "**08_smart_crop_pairs** (optional): Pairs of original and "
+                                    "smart-pre-crop variant with both scores in the filename. "
+                                    "Valuable for debugging whether your smart-crop settings make "
+                                    "sense. Costs disk space, but very informative when needed."
+                                    "</details>",
+                                ))
+                                with gr.Row():
+                                    c_exp_review = gr.Checkbox(
+                                        label=tr("Review-Kandidaten exportieren", "Export review candidates"),
+                                        value=S["c_exp_review"],
+                                        info=tr(
+                                            "Speichert Bilder im Grenzbereich in `04_review` zur manuellen Sichtung. Empfohlen: an, besonders wenn dir der Curator gerade neue Schwellen lernt.",
+                                            "Saves borderline images to `04_review` for manual review. Recommended: on, especially while you're tuning the curator's thresholds.",
+                                        ),
+                                    )
+                                    c_exp_reject = gr.Checkbox(
+                                        label=tr("Verworfene Bilder exportieren", "Export rejected images"),
+                                        value=S["c_exp_reject"],
+                                        info=tr(
+                                            "Speichert verworfene Bilder mit Reject-Grund in `05_reject`. Empfohlen: an für die ersten Läufe (zum Debuggen). Bei großen Produktions-Datasets kannst du es ausschalten, um Platz zu sparen.",
+                                            "Saves rejected images with reject reason to `05_reject`. Recommended: on for initial runs (for debugging). For large production datasets you can turn it off to save space.",
+                                        ),
+                                    )
+                                    c_exp_compare = gr.Checkbox(
+                                        label=tr("Smart-Crop-Vergleichspaare exportieren", "Export smart-crop comparison pairs"),
+                                        value=S["c_exp_compare"],
+                                        info=tr(
+                                            "Speichert Original und Smart-Crop nebeneinander in `08_smart_crop_pairs`, mit beiden Bewertungen im Dateinamen. Empfohlen: an, wenn du Smart Pre-Crop nutzt – essentiell zum Debuggen, falls die Crops nicht so aussehen wie erwartet.",
+                                            "Saves original and smart crop side-by-side in `08_smart_crop_pairs`, with both scores in the filename. Recommended: on if you use smart pre-crop – essential for debugging when crops don't look as expected.",
+                                        ),
+                                    )
+                                c_controlled_buckets = gr.Checkbox(
+                                    label=tr("Kontrollierte Buckets verwenden", "Use controlled buckets"),
+                                    value=S["c_controlled_buckets"],
+                                    info=tr(
+                                        "Standard: aus. Aus behält die natürliche Komposition der ausgewählten Bilder bei. An normalisiert erst beim finalen Export: Headshots 1024×1024, Medium und Full Body 832×1216. IG-Rahmenentfernung und Rettungs-Crops bleiben davon unabhängig.",
+                                        "Default: off. Off preserves the natural composition of selected images. On normalizes only during final export: headshots 1024×1024, medium and full body 832×1216. IG-frame removal and rescue crops remain independent.",
+                                    ),
+                                )
 
                 # ── Aktionen ──
                 gr.Markdown("---")
+                c_run_overview = gr.Markdown()
+                c_refresh_overview = gr.Button(tr("Laufübersicht aktualisieren · lokal", "Refresh run preview · local"), variant="secondary")
                 with gr.Row():
-                    c_start_btn = gr.Button(tr("▶ Curator starten", "▶ Start curator"), variant="primary", scale=3)
+                    c_start_btn = gr.Button(tr("▶ Audit starten", "▶ Start audit"), variant="primary", scale=3)
                     c_stop_btn = gr.Button(tr("⏹ Abbrechen", "⏹ Cancel"), variant="stop", scale=1)
                     c_save_btn = gr.Button(tr("💾 Einstellungen speichern", "💾 Save settings"), variant="secondary", scale=2)
 
@@ -7514,6 +7621,14 @@ def build_ui() -> gr.Blocks:
                         c_gallery = gr.Gallery(label=tr("Train-Ready Vorschau", "Train-ready preview"), columns=3, rows=3, height=380, object_fit="cover")
 
                 # Alle Curator-Inputs als Liste (fuer Save und Start)
+                c_apply_models.click(
+                    fn=model_preset, inputs=[c_model_preset],
+                    outputs=[c_model, c_audit_reasoning_effort, c_trigger_model, c_trigger_reasoning_effort,
+                             c_review_escalation_model, c_review_escalation_reasoning_effort,
+                             c_profile_normalizer_model, c_profile_reasoning_effort,
+                             c_krea_caption_model, c_krea_caption_reasoning_effort,
+                             c_krea_caption_repair_model, c_krea_caption_repair_reasoning_effort],
+                )
                 curator_inputs = [
                     c_trigger, c_input, c_target, c_api_key, c_model, c_audit_reasoning_effort, c_openai_token_limit, c_use_trigger_check, c_trigger_model, c_trigger_reasoning_effort,
                     c_use_review_escalation, c_review_escalation_model, c_review_escalation_reasoning_effort,
@@ -7543,8 +7658,15 @@ def build_ui() -> gr.Blocks:
                     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
                     c_profile_sample_threshold, c_profile_sample_size,
                     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
+                    c_initial_caption_engine, c_initial_caption_task,
+                    c_caption_composition_mode,
                 ]
 
+                overview_inputs = [c_trigger, c_input, c_target, c_model, c_pipeline_mode, fr_state]
+                c_refresh_overview.click(fn=audit_run_overview_ui, inputs=overview_inputs, outputs=c_run_overview, queue=False)
+                audit_tab.select(fn=audit_run_overview_ui, inputs=overview_inputs, outputs=c_run_overview, queue=False)
+                for overview_control in (c_target, c_model, c_pipeline_mode):
+                    overview_control.change(fn=audit_run_overview_ui, inputs=overview_inputs, outputs=c_run_overview, queue=False)
                 c_run_event = c_start_btn.click(
                     fn=start_curator,
                     inputs=curator_inputs,
@@ -7567,16 +7689,16 @@ def build_ui() -> gr.Blocks:
                     "2. Nach der Pause hier `Profil laden` klicken.\n"
                     "3. Stable Identity prüfen (Dropdowns mit Confidence-Anzeige), bei Bedarf korrigieren. Speziell **Body Build** prüfen — bei Headshot-Dominanz wird er auf leer gesetzt, das ist Absicht.\n"
                     "4. Variable Traits per Bucket-Sicht prüfen, Ausreißer per `Re-Bucket all` korrigieren.\n"
-                    "5. `Profil speichern` klicken.\n"
-                    "6. `Captioning aus bestätigtem Profil starten` — es läuft kein neues Audit, nur Export + Caption-Build.\n",
+                    "5. Ein Bild auswählen und die Caption-Vorschau aktualisieren; ungespeicherte Profiländerungen werden berücksichtigt.\n"
+                    "6. `Profil bestätigen, speichern und Captions exportieren` übernimmt die Editorwerte vor dem Export — keine neue Bilderkennung.\n",
                     "### Edit profile and start captioning\n\n"
                     "Workflow:\n"
                     "1. In the Curator tab set `Pipeline mode = Profile then Caption` and start a run.\n"
                     "2. After the pause click `Load profile` here.\n"
                     "3. Review stable identity (dropdowns with confidence indicators), correct if needed. Pay attention to **Body Build** — it is forced empty on headshot-dominated sets, by design.\n"
                     "4. Review variable traits in the bucket view; fix outliers via `Re-bucket all`.\n"
-                    "5. Click `Save profile`.\n"
-                    "6. `Start captioning from confirmed profile` — no new audit runs, only export + caption build.\n",
+                    "5. Select an image and refresh the caption preview; unsaved profile edits are included.\n"
+                    "6. `Confirm, save profile and export captions` saves your edits before composing captions; no new image recognition.\n",
                 ))
 
                 p_state = gr.State({})
@@ -7822,7 +7944,7 @@ def build_ui() -> gr.Blocks:
                                     datatype=["str", "str", "str", "str", "str"],
                                     value=[],
                                     interactive=True,
-                                    row_count=(0, "dynamic"),
+                                    row_count=0,
                                     label=tr("Piercing- und Ohrschmuck-Inventar", "Piercing and ear-jewelry inventory"),
                                 )
                                 gr.Markdown(tr(
@@ -7834,8 +7956,8 @@ def build_ui() -> gr.Blocks:
                     with gr.TabItem(tr("🧩 Identity Clustering", "🧩 Identity clustering")):
                         p_cluster_md = gr.Markdown("_kein Profil geladen_")
                         gr.Markdown(tr(
-                            "`core` gibt einen kleinen Ranking-Boost. `variation` und `body_reference` bleiben Trainingskandidaten. `review` und `exclude` gehen nicht in `01_train_ready`. Vollständig auditierte Rejects stehen immer im letzten Bucket, beginnen als `exclude`, und zeigen den Reject-Grund direkt am Bild. Ein einzelnes Bild kann über seine Asset-ID sicher aus dem Bucket gelöst oder als Favorit zwingend in Train Ready übernommen werden.",
-                            "`core` gives a small ranking boost. `variation` and `body_reference` remain training candidates. `review` and `exclude` do not go to `01_train_ready`. Fully audited rejects always appear in the last bucket, start as `exclude`, and show the reject reason on each image. An individual image can be moved safely by its asset ID or forced into Train Ready as a favorite.",
+                            "`core` gibt einen kleinen Ranking-Boost. `variation` und `body_reference` bleiben Trainingskandidaten. `review` und `exclude` gehen nicht in `01_train_ready`. Vollständig auditierte Rejects stehen immer im letzten Bucket, beginnen als `exclude`, und zeigen den Reject-Grund direkt am Bild. Ein einzelnes Bild kann aus seinem Bucket gelöst oder als Priority zwingend in Train Ready übernommen werden.",
+                            "`core` gives a small ranking boost. `variation` and `body_reference` remain training candidates. `review` and `exclude` do not go to `01_train_ready`. Fully audited rejects always appear in the last bucket, start as `exclude`, and show the reject reason on each image. An individual image can be detached from its bucket or forced into Train Ready as Priority.",
                         ))
                         with gr.Row():
                             with gr.Column(scale=3):
@@ -7845,7 +7967,7 @@ def build_ui() -> gr.Blocks:
                                     datatype=["str", "str", "number", "str", "str", "str"],
                                     value=[],
                                     interactive=True,
-                                    row_count=(0, "dynamic"),
+                                    row_count=0,
                                     label=tr("Cluster-Kategorien / Rollen", "Cluster categories / roles"),
                                 )
                                 p_selected_cluster_id = gr.State("")
@@ -7887,11 +8009,19 @@ def build_ui() -> gr.Blocks:
                                 p_selected_cluster_image_info = gr.Markdown(tr("_Kein Bild ausgewählt._", "_No image selected._"))
                                 with gr.Row():
                                     p_detach_cluster_image_btn = gr.Button(tr("↗ Bild aus Bucket lösen", "↗ Detach image from bucket"), variant="secondary", scale=2)
-                                    p_priority_image_btn = gr.Button(tr("⭐ Zu Favoriten hinzufügen", "⭐ Add to favorites"), variant="primary", scale=2)
-                                    p_unpriority_image_btn = gr.Button(tr("☆ Favorit entfernen", "☆ Remove favorite"), variant="secondary", scale=2)
+                                    p_priority_image_btn = gr.Button(tr("⭐ Als Priority markieren", "⭐ Mark as Priority"), variant="primary", scale=2)
+                                    p_unpriority_image_btn = gr.Button(tr("☆ Priority entfernen", "☆ Remove Priority"), variant="secondary", scale=2)
+                                p_priority_hazard_confirm = gr.Checkbox(
+                                    label=tr("Problematisches Priority-Bild trotzdem bestätigen", "Confirm problematic Priority image anyway"),
+                                    value=False,
+                                    info=tr(
+                                        "Nur nötig bei Duplikat-, Mehrpersonen-, ArcFace-Hard- oder technischen Warnungen.",
+                                        "Only needed for duplicate, multi-person, ArcFace-hard or technical warnings.",
+                                    ),
+                                )
                                 gr.Markdown(tr(
-                                    "**Favoriten** werden mit goldenem Rahmen und Stern markiert. Sie überschreiben Qualitätswert, ArcFace, Bucket-Rolle, Quoten, Dubletten- und Caption-Remove-Entscheidungen und werden zwingend in Train Ready übernommen.",
-                                    "**Favorites** are marked with a gold frame and star. They override quality, ArcFace, bucket role, quotas, duplicate and caption-remove decisions and are forced into Train Ready.",
+                                    "**Priority** überschreibt Qualitätswert, ArcFace, Bucket-Rolle, Quoten, Dubletten- und Caption-Remove-Entscheidungen. Problematische Fälle verlangen vorab die Bestätigung oben.",
+                                    "**Priority** overrides quality, ArcFace, bucket role, quotas, duplicate and caption-remove decisions. Problematic cases require the confirmation above first.",
                                 ))
 
                     # ----- Subtab: Diagnostics -----
@@ -7910,13 +8040,51 @@ def build_ui() -> gr.Blocks:
                             ),
                         )
 
+                with gr.Accordion(tr("Caption-Vorschau · aktuelle Profilwerte", "Caption preview · current profile fields"), open=True):
+                    p_caption_composition_mode = gr.Dropdown(label=tr("Zusammensetzung", "Composition"),
+                        choices=[(tr("Lokal · Audit und Personenprofil", "Local · audit and person profile"), "local"),
+                                 (tr("Luna-Textdetails + lokale Profilregeln", "Luna text details + local profile rules"), "luna_text")],
+                        value=S["c_caption_composition_mode"])
+                    p_caption_details_info = gr.Markdown(tr("**Luna-Textdetails:** Der optionale API-Schritt sendet nur gespeicherte Beschreibungen an OpenAI. Keine Bilder und kein Personenprofil. Zusätzliche Kosten; danach Vorschau aktualisieren. Ohne Vorbereitung bleibt dieser Modus gesperrt.",
+                                                           "**Luna text details:** The optional API step sends only saved descriptions to OpenAI. No images or person profile. Additional costs; refresh the preview afterwards. Prepare details before exporting with this mode."),
+                                                        visible=S["c_caption_composition_mode"] == "luna_text")
+                    p_caption_details_btn = gr.Button(tr("Luna-Textdetails vorbereiten · API-Kosten", "Prepare Luna text details · API costs"),
+                                                      visible=S["c_caption_composition_mode"] == "luna_text")
+                    p_caption_target = gr.Dropdown(label=tr("Trainingsziel", "Training target"), choices=training_target_choices(),
+                                                   value=normalize_training_target(S.get("c_training_target")))
+                    with gr.Accordion(tr("Caption-Felder und Abweichungen", "Caption fields and deviations"), open=False):
+                        p_caption_fields = gr.CheckboxGroup(label=tr("Aktive Caption-Felder", "Active caption fields"),
+                                                           choices=CAPTION_FIELD_CHOICES, value=S["c_captions"])
+                        p_caption_variable_mode = gr.Dropdown(label=tr("Variable Merkmale", "Variable features"),
+                            choices=[(tr("Nur Abweichungen vom Profil", "Only profile deviations"), "canonical_deviations"),
+                                     (tr("Jeder sichtbare Wert bei echter Variation", "Every visible value with genuine variation"), "all_visible_when_variable")],
+                            value=S["c_variable_feature_mode"])
+                    p_caption_image_choice = gr.Dropdown(label=tr("Vorbereitetes Bild", "Prepared image"), choices=[])
+                    with gr.Row():
+                        p_caption_reload = gr.Button(tr("Bilderliste laden", "Load image list"))
+                        p_caption_preview_btn = gr.Button(tr("Vorschau aktualisieren · keine KI-Anfrage", "Refresh preview · no AI request"), variant="secondary")
+                    with gr.Row():
+                        p_caption_image = gr.Image(label=tr("Exportvorschau", "Export preview"), height=360, interactive=False)
+                        with gr.Column():
+                            p_caption_raw = gr.Textbox(label=tr("1 · Unveränderte Erstbeschreibung", "1 · Unchanged initial description"), lines=6, interactive=False)
+                            p_caption_final = gr.Textbox(label=tr("2 · Trainingscaption mit Profilregeln", "2 · Training caption with profile rules"), lines=6, interactive=False)
+                    p_caption_preview_status = gr.Markdown(tr("Profil laden und Vorschau aktualisieren. Die Auswahl des Zielmodells und der Caption-Felder aus Modul 2 gilt auch hier.",
+                                                            "Load the profile and refresh the preview. Target model and caption fields from module 2 apply here too."))
+                    gr.Markdown(tr(
+                        "Florence- und JoyCaption-Texte werden beim Subject Profile mit dem Bildaudit gegengeprüft. "
+                        "Übereinstimmungen stützen bereits auditierte Merkmale; Widersprüche erscheinen in der Profil-Diagnostik. "
+                        "Die Trainingscaption nutzt weiterhin Audit und Profil. Optional ergänzt Luna belegte Szenenpassagen aus dem Rohtext.",
+                        "Florence and JoyCaption descriptions are cross-checked against the image audit for the Subject Profile. "
+                        "Agreements support audited traits; conflicts appear in profile diagnostics. "
+                        "Training captions still use audit and profile. Luna can optionally add grounded scene excerpts from the raw text."))
+
                 # Action bar
                 with gr.Row():
                     p_save_btn = gr.Button(tr("💾 Profil speichern", "💾 Save profile"), variant="secondary", scale=1)
                     p_reset_btn = gr.Button(tr("↩️ Reset auf Backup", "↩️ Reset to backup"), variant="secondary", scale=1)
                     p_continue_btn = gr.Button(
-                        tr("▶ Captioning aus bestätigtem Profil starten",
-                           "▶ Start captioning from confirmed profile"),
+                        tr("▶ Profil bestätigen, speichern und Captions exportieren",
+                           "▶ Confirm, save profile and export captions"),
                         variant="primary",
                         scale=2,
                     )
@@ -7956,7 +8124,33 @@ def build_ui() -> gr.Blocks:
                 ).then(
                     fn=lambda: ("", tr("_Kein Bild ausgewählt._", "_No image selected._")),
                     outputs=[p_selected_cluster_image_id, p_selected_cluster_image_info],
+                ).then(
+                    fn=profile_caption_choices, inputs=[p_trigger, p_input], outputs=[p_caption_image_choice],
                 )
+                p_editor_inputs = [p_trigger, p_input, p_raw_json,
+                    p_gender, p_skin, p_eyes, p_hair_texture, p_body, p_body_height,
+                    p_hair_color_baseline, p_beard_pattern, p_beard_color,
+                    p_glasses_regular, p_glasses_desc, p_freckles_present, p_freckles_desc, p_piercing_md]
+                p_caption_reload.click(fn=profile_caption_choices, inputs=[p_trigger, p_input], outputs=[p_caption_image_choice])
+                for main_control, profile_control in [(c_training_target, p_caption_target),
+                                                      (c_captions, p_caption_fields),
+                                                      (c_variable_feature_mode, p_caption_variable_mode),
+                                                      (c_caption_composition_mode, p_caption_composition_mode)]:
+                    main_control.change(fn=lambda value: value, inputs=main_control, outputs=profile_control, queue=False)
+                    profile_control.input(fn=lambda value: value, inputs=profile_control, outputs=main_control, queue=False)
+                p_caption_preview_btn.click(fn=preview_profile_caption,
+                    inputs=[p_trigger, p_input, p_raw_json, p_caption_image_choice,
+                            p_caption_target, p_caption_fields, p_caption_variable_mode, p_caption_composition_mode, c_controlled_buckets, *p_editor_inputs[3:]],
+                    outputs=[p_caption_image, p_caption_raw, p_caption_final, p_caption_preview_status],
+                    concurrency_id="caption_preview", concurrency_limit=1)
+                p_caption_composition_mode.change(fn=lambda mode: (gr.update(visible=mode == "luna_text"), gr.update(visible=mode == "luna_text")),
+                    inputs=[p_caption_composition_mode], outputs=[p_caption_details_btn, p_caption_details_info], queue=False)
+                for preview_control in [p_caption_target, p_caption_fields, p_caption_variable_mode, p_caption_composition_mode, c_controlled_buckets, *p_editor_inputs[3:]]:
+                    preview_control.change(fn=lambda: ("", tr("Werte geändert. Vorschau aktualisieren, bevor du die Caption beurteilst.",
+                                                            "Values changed. Refresh the preview before reviewing the caption.")),
+                                          outputs=[p_caption_final, p_caption_preview_status], queue=False)
+                p_caption_image_choice.change(fn=lambda: (None, "", "", tr("Bild ausgewählt. Vorschau aktualisieren.", "Image selected. Refresh the preview.")),
+                    outputs=[p_caption_image, p_caption_raw, p_caption_final, p_caption_preview_status], queue=False)
 
                 # Snapshot p_raw_json into the read-only diagnostics view
                 p_raw_json.change(
@@ -8007,12 +8201,12 @@ def build_ui() -> gr.Blocks:
                 )
 
                 p_priority_image_btn.click(
-                    fn=lambda t, i, p, c, img, pg: set_selected_image_priority_ui(t, i, p, c, img, pg, True),
-                    inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_selected_cluster_image_id, p_cluster_gallery_page],
+                    fn=lambda t, i, p, c, img, pg, confirm: set_selected_image_priority_ui(t, i, p, c, img, pg, True, confirm),
+                    inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_selected_cluster_image_id, p_cluster_gallery_page, p_priority_hazard_confirm],
                     outputs=[p_state, p_raw_json, p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_image_info, p_status],
                 )
                 p_unpriority_image_btn.click(
-                    fn=lambda t, i, p, c, img, pg: set_selected_image_priority_ui(t, i, p, c, img, pg, False),
+                    fn=lambda t, i, p, c, img, pg: set_selected_image_priority_ui(t, i, p, c, img, pg, False, False),
                     inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_selected_cluster_image_id, p_cluster_gallery_page],
                     outputs=[p_state, p_raw_json, p_cluster_preview_md, p_cluster_gallery, p_selected_cluster_image_info, p_status],
                 )
@@ -8098,17 +8292,22 @@ def build_ui() -> gr.Blocks:
                     return trigger_value, input_value
 
                 p_sync_event = p_continue_btn.click(
+                    fn=save_profile_before_export, inputs=p_editor_inputs, outputs=[p_status],
+                ).success(
                     fn=_sync_trigger_input,
                     inputs=[p_trigger, p_input],
                     outputs=[c_trigger, c_input],
                 )
-                p_run_event = p_sync_event.then(
+                p_run_event = p_sync_event.success(
                     fn=start_caption_from_profile,
                     inputs=curator_inputs,  # dieselbe Liste wie der ehemalige Continue-Button im Curator-Tab
                     outputs=[p_log, p_gallery, p_progress, p_status_run, p_openai_usage],
                     concurrency_id="dataset_curator_process",
                     concurrency_limit=1,
                 )
+                p_caption_details_btn.click(fn=start_caption_text_details, inputs=curator_inputs,
+                    outputs=[p_log, p_gallery, p_progress, p_status_run, p_openai_usage],
+                    concurrency_id="dataset_curator_process", concurrency_limit=1)
                 p_stop_btn.click(
                     fn=kill_process,
                     outputs=[p_status_run],
@@ -8292,6 +8491,7 @@ def build_ui() -> gr.Blocks:
                 c_min_side, c_use_filesize, c_min_filesize,
                 c_ig_frame_crop, c_ig_two_stage_bar, c_frame_cleanup_mode, c_frame_pause_on_medium,
                 p_trigger, p_input, r_trigger, r_input,
+                frame_tab, audit_tab, profile_tab, results_tab,
             ]
             workspace_common_inputs = [
                 w_trigger, w_input, w_api_key,
@@ -8307,7 +8507,7 @@ def build_ui() -> gr.Blocks:
                 outputs=workspace_sync_outputs,
                 show_progress="hidden",
             )
-            w_preflight_btn.click(
+            preflight_event = w_preflight_btn.click(
                 fn=run_workspace_preflight_and_sync_ui,
                 inputs=[
                     w_trigger, w_input, w_api_key,
@@ -8323,118 +8523,159 @@ def build_ui() -> gr.Blocks:
             )
 
             # ── Frame module callbacks with multiple candidate selection ──
+            frame_scan_outputs = [fr_state, fr_summary, fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2, fr_status]
+            frame_navigation_outputs = [fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2]
+            ai_frame_event = fr_ai_btn.click(
+                fn=semantic_frame_review_ui,
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_ai_scope, w_api_key, fr_ai_model],
+                outputs=[fr_state, fr_summary, *frame_navigation_outputs, fr_status],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            )
+            fr_ai_stop.click(fn=None, cancels=[ai_frame_event], queue=False)
+            preflight_event.then(
+                fn=scan_frames_after_preflight_ui,
+                inputs=[w_trigger, w_input, w_frame_advanced, w_frame_enabled, workspace_ready_state],
+                outputs=frame_scan_outputs,
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            ).then(
+                fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
+                inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
+            )
             fr_scan_btn.click(
                 fn=scan_frame_review_ui,
-                inputs=[w_trigger, w_input, w_frame_advanced, fr_filter],
-                outputs=[fr_state, fr_summary, fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
+                inputs=[w_trigger, w_input, w_frame_advanced],
+                outputs=[fr_state, fr_summary, fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
                 concurrency_id="frame_review_local",
+                concurrency_limit=1,
             ).then(
-                fn=load_manual_crop_marker_ui,
-                inputs=[fr_state, fr_selected_asset_id],
-                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
-                show_progress="hidden",
+                fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
+                inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
             )
             fr_filter.change(
                 fn=refresh_frame_review_page_ui,
                 inputs=[fr_state, fr_filter, fr_page],
-                outputs=[fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
-                show_progress="hidden",
-            ).then(
-                fn=load_manual_crop_marker_ui,
-                inputs=[fr_state, fr_selected_asset_id],
-                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
+                outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
                 show_progress="hidden",
             )
             fr_page.input(
                 fn=refresh_frame_review_page_ui,
                 inputs=[fr_state, fr_filter, fr_page],
-                outputs=[fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
-                show_progress="hidden",
-            ).then(
-                fn=load_manual_crop_marker_ui,
-                inputs=[fr_state, fr_selected_asset_id],
-                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
+                outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
                 show_progress="hidden",
             )
             fr_gallery.select(
                 fn=select_frame_review_image_ui,
                 inputs=[fr_state, fr_filter, fr_page],
-                outputs=[fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
-            ).then(
-                fn=load_manual_crop_marker_ui,
-                inputs=[fr_state, fr_selected_asset_id],
-                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
-                show_progress="hidden",
+                outputs=[fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
             )
             fr_previous_btn.click(
                 fn=lambda st, flt, sid: navigate_frame_review_image_ui(st, flt, sid, -1),
-                inputs=[fr_state, fr_filter, fr_selected_asset_id],
-                outputs=[fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
-                show_progress="hidden",
-            ).then(
-                fn=load_manual_crop_marker_ui,
-                inputs=[fr_state, fr_selected_asset_id],
-                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
+                inputs=[fr_state, fr_filter, fr_selected_hash],
+                outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
                 show_progress="hidden",
             )
             fr_next_btn.click(
                 fn=lambda st, flt, sid: navigate_frame_review_image_ui(st, flt, sid, 1),
-                inputs=[fr_state, fr_filter, fr_selected_asset_id],
-                outputs=[fr_page, fr_gallery, fr_selected_asset_id, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
-                show_progress="hidden",
-            ).then(
-                fn=load_manual_crop_marker_ui,
-                inputs=[fr_state, fr_selected_asset_id],
-                outputs=[fr_manual_click_image, fr_manual_click_state, fr_manual_status],
+                inputs=[fr_state, fr_filter, fr_selected_hash],
+                outputs=[fr_page, fr_gallery, fr_selected_hash, fr_selected_info, fr_option_gallery, fr_option_radio, fr_viewer_position, fr_previous_btn, fr_next_btn, fr_x1, fr_y1, fr_x2, fr_y2],
                 show_progress="hidden",
             )
             fr_option_radio.input(
-                fn=apply_frame_option_ui,
-                inputs=[fr_state, fr_filter, fr_page, fr_selected_asset_id, fr_option_radio],
-                outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_option_gallery, fr_option_radio, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
+                fn=save_frame_and_navigate_ui,
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_option_radio, fr_advance],
+                outputs=[fr_state, fr_summary, *frame_navigation_outputs, fr_status],
                 show_progress="hidden",
+                concurrency_id="frame_review_local", concurrency_limit=1,
             )
-            fr_accept_current_btn.click(
-                fn=apply_frame_option_ui,
-                inputs=[fr_state, fr_filter, fr_page, fr_selected_asset_id, fr_option_radio],
-                outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_option_gallery, fr_option_radio, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
+            fr_exclude_btn.click(
+                fn=exclude_frame_and_navigate_ui,
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_advance],
+                outputs=[fr_state, fr_summary, *frame_navigation_outputs, fr_status],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            )
+            fr_option_radio.change(
+                fn=lambda option: gr.update(interactive=bool(option)), inputs=[fr_option_radio],
+                outputs=[fr_confirm_selected_btn], show_progress="hidden",
+            )
+            fr_confirm_selected_btn.click(
+                fn=save_frame_and_navigate_ui,
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_option_radio, fr_advance],
+                outputs=[fr_state, fr_summary, *frame_navigation_outputs, fr_status],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            )
+            fr_automation_btn.click(
+                fn=set_frame_automation_ui,
+                inputs=[fr_state, fr_automation_mode, fr_automation_types, fr_filter],
+                outputs=[fr_state, fr_summary, fr_status],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            ).then(
+                fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
+                inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
+            )
+            fr_recommended_auto_btn.click(
+                fn=lambda st, flt: set_frame_automation_ui(st, "auto_high_review_medium", ["uniform_canvas", "story_bars"], flt),
+                inputs=[fr_state, fr_filter], outputs=[fr_state, fr_summary, fr_status],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            ).then(
+                fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
+                inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
+            )
+            fr_state.change(
+                fn=lambda st: (gr.update(value=st.get("frame_mode", "suggest_only")),
+                               gr.update(value=st.get("auto_accept_types", [])),
+                               gr.update(value=st.get("frame_mode", "suggest_only")),
+                               gr.update(value=st.get("frame_mode", "suggest_only")),
+                               gr.update(value=st.get("auto_accept_types", []))) if st.get("records") else tuple(gr.skip() for _ in range(5)),
+                inputs=[fr_state], outputs=[fr_automation_mode, fr_automation_types, w_frame_mode,
+                                           c_frame_cleanup_mode, w_frame_auto_types],
                 show_progress="hidden",
             )
             fr_auto_btn.click(
                 fn=restore_frame_auto_ui,
-                inputs=[fr_state, fr_filter, fr_page, fr_selected_asset_id],
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash],
                 outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_option_gallery, fr_option_radio, fr_x1, fr_y1, fr_x2, fr_y2, fr_status],
                 show_progress="hidden",
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            ).then(
+                fn=lambda st, flt, sid: navigate_frame_review_image_ui(st, flt, sid, 0),
+                inputs=[fr_state, fr_filter, fr_selected_hash], outputs=frame_navigation_outputs,
             )
-            # The manual marker is refreshed explicitly after every action
-            # that can change the selected frame. This is more reliable than
-            # depending on a chained State.change event during initial loading.
-            fr_manual_click_image.select(
-                fn=mark_manual_crop_point_ui,
-                inputs=[fr_state, fr_selected_asset_id, fr_manual_click_state],
-                outputs=[fr_manual_click_image, fr_manual_click_state, fr_x1, fr_y1, fr_x2, fr_y2, fr_manual_preview, fr_manual_status],
+            fr_group_preview_btn.click(
+                fn=preview_frame_group_ui, inputs=[fr_state, fr_selected_hash],
+                outputs=[fr_group_plan, fr_group_gallery, fr_group_selection, fr_group_status, fr_group_apply_btn],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            )
+            fr_group_plan.change(
+                fn=lambda plan: tuple(gr.update(visible=bool(plan.get("targets"))) for _ in range(3)),
+                inputs=[fr_group_plan], outputs=[fr_group_gallery, fr_group_selection, fr_group_apply_btn],
                 show_progress="hidden",
             )
-            fr_reset_manual_click_btn.click(
-                fn=reset_manual_crop_marker_ui,
-                inputs=[fr_state, fr_selected_asset_id],
-                outputs=[fr_manual_click_image, fr_manual_click_state, fr_x1, fr_y1, fr_x2, fr_y2, fr_manual_preview, fr_manual_status],
-                show_progress="hidden",
+            fr_group_apply_btn.click(
+                fn=apply_frame_group_ui,
+                inputs=[fr_state, fr_group_plan, fr_group_selection, fr_filter, fr_page],
+                outputs=[fr_state, fr_summary, fr_gallery, fr_group_status, fr_group_plan,
+                         fr_group_selection, fr_group_gallery, fr_group_apply_btn],
+                concurrency_id="frame_review_local", concurrency_limit=1,
+            ).then(
+                fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
+                inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
             )
             fr_preview_manual_btn.click(
                 fn=preview_manual_frame_crop_ui,
-                inputs=[fr_state, fr_selected_asset_id, fr_x1, fr_y1, fr_x2, fr_y2],
+                inputs=[fr_state, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2],
                 outputs=[fr_manual_preview, fr_manual_status],
             )
+            fr_selected_hash.change(fn=load_click_crop_ui, inputs=[fr_state, fr_selected_hash],
+                                    outputs=[fr_click_crop, fr_crop_corner], show_progress="hidden")
+            fr_click_crop.select(fn=select_crop_corner_ui, inputs=[fr_state, fr_selected_hash, fr_crop_corner],
+                                 outputs=[fr_click_crop, fr_crop_corner, fr_x1, fr_y1, fr_x2, fr_y2, fr_manual_status],
+                                 show_progress="hidden")
             fr_accept_manual_btn.click(
-                fn=lambda st, flt, pg, sid, a, b, c, d: set_frame_review_decision_ui(st, flt, pg, sid, "manual", None, a, b, c, d),
-                inputs=[fr_state, fr_filter, fr_page, fr_selected_asset_id, fr_x1, fr_y1, fr_x2, fr_y2],
-                outputs=[fr_state, fr_summary, fr_gallery, fr_selected_info, fr_status],
-            ).then(
-                fn=lambda st, sid: _frame_option_gallery_update(_find_frame_record(st, sid), st),
-                inputs=[fr_state, fr_selected_asset_id],
-                outputs=[fr_option_gallery, fr_option_radio],
+                fn=save_manual_frame_and_navigate_ui,
+                inputs=[fr_state, fr_filter, fr_page, fr_selected_hash, fr_x1, fr_y1, fr_x2, fr_y2, fr_advance],
+                outputs=[fr_state, fr_summary, *frame_navigation_outputs, fr_status],
                 show_progress="hidden",
+                concurrency_id="frame_review_local", concurrency_limit=1,
             )
             fr_reset_cache_btn.click(
                 fn=reset_frame_detector_cache_ui,
@@ -8445,6 +8686,12 @@ def build_ui() -> gr.Blocks:
                 fn=reset_frame_manual_decisions_ui,
                 inputs=[w_trigger, w_input],
                 outputs=[fr_status],
+            ).then(
+                fn=scan_frame_review_ui, inputs=[w_trigger, w_input, w_frame_advanced],
+                outputs=frame_scan_outputs, concurrency_id="frame_review_local", concurrency_limit=1,
+            ).then(
+                fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
+                inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
             )
 
             # ── Save-Button Event (braucht Zugriff auf ALLE Inputs) ──

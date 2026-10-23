@@ -106,13 +106,7 @@ def row_identity_key(row: Optional[Mapping[str, Any]]) -> str:
     return ""
 
 
-def normalize_training_target(value: Any) -> str:
-    v = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if v in {"z_image_base", "zimage", "z_image"}:
-        return "z_image_base"
-    if v in {"krea2", "krea_2", "krea2_character", "krea_2_character"}:
-        return "krea2"
-    return "ernie"
+from training_targets import normalize_training_target, caption_profile_for_training_target, TARGET_REGISTRY_VERSION
 
 
 def normalize_pipeline_mode(value: Any) -> str:
@@ -135,14 +129,24 @@ def normalize_run_config_payload(payload: Optional[Mapping[str, Any]]) -> Dict[s
     data = dict(payload or {})
     target = normalize_training_target(data.get("TRAINING_TARGET") or data.get("CAPTION_PROFILE"))
     data["TRAINING_TARGET"] = target
-    data["CAPTION_PROFILE"] = "krea2_character" if target == "krea2" else target
+    data["CAPTION_PROFILE"] = caption_profile_for_training_target(target)
     data["PIPELINE_MODE"] = normalize_pipeline_mode(data.get("PIPELINE_MODE"))
     data["CAPTION_POLICY"] = normalized_caption_policy(data.get("CAPTION_POLICY"))
     data["RUN_CONFIG_SCHEMA_VERSION"] = RUN_CONFIG_SCHEMA_VERSION
     data["ACTIVE_CAPTION_POLICY_SNAPSHOT"] = dict(data["CAPTION_POLICY"])
+    engine = str(data.get("INITIAL_CAPTION_ENGINE") or "")
+    if data.get("CAPTION_COMPOSITION_MODE", "local") not in {"local", "luna_text"}:
+        raise ValueError("Unsupported caption composition mode")
+    if engine:
+        from initial_captions import ENGINES, FLORENCE_TASKS
+        if engine not in ENGINES:
+            raise ValueError(f"Unsupported initial caption provider: {engine}")
+        if data.get("INITIAL_CAPTION_FLORENCE_TASK", "<MORE_DETAILED_CAPTION>") not in FLORENCE_TASKS:
+            raise ValueError("Unsupported Florence caption level")
     data["RUN_CONFIG_FINGERPRINT"] = stable_hash({
         "schema": RUN_CONFIG_SCHEMA_VERSION,
         "target": target,
+        "target_registry": TARGET_REGISTRY_VERSION,
         "pipeline": data["PIPELINE_MODE"],
         "caption_policy": data["CAPTION_POLICY"],
         "variable_feature_mode": data.get("VARIABLE_FEATURE_CAPTION_MODE", "canonical_deviations"),
@@ -150,6 +154,11 @@ def normalize_run_config_payload(payload: Optional[Mapping[str, Any]]) -> Dict[s
         "profile_model": data.get("SUBJECT_PROFILE_NORMALIZER_MODEL", ""),
         "caption_model": data.get("KREA_CAPTION_MODEL", ""),
         "repair_model": data.get("KREA_CAPTION_REPAIR_MODEL", ""),
+        "initial_caption_engine": engine,
+        "initial_caption_task": data.get("INITIAL_CAPTION_FLORENCE_TASK", ""),
+        "initial_caption_runtime": data.get("INITIAL_CAPTION_PYTHON", ""),
+        "initial_caption_weights": data.get("INITIAL_CAPTION_WEIGHTS", ""),
+        "caption_composition_mode": data.get("CAPTION_COMPOSITION_MODE", "local"),
     })
     return data
 
@@ -300,6 +309,7 @@ def build_caption_fingerprint(
         "source": source_key,
         "image_id": image_id,
         "target": normalize_training_target(training_target),
+        "target_registry": TARGET_REGISTRY_VERSION,
         "trigger": trigger_word,
         "prompt": prompt_version,
         "primary": [primary_model, primary_reasoning],
@@ -452,25 +462,9 @@ class OutputTransaction:
 # ---------------------------------------------------------------------------
 # OpenAI model presets (shared by UI and pipeline)
 # ---------------------------------------------------------------------------
-# GPT-6 family (API, September 2026):
-#   gpt-6-luna   – efficient tier for per-image audits and captions
-#   gpt-6.1-sol  – balanced tier for the profile normalizer, repairs, escalation
-#   gpt-6-sol    – previous balanced tier, still accepts reasoning effort "none"
-#   gpt-6-astra  – flagship tier
-# gpt-6-astra and gpt-6.1-sol reject reasoning effort "none" (HTTP 400); the
-# pipeline raises such requests to "low" automatically.
-MODEL_AUDIT_DEFAULT = "gpt-6-luna"
-MODEL_BALANCED_DEFAULT = "gpt-6.1-sol"
-MODEL_FLAGSHIP_DEFAULT = "gpt-6-astra"
+# The model list itself lives in openai_models. This module only keeps the
+# migration of retired presets from older settings files.
 
-OPENAI_MODEL_PRESETS: tuple = (
-    "gpt-6-luna",
-    "gpt-6.1-sol",
-    "gpt-6-sol",
-    "gpt-6-astra",
-)
-
-MODELS_WITHOUT_NONE_EFFORT: tuple = ("gpt-6-astra", "gpt-6.1-sol")
 
 # Saved settings from earlier releases point to retired presets. They are
 # moved to the tier that fills the same role in the GPT-6 family.
@@ -490,9 +484,3 @@ def migrate_openai_model_name(value: Any) -> str:
     """Return the GPT-6 replacement for a retired preset, else the value unchanged."""
     text = str(value or "").strip()
     return LEGACY_MODEL_MIGRATION.get(text.lower(), text)
-
-
-def model_rejects_none_effort(model: Any) -> bool:
-    """Whether a model refuses reasoning effort ``none``."""
-    name = str(model or "").strip().lower()
-    return any(name == prefix or name.startswith(prefix + "-") for prefix in MODELS_WITHOUT_NONE_EFFORT)

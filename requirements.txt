@@ -1,4 +1,4 @@
-# Core dependencies for the portable, CPU-friendly manual installation.
+# Python 3.13: core dependencies for the portable, CPU-friendly manual installation.
 # For NVIDIA/CUDA, install PyTorch and ONNX Runtime builds matching your system.
 requests
 pillow
@@ -11,7 +11,7 @@ open_clip_torch
 opencv-python
 onnxruntime
 scikit-learn
-gradio
+gradio>=5,<7
 
 # Optional: required for Video Processor face matching and ArcFace identity checks.
 # insightface

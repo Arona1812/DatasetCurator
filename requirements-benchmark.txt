@@ -1,0 +1,3 @@
+# Additional decoder for HEIC/HEIF references in frame_benchmark.py.
+# Install the normal application dependencies first.
+pillow-heif>=1.8,<2
