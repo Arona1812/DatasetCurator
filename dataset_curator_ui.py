@@ -7128,12 +7128,14 @@ def build_ui() -> gr.Blocks:
                         "wird ein stratifiziertes Sample an den Normalizer geschickt und die Regeln "
                         "werden lokal auf alle verwertbaren Bilder angewendet. Marker wie Brille, "
                         "Tattoos und Piercings bleiben strikt force-only-when-visible.\n\n"
+                        "👉 **Automatisch oder selbst prüfen** wählst du ganz oben in diesem Tab, direkt unter dem Trainingsziel.\n\n"
                         "👉 **Profil bearbeiten** und das anschließende Captioning aus dem Profil "
                         "starten findest du im eigenen Tab `🧬 Subject Profile`.",
                         "Phase 2 builds a central subject profile after image audit. Reject and review "
                         "images are excluded. For large datasets, a stratified sample is sent to the "
                         "normalizer and the rules are applied locally to all usable images. Markers "
                         "such as glasses, tattoos and piercings remain strictly force-only-when-visible.\n\n"
+                        "👉 **Automatic or review it yourself** is chosen at the very top of this tab, directly below the training target.\n\n"
                         "👉 **Editing the profile** and starting captioning from the profile is done "
                         "in the dedicated `🧬 Subject Profile` tab.",
                     ))
