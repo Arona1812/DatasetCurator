@@ -3023,31 +3023,30 @@ def _init_local_vision_models() -> None:
             return
         LOCAL_VISION_INIT_ATTEMPTED = True
         started = time.perf_counter()
-        if HAVE_MP:
+        # MediaPipe 0.10.x ships only the Tasks API (no ``mp.solutions``) and
+        # OpenCV 5 dropped the Haar cascade. ``local_vision`` wraps the Tasks
+        # detectors (with automatic model download) behind the legacy
+        # ``process()`` result structures used below and falls back to the
+        # older APIs when they are still installed.
+        if HAVE_MP or HAVE_CV2:
             try:
-                MP_FACE = mp.solutions.face_detection.FaceDetection(
-                    model_selection=1,
-                    min_detection_confidence=0.5,
-                )
-                MP_POSE = mp.solutions.pose.Pose(
-                    static_image_mode=True,
-                    model_complexity=1,
-                    enable_segmentation=False,
-                    min_detection_confidence=0.5,
-                )
+                import local_vision
+
+                MP_FACE = local_vision.get_face_detector(min_confidence=0.5)
+                MP_POSE = local_vision.get_pose_detector(min_confidence=0.5, model_complexity=1)
+                if MP_FACE is None and MP_POSE is None:
+                    for reason in local_vision.last_init_errors()[:3]:
+                        safe_print(f"   ⚠️ Lokale Gesichts-/Posenerkennung nicht verfügbar: {reason}")
+                else:
+                    safe_print(f"   🧍 Lokale Erkennung aktiv ({local_vision.backend_summary()})")
             except RunCancelled:
                 raise
-            except Exception:
+            except Exception as exc:
                 MP_FACE = None
                 MP_POSE = None
-        if HAVE_CV2:
-            try:
-                cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-                HAAR_CASCADE = cv2.CascadeClassifier(cascade_path)
-            except RunCancelled:
-                raise
-            except Exception:
-                HAAR_CASCADE = None
+                safe_print(f"   ⚠️ Lokale Gesichts-/Posenerkennung konnte nicht geladen werden: {exc}")
+        # The Haar fallback now lives inside local_vision's face adapter.
+        HAAR_CASCADE = None
         perf_count("local_vision_models_initialized")
         perf_add_time("local_vision_model_init", time.perf_counter() - started)
 

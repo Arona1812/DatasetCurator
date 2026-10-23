@@ -22,7 +22,7 @@ Der Bild-Curator folgt in der UI der tatsächlichen Verarbeitungsreihenfolge:
 
 1. **Start / Project** — Bildordner, Trigger Word und API-Key festlegen.
 2. **Preflight** — lokale Datei- und pHash-Duplikatprüfungen ausführen. Dabei wird keine OpenAI-Anfrage gestellt. Bereits bei der Projektinitialisierung erhält jedes Quellbild eine persistente ganzzahlige Bild-ID; die Rahmennavigation verwendet diese ID statt Dateinamen oder Galeriepositionen.
-3. **Frames** *(optional)* — lokale Crop-Vorschläge prüfen, Original behalten oder manuellen Crop definieren.
+3. **Frames** *(optional)* — lokale Crop-Vorschläge prüfen, Original behalten oder manuellen Crop definieren. Der lokale Detektor findet Fotos in App-Screenshots, Story-Canvases, Polaroid-Rahmen und Collagen; ein Innenbild wird immer zuerst vorgeschlagen, der äußere Rahmen-Crop bleibt als Alternative wählbar.
 4. **Audit & Selection** — Qualitäts-, Identitäts-, Diversitäts- und Captioning-Verarbeitung starten.
 5. **Subject Profile** — bei `Profile then Caption` das Profil prüfen oder bei `Single Pass` automatisch fortfahren lassen.
 6. **Results** — exportierte Trainings-, Review- und Nachbearbeitungsordner prüfen.
@@ -33,6 +33,7 @@ Der Bild-Curator folgt in der UI der tatsächlichen Verarbeitungsreihenfolge:
 - Ein **OpenAI-API-Key mit verfügbarem Guthaben** für Audit- und Captioning-Pipeline. Lokaler Preflight und Frame-Analyse funktionieren ohne ihn.
 - NVIDIA-GPU-Beschleunigung ist optional. Die Anwendung kann auch auf der CPU laufen.
 - **InsightFace** ist für die normale Bildkuratierung optional, aber für Personenabgleich im Video Processor und den ArcFace Identity Check erforderlich.
+- **MediaPipe-Modelle** für die lokale Gesichts- und Posenerkennung (etwa 6 MB) werden beim ersten Gebrauch einmalig nach `_models/` neben den Skripten geladen. Ohne sie arbeitet der Rahmen-Detektor weiter, prüft Crops aber nicht mehr gegen Gesichter und Körper.
 
 Die UI zeigt die installierte Quellversion über `git describe --tags --always --dirty`. Dadurch wird der ausgecheckte Git-Tag inklusive weiterer Commits und lokaler Änderungen angezeigt, statt eine Versionsnummer manuell im Code zu pflegen.
 

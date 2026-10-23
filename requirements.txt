@@ -4,7 +4,7 @@ requests
 pillow
 numpy
 scipy
-mediapipe==0.10.33
+mediapipe==0.10.33  # Tasks API only; models are downloaded into _models/ on first use
 torch
 torchvision
 open_clip_torch

@@ -22,7 +22,7 @@ The image curator follows the processing order in the UI:
 
 1. **Start / Project** — set the image folder, trigger word, and API key.
 2. **Preflight** — run local file and pHash duplicate checks. No OpenAI request is made. Every source image already receives a persistent integer asset ID during project initialization; frame navigation uses that ID instead of filenames or gallery positions.
-3. **Frames** *(optional)* — inspect local crop suggestions, keep the original, or define a manual crop.
+3. **Frames** *(optional)* — inspect local crop suggestions, keep the original, or define a manual crop. The local detector finds photos inside app screenshots, story canvases, polaroid frames and collages; an inner photo is always proposed first, the outer frame crop stays available as an alternative.
 4. **Audit & Selection** — run quality, identity, diversity, and caption processing.
 5. **Subject Profile** — review the profile when using `Profile then Caption`, or let `Single Pass` continue automatically.
 6. **Results** — inspect the exported training, review, and cleanup buckets.
@@ -33,6 +33,7 @@ The image curator follows the processing order in the UI:
 - An **OpenAI API key and available API credit** for the audit and captioning pipeline. Local preflight and frame analysis work without it.
 - NVIDIA GPU acceleration is optional. The application can run on CPU.
 - **InsightFace** is optional for image curation, but required for Video Processor face matching and the ArcFace identity check.
+- **MediaPipe models** for local face and pose detection (about 6 MB) are downloaded once on first use into `_models/` next to the scripts. Without them the frame detector still works, but crops are no longer checked against faces and bodies.
 
 The interface displays the installed source version from `git describe --tags --always --dirty`. It therefore reflects the checked-out Git tag, commits after that tag, and uncommitted changes rather than a manually maintained version string.
 

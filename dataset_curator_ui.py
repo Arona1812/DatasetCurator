@@ -5052,6 +5052,7 @@ FRAME_AUTO_ACCEPT_TYPE_CHOICES = [
     ("side_canvas", "Beidseitige Canvas-Ränder", "Paired side canvas"),
     ("multi_side_border", "Mehrseitiger rechteckiger Rahmen", "Multi-side rectangular border"),
     ("single_side_border", "Einseitiger Rand", "Single-side border"),
+    ("nested_inner_image", "Innenbild in Foto, Collage oder Rahmen", "Inner photo inside a photo, collage or frame"),
 ]
 
 
