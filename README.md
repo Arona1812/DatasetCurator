@@ -29,7 +29,7 @@ The image curator follows the processing order in the UI:
 
 ## Requirements
 
-- **Python 3.10**
+- **Python 3.13**
 - An **OpenAI API key and available API credit** for the audit and captioning pipeline. Local preflight and frame analysis work without it.
 - NVIDIA GPU acceleration is optional. The application can run on CPU.
 - **InsightFace** is optional for image curation, but required for Video Processor face matching and the ArcFace identity check.
@@ -49,12 +49,14 @@ The interface displays the installed source version from `git describe --tags --
 
 The launcher creates `curator_env`, installs core packages, tries to install optional InsightFace support, and opens the Gradio UI in your browser.
 
+If `curator_env` was created with an older Python version, rename or remove that folder before running the launcher again. Virtual environments cannot be switched to a new Python version in place; dependencies must be reinstalled.
+
 > The Windows launcher currently installs CUDA 13.0 PyTorch and ONNX Runtime builds. It still works without an NVIDIA GPU, but a CPU-only manual installation is smaller.
 
 ## Manual installation (Linux, macOS, or CPU-focused setup)
 
 ```bash
-python3.10 -m venv curator_env
+python3.13 -m venv curator_env
 source curator_env/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt

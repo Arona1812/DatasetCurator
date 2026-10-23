@@ -29,11 +29,16 @@ echo ========================================
 echo.
 
 :: --- Step 1: Virtual environment ---
+py -3.13 --version >nul 2>&1
+if errorlevel 1 goto err_python
+
 if exist "curator_env\Scripts\activate.bat" (
     echo Step 1 of 3: Virtual environment found
+    curator_env\Scripts\python.exe -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 13) else 1)" >nul 2>&1
+    if errorlevel 1 goto err_venv
 ) else (
     echo Step 1 of 3: Creating virtual environment
-    py -3.10 -m venv curator_env
+    py -3.13 -m venv curator_env
     if errorlevel 1 goto err_python
     echo       Created
 )
@@ -217,8 +222,16 @@ exit /b 0
 :: ============================================================
 :err_python
 echo.
-echo ERROR: Python 3.10 not found
+echo ERROR: Python 3.13 not found
 echo Please install it from: https://www.python.org/downloads/
+pause
+exit /b 1
+
+:err_venv
+echo.
+echo ERROR: curator_env does not use Python 3.13 or is broken.
+echo Rename or remove curator_env and run this launcher again.
+echo The launcher will create a new environment with Python 3.13.
 pause
 exit /b 1
 

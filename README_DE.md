@@ -29,7 +29,7 @@ Der Bild-Curator folgt in der UI der tatsächlichen Verarbeitungsreihenfolge:
 
 ## Voraussetzungen
 
-- **Python 3.10**
+- **Python 3.13**
 - Ein **OpenAI-API-Key mit verfügbarem Guthaben** für Audit- und Captioning-Pipeline. Lokaler Preflight und Frame-Analyse funktionieren ohne ihn.
 - NVIDIA-GPU-Beschleunigung ist optional. Die Anwendung kann auch auf der CPU laufen.
 - **InsightFace** ist für die normale Bildkuratierung optional, aber für Personenabgleich im Video Processor und den ArcFace Identity Check erforderlich.
@@ -49,12 +49,14 @@ Die UI zeigt die installierte Quellversion über `git describe --tags --always -
 
 Der Launcher erstellt `curator_env`, installiert die Kernpakete, versucht die optionale InsightFace-Unterstützung zu installieren und öffnet die Gradio-UI im Browser.
 
+Falls `curator_env` mit einer älteren Python-Version erstellt wurde, benenne den Ordner vor dem nächsten Start um oder entferne ihn. Eine virtuelle Umgebung lässt sich nicht direkt auf eine andere Python-Version umstellen; die Abhängigkeiten müssen neu installiert werden.
+
 > Der Windows-Launcher installiert derzeit CUDA-13.0-Builds von PyTorch und ONNX Runtime. Das Tool funktioniert auch ohne NVIDIA-GPU, für eine reine CPU-Installation ist die manuelle Installation aber schlanker.
 
 ## Manuelle Installation (Linux, macOS oder CPU-orientiertes Setup)
 
 ```bash
-python3.10 -m venv curator_env
+python3.13 -m venv curator_env
 source curator_env/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
