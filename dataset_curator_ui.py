@@ -2545,6 +2545,221 @@ def detach_selected_image_from_cluster_ui(
     )
 
 
+CLUSTER_MOVE_NEW_BUCKET = "__new__"
+
+
+def move_cluster_members(
+    profile: Dict[str, Any],
+    source_cluster_id: str,
+    selection_refs: List[Any],
+    target_cluster_id: str,
+    new_bucket_role: str,
+    row_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[Dict[str, Any], int, str, str]:
+    """Move several members from one identity bucket to another.
+
+    ``target_cluster_id`` is an existing bucket or ``CLUSTER_MOVE_NEW_BUCKET``
+    (one new manual bucket for all selected images, with ``new_bucket_role``).
+    Returns ``(profile, moved_count, destination_id, error)``; ``error`` is
+    empty on success. An emptied source bucket is removed.
+    """
+    row_lookup = row_lookup or {}
+    clusters = _sorted_identity_clusters(profile)
+    source_id = str(source_cluster_id or "").strip()
+    source = next((c for c in clusters if str(c.get("cluster_id", "") or "") == source_id), None)
+    if source is None:
+        return profile, 0, "", "source_missing"
+    indexes = sorted({
+        index for index, _record in (
+            _resolve_cluster_record(source, ref) for ref in (selection_refs or [])
+        ) if index >= 0
+    })
+    if not indexes:
+        return profile, 0, "", "nothing_selected"
+
+    target_id = str(target_cluster_id or "").strip() or CLUSTER_MOVE_NEW_BUCKET
+    if target_id == source_id:
+        return profile, 0, "", "same_bucket"
+    target = None
+    if target_id != CLUSTER_MOVE_NEW_BUCKET:
+        target = next((c for c in clusters if str(c.get("cluster_id", "") or "") == target_id), None)
+        if target is None:
+            return profile, 0, "", "target_missing"
+
+    members = list(source.get("asset_ids") or source.get("members", []) or [])
+    filenames = list(source.get("filenames", []) or [])
+    paths = list(source.get("image_paths", []) or [])
+    reasons = list(source.get("reject_reasons", []) or [])
+    moved = []
+    for index in reversed(indexes):
+        moved.append((
+            members.pop(index) if index < len(members) else "",
+            filenames.pop(index) if index < len(filenames) else "",
+            paths.pop(index) if index < len(paths) else "",
+            reasons.pop(index) if index < len(reasons) else "",
+        ))
+    moved.reverse()
+    source["members"], source["filenames"], source["image_paths"] = members, filenames, paths
+    source["asset_ids"] = [int(v) for v in members if core_normalize_asset_id(v) > 0]
+    if reasons or "reject_reasons" in source:
+        source["reject_reasons"] = reasons
+    _refresh_cluster_stats_ui(source, row_lookup)
+
+    source_is_reject = str(source.get("cluster_kind", "") or "") == "audited_rejects" or source_id == AUDITED_REJECT_CLUSTER_ID
+    if target is None:
+        existing = {str(c.get("cluster_id", "") or "") for c in clusters}
+        base = f"manual_group_{time.strftime('%Y%m%d_%H%M%S')}"
+        target_id, counter = base, 2
+        while target_id in existing:
+            target_id, counter = f"{base}_{counter}", counter + 1
+        role = str(new_bucket_role or "").strip()
+        if role not in IDENTITY_CLUSTER_ROLE_CHOICES:
+            role = "exclude" if source_is_reject else str(source.get("role", "variation") or "variation")
+        target = {
+            "cluster_id": target_id,
+            "cluster_kind": "manual_group",
+            "role": role,
+            "n": 0,
+            "summary": f"manually moved from {source_id}",
+            "avg_quality_total": "",
+            "avg_identity_usefulness": "",
+            "shot_counts": {},
+            "style_counts": {},
+            "members": [],
+            "asset_ids": [],
+            "filenames": [],
+            "image_paths": [],
+            "origin_cluster_id": source_id,
+            "detached_from_reject": bool(source_is_reject),
+        }
+        insert_at = next((i for i, c in enumerate(clusters) if str(c.get("cluster_kind", "") or "") == "audited_rejects"), len(clusters))
+        clusters.insert(insert_at, target)
+
+    target_members = list(target.get("asset_ids") or target.get("members", []) or [])
+    target_files = list(target.get("filenames", []) or [])
+    target_paths = list(target.get("image_paths", []) or [])
+    keeps_reasons = "reject_reasons" in target or str(target.get("cluster_kind", "") or "") == "audited_rejects"
+    target_reasons = list(target.get("reject_reasons", []) or [])
+    for member, filename, image_path, reason in moved:
+        asset_id = core_normalize_asset_id(member)
+        target_members.append(asset_id if asset_id > 0 else member)
+        target_files.append(filename)
+        target_paths.append(image_path)
+        if keeps_reasons:
+            target_reasons.append(reason or "user_moved_to_bucket")
+    target["members"], target["filenames"], target["image_paths"] = target_members, target_files, target_paths
+    target["asset_ids"] = [int(v) for v in target_members if core_normalize_asset_id(v) > 0]
+    if keeps_reasons:
+        target["reject_reasons"] = target_reasons
+    _refresh_cluster_stats_ui(target, row_lookup)
+
+    if not members:
+        clusters = [c for c in clusters if c is not source]
+    profile["identity_clusters"] = clusters
+    _rebuild_cluster_member_maps_ui(profile)
+    notes = profile.setdefault("normalizer_notes", [])
+    if isinstance(notes, list):
+        notes.append(f"User moved {len(moved)} image(s) from {source_id} to {target_id} at {time.strftime('%Y-%m-%dT%H:%M:%S')}.")
+        profile["normalizer_notes"] = notes[-40:]
+    return profile, len(moved), target_id, ""
+
+
+def _cluster_page_choices(profile: Dict[str, Any], cluster_id: str, page: Any = 1) -> List[Tuple[str, str]]:
+    """Checkbox choices for the images on the current gallery page."""
+    if not str(cluster_id or "").strip():
+        return []
+    cluster = _identity_cluster_by_id(profile, cluster_id)
+    if not cluster:
+        return []
+    records = _cluster_member_records(cluster)
+    size = CLUSTER_GALLERY_PAGE_SIZE
+    total_pages = max(1, (len(records) + size - 1) // size)
+    current = min(_parse_cluster_gallery_page(page), total_pages)
+    start = (current - 1) * size
+    return [
+        (f"{start + offset + 1}. {record.get('filename') or record.get('image_id')}", _selection_ref_for_record(record, start + offset))
+        for offset, record in enumerate(records[start:start + size])
+    ]
+
+
+def _cluster_move_target_choices(profile: Dict[str, Any], source_cluster_id: str) -> List[Tuple[str, str]]:
+    choices = [(tr("➕ Neuer Bucket", "➕ New bucket"), CLUSTER_MOVE_NEW_BUCKET)]
+    for cluster in _sorted_identity_clusters(profile):
+        cid = str(cluster.get("cluster_id", "") or "")
+        if not cid or cid == str(source_cluster_id or ""):
+            continue
+        choices.append((f"{cid} · {cluster.get('role', 'variation')} · n={cluster.get('n', len(cluster.get('members', []) or []))}", cid))
+    return choices
+
+
+def refresh_cluster_multiselect_ui(profile_state: Dict[str, Any], cluster_id: str, page: Any):
+    """Refresh the per-page checkbox list and the move-target dropdown."""
+    profile = profile_state if isinstance(profile_state, dict) else {}
+    return (
+        gr.update(choices=_cluster_page_choices(profile, cluster_id, page), value=[]),
+        gr.update(choices=_cluster_move_target_choices(profile, cluster_id), value=CLUSTER_MOVE_NEW_BUCKET),
+    )
+
+
+def select_all_cluster_page_ui(profile_state: Dict[str, Any], cluster_id: str, page: Any):
+    profile = profile_state if isinstance(profile_state, dict) else {}
+    return gr.update(value=[value for _label, value in _cluster_page_choices(profile, cluster_id, page)])
+
+
+def move_selected_cluster_images_ui(
+    trigger_word: str,
+    input_folder: str,
+    profile_state: Dict[str, Any],
+    selected_cluster_id: str,
+    selected_refs: List[str],
+    target_cluster_id: str,
+    new_bucket_role: str,
+    gallery_page: Any,
+):
+    """Move all checked images of the current bucket and refresh the panel."""
+    profile, path = _load_profile_for_bucket_edit(trigger_word, input_folder, profile_state)
+    cid = str(selected_cluster_id or "").strip()
+    messages = {
+        "source_missing": tr("❌ Erst einen Bucket in der Tabelle auswählen.", "❌ Select a bucket in the table first."),
+        "nothing_selected": tr("⚠️ Keine Bilder angehakt.", "⚠️ No images checked."),
+        "same_bucket": tr("⚠️ Ziel ist derselbe Bucket.", "⚠️ Target is the same bucket."),
+        "target_missing": tr("❌ Ziel-Bucket nicht gefunden.", "❌ Target bucket not found."),
+    }
+    if not profile or not cid:
+        status = messages["source_missing"]
+        return profile, json.dumps(profile or {}, ensure_ascii=False, indent=2), _identity_clusters_markdown(profile or {}), _identity_clusters_table(profile or {}), _identity_cluster_preview_markdown(profile or {}, cid, page=gallery_page), _identity_cluster_preview_gallery(profile or {}, trigger_word, input_folder, cid, page=gallery_page), cid, gr.update(), _cluster_gallery_page_update(profile or {}, cid, gallery_page), "", tr("_Kein Bild ausgewählt._", "_No image selected._"), status
+    row_lookup = _stage_rows_by_profile_id(trigger_word, input_folder)
+    profile, moved, destination, error = move_cluster_members(
+        profile, cid, list(selected_refs or []), target_cluster_id, new_bucket_role, row_lookup
+    )
+    if error:
+        status = messages.get(error, error)
+        return profile, json.dumps(profile, ensure_ascii=False, indent=2), _identity_clusters_markdown(profile), _identity_clusters_table(profile), _identity_cluster_preview_markdown(profile, cid, page=gallery_page), _identity_cluster_preview_gallery(profile, trigger_word, input_folder, cid, page=gallery_page), cid, gr.update(), _cluster_gallery_page_update(profile, cid, gallery_page), "", tr("_Kein Bild ausgewählt._", "_No image selected._"), status
+    _save_profile_bucket_edit(profile, path)
+    # Stay on the source bucket so more images can be sorted out; fall back to
+    # the destination when the source became empty.
+    view_id = cid if _identity_cluster_by_id(profile, cid) else destination
+    page = gallery_page if view_id == cid else 1
+    status = tr(
+        f"✅ {moved} Bild(er) aus `{cid}` nach `{destination}` verschoben.",
+        f"✅ Moved {moved} image(s) from `{cid}` to `{destination}`.",
+    )
+    return (
+        profile,
+        json.dumps(profile, ensure_ascii=False, indent=2),
+        _identity_clusters_markdown(profile),
+        gr.update(value=_identity_clusters_table(profile)),
+        _identity_cluster_preview_markdown(profile, view_id, page=page),
+        gr.update(value=_identity_cluster_preview_gallery(profile, trigger_word, input_folder, view_id, page=page)),
+        view_id,
+        gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value=_identity_cluster_role_for_id(profile, view_id)),
+        _cluster_gallery_page_update(profile, view_id, page),
+        "",
+        tr("_Kein Bild ausgewählt._", "_No image selected._"),
+        status,
+    )
+
+
 def refresh_identity_cluster_panel_ui(
     trigger_word: str,
     input_folder: str,
@@ -8011,6 +8226,35 @@ def build_ui() -> gr.Blocks:
                                     p_detach_cluster_image_btn = gr.Button(tr("↗ Bild aus Bucket lösen", "↗ Detach image from bucket"), variant="secondary", scale=2)
                                     p_priority_image_btn = gr.Button(tr("⭐ Als Priority markieren", "⭐ Mark as Priority"), variant="primary", scale=2)
                                     p_unpriority_image_btn = gr.Button(tr("☆ Priority entfernen", "☆ Remove Priority"), variant="secondary", scale=2)
+                                with gr.Accordion(tr("☑ Mehrere Bilder verschieben", "☑ Move several images"), open=True):
+                                    p_cluster_multi = gr.CheckboxGroup(
+                                        label=tr("Bilder dieser Seite", "Images on this page"),
+                                        choices=[],
+                                        value=[],
+                                        info=tr(
+                                            "Nummern entsprechen der Reihenfolge in der Vorschau. Auswahl gilt für die aktuelle Galerieseite.",
+                                            "Numbers follow the preview order. The selection applies to the current gallery page.",
+                                        ),
+                                    )
+                                    with gr.Row():
+                                        p_cluster_select_all_btn = gr.Button(tr("Alle auf dieser Seite", "All on this page"), variant="secondary", scale=1)
+                                        p_cluster_select_none_btn = gr.Button(tr("Auswahl leeren", "Clear selection"), variant="secondary", scale=1)
+                                    with gr.Row():
+                                        p_cluster_move_target = gr.Dropdown(
+                                            label=tr("Ziel", "Target"),
+                                            choices=[(tr("➕ Neuer Bucket", "➕ New bucket"), CLUSTER_MOVE_NEW_BUCKET)],
+                                            value=CLUSTER_MOVE_NEW_BUCKET,
+                                            allow_custom_value=False,
+                                            scale=2,
+                                        )
+                                        p_cluster_move_role = gr.Dropdown(
+                                            label=tr("Rolle für neuen Bucket", "Role for new bucket"),
+                                            choices=IDENTITY_CLUSTER_ROLE_CHOICES,
+                                            value="exclude",
+                                            allow_custom_value=False,
+                                            scale=1,
+                                        )
+                                    p_cluster_move_btn = gr.Button(tr("↗ Ausgewählte verschieben", "↗ Move selected"), variant="primary")
                                 p_priority_hazard_confirm = gr.Checkbox(
                                     label=tr("Problematisches Priority-Bild trotzdem bestätigen", "Confirm problematic Priority image anyway"),
                                     value=False,
@@ -8198,6 +8442,31 @@ def build_ui() -> gr.Blocks:
                         p_selected_cluster_image_info,
                     ],
                     show_progress="hidden",
+                )
+
+                _multi_inputs = [p_state, p_selected_cluster_id, p_cluster_gallery_page]
+                _multi_outputs = [p_cluster_multi, p_cluster_move_target]
+                p_selected_cluster_id.change(
+                    fn=refresh_cluster_multiselect_ui, inputs=_multi_inputs, outputs=_multi_outputs, show_progress="hidden",
+                )
+                p_cluster_gallery_page.change(
+                    fn=refresh_cluster_multiselect_ui, inputs=_multi_inputs, outputs=_multi_outputs, show_progress="hidden",
+                )
+                p_cluster_select_all_btn.click(
+                    fn=select_all_cluster_page_ui, inputs=_multi_inputs, outputs=[p_cluster_multi], queue=False,
+                )
+                p_cluster_select_none_btn.click(fn=lambda: gr.update(value=[]), outputs=[p_cluster_multi], queue=False)
+                p_cluster_move_btn.click(
+                    fn=move_selected_cluster_images_ui,
+                    inputs=[p_trigger, p_input, p_state, p_selected_cluster_id, p_cluster_multi,
+                            p_cluster_move_target, p_cluster_move_role, p_cluster_gallery_page],
+                    outputs=[
+                        p_state, p_raw_json, p_cluster_md, p_cluster_table, p_cluster_preview_md, p_cluster_gallery,
+                        p_selected_cluster_id, p_cluster_role_editor, p_cluster_gallery_page, p_selected_cluster_image_id,
+                        p_selected_cluster_image_info, p_status,
+                    ],
+                ).then(
+                    fn=refresh_cluster_multiselect_ui, inputs=_multi_inputs, outputs=_multi_outputs, show_progress="hidden",
                 )
 
                 p_priority_image_btn.click(
