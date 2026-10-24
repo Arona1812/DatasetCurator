@@ -355,6 +355,7 @@ DEFAULTS: Dict[str, Any] = {
     "c_crop_gain": 8,
     "c_crop_pad": 0.6,
     "c_medium_rescue_crop": True,
+    "c_overlay_crop": True,
     "c_medium_rescue_gain": 4,
     # Clustering
     "c_use_cluster": True,
@@ -694,7 +695,7 @@ def save_settings_fn(
     c_ig_frame_crop, c_ig_two_stage_bar, c_frame_cleanup_mode, c_frame_pause_on_medium,
     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh, c_clip_model,
     c_smart_crop, c_crop_gain, c_crop_pad,
-    c_medium_rescue_crop, c_medium_rescue_gain,
+    c_medium_rescue_crop, c_medium_rescue_gain, c_overlay_crop,
     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,
     c_use_canon_representation, c_canon_representation_target, c_canon_max_quality_gap,
     c_use_pose_diversity, c_pose_soft_limit, c_pose_penalty_weight,
@@ -757,6 +758,7 @@ def save_settings_fn(
         "c_smart_crop": c_smart_crop, "c_crop_gain": c_crop_gain, "c_crop_pad": c_crop_pad,
         "c_crop_pad_revision": CROP_PAD_REVISION,
         "c_medium_rescue_crop": c_medium_rescue_crop,
+        "c_overlay_crop": bool(c_overlay_crop),
         "c_medium_rescue_gain": c_medium_rescue_gain,
         "c_use_cluster": c_use_cluster, "c_max_outfit": c_max_outfit,
         "c_max_session": c_max_session, "c_use_diversity": c_use_diversity,
@@ -3832,7 +3834,7 @@ CURATOR_INPUT_NAMES = (
     "use_early_phash", "use_early_phash_loop1", "early_phash_threshold_1", "early_phash_keep_per_group_1",
     "use_early_phash_loop2", "early_phash_threshold_2", "early_phash_keep_per_group_2", "subject_sanity", "subject_min_torso",
     "ig_frame_crop", "ig_two_stage_bar", "frame_cleanup_mode", "frame_pause_on_medium", "use_clip", "use_phash", "phash_threshold", "clip_threshold", "clip_model",
-    "enable_smart_crop", "crop_min_gain", "crop_padding", "enable_medium_rescue_crop", "medium_rescue_min_gain",
+    "enable_smart_crop", "crop_min_gain", "crop_padding", "enable_medium_rescue_crop", "medium_rescue_min_gain", "enable_overlay_crop",
     "use_clustering", "max_outfit", "max_session", "use_diversity", "c_use_canon_representation", "c_canon_representation_target", "c_canon_max_quality_gap",
     "use_pose_diversity", "pose_soft_limit", "pose_penalty_weight", "use_arcface", "arcface_hard", "arcface_soft", "arcface_trim",
     "arcface_min_faces", "arcface_model", "arcface_det_size", "training_target", "caption_options", "variable_feature_mode",
@@ -3916,6 +3918,7 @@ def build_run_config_from_ui_values(values: Tuple[Any, ...], *, continue_from_pr
         "SMART_PRECROP_MIN_GAIN": float(v["crop_min_gain"]),
         "SMART_PRECROP_PADDING_FACTOR": float(v["crop_padding"]),
         "ENABLE_MEDIUM_RESCUE_CROP": bool(v["enable_medium_rescue_crop"]),
+        "ENABLE_OVERLAY_CROP": bool(v["enable_overlay_crop"]),
         "MEDIUM_RESCUE_MIN_GAIN": float(v["medium_rescue_min_gain"]),
         "USE_SESSION_OUTFIT_CLUSTERING": bool(v["use_clustering"]),
         "MAX_PER_OUTFIT_CLUSTER": int(v["max_outfit"]),
@@ -7038,6 +7041,14 @@ def build_ui() -> gr.Blocks:
                                             "How many points better the medium rescue crop must score. Recommended: 4 because it may also fill a missing shot category.",
                                         ),
                                     )
+                                c_overlay_crop = gr.Checkbox(
+                                    label=tr("Overlays wegschneiden statt Bild aussortieren", "Crop away overlays instead of dropping the image"),
+                                    value=S["c_overlay_crop"],
+                                    info=tr(
+                                        "Empfohlen: an. Hat ein Bild einen Sticker, Datumsstempel oder ein Wasserzeichen, sucht Luna die Stelle und das Tool schneidet sie weg, sofern die Person vollständig und das Bild groß genug bleibt. Der Zuschnitt wird neu geprüft und ersetzt das Original nur ohne Overlay (etwa 0,001 USD pro betroffenem Bild, danach gespeichert).",
+                                        "Recommended: on. If an image has a sticker, date stamp or watermark, Luna locates it and the tool crops it away as long as the person stays complete and the image large enough. The crop is audited again and replaces the original only without overlay (about 0.001 USD per affected image, stored afterwards).",
+                                    ),
+                                )
 
                         with gr.TabItem(tr("Auswahl & Vielfalt", "Selection & diversity")):
                             with gr.Accordion(tr("Aufnahme-Verteilung", "Shot distribution"), open=False):
@@ -7906,7 +7917,7 @@ def build_ui() -> gr.Blocks:
                     c_ig_frame_crop, c_ig_two_stage_bar, c_frame_cleanup_mode, c_frame_pause_on_medium,
                     c_use_clip, c_use_phash, c_phash_thresh, c_clip_thresh, c_clip_model,
                     c_smart_crop, c_crop_gain, c_crop_pad,
-                    c_medium_rescue_crop, c_medium_rescue_gain,
+                    c_medium_rescue_crop, c_medium_rescue_gain, c_overlay_crop,
                     c_use_cluster, c_max_outfit, c_max_session, c_use_diversity,
                     c_use_canon_representation, c_canon_representation_target, c_canon_max_quality_gap,
                     c_use_pose_diversity, c_pose_soft_limit, c_pose_penalty_weight,

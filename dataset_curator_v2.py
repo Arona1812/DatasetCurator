@@ -807,6 +807,12 @@ SMART_PRECROP_ALLOW_DATASET_DUPLICATES = False  # False = Original und Crop dür
 # images. It tries to retain head, shoulders, torso and hips instead of turning
 # every distant image into a square face crop.
 ENABLE_MEDIUM_RESCUE_CROP = True
+# Overlay-Crop: Bilder mit Sticker/Datumsstempel/Wasserzeichen werden nicht nur
+# aussortiert; ein Zuschnitt ohne Overlay ersetzt das Original, wenn die Person
+# vollstaendig bleibt und der Zuschnitt eine eigene Pruefung besteht.
+ENABLE_OVERLAY_CROP = True
+OVERLAY_CROP_MIN_AREA = 0.55          # Mindestanteil der Bildflaeche
+OVERLAY_CROP_MAX_SCORE_LOSS = 6.0     # erlaubter Punkteverlust gegenueber dem Original
 MEDIUM_RESCUE_MIN_GAIN = 4.0
 MEDIUM_RESCUE_TRIGGER_COMPOSITION_MAX = 65.0
 MEDIUM_RESCUE_MIN_FACE_PX = 90
@@ -2112,6 +2118,146 @@ def generate_headshot_crop(
         raise
     except Exception:
         return None
+
+
+OVERLAY_LOCATOR_VERSION = "overlay-locator-v1"
+
+
+def locate_overlay_regions(image_path: str, file_hash: str, phase_label: str) -> List[Dict[str, Any]]:
+    """Ask the audit model where stickers, stamps and watermarks sit (0-1000 grid); cached per image."""
+    cache_path = os.path.join(CACHE_DIR, "overlay_regions", f"{file_hash}_{OVERLAY_LOCATOR_VERSION}_{AI_MODEL}.json")
+    if ENABLE_CACHE and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as handle:
+                cached = json.load(handle)
+            safe_print("   ↳ Overlay locator cache used")
+            return list(cached.get("overlays", []) or [])
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    with open_local_image(image_path) as opened:
+        image_b64 = _encode_pil_for_api(opened)
+    box = {"type": "object", "properties": {key: {"type": "number"} for key in ("x1", "y1", "x2", "y2")},
+           "required": ["x1", "y1", "x2", "y2"], "additionalProperties": False}
+    payload = {
+        "instructions": (
+            "Find every element that was laid over this photo after it was taken: stickers (for example music or "
+            "song stickers), emojis, GIFs, date or time stamps, watermarks, captions, app interface text. Ignore "
+            "text that physically exists in the scene, such as shirt prints or signs. Return each element as a tight "
+            "box on a 0-1000 grid relative to the full image (x1,y1 top-left, x2,y2 bottom-right). Return an empty "
+            "list when there is none."
+        ),
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": "Locate the overlays."},
+            {"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_b64}", "detail": "high"},
+        ]}],
+        "text": {"format": {"type": "json_schema", "name": "overlay_regions", "strict": True, "schema": {
+            "type": "object", "properties": {"overlays": {"type": "array", "items": box}},
+            "required": ["overlays"], "additionalProperties": False}}},
+        "max_output_tokens": 400,
+        "store": False,
+        "_reasoning_effort": "none",
+    }
+    data = responses_api_call(AI_MODEL, payload, phase_label=phase_label)
+    overlays = list(json.loads(extract_response_text(data)).get("overlays", []) or [])
+    if ENABLE_CACHE:
+        core_atomic_write_json(cache_path, {"overlays": overlays, "model": AI_MODEL})
+    return overlays
+
+
+def evaluate_overlay_crop(row: Dict[str, Any], image_path: str, file_hash: str, phase_prefix: str) -> Optional[Dict[str, Any]]:
+    """Return an audited crop row without the overlay, or None when no safe crop exists.
+
+    The crop keeps the whole person, at least OVERLAY_CROP_MIN_AREA of the image
+    and is accepted only when its own audit finds no overlay and its score is at
+    most OVERLAY_CROP_MAX_SCORE_LOSS below the original.
+    """
+    from overlay_crop import keep_box_for_person, overlay_boxes_from_response, overlay_free_crop
+
+    name = str(row.get("original_filename", "") or "")
+    with open_local_image(image_path) as opened:
+        width, height = ImageOps.exif_transpose(opened).size
+    regions = locate_overlay_regions(image_path, file_hash, f"{phase_prefix} overlay_locator {name}")
+    boxes = overlay_boxes_from_response(regions, width, height)
+    keep = keep_box_for_person(width, height, row.get("main_face_bbox"), row.get("pose_bbox"))
+    bbox = overlay_free_crop(width, height, boxes, keep, min_area_fraction=OVERLAY_CROP_MIN_AREA) if boxes and keep else None
+    if not bbox:
+        safe_print("   ❌ Overlay crop: no crop keeps the person and removes the overlay")
+        return None
+    x, y, w, h = bbox
+    import tempfile
+    tmp_fd, crop_path = tempfile.mkstemp(suffix=".jpg", prefix="overlay_crop_")
+    os.close(tmp_fd)
+    try:
+        with open_local_image(image_path) as opened:
+            ImageOps.exif_transpose(opened).convert("RGB").crop((x, y, x + w, y + h)).save(crop_path, "JPEG", quality=100)
+        crop_hash = hashlib.sha1(f"{file_hash}_overlay_crop_{'_'.join(str(v) for v in bbox)}".encode()).hexdigest()
+        cache_key = audit_cache_key(crop_hash, AI_MODEL, "primary_overlay_crop_audit")
+        cached = load_cached_audit(cache_key)
+        meta = local_subject_metrics(crop_path, file_hash=crop_hash)
+        if cached:
+            crop_audit = cached.get("audit", cached)
+            safe_print(f"   ↳ Overlay crop audit cache used ({AI_MODEL})")
+        else:
+            crop_audit = openai_audit_image(crop_path, meta, model=AI_MODEL,
+                                            phase_label=f"{phase_prefix} primary_overlay_crop_audit {name}")
+        if crop_audit.get("AUDIT_PROVIDER_REFUSAL") or crop_audit.get("NSFW_BLOCKED"):
+            return None
+        crop_audit = normalize_audit_scores(crop_audit)
+        if not cached:
+            save_cached_audit(cache_key, audit_cache_payload(crop_audit, AI_MODEL, "primary_overlay_crop_audit"))
+        crop_score = float(crop_audit.get("quality_total", 0) or 0)
+        orig_score = float(row.get("quality_total", 0) or 0)
+        if crop_audit.get("watermark_or_overlay"):
+            safe_print("   ❌ Overlay crop rejected: the crop still shows an overlay")
+            return None
+        if crop_score < orig_score - OVERLAY_CROP_MAX_SCORE_LOSS:
+            safe_print(f"   ❌ Overlay crop rejected: score {crop_score:.1f} vs. original {orig_score:.1f}")
+            return None
+        crop_row: Dict[str, Any] = {
+            "original_filename": name + "__overlay_crop",
+            # Local checks read the crop; export reapplies rescue_crop_bbox to the source.
+            "original_path": crop_path,
+            "is_rescue_crop": True,
+            "crop_variant": "overlay_removed",
+            "crop_of": name,
+            "rescue_crop_bbox": bbox,
+            "overlay_regions": regions,
+            "status_notes": ["overlay_crop"],
+            "selected": False,
+            "output_bucket": "",
+            "new_basename": "",
+            "file_hash": crop_hash,
+            "mtime_bucket": row.get("mtime_bucket"),
+            "width": meta.get("width", w),
+            "height": meta.get("height", h),
+            "file_size_mb": meta.get("file_size_mb", 0),
+            "phash": meta.get("phash"),
+            "clip_embedding": compute_clip_embedding(crop_path, crop_hash) if USE_CLIP_DUPLICATE_SCORING else None,
+        }
+        crop_row.update(crop_audit)
+        crop_row["grundscore"] = crop_score
+        crop_row["score_nach_eskalation"] = ""
+        crop_row = apply_local_score_adjustments(crop_row)
+        local_status, local_reasons = local_status_override(crop_row)
+        api_status = crop_row.get("suggested_status", "review")
+        crop_row["base_status"] = (
+            "reject" if "reject" in {api_status, local_status}
+            else "review" if "review" in {api_status, local_status} else "keep"
+        )
+        crop_row["local_override_reasons"] = local_reasons
+        if crop_row["base_status"] == "reject":
+            safe_print("   ❌ Overlay crop rejected by its own audit")
+            return None
+        crop_row["original_path"] = row.get("original_path", image_path)
+        crop_row["source_original_path"] = row.get("source_original_path", row.get("original_path", image_path))
+        crop_row["effective_image_path"] = image_path
+        safe_print(f"   ✅ Overlay crop accepted: score={crop_row.get('quality_total', 0):.1f} | status={crop_row['base_status']}")
+        return crop_row
+    finally:
+        try:
+            os.remove(crop_path)
+        except OSError:
+            pass
 
 
 def is_crop_variant(item: Dict[str, Any]) -> bool:
@@ -5941,6 +6087,22 @@ def get_visible_tattoo_state(
     return {"phrases": visible, "visible": bool(visible), "must_caption": must_caption}
 
 
+_HAIR_DESCRIPTORS = (
+    r"long|short|shoulder-length|wavy|straight|curly|loose|sleek|messy|voluminous|thick|dark|light|black|brown|"
+    r"brunette|blonde|blond|red|auburn|burgundy|ginger|copper|gray|grey|silver|white|pink|blue|green|purple|"
+    r"bleached|dyed|highlighted|ombre|colored|coloured"
+)
+_HAIRSTYLE_WORDS = r"braids?|ponytail|pigtails|bun|updo|dreadlocks|cornrows|pixie cut|bob cut|bangs|fringe"
+
+
+def _describes_hair(caption: str) -> bool:
+    """True when a caption describes hair color, length or style, not merely 'her hair' in a pose."""
+    text = str(caption or "").lower()
+    if re.search(rf"\b(?:{_HAIRSTYLE_WORDS})\b", text):
+        return True
+    return bool(re.search(rf"\b(?:{_HAIR_DESCRIPTORS})\b(?:[\s,-]+[a-z-]+){{0,3}}?[\s,-]+hair\b", text))
+
+
 def _validate_krea_caption_features(caption: str, feature_states: Dict[str, Dict[str, Any]]) -> Tuple[bool, List[str]]:
     reasons: List[str] = []
     text = normalize_compact_text(caption)
@@ -5988,9 +6150,8 @@ def _validate_krea_caption_features(caption: str, feature_states: Dict[str, Dict
             reasons.append("canonical glasses state should be omitted")
 
     hair = feature_states.get("hair", {}) or {}
-    if not hair.get("must_caption"):
-        if contains_any([" hair", "hair ", "braids", "ponytail", "pigtails", "bun", "updo", "dreadlocks", "cornrows", "pixie cut", "bob cut"]):
-            reasons.append("canonical hair state should be omitted")
+    if not hair.get("must_caption") and _describes_hair(caption):
+        reasons.append("canonical hair state should be omitted")
 
     piercings = feature_states.get("piercings", {}) or {}
     if piercings.get("must_caption"):
@@ -8590,6 +8751,10 @@ def rebuild_selection_from_identity_roles(
         if face_outlier_blocked(row):
             review_items.append(row)
             continue
+        if row.get("overlay_crop_available"):
+            # Its overlay-free crop competes instead of the original.
+            overflow_items.append(row)
+            continue
         if row.get("base_status") == "reject":
             # A rejected image is recoverable only after the user deliberately
             # detached it from the always-last reject bucket and assigned a
@@ -9602,6 +9767,9 @@ def _write_captioned_image(row: Dict[str, Any], out_dir: str, new_basename: str,
             "original_filename": row.get("original_filename"),
             "initial_caption": row["initial_caption"], "final_caption": row["final_caption"],
             "composition_source": row.get("caption_composition_source", "audited_observations_and_subject_profile"),
+            "caption_source": row.get("caption_source", ""),
+            "caption_model": row.get("caption_model", ""),
+            "caption_validation_error": row.get("caption_validation_error", ""),
             "detail_changes": row.get("caption_detail_changes", {}),
             "rejected_details": row.get("caption_detail_rejected", []),
             "training_target": TRAINING_TARGET, "caption_policy": CAPTION_POLICY,
@@ -9760,7 +9928,7 @@ def backfill_train_ready_selection(
     for row in candidate_pool:
         if row_identity_key(row) in selected_keys:
             continue
-        if row.get("base_status") != "keep" or face_outlier_blocked(row):
+        if row.get("base_status") != "keep" or face_outlier_blocked(row) or row.get("overlay_crop_available"):
             continue
         if needs_caption_remove(row):
             continue
@@ -11912,7 +12080,8 @@ def render_local_caption(facts: Dict[str, Any]) -> str:
     scene = facts.get("scene", {})
     be = "is" if pronoun in {"He", "She"} else "are"
     if scene.get("clothing"):
-        clothing = _fix_pronouns(_ensure_article(scene["clothing"].strip().rstrip(".")), pronoun)
+        clothing = re.sub(r"\s*;\s*", ", along with ", scene["clothing"].strip().rstrip("."))
+        clothing = _fix_pronouns(_ensure_article(clothing), pronoun)
         sentences.append(f"{pronoun} {be} wearing {clothing}.")
     sentences.extend(_pose_sentences(pronoun, scene.get("pose", ""), scene.get("expression", ""), scene.get("gaze", "")))
     if scene.get("lighting"):
@@ -12239,9 +12408,10 @@ def body_aware_crop(image_path: str, item: Dict[str, Any]) -> Image.Image:
         rh = max(1, min(rh, h - ry))
         content_crop = pil_img.crop((rx, ry, rx + rw, ry + rh))
         if USE_CONTROLLED_BUCKETS:
+            headshot = item.get("crop_variant") == "overlay_removed" and item.get("shot_type") == "headshot"
             return ImageOps.fit(
                 content_crop,
-                (832, 1216),
+                (1024, 1024) if headshot else (832, 1216),
                 method=Image.Resampling.LANCZOS,
                 centering=(0.5, 0.38),
             )
@@ -13549,6 +13719,28 @@ def main() -> None:
                         except Exception:
                             pass
 
+            # ─────────────────────────────────────────────────────────────
+            # OVERLAY CROP: cut stickers/stamps/watermarks away instead of
+            # sending a good image to 03_caption_remove.
+            # ─────────────────────────────────────────────────────────────
+            if (
+                ENABLE_OVERLAY_CROP
+                and base_status != "reject"
+                and row.get("watermark_or_overlay")
+                and row.get("main_face_bbox") is not None
+            ):
+                try:
+                    safe_print("   ✂️  Overlay crop: locating overlays...")
+                    overlay_row = evaluate_overlay_crop(row, image_path, file_hash, f"[{idx}/{len(image_paths)}]")
+                    if overlay_row:
+                        row["overlay_crop_available"] = overlay_row["original_filename"]
+                        row.setdefault("status_notes", []).append("replaced_by_overlay_crop")
+                        all_rows.append(overlay_row)
+                except RunCancelled:
+                    raise
+                except Exception as overlay_e:  # The original stays usable for manual cleanup in 03_caption_remove.
+                    safe_print(f"   ⚠️ Overlay crop failed: {overlay_e}")
+
         except RunCancelled:
             raise
         except Exception as e:
@@ -13600,6 +13792,7 @@ def main() -> None:
     valid_candidates = [
         r for r in all_rows
         if r.get("base_status") in {"keep", "review"} and not face_outlier_blocked(r)
+        and not r.get("overlay_crop_available")
     ]
     review_items = [r for r in all_rows if r.get("base_status") == "review"]
     reject_items = [r for r in all_rows if r.get("base_status") == "reject"]

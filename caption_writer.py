@@ -56,7 +56,7 @@ def writer_request(facts: Dict[str, Any], target_label: str, reference: str) -> 
     if omitted.get("tattoos"):
         never.append("tattoos")
     states = facts.get("feature_states", {})
-    for name, label in (("hair", "hair color or hairstyle"), ("eye", "eye color"), ("beard", "beard"), ("glasses", "glasses")):
+    for name, label in (("hair", "hair color, length or style (a pose may still say 'her hair')"), ("eye", "eye color"), ("beard", "beard"), ("glasses", "glasses")):
         if not (states.get(name) or {}).get("must_caption"):
             never.append(label)
     pronoun = facts.get("pronoun", "They")

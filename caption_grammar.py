@@ -193,14 +193,24 @@ def expression_phrase(expression: str) -> Tuple[str, str]:
     text = re.sub(r"\s*(?:,\s*)?(?:and\s+)?with\s+", " and ", text)
     adjectives: List[str] = []
     nouns: List[str] = []
+    pieces: List[str] = []
     for chunk in [c.strip() for c in text.split(" and ") if c.strip()]:
+        parts = [p.strip() for p in chunk.split(",") if p.strip()]
+        # "soft, closed-mouth smile" is one noun phrase; "pensive, lips pursed" are two.
+        if len(parts) > 1 and _words(parts[-1])[-1] in _EXPRESSION_NOUNS and not any(
+                w in _EXPRESSION_NOUNS for p in parts[:-1] for w in _words(p)):
+            pieces.append(chunk)
+        else:
+            pieces.extend(parts)
+    for chunk in pieces:
         chunk = re.sub(r"^(?:an?|the)\s+", "", chunk)
+        chunk = re.sub(r"^(lips|mouth)\s+(pursed|closed|parted|open)$", r"\2 \1", chunk)
         words = _words(chunk)
         if any(w in _EXPRESSION_NOUNS for w in words):
             noun = next(w for w in reversed(words) if w in _EXPRESSION_NOUNS)
             nouns.append(chunk if noun in _PLURAL_EXPRESSION_NOUNS else with_article(chunk))
         elif chunk and len(words) <= 4:
-            adjectives.extend(p.strip() for p in chunk.split(",") if p.strip())
+            adjectives.append(chunk)
     parts = []
     if adjectives:
         parts.append(with_article(f"{join_natural(adjectives)} expression"))

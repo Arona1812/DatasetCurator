@@ -33,6 +33,10 @@ class PoseSentences(unittest.TestCase):
                          "She is facing the camera with her head tilted.")
 
 
+    def test_ausdruck_mit_lippen_wird_sauber(self):
+        self.assertIn("with a pensive expression and pursed lips", self.satz("seated in a chair", "pensive, lips pursed"))
+
+
 class IdentityAndScene(unittest.TestCase):
     def test_merkmale_stehen_in_einem_ganzen_satz_statt_als_tag_liste(self):
         sentence = grammar.identity_sentence("She", [
@@ -84,6 +88,15 @@ class WriterRules(unittest.TestCase):
                          "luna_writer")
         with self.assertRaises(ValueError):
             normalize_run_config_payload({"CAPTION_COMPOSITION_MODE": "invented"})
+
+
+
+class HairRule(unittest.TestCase):
+    def test_haar_in_der_pose_ist_erlaubt_haarbeschreibung_nicht(self):
+        import dataset_curator_v2 as curator
+        self.assertFalse(curator._describes_hair("Wiktoria, a photo. One hand is raised near her hair."))
+        self.assertTrue(curator._describes_hair("Her top is mostly obscured by long hair."))
+        self.assertTrue(curator._describes_hair("Her red wavy hair falls over her shoulders."))
 
 
 if __name__ == "__main__":
