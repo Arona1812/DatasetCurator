@@ -3346,11 +3346,15 @@ def save_identity_cluster_roles_ui(trigger_word: str, input_folder: str, table_d
         return tr(f"❌ Speichern fehlgeschlagen: {e}", f"❌ Save failed: {e}")
 
 
+CAPTION_PROGRESS_RE = re.compile(r"^(?:Initial caption|Text details) ready: (\d+)/(\d+)\b")
+
+
 def parse_progress(line: str) -> Optional[Tuple[int, int]]:
     # Nur echte Bildstart-Zeilen zaehlen, nicht Heartbeats/Subphasen wie
     # "START [12/80] local_subject_metrics ...". Dadurch bleiben Fortschritt,
     # Sekunden/Bild und ETA stabil.
-    m = re.match(r"^\[(\d+)/(\d+)\]", line)
+    # Caption stages report finished items as "Text details ready: 3/92".
+    m = re.match(r"^\[(\d+)/(\d+)\]", line) or CAPTION_PROGRESS_RE.match(line)
     if m:
         return int(m.group(1)), int(m.group(2))
     return None
@@ -3624,6 +3628,8 @@ def run_script(
     last_gallery_update = 0
     images: List[Any] = []
     run_started_at = time.time()
+    phase_started_at = run_started_at
+    phase_base_idx = 0
     last_progress_idx = 0
     last_progress_total = 0
     seconds_per_item: Optional[float] = None
@@ -3664,13 +3670,18 @@ def run_script(
             p = parse_progress(line)
             if p:
                 idx, total = p
+                if last_progress_total and (total != last_progress_total or idx < last_progress_idx):
+                    # A new stage (e.g. captions after the image audit) restarts
+                    # the count; its speed must not include the earlier stage.
+                    phase_started_at = time.time()
+                    phase_base_idx = idx
                 progress = idx / max(1, total)
                 last_progress_idx = idx
                 last_progress_total = total
 
-                elapsed = max(0.0, time.time() - run_started_at)
-                if idx > 0:
-                    seconds_per_item = elapsed / idx
+                elapsed = max(0.0, time.time() - phase_started_at)
+                if idx > phase_base_idx:
+                    seconds_per_item = elapsed / (idx - phase_base_idx)
                     remaining_items = max(0, total - idx)
                     eta_seconds = remaining_items * seconds_per_item
 

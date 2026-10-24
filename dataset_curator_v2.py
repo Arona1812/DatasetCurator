@@ -9258,7 +9258,7 @@ def prepare_initial_captions(rows: List[Dict[str, Any]]) -> None:
             cases.append({"path": path, "image_sha256": digest})
     safe_print(f"First captions: {engine} | {len(cases)} new images, {len(rows) - sum(len(x) for x in pending.values())} cached")
     if engine == "gpt-6-luna":
-        for case in cases:
+        for index, case in enumerate(cases, 1):
             raise_if_cancelled("initial Luna caption")
             with open_local_image(case["path"]) as opened:
                 image = ImageOps.exif_transpose(opened).convert("RGB")
@@ -9279,6 +9279,7 @@ def prepare_initial_captions(rows: List[Dict[str, Any]]) -> None:
                  "response_model": response.get("model", engine), "usage": response.get("usage", {})})
             for row in pending[case["image_sha256"]]:
                 row["initial_caption"] = record
+            safe_print(f"Initial caption ready: {index}/{len(cases)} | {Path(case['path']).name}")
     elif cases:
         with tempfile.TemporaryDirectory(prefix="caption_batch_", dir=cache_dir) as batch:
             job = os.path.join(batch, "job.json")
