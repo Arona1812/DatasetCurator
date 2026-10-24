@@ -168,6 +168,12 @@ def stable_hash(payload: Any) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def _is_lock_error(exc: OSError) -> bool:
+    """True for errors a short wait can resolve (access denied, sharing violation)."""
+    # WinError 5 = access denied; WinError 32 = sharing violation.
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32} or exc.errno in {13, 16}
+
+
 def replace_file_with_retry(tmp: str, path: str) -> None:
     """Replace ``path`` while tolerating short Windows/cloud-sync locks.
 
@@ -183,11 +189,8 @@ def replace_file_with_retry(tmp: str, path: str) -> None:
         try:
             os.replace(tmp, path)
             return
-        except PermissionError as exc:
-            last_error = exc
         except OSError as exc:
-            # WinError 5 = access denied; WinError 32 = sharing violation.
-            if getattr(exc, "winerror", None) not in {5, 32} and exc.errno not in {13, 16}:
+            if not _is_lock_error(exc):
                 raise
             last_error = exc
         time.sleep(delay)
@@ -322,6 +325,40 @@ def build_caption_fingerprint(
     return stable_hash(payload)
 
 
+# Sync clients (Dropbox, OneDrive) and virus scanners briefly lock freshly
+# written folders on Windows; the same rename succeeds a few seconds later.
+DIR_REPLACE_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 8.0)
+
+
+def replace_dir_with_retry(source: str, target: str) -> None:
+    """Rename the folder ``source`` to ``target``, retrying while it is locked.
+
+    Waits about 30 seconds in total; a lock that persists raises a
+    PermissionError that names the likely cause.
+    """
+    last_error: Optional[OSError] = None
+    for delay in DIR_REPLACE_RETRY_DELAYS:
+        try:
+            os.replace(source, target)
+            return
+        except OSError as exc:
+            if not _is_lock_error(exc):
+                raise
+            last_error = exc
+        print(f"   ⏳ Folder locked, retrying in {delay:.1f}s: {target}", flush=True)
+        time.sleep(delay)
+    try:
+        os.replace(source, target)
+    except OSError as exc:
+        if not _is_lock_error(exc):
+            raise
+        raise PermissionError(
+            f"Could not move '{source}' to '{target}' after repeated retries. "
+            "A cloud-sync client (e.g. Dropbox), antivirus scanner or an open "
+            "Explorer window may still be holding the folder."
+        ) from (last_error or exc)
+
+
 @dataclass
 class OutputTransaction:
     """Stage export folders and atomically swap them after validation.
@@ -419,9 +456,9 @@ class OutputTransaction:
                 if os.path.exists(backup):
                     shutil.rmtree(backup, ignore_errors=True)
                 if os.path.exists(final_path):
-                    os.replace(final_path, backup)
+                    replace_dir_with_retry(final_path, backup)
                     backups[final_path] = backup
-                os.replace(staged, final_path)
+                replace_dir_with_retry(staged, final_path)
                 namespace[global_name] = final_path
             for backup in backups.values():
                 shutil.rmtree(backup, ignore_errors=True)
@@ -434,7 +471,7 @@ class OutputTransaction:
                 if os.path.exists(backup):
                     if os.path.exists(final_path):
                         shutil.rmtree(final_path, ignore_errors=True)
-                    os.replace(backup, final_path)
+                    replace_dir_with_retry(backup, final_path)
             self._write_manifest("failed", error=f"{type(exc).__name__}: {exc}")
             raise
         finally:
