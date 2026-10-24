@@ -590,6 +590,15 @@ ARCFACE_MIN_FACES_FOR_CENTROID = 5 # weniger als 5 Gesichter -> Check skippen (n
 ARCFACE_MODEL_PACK = "buffalo_l"   # buffalo_l (genauer) oder buffalo_s (schneller)
 ARCFACE_DET_SIZE = 640             # Detection-Eingabegroesse (kleinere Werte = schneller, weniger genau)
 ARCFACE_USE_CUDA = False           # Aus = CPU erzwingen. Verhindert ONNXRuntime-CUDA-DLL-Fehler bei fehlendem CUDA/cuDNN.
+# Gesichtsaehnlichkeit vor der Auswahl: alle keep/review-Kandidaten werden
+# gegen die Referenz (Favoriten/Core aus dem bestaetigten Profil, sonst alle
+# Kandidaten) gemessen. Hard-Ausreisser stehen im Profil als Review; die
+# Aehnlichkeit wirkt als leichter Bonus bzw. Abzug in der Auswahl.
+IDENTITY_REFERENCE_MIN_FACES = 3
+IDENTITY_SIMILARITY_BONUS_MAX = 4.0        # Bonus bei sehr hoher Aehnlichkeit
+IDENTITY_SIMILARITY_FULL_BONUS_AT = 0.85   # ab dieser Aehnlichkeit voller Bonus
+IDENTITY_SIMILARITY_PENALTY_MAX = 6.0      # Abzug kurz ueber der Hard-Schwelle
+FACE_OUTLIER_CLUSTER_ID = "face_outliers"
 
 # --------------------------------
 # Crop-Profile
@@ -3927,9 +3936,13 @@ def compute_trimmed_centroid(
 
 def run_identity_consistency_check(
     selected_rows: List[Dict[str, Any]],
+    reference_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
-    Berechnet Identitaets-Konsistenz fuer die finalen Bilder:
+    Berechnet Identitaets-Konsistenz fuer alle uebergebenen Kandidaten:
+    Referenz sind die Favoriten-/Core-Bilder aus ``reference_rows``, sobald
+    davon mindestens IDENTITY_REFERENCE_MIN_FACES ein Gesicht haben; sonst
+    der getrimmte Mittelwert aller Kandidaten.
       - Embedding pro Bild (mit Cache)
       - Outlier-getrimmter Centroid
       - Cosine-Similarity jedes Embeddings zum Centroid
@@ -4001,7 +4014,18 @@ def run_identity_consistency_check(
 
     summary["n_with_face"] = len(embeddings)
 
-    if len(embeddings) < ARCFACE_MIN_FACES_FOR_CENTROID:
+    reference_embeddings: List[np.ndarray] = []
+    for ref in reference_rows or []:
+        ref_path = row_effective_image_path(ref)
+        ref_hash = ref.get("file_hash") or (file_sha1(ref_path) if ref_path and os.path.exists(ref_path) else "")
+        if ref_hash and os.path.exists(ref_path):
+            ref_emb = compute_arcface_embedding(ref_path, ref_hash)
+            if ref_emb is not None:
+                reference_embeddings.append(ref_emb)
+    use_profile_reference = len(reference_embeddings) >= IDENTITY_REFERENCE_MIN_FACES
+    summary["reference"] = "priority_core" if use_profile_reference else "all_candidates"
+
+    if len(embeddings) < ARCFACE_MIN_FACES_FOR_CENTROID and not use_profile_reference:
         summary["skipped_reason"] = (
             f"too_few_faces_{len(embeddings)}_lt_{ARCFACE_MIN_FACES_FOR_CENTROID}"
         )
@@ -4016,7 +4040,11 @@ def run_identity_consistency_check(
         return summary
 
     # Outlier-getrimmten Centroid berechnen
-    centroid = compute_trimmed_centroid(embeddings, ARCFACE_TRIM_FRACTION)
+    centroid = compute_trimmed_centroid(
+        reference_embeddings if use_profile_reference else embeddings, ARCFACE_TRIM_FRACTION
+    )
+    if use_profile_reference:
+        safe_print(f"   Reference: {len(reference_embeddings)} Priority/Core image(s) from the confirmed profile")
     if centroid is None:
         summary["skipped_reason"] = "centroid_computation_failed"
         for row, _ in rows_with_emb:
@@ -4048,9 +4076,9 @@ def run_identity_consistency_check(
     )
     if summary["n_hard"]:
         safe_print(
-            f"   ⚠️ Hard-flagged (likely different person, will be moved out of train_ready):"
+            f"   ⚠️ Hard-flagged (face differs from the reference; set to Review in the profile):"
         )
-        for fn in summary["hard_flagged"]:
+        for fn in summary["hard_flagged"][:15]:
             row = next((r for r in selected_rows if r.get("original_filename") == fn), None)
             sim_str = f"sim={row['arcface_distance_to_centroid']:.3f}" if row else ""
             safe_print(f"      - {fn} ({sim_str})")
@@ -4058,7 +4086,7 @@ def run_identity_consistency_check(
         safe_print(
             f"   ℹ️ Soft-flagged (borderline, kept in train_ready, see report):"
         )
-        for fn in summary["soft_flagged"]:
+        for fn in summary["soft_flagged"][:15]:
             row = next((r for r in selected_rows if r.get("original_filename") == fn), None)
             sim_str = f"sim={row['arcface_distance_to_centroid']:.3f}" if row else ""
             safe_print(f"      - {fn} ({sim_str})")
@@ -8114,7 +8142,8 @@ def is_post_audit_reject(row: Dict[str, Any]) -> bool:
     """
     if not isinstance(row, dict):
         return False
-    if row.get("base_status") != "reject" and row.get("arcface_flag") != "hard":
+    # Face outliers have their own Review bucket (attach_face_outlier_cluster_to_profile).
+    if row.get("base_status") != "reject":
         return False
     reason = str(row.get("short_reason", "") or "").strip().lower()
     notes_raw = row.get("status_notes") or []
@@ -8286,19 +8315,127 @@ def attach_audited_reject_cluster_to_profile(
         # entries (especially early pHash duplicates) from an older profile.
         pass
 
+    _store_identity_clusters(profile, normal_clusters)
+    return profile
+
+
+def _store_identity_clusters(profile: Dict[str, Any], clusters: List[Dict[str, Any]]) -> None:
+    """Save clusters and rebuild the member -> role/cluster lookups."""
     member_roles: Dict[str, str] = {}
     member_clusters: Dict[str, str] = {}
-    for cluster in normal_clusters:
+    for cluster in clusters:
         cid = str(cluster.get("cluster_id", "") or "")
         role = str(cluster.get("role", "variation") or "variation")
         for mid in cluster.get("members", []) or []:
             member_roles[str(mid)] = role
             member_clusters[str(mid)] = cid
-
-    profile["identity_clusters"] = normal_clusters
+    profile["identity_clusters"] = clusters
     profile["identity_cluster_member_roles"] = member_roles
     profile["identity_cluster_member_clusters"] = member_clusters
     profile["identity_cluster_schema_version"] = IDENTITY_CLUSTER_SCHEMA_VERSION
+
+
+def _remove_cluster_member(cluster: Dict[str, Any], member_id: str) -> bool:
+    """Drop one member from a cluster's parallel lists; True when it was there."""
+    members = [str(m) for m in cluster.get("members", []) or []]
+    if member_id not in members:
+        return False
+    index = members.index(member_id)
+    for key in ("members", "filenames", "image_paths", "reject_reasons"):
+        values = list(cluster.get(key, []) or [])
+        if len(values) == len(members):
+            values.pop(index)
+            cluster[key] = values
+    cluster["asset_ids"] = [int(v) for v in cluster.get("members", []) if normalize_asset_id(v) > 0]
+    cluster["n"] = len(cluster.get("members", []))
+    return True
+
+
+def face_outlier_blocked(row: Dict[str, Any]) -> bool:
+    """True when a face outlier must stay out of training.
+
+    The outlier bucket starts as Review. It is released when the user gives
+    the bucket a training role, moves the image into another training bucket
+    or marks it as Priority.
+    """
+    if row.get("arcface_flag") != "hard" or row.get("priority_image"):
+        return False
+    return normalize_text(row.get("identity_cluster_role", "")) not in IDENTITY_CLUSTER_TRAIN_ROLES
+
+
+def identity_similarity_bonus(item: Dict[str, Any]) -> float:
+    """Small selection bonus for faces close to the reference, a penalty for borderline ones."""
+    if item.get("arcface_flag") not in {"ok", "soft", "hard"}:
+        return 0.0
+    sim = float(item.get("arcface_distance_to_centroid", -1.0) or -1.0)
+    soft, hard = float(ARCFACE_SOFT_THRESHOLD), float(ARCFACE_HARD_THRESHOLD)
+    if sim >= soft:
+        span = max(1e-6, float(IDENTITY_SIMILARITY_FULL_BONUS_AT) - soft)
+        return float(IDENTITY_SIMILARITY_BONUS_MAX) * min(1.0, (sim - soft) / span)
+    span = max(1e-6, soft - hard)
+    return -float(IDENTITY_SIMILARITY_PENALTY_MAX) * min(1.0, (soft - sim) / span)
+
+
+def attach_face_outlier_cluster_to_profile(
+    profile: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Put ArcFace outliers into one Review bucket of the identity clusters.
+
+    Newly flagged images leave their appearance bucket once. Images the user
+    has already moved out of the outlier bucket stay where the user put them;
+    images that are no longer outliers leave the bucket again.
+    """
+    if not isinstance(profile, dict) or not profile:
+        return profile
+    clusters = [c for c in (profile.get("identity_clusters", []) or []) if isinstance(c, dict)]
+    outlier = next((c for c in clusters if str(c.get("cluster_id", "")) == FACE_OUTLIER_CLUSTER_ID), None)
+    others = [c for c in clusters if c is not outlier]
+    assigned = {str(v) for v in profile.get("face_outlier_assigned", []) or []}
+    flagged = {
+        str(asset_id_for_row(r) or profile_member_id(r)): r
+        for r in rows
+        if r.get("arcface_flag") == "hard" and r.get("base_status") != "reject" and not is_priority_image(r, profile)
+    }
+    bucket = dict(outlier or {})
+    keep_ids = [str(m) for m in bucket.get("members", []) or [] if str(m) in flagged]
+    for member_id in [str(m) for m in bucket.get("members", []) or []]:
+        if member_id not in flagged:
+            _remove_cluster_member(bucket, member_id)
+            assigned.discard(member_id)
+    for member_id, row in flagged.items():
+        if member_id in keep_ids or member_id in assigned:
+            continue
+        for cluster in others:
+            _remove_cluster_member(cluster, member_id)
+        keep_ids.append(member_id)
+        assigned.add(member_id)
+    by_id = flagged
+    members = [m for m in keep_ids if m in by_id]
+    others = [c for c in others if c.get("members") or str(c.get("cluster_kind", "")) == "audited_rejects"]
+    if members:
+        member_rows = [by_id[m] for m in members]
+        bucket.update({
+            "cluster_id": FACE_OUTLIER_CLUSTER_ID,
+            "cluster_kind": "face_outliers",
+            "sort_last": True,
+            "role": str(bucket.get("role") or "review"),
+            "n": len(members),
+            "summary": "face differs from the reference identity | check and release if it is the same person",
+            "members": members,
+            "asset_ids": [int(v) for v in members if normalize_asset_id(v) > 0],
+            "filenames": [str(r.get("original_filename", "") or "") for r in member_rows],
+            "image_paths": [row_effective_image_path(r) for r in member_rows],
+            "face_similarity_by_file": {
+                str(r.get("original_filename", "") or ""): round(float(r.get("arcface_distance_to_centroid", -1.0) or -1.0), 3)
+                for r in member_rows
+            },
+            "shot_counts": dict(Counter(normalize_text(r.get("shot_type")) or "unknown" for r in member_rows)),
+        })
+        insert_at = next((i for i, c in enumerate(others) if str(c.get("cluster_kind", "")) == "audited_rejects"), len(others))
+        others.insert(insert_at, bucket)
+    profile["face_outlier_assigned"] = sorted(assigned)
+    _store_identity_clusters(profile, others)
     return profile
 
 
@@ -8450,7 +8587,8 @@ def rebuild_selection_from_identity_roles(
             continue
         role = str(row.get("identity_cluster_role", "") or "").strip().lower()
         cluster_id = str(row.get("identity_cluster_id", "") or "").strip()
-        if row.get("arcface_flag") == "hard":
+        if face_outlier_blocked(row):
+            review_items.append(row)
             continue
         if row.get("base_status") == "reject":
             # A rejected image is recoverable only after the user deliberately
@@ -9109,7 +9247,7 @@ def refresh_subject_profile_from_existing_audits(
     for row in all_rows:
         role = normalize_text(row.get("identity_cluster_role"))
         priority = bool(row.get("priority_image"))
-        normal_usable = row.get("base_status") == "keep" and row.get("arcface_flag") != "hard" and role not in {"review", "exclude"}
+        normal_usable = row.get("base_status") == "keep" and not face_outlier_blocked(row) and role not in {"review", "exclude"}
         if priority or normal_usable:
             row["profile_weight"] = profile_role_weight(row)
             eligible.append(row)
@@ -9606,7 +9744,7 @@ def backfill_train_ready_selection(
     selected_keys = {row_identity_key(r) for r in out}
     clean_count = sum(
         1 for r in out
-        if bool(r.get("priority_image")) or (not needs_caption_remove(r) and r.get("arcface_flag") != "hard")
+        if bool(r.get("priority_image")) or (not needs_caption_remove(r) and not face_outlier_blocked(r))
     )
     if clean_count >= target:
         return out, []
@@ -9622,7 +9760,7 @@ def backfill_train_ready_selection(
     for row in candidate_pool:
         if row_identity_key(row) in selected_keys:
             continue
-        if row.get("base_status") != "keep" or row.get("arcface_flag") == "hard":
+        if row.get("base_status") != "keep" or face_outlier_blocked(row):
             continue
         if needs_caption_remove(row):
             continue
@@ -9936,12 +10074,25 @@ def continue_caption_from_profile() -> None:
             save_subject_profile(subject_profile)
             safe_print("   🧬 Migrated legacy profile to generalized feature-policy schema.")
 
+    # Measure face similarity against the user's Priority/Core images, then
+    # refresh the Review bucket for face outliers before roles are applied.
+    apply_profile_role_metadata(all_rows, subject_profile)
+    if USE_ARCFACE_IDENTITY_CHECK and HAVE_INSIGHTFACE:
+        run_identity_consistency_check(
+            [r for r in all_rows if r.get("base_status") in {"keep", "review"}],
+            reference_rows=[
+                r for r in all_rows
+                if r.get("priority_image") or normalize_text(r.get("identity_cluster_role")) == "core"
+            ],
+        )
+    subject_profile = attach_face_outlier_cluster_to_profile(subject_profile, all_rows)
     subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
     apply_profile_role_metadata(all_rows, subject_profile)
     if bool(subject_profile.get("profile_rebuild_required")):
         subject_profile = refresh_subject_profile_from_existing_audits(subject_profile, all_rows)
-        # Reattach the derived audited-reject view and current manual roles,
-        # which are intentionally outside the normalizer response.
+        # Reattach the derived outlier/audited-reject views and current manual
+        # roles, which are intentionally outside the normalizer response.
+        subject_profile = attach_face_outlier_cluster_to_profile(subject_profile, all_rows)
         subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
         apply_profile_role_metadata(all_rows, subject_profile)
     subject_profile = migrate_profile_to_asset_ids(subject_profile, all_rows)
@@ -11054,6 +11205,9 @@ def adjusted_pick_score(item: Dict[str, Any], selected: List[Dict[str, Any]]) ->
     # UI-Clusterrollen aus dem Subject-Profile: core darf im Ranking etwas
     # nach oben, aber mit Core-Share-Bremse, damit Variation nicht stirbt.
     base += identity_cluster_role_bonus(item, selected)
+
+    # Gesichtsaehnlichkeit zur Referenz: zusammenpassende Bilder gewinnen.
+    base += identity_similarity_bonus(item)
 
     # Face-Orientation-Penalty: bestraft Bilder mit gekippten/seitlichen/
     # umgekehrten Gesichtern im Frame (LoRA-Anti-Toxin).
@@ -13437,7 +13591,16 @@ def main() -> None:
     global_rules = compute_global_rules(clean_candidates_for_rules)
 
     # PASS 4: Finale Auswahl
-    valid_candidates = [r for r in all_rows if r.get("base_status") in {"keep", "review"}]
+    # Gesichtsaehnlichkeit fuer alle Kandidaten VOR der Auswahl: Ausreisser
+    # kommen nicht in die Auswahl (im Profil als Review), alle anderen
+    # bekommen einen leichten Aehnlichkeitsbonus bzw. -abzug.
+    identity_summary = run_identity_consistency_check(
+        [r for r in all_rows if r.get("base_status") in {"keep", "review"}]
+    )
+    valid_candidates = [
+        r for r in all_rows
+        if r.get("base_status") in {"keep", "review"} and not face_outlier_blocked(r)
+    ]
     review_items = [r for r in all_rows if r.get("base_status") == "review"]
     reject_items = [r for r in all_rows if r.get("base_status") == "reject"]
 
@@ -13452,19 +13615,13 @@ def main() -> None:
     if final_duplicate_rows:
         reject_items.extend(final_duplicate_rows)
 
-    # ── Identity-Konsistenz-Check (ArcFace) ──────────────────────────────
-    # Berechnet pro Bild die Aehnlichkeit zur "Set-Identitaet" (outlier-
-    # getrimmter Centroid). Hard-Flags werden aus dem Train-Set entfernt
-    # und gehen in 06_needs_manual_review; Soft-Flags bleiben drin und
-    # werden im Markdown-Report markiert. Captions werden NIE veraendert.
-    identity_summary = run_identity_consistency_check(selected)
-
-    # Hard-Flags physisch entfernen und in MANUAL_REVIEW_DIR kopieren.
-    # Das passiert VOR dem Train-Ready-Export, sodass die rausgefilterten
-    # Bilder gar nicht erst in 01_train_ready landen.
+    # ── Identity-Konsistenz (ArcFace) ────────────────────────────────────
+    # Die Aehnlichkeit wurde vor der Auswahl fuer alle Kandidaten berechnet.
+    # Hard-Ausreisser werden zur Kontrolle mit Diagnosedatei in
+    # MANUAL_REVIEW_DIR kopiert; im Profil stehen sie als Review.
     hard_flagged_rows: List[Dict[str, Any]] = []
     if identity_summary.get("centroid_present"):
-        hard_flagged_rows = [r for r in selected if r.get("arcface_flag") == "hard"]
+        hard_flagged_rows = [r for r in all_rows if face_outlier_blocked(r)]
     if hard_flagged_rows:
         hard_flag_counter = 1
         for hf_row in hard_flagged_rows:
@@ -13523,8 +13680,8 @@ def main() -> None:
         hard_keys = {row_identity_key(r) for r in hard_flagged_rows}
         selected = [r for r in selected if row_identity_key(r) not in hard_keys]
         safe_print(
-            f"   🛂 Removed {len(hard_flagged_rows)} hard-flagged image(s) from train_ready; "
-            f"copies in 06_needs_manual_review."
+            f"   🛂 {len(hard_flagged_rows)} face outlier(s) kept out of train_ready; "
+            f"copies in 06_needs_manual_review, Review bucket in the profile."
         )
 
     selected, backfill_added = backfill_train_ready_selection(selected, valid_candidates, TARGET_DATASET_SIZE)
@@ -13560,6 +13717,7 @@ def main() -> None:
     prepare_initial_captions([r for r in all_rows if r.get("base_status") in {"keep", "review"} and r.get("arcface_flag") != "hard"])
     profile_source_rows = list(selected) + list(unselected_keep)
     subject_profile = build_subject_profile(profile_source_rows)
+    subject_profile = attach_face_outlier_cluster_to_profile(subject_profile, all_rows)
     subject_profile = attach_audited_reject_cluster_to_profile(subject_profile, all_rows)
     subject_profile = migrate_profile_to_asset_ids(subject_profile, all_rows)
     if subject_profile:

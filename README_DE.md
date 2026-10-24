@@ -10,7 +10,7 @@
 
 - **Bilder bereinigen:** Unlesbare Dateien, ähnliche Duplikate und Qualitätsprobleme vor dem Bildaudit erkennen.
 - **Screenshot-Rahmen entfernen:** Lokale Zuschnittvorschläge prüfen, ähnliche Layouts gemeinsam bearbeiten oder ein Bild ausschließen. Die Quelldateien bleiben unverändert. Der lokale Detektor findet auch Innenbilder in Story-Screenshots, Polaroid-Rahmen und Chat-Ansichten; ein Innenbild steht immer als erste Variante. Die Ansicht lässt sich auf **Nicht sicher automatisch beschnitten**, **Mehrere Entwürfe** oder **Alle Bilder** stellen.
-- **Geeignete Fotos auswählen:** Qualität und Identität prüfen und einen vielfältigen Mix aus Porträts, Halb- und Ganzkörperbildern zusammenstellen.
+- **Geeignete Fotos auswählen:** Qualität und Identität prüfen und einen vielfältigen Mix aus Porträts, Halb- und Ganzkörperbildern zusammenstellen. Mit InsightFace wird jedes Gesicht vor der Auswahl mit der Referenz verglichen (deine Favoriten und Core-Bilder, sonst alle Kandidaten): Ausreißer stehen im Profil als *Review*, zusammenpassende Bilder werden bevorzugt.
 - **Subject Profile bilden:** Den häufigen Look der Person erkennen und sichtbare Veränderungen wie Haare, Brille, Piercings und Tattoos steuerbar halten.
 - **Trainingscaptions erstellen:** Erstbeschreibungen von Florence 2, JoyCaption oder GPT-6 Luna speichern; Was in die finale Caption kommt, legen Caption-Regeln und Personenprofil fest; daraus entstehen ganze Sätze, lokal oder auf Wunsch von GPT-6 Luna aus dem exportierten Bild formuliert und gegen die Regeln geprüft. Vorschau vor dem Export.
 - **Für Bild-LoRAs exportieren:** Neun Trainingsziele wählen, darunter ERNIE Image, Z-Image, Krea 2, Qwen-Image 2.1, FLUX.2 und experimentell Ideogram 4.

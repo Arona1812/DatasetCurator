@@ -2235,7 +2235,8 @@ def _identity_cluster_selector_choices(profile: Dict[str, Any]) -> List[Tuple[st
         role = str(c.get("role", "variation") or "variation")
         n = int(c.get("n", 0) or 0)
         summary = str(c.get("summary", "") or cid)
-        prefix = "⬇ REJECTED | " if str(c.get("cluster_kind", "") or "") == "audited_rejects" else ""
+        kind = str(c.get("cluster_kind", "") or "")
+        prefix = "⬇ REJECTED | " if kind == "audited_rejects" else ("🪪 " + tr("GESICHT WEICHT AB", "FACE DIFFERS") + " | " if kind == "face_outliers" else "")
         label = f"{idx:02d}. {prefix}{role} | n={n} | {summary}"
         choices.append((label, cid))
     return choices
@@ -2279,6 +2280,18 @@ def _identity_cluster_preview_markdown(profile: Dict[str, Any], cluster_id: Opti
             "Vollständig auditierte Rejects; immer am Ende und standardmäßig `exclude`. Einzelbilder können gelöst oder als Favorit markiert werden.  ",
             "Fully audited rejects; always listed last and default to `exclude`. Individual images can be detached or marked as favorites.  ",
         ))
+    if cluster_kind == "face_outliers":
+        by_file = c.get("face_similarity_by_file", {}) or {}
+        sims = {name: float(by_file[name]) for name in filenames if isinstance(by_file.get(name), (int, float))}
+        lines.append("**" + tr("Sonder-Bucket", "Special bucket") + ":** " + tr(
+            "Gesicht weicht deutlich von der Referenz ab (Favoriten/Core, sonst alle Kandidaten). Startet als `review`. "
+            "Ist es dieselbe Person: Rolle des Buckets ändern, Bilder in einen anderen Bucket verschieben oder als Favorit markieren.  ",
+            "Face differs clearly from the reference (favorites/core, otherwise all candidates). Starts as `review`. "
+            "If it is the same person: change the bucket role, move images to another bucket or mark them as favorites.  ",
+        ))
+        if sims:
+            lines.append("**" + tr("Ähnlichkeit", "Similarity") + ":** " + ", ".join(
+                f"`{name}`={sim:.2f}" for name, sim in sims.items()))
     if quality or identity:
         lines.append(f"**Quality / Identity:** {quality or '-'} / {identity or '-'}  ")
     if shot_counts:
