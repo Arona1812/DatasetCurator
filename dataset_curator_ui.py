@@ -352,7 +352,7 @@ DEFAULTS: Dict[str, Any] = {
     # Smart Crop
     "c_smart_crop": True,
     "c_crop_gain": 8,
-    "c_crop_pad": 1.5,
+    "c_crop_pad": 0.6,
     "c_medium_rescue_crop": True,
     "c_medium_rescue_gain": 4,
     # Clustering
@@ -556,6 +556,10 @@ def caption_policy_adjustment_note(target: Optional[str], selected_fields: Optio
     )
 
 
+LEGACY_CROP_PAD_DEFAULT = 1.5
+CROP_PAD_REVISION = 2
+
+
 def load_settings() -> Dict[str, Any]:
     """Laedt gespeicherte Einstellungen, ergaenzt fehlende mit Defaults."""
     settings = dict(DEFAULTS)
@@ -605,6 +609,17 @@ def load_settings() -> Dict[str, Any]:
     ):
         if settings.get(model_key):
             settings[model_key] = migrate_openai_model_name(settings[model_key])
+    # Older releases shipped 1.5 as the face padding default: four face widths,
+    # so the headshot crop never beat the original and every audit was wasted.
+    # Only that untouched old default moves to 0.6; files saved by this release
+    # carry the revision marker and keep whatever the user chose.
+    if saved.get("c_crop_pad_revision") != CROP_PAD_REVISION:
+        try:
+            if abs(float(settings.get("c_crop_pad", 0.6)) - LEGACY_CROP_PAD_DEFAULT) < 1e-6:
+                settings["c_crop_pad"] = DEFAULTS["c_crop_pad"]
+        except (TypeError, ValueError):
+            settings["c_crop_pad"] = DEFAULTS["c_crop_pad"]
+    settings["c_crop_pad_revision"] = CROP_PAD_REVISION
     legacy_target = saved.get("c_training_target") or saved.get("c_caption_profile") or settings.get("c_training_target")
     settings["c_training_target"] = normalize_training_target(legacy_target)
     settings["c_caption_profile"] = settings["c_training_target"]
@@ -735,6 +750,7 @@ def save_settings_fn(
         "c_phash_thresh": c_phash_thresh, "c_clip_thresh": c_clip_thresh,
         "c_clip_model": c_clip_model,
         "c_smart_crop": c_smart_crop, "c_crop_gain": c_crop_gain, "c_crop_pad": c_crop_pad,
+        "c_crop_pad_revision": CROP_PAD_REVISION,
         "c_medium_rescue_crop": c_medium_rescue_crop,
         "c_medium_rescue_gain": c_medium_rescue_gain,
         "c_use_cluster": c_use_cluster, "c_max_outfit": c_max_outfit,
