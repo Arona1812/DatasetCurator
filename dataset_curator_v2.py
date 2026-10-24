@@ -2215,14 +2215,15 @@ def local_blur_variance_in_face(image_path: str, face_bbox: Optional[List[int]])
         crop = img[y1:y2, x1:x2]
         ch, cw = crop.shape[:2]
         long_edge = max(ch, cw)
-        # Normierung: Face-Crop auf dieselbe Zielgroesse wie Vollbild-Messung.
-        # So sind Face-Werte und Full-Image-Werte direkt vergleichbar.
-        if long_edge != BLUR_NORMALIZE_LONG_EDGE:
+        # Normierung nur nach unten: grosse Gesichter werden auf die
+        # Zielgroesse verkleinert. Kleine Gesichter werden NICHT vergroessert,
+        # weil die Interpolation sie kuenstlich weichzeichnet und die Varianz
+        # bei Ganzkoerperbildern systematisch gegen null drueckt.
+        if long_edge > BLUR_NORMALIZE_LONG_EDGE:
             scale = BLUR_NORMALIZE_LONG_EDGE / float(long_edge)
             new_w = max(8, int(round(cw * scale)))
             new_h = max(8, int(round(ch * scale)))
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
-            crop = cv2.resize(crop, (new_w, new_h), interpolation=interp)
+            crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
         return float(cv2.Laplacian(crop, cv2.CV_64F).var())
     except RunCancelled:
         raise
@@ -10084,6 +10085,37 @@ def continue_caption_from_profile() -> None:
     )
     commit_output_transaction()
 
+FACE_BLUR_AI_SHARPNESS_TRUST = 60.0  # 0-100; ab hier verwirft die lokale Messung allein nicht
+FACE_BLUR_HARD_REJECT_FRACTION = 0.5  # unter diesem Anteil der Schwelle: Reject statt Review
+
+
+def face_blur_decision(
+    face_var: float,
+    threshold: float,
+    ai_sharpness: Any,
+    used_local_bbox: bool = True,
+) -> Optional[str]:
+    """Decide what a low local face-sharpness value means.
+
+    Returns ``None`` (sharp enough), ``"note"`` (low value overruled by the
+    model's sharpness rating), ``"review"`` or ``"reject"``. Beauty filters
+    and JPEG smoothing push the Laplacian variance of sharp selfie faces far
+    below any fixed threshold, so the local value alone never rejects when
+    the image audit rated the image as sharp.
+    """
+    if face_var is None or face_var < 0 or threshold <= 0 or face_var >= threshold:
+        return None
+    try:
+        sharpness = float(ai_sharpness)
+    except (TypeError, ValueError):
+        sharpness = -1.0
+    if sharpness >= FACE_BLUR_AI_SHARPNESS_TRUST:
+        return "note"
+    if used_local_bbox and sharpness >= 0 and face_var < threshold * FACE_BLUR_HARD_REJECT_FRACTION:
+        return "reject"
+    return "review"
+
+
 def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     reasons = []
 
@@ -10193,7 +10225,7 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
     # passen Bbox und Pfad zusammen. Falls du den IG-Crop-Schritt aus der
     # Pipeline entfernst, muss diese Annahme neu geprueft werden.
     if USE_BLUR_FILTER and face_visible:
-        face_bbox = item.get("main_face_bbox")
+        face_bbox = item.get("local_face_bbox") or item.get("main_face_bbox")
         orig_path = row_effective_image_path(item)
         if face_bbox and orig_path and os.path.exists(orig_path):
             # Plausibilitaet: Bbox muss innerhalb der Bilddimensionen liegen.
@@ -10226,12 +10258,19 @@ def local_status_override(item: Dict[str, Any]) -> Tuple[str, List[str]]:
                     threshold = float(FACE_MIN_BLUR_VARIANCE_FULL_BODY)
                 else:
                     threshold = float(FACE_MIN_BLUR_VARIANCE)
-                if face_var >= 0 and face_var < threshold:
+                blur_decision = face_blur_decision(
+                    face_var, threshold, item.get("quality_sharpness"),
+                    used_local_bbox=bool(item.get("local_face_bbox")) or "used_ai_face_bbox" not in (item.get("status_notes") or []),
+                )
+                if blur_decision:
                     item.setdefault("status_notes", []).append(
                         f"face_blur_variance_{face_var:.1f}_below_{threshold}_shot_{shot or 'unknown'}"
                     )
-                    reasons.append("face_blur_too_high")
-                    return "reject", reasons
+                    if blur_decision == "note":
+                        item.setdefault("status_notes", []).append("face_blur_overruled_by_ai_sharpness")
+                    else:
+                        reasons.append("face_blur_too_high")
+                        return blur_decision, reasons
 
     if score < HARD_REJECT_SCORE:
         reasons.append(f"score_below_hard_reject_floor ({score}<{HARD_REJECT_SCORE})")
@@ -13217,6 +13256,11 @@ def main() -> None:
                             w_abs = clamp_int(int(w_rel * img_w), 1, img_w - x_abs)
                             h_abs = clamp_int(int(h_rel * img_h), 1, img_h - y_abs)
 
+                            # Keep the precise local MediaPipe box for pixel
+                            # measurements (face blur); model coordinates are
+                            # only approximate.
+                            if row.get("main_face_bbox") and not row.get("local_face_bbox"):
+                                row["local_face_bbox"] = list(row["main_face_bbox"])
                             row["main_face_bbox"] = [x_abs, y_abs, w_abs, h_abs]
                             row["main_face_ratio"] = bbox_area_ratio(row["main_face_bbox"], img_w, img_h)
                             row.setdefault("status_notes", []).append("used_ai_face_bbox")
