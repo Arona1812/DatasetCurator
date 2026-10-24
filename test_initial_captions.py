@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest.mock import patch, Mock
 
 import initial_captions as initial
-import caption_details as details
 import test_frames_export as fixtures
 from curator_core import normalize_run_config_payload
 
@@ -36,37 +35,7 @@ class InitialCaptionCache(unittest.TestCase):
                 with self.assertRaises(ValueError): initial.store_caption(directory, "first-image", config, bad)
 
 
-class TextDetails(unittest.TestCase):
-    def test_request_is_text_only_and_copied_details_cannot_override_identity(self):
-        raw = "A woman with brown eyes wears a red wool jacket, standing by a window in soft daylight."
-        result = {key: "" for key in details.FIELDS}
-        result.update(clothing_description="a red wool jacket", pose_description="standing by a window",
-                      lighting_description="soft daylight", makeup_description="brown eyes",
-                      background_description="a castle")
-        payloads = []
-        def request(payload):
-            payloads.append(payload)
-            self.assertEqual([p["type"] for p in payload["input"][0]["content"]], ["input_text"])
-            self.assertNotIn("stable_identity", json.dumps(payload))
-            return result
-        row = {"initial_caption": {"caption": raw}, "eye_color": "blue", "face_visible": False,
-               "clothing_description": "a jacket", "piercing_inventory_now": [{"location": "nose_septum"}]}
-        with tempfile.TemporaryDirectory() as directory:
-            record = details.prepare_details(directory, row, request)
-            again = details.prepare_details(directory, row, lambda _: self.fail("Repeated text request"))
-        self.assertEqual(record, again)
-        self.assertEqual(len(payloads), 1)
-        self.assertEqual(len(record["rejected"]), 2)
-        enriched = details.enriched_row(row, record)
-        self.assertEqual(enriched["clothing_description"], "a red wool jacket")
-        for key in ["eye_color", "face_visible", "piercing_inventory_now", "initial_caption"]:
-            self.assertEqual(enriched[key], row[key])
-        self.assertEqual(row["clothing_description"], "a jacket")
-
-    def test_incomplete_and_unexpected_fields_are_not_accepted(self):
-        for invalid in [{}, {**{k: "" for k in details.FIELDS}, "eye_color": "blue"}]:
-            with self.assertRaises(ValueError): details.parse_details(invalid, "source")
-
+class CaptionSettings(unittest.TestCase):
     def test_ui_input_and_settings_contracts_include_all_three_new_options(self):
         import dataset_curator_ui as ui
         with patch.object(ui, "load_settings", return_value=dict(ui.DEFAULTS)):
@@ -183,26 +152,3 @@ class TwoStageExports(unittest.TestCase):
         profile = ui.apply_profile_editor_values(stage["subject_profile"], *values)
         with patch.object(self.backend, "CAPTION_POLICY", {key: key in policy for key in ui.CAPTION_FIELD_CHOICES}):
             self.assertEqual(preview[2], self.backend.build_caption(stage["all_rows"][0], {}, profile))
-
-    def test_luna_text_mode_uses_cached_excerpts_and_profile_changes_do_not_request_again(self):
-        stage = self.prepared_stage()
-        row = stage["all_rows"][0]
-        fields = {key: "" for key in details.FIELDS}
-        fields.update(clothing_description="a red wool jacket", lighting_description="soft daylight")
-        details.prepare_details(self.backend.CACHE_DIR, row, lambda _: fields)
-        with patch.object(self.backend, "CAPTION_COMPOSITION_MODE", "luna_text"), \
-             patch.object(self.backend, "responses_api_call", side_effect=AssertionError("No new model call")):
-            caption = self.backend.build_caption(row, {}, stage["subject_profile"])
-            profile = json.loads(json.dumps(stage["subject_profile"]))
-            profile.setdefault("stable_identity", {})["eye_color"] = "blue"
-            self.backend.build_caption(row, {}, profile)
-        self.assertIn("red wool jacket", caption)
-        self.assertNotIn("brown eyes", caption)
-        self.assertEqual(row["clothing_description"], "a red jacket")
-
-    def test_missing_text_details_block_export_without_api_calls(self):
-        self.prepared_stage()
-        with patch.object(self.backend, "CAPTION_COMPOSITION_MODE", "luna_text"), \
-             patch.object(self.backend, "responses_api_call", side_effect=AssertionError("No automatic request")):
-            with self.assertRaisesRegex(ValueError, "not prepared"):
-                self.fixture.export()

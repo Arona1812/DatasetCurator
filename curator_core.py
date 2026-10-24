@@ -125,6 +125,22 @@ def normalized_caption_policy(policy: Optional[Mapping[str, Any]]) -> Dict[str, 
     return {str(k): bool(raw.get(k)) for k in keys}
 
 
+# local: sentences composed on this computer from caption rules and profile.
+# luna_writer: the caption model phrases the same rule-derived facts for the
+# exported image. "luna_text" (verbatim scene excerpts) was replaced by it.
+CAPTION_COMPOSITION_MODES = ("local", "luna_writer")
+LEGACY_CAPTION_COMPOSITION_MODES = {"luna_text": "luna_writer"}
+
+
+def normalize_caption_composition_mode(value: Any) -> str:
+    """Return a supported caption composition mode; older values are migrated."""
+    mode = str(value or "local").strip()
+    mode = LEGACY_CAPTION_COMPOSITION_MODES.get(mode, mode)
+    if mode not in CAPTION_COMPOSITION_MODES:
+        raise ValueError("Unsupported caption composition mode")
+    return mode
+
+
 def normalize_run_config_payload(payload: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     data = dict(payload or {})
     target = normalize_training_target(data.get("TRAINING_TARGET") or data.get("CAPTION_PROFILE"))
@@ -135,8 +151,8 @@ def normalize_run_config_payload(payload: Optional[Mapping[str, Any]]) -> Dict[s
     data["RUN_CONFIG_SCHEMA_VERSION"] = RUN_CONFIG_SCHEMA_VERSION
     data["ACTIVE_CAPTION_POLICY_SNAPSHOT"] = dict(data["CAPTION_POLICY"])
     engine = str(data.get("INITIAL_CAPTION_ENGINE") or "")
-    if data.get("CAPTION_COMPOSITION_MODE", "local") not in {"local", "luna_text"}:
-        raise ValueError("Unsupported caption composition mode")
+    if "CAPTION_COMPOSITION_MODE" in data:
+        data["CAPTION_COMPOSITION_MODE"] = normalize_caption_composition_mode(data["CAPTION_COMPOSITION_MODE"])
     if engine:
         from initial_captions import ENGINES, FLORENCE_TASKS
         if engine not in ENGINES:

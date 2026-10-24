@@ -39,6 +39,7 @@ from vision_frames import propose_photo_region, load_photo_proposal, attach_phot
 from curator_core import (
     APP_VERSION,
     migrate_openai_model_name,
+    normalize_caption_composition_mode,
     atomic_write_json as core_atomic_write_json,
     normalize_run_config_payload,
     normalize_asset_id as core_normalize_asset_id,
@@ -620,6 +621,10 @@ def load_settings() -> Dict[str, Any]:
         except (TypeError, ValueError):
             settings["c_crop_pad"] = DEFAULTS["c_crop_pad"]
     settings["c_crop_pad_revision"] = CROP_PAD_REVISION
+    try:
+        settings["c_caption_composition_mode"] = normalize_caption_composition_mode(settings.get("c_caption_composition_mode"))
+    except ValueError:
+        settings["c_caption_composition_mode"] = "local"
     legacy_target = saved.get("c_training_target") or saved.get("c_caption_profile") or settings.get("c_training_target")
     settings["c_training_target"] = normalize_training_target(legacy_target)
     settings["c_caption_profile"] = settings["c_training_target"]
@@ -1636,6 +1641,17 @@ def initial_caption_readiness_ui(engine):
                   "Local provider is not installed yet. See CAPTION_PIPELINE.md or choose Luna. A missing provider is reported before paid audits.")
 
 
+def caption_writer_config(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Caption-writer models from saved settings; preview and export must use the same ones."""
+    return {
+        "KREA_CAPTION_MODEL": str(settings.get("c_krea_caption_model") or "gpt-6-luna").strip(),
+        "KREA_CAPTION_REASONING_EFFORT": str(settings.get("c_krea_caption_reasoning_effort") or "none"),
+        "USE_KREA_CAPTION_REPAIR": bool(settings.get("c_use_krea_caption_repair", True)),
+        "KREA_CAPTION_REPAIR_MODEL": str(settings.get("c_krea_caption_repair_model") or "gpt-6.1-sol").strip(),
+        "KREA_CAPTION_REPAIR_REASONING_EFFORT": str(settings.get("c_krea_caption_repair_reasoning_effort") or "low"),
+    }
+
+
 def preview_profile_caption(trigger_word, input_folder, raw_profile_json, filename,
                             target, caption_options, variable_mode, composition_mode, controlled_buckets, *editor_values):
     """Preview unsaved editor fields without saving profile, audit or exports."""
@@ -1663,7 +1679,7 @@ def preview_profile_caption(trigger_word, input_folder, raw_profile_json, filena
         config = {"TRIGGER_WORD": trigger_word, "TRAINING_TARGET": target,
                   "CAPTION_POLICY": {key: key in (caption_options or []) for key in CAPTION_FIELD_CHOICES},
                   "VARIABLE_FEATURE_CAPTION_MODE": variable_mode, "CAPTION_COMPOSITION_MODE": composition_mode,
-                  "USE_CONTROLLED_BUCKETS": bool(controlled_buckets)}
+                  "USE_CONTROLLED_BUCKETS": bool(controlled_buckets), **caption_writer_config(load_settings())}
         with tempfile.TemporaryDirectory(prefix="curator_caption_preview_") as scratch:
             request, result = os.path.join(scratch, "request.json"), os.path.join(scratch, "result.json")
             preview_image_path = os.path.join(scratch, "export_preview.jpg")
@@ -1676,14 +1692,18 @@ def preview_profile_caption(trigger_word, input_folder, raw_profile_json, filena
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if proc.returncode:
                 raise ValueError(proc.stderr[-1500:] or "Caption preview failed")
-            caption = _load_json_dict(result)["caption"]
+            result_data = _load_json_dict(result)
+            caption = result_data["caption"]
             with Image.open(preview_image_path) as opened:
                 image = opened.convert("RGB")
-        status = tr("Vorschau mit aktuellen, noch ungespeicherten Profilwerten und Caption-Schaltern. Keine Modellanfrage. Zusätzliche freie Details sind Referenz; der Satzaufbau nutzt die Audit-Merkmale.",
-                    "Preview uses current unsaved profile fields and caption switches. No model request. Additional free details are evidence; composition uses audited observations.")
-        if composition_mode == "luna_text":
-            status = tr("Vorschau aus zwischengespeicherten Luna-Textdetails und aktuellen Profilregeln. Keine neue Modellanfrage. Identität und sichtbare Piercings/Brillen werden weiterhin durch Audit und Profil geregelt.",
-                        "Preview uses cached Luna text details and current profile rules. No new model request. Audit and profile still control identity and visible piercings/glasses.")
+        status = tr("Vorschau mit aktuellen, noch ungespeicherten Profilwerten und Caption-Regeln. Keine Modellanfrage.",
+                    "Preview uses current unsaved profile fields and caption rules. No model request.")
+        if result_data.get("composition_source") == "written_cache":
+            status = tr("Gespeicherte Luna-Caption für genau diese Regeln und dieses Profil. Keine neue Modellanfrage.",
+                        "Stored Luna caption for exactly these rules and this profile. No new model request.")
+        elif result_data.get("composition_source") == "local_draft":
+            status = tr("Lokaler Entwurf. Luna schreibt die endgültige Caption beim Export aus Bild, Regeln und Profil (etwa 0,0005 USD pro Bild, danach gespeichert).",
+                        "Local draft. Luna writes the final caption at export from image, rules and profile (about 0.0005 USD per image, stored afterwards).")
         return image, initial.get("caption", tr("Dieser ältere Lauf enthält noch keine separate Erstbeschreibung.", "This older run has no separate initial description.")), caption, status
     except Exception as exc:
         return None, "", "", str(exc)
@@ -4045,21 +4065,6 @@ def start_caption_from_profile(*values):
     yield from run_script(CURATOR_SCRIPT, CURATOR_CONFIG, config, train_dir)
 
 
-def start_caption_text_details(*values):
-    v = _ui_values_dict(values)
-    if not str(v.get("api_key") or "").strip():
-        yield tr("Für Luna-Textdetails einen OpenAI API-Key im Projekt setzen.", "Set a project OpenAI API key for Luna text details."), [], 0, "API key missing", ""
-        return
-    if not os.path.isfile(caption_stage_path_for(v["input_folder"], v["trigger_word"])):
-        yield tr("Zuerst Erstbeschreibungen vorbereiten.", "Prepare initial descriptions first."), [], 0, "No stage", ""
-        return
-    config = build_run_config_from_ui_values(values, continue_from_profile=True)
-    config["PREPARE_CAPTION_DETAILS_ONLY"] = True
-    yield from run_script(CURATOR_SCRIPT, CURATOR_CONFIG, config,
-                          os.path.join(output_root_for(v["input_folder"], v["trigger_word"]), "01_train_ready"))
-
-
-
 # ============================================================
 # VIDEO PROCESSOR LAUNCHER
 # ============================================================
@@ -6016,10 +6021,10 @@ def build_ui() -> gr.Blocks:
                 c_caption_composition_mode = gr.Dropdown(
                     label=tr("2 · Zusammensetzung der Trainingscaption", "2 · Training caption composition"),
                     choices=[(tr("Lokal · Audit und Personenprofil", "Local · audit and person profile"), "local"),
-                             (tr("Luna-Textdetails + lokale Profilregeln", "Luna text details + local profile rules"), "luna_text")],
+                             (tr("Luna · natürliche Sätze aus Bild, Regeln und Profil", "Luna · natural sentences from image, rules and profile"), "luna_writer")],
                     value=S["c_caption_composition_mode"],
-                    info=tr("Lokal ist ohne weitere KI-Anfrage. Optional extrahiert Luna einmal Szenendetails aus dem gespeicherten Rohtext: keine erneute Bildübertragung, zusätzliche API-Kosten. Profiländerungen bleiben danach lokal.",
-                            "Local uses no additional AI request. Optionally Luna extracts scene details once from saved descriptions: no image retransmission, additional API costs. Profile changes stay local afterwards."))
+                    info=tr("Was in die Caption kommt, legen Caption-Regeln und Personenprofil fest. Lokal formt daraus Sätze ohne KI-Anfrage. Luna schreibt daraus beim Export flüssige Sätze für das gewählte Trainingsziel, sieht dabei das exportierte Bild und prüft jede Caption gegen die Regeln (etwa 0,0005 USD pro Trainingsbild, danach gespeichert).",
+                            "Caption rules and the person profile decide what goes into a caption. Local turns them into sentences without an AI request. Luna writes fluent sentences for the chosen training target at export, sees the exported image and every caption is checked against the rules (about 0.0005 USD per training image, stored afterwards)."))
                 c_pipeline_mode = gr.Radio(
                     label=tr("Ablauf nach dem Audit", "After the audit"),
                     choices=[(tr("Profil automatisch nutzen und exportieren", "Use profile automatically and export"), "single_pass"),
@@ -8314,13 +8319,8 @@ def build_ui() -> gr.Blocks:
                 with gr.Accordion(tr("Caption-Vorschau · aktuelle Profilwerte", "Caption preview · current profile fields"), open=True):
                     p_caption_composition_mode = gr.Dropdown(label=tr("Zusammensetzung", "Composition"),
                         choices=[(tr("Lokal · Audit und Personenprofil", "Local · audit and person profile"), "local"),
-                                 (tr("Luna-Textdetails + lokale Profilregeln", "Luna text details + local profile rules"), "luna_text")],
+                                 (tr("Luna · natürliche Sätze aus Bild, Regeln und Profil", "Luna · natural sentences from image, rules and profile"), "luna_writer")],
                         value=S["c_caption_composition_mode"])
-                    p_caption_details_info = gr.Markdown(tr("**Luna-Textdetails:** Der optionale API-Schritt sendet nur gespeicherte Beschreibungen an OpenAI. Keine Bilder und kein Personenprofil. Zusätzliche Kosten; danach Vorschau aktualisieren. Ohne Vorbereitung bleibt dieser Modus gesperrt.",
-                                                           "**Luna text details:** The optional API step sends only saved descriptions to OpenAI. No images or person profile. Additional costs; refresh the preview afterwards. Prepare details before exporting with this mode."),
-                                                        visible=S["c_caption_composition_mode"] == "luna_text")
-                    p_caption_details_btn = gr.Button(tr("Luna-Textdetails vorbereiten · API-Kosten", "Prepare Luna text details · API costs"),
-                                                      visible=S["c_caption_composition_mode"] == "luna_text")
                     p_caption_target = gr.Dropdown(label=tr("Trainingsziel", "Training target"), choices=training_target_choices(),
                                                    value=normalize_training_target(S.get("c_training_target")))
                     with gr.Accordion(tr("Caption-Felder und Abweichungen", "Caption fields and deviations"), open=False):
@@ -8414,8 +8414,6 @@ def build_ui() -> gr.Blocks:
                             p_caption_target, p_caption_fields, p_caption_variable_mode, p_caption_composition_mode, c_controlled_buckets, *p_editor_inputs[3:]],
                     outputs=[p_caption_image, p_caption_raw, p_caption_final, p_caption_preview_status],
                     concurrency_id="caption_preview", concurrency_limit=1)
-                p_caption_composition_mode.change(fn=lambda mode: (gr.update(visible=mode == "luna_text"), gr.update(visible=mode == "luna_text")),
-                    inputs=[p_caption_composition_mode], outputs=[p_caption_details_btn, p_caption_details_info], queue=False)
                 for preview_control in [p_caption_target, p_caption_fields, p_caption_variable_mode, p_caption_composition_mode, c_controlled_buckets, *p_editor_inputs[3:]]:
                     preview_control.change(fn=lambda: ("", tr("Werte geändert. Vorschau aktualisieren, bevor du die Caption beurteilst.",
                                                             "Values changed. Refresh the preview before reviewing the caption.")),
@@ -8601,9 +8599,6 @@ def build_ui() -> gr.Blocks:
                     concurrency_id="dataset_curator_process",
                     concurrency_limit=1,
                 )
-                p_caption_details_btn.click(fn=start_caption_text_details, inputs=curator_inputs,
-                    outputs=[p_log, p_gallery, p_progress, p_status_run, p_openai_usage],
-                    concurrency_id="dataset_curator_process", concurrency_limit=1)
                 p_stop_btn.click(
                     fn=kill_process,
                     outputs=[p_status_run],

@@ -12,7 +12,7 @@
 - **Remove screenshot frames:** get local crop suggestions, review similar layouts together, or mark an image for exclusion. Source images stay untouched. The local detector also finds inner photos in story screenshots, polaroid frames and chat views; an inner photo is always the first variant. The view can be set to **Not safely auto-cropped**, **More than one draft** or **All images**.
 - **Select useful photos:** audit quality and identity, then keep a varied set of portraits, medium shots, and full-body images.
 - **Build a Subject Profile:** find the person's usual appearance while keeping visible changes such as hair, glasses, piercings, and tattoos controllable.
-- **Create training captions:** save first descriptions from Florence 2, JoyCaption, or GPT-6 Luna; compose final captions from the image audit, profile, and selected caption rules. Preview them before export.
+- **Create training captions:** save first descriptions from Florence 2, JoyCaption, or GPT-6 Luna; caption rules and the person profile decide what goes into each final caption, which is written as whole sentences, locally or by GPT-6 Luna from the exported image and checked against the rules. Preview them before export.
 - **Export for image LoRAs:** choose among nine image training targets, including ERNIE Image, Z-Image, Krea 2, Qwen-Image 2.1, FLUX.2, and experimental Ideogram 4.
 
 The image workflow is the focus. An optional Video Processor can extract candidate photos from videos.

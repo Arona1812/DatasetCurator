@@ -33,21 +33,23 @@ def preview(request):
         if profile.get("profile_rebuild_required"):
             raise ValueError("Identity roles changed: rebuild the profile before previewing captions.")
         row = request["row"]
-        if request["config"].get("CAPTION_COMPOSITION_MODE") == "luna_text" and int(row.get("face_count_local") or 0) <= 1:
-            from caption_details import cached_details, enriched_row
-            raw = str((row.get("initial_caption") or {}).get("caption") or "")
-            details = cached_details(request["cache_dir"], raw) if raw else None
-            if not details:
-                raise ValueError("Luna text details are not prepared yet. Use the explicit API preparation button, or select local composition.")
-            row = enriched_row(row, details)
-        backend.USE_KREA_AI_CAPTIONING = False
-        text = backend.adapt_caption_for_target(backend.TRAINING_TARGET,
-            backend.build_local_caption(row, request.get("global_rules", {}), profile))
+        rules = request.get("global_rules", {})
+        source = "audited_observations_and_subject_profile"
+        text = ""
+        if request["config"].get("CAPTION_COMPOSITION_MODE") == "luna_writer":
+            # Show the stored Luna caption for exactly these rules and this
+            # profile; a preview never sends a request.
+            backend.CACHE_DIR = request["cache_dir"]
+            text = backend.cached_written_caption(row, rules, profile)
+            source = "written_cache" if text else "local_draft"
+        if not text:
+            text = backend.build_local_caption(row, rules, profile)
+        text = backend.adapt_caption_for_target(backend.TRAINING_TARGET, text)
         if request.get("preview_image_path"):
             view = backend.body_aware_crop(backend.row_effective_image_path(row), row)
             view.thumbnail((1200, 1200))
             view.save(request["preview_image_path"], "JPEG", quality=92)
-        return {"caption": text, "composition_source": "audited_observations_and_subject_profile"}
+        return {"caption": text, "composition_source": source}
 
 
 if __name__ == "__main__":
