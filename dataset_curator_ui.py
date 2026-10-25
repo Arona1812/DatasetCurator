@@ -3381,7 +3381,20 @@ def save_identity_cluster_roles_ui(trigger_word: str, input_folder: str, table_d
         return tr(f"❌ Speichern fehlgeschlagen: {e}", f"❌ Save failed: {e}")
 
 
-CAPTION_PROGRESS_RE = re.compile(r"^(?:Initial caption|Text details) ready: (\d+)/(\d+)\b")
+CAPTION_PROGRESS_RE = re.compile(r"^(?:Initial caption|Text details|Face check|Export) ready: (\d+)/(\d+)\b")
+STAGE_RE = re.compile(r"^\[STAGE (\d+)/(\d+)\] (.+)$")
+STAGE_LABELS = {
+    "Audit": ("Audit", "Audit"),
+    "Face check": ("Gesichtsprüfung", "Face check"),
+    "First descriptions": ("Erstbeschreibungen", "First descriptions"),
+    "Captions & export": ("Captions & Export", "Captions & export"),
+}
+
+
+def parse_stage(line: str) -> Optional[Tuple[int, int, str]]:
+    """'[STAGE 2/4] Face check' -> (2, 4, 'Face check'); None for other lines."""
+    m = STAGE_RE.match(line)
+    return (int(m.group(1)), int(m.group(2)), m.group(3).strip()) if m else None
 
 
 def parse_progress(line: str) -> Optional[Tuple[int, int]]:
@@ -3665,6 +3678,7 @@ def run_script(
     run_started_at = time.time()
     phase_started_at = run_started_at
     phase_base_idx = 0
+    stage_index, stage_total, stage_name = 0, 0, ""
     last_progress_idx = 0
     last_progress_total = 0
     seconds_per_item: Optional[float] = None
@@ -3702,6 +3716,15 @@ def run_script(
                     openai_total_tokens,
                 )
 
+            stage = parse_stage(line)
+            if stage:
+                # A new step of the run: the item counter and its speed start over.
+                stage_index, stage_total, stage_name = stage
+                last_progress_idx, last_progress_total = 0, 0
+                seconds_per_item, eta_seconds = None, None
+                phase_started_at, phase_base_idx = time.time(), 0
+                progress = (stage_index - 1) / max(1, stage_total)
+
             p = parse_progress(line)
             if p:
                 idx, total = p
@@ -3711,6 +3734,8 @@ def run_script(
                     phase_started_at = time.time()
                     phase_base_idx = idx
                 progress = idx / max(1, total)
+                if stage_total:
+                    progress = (stage_index - 1 + progress) / stage_total
                 last_progress_idx = idx
                 last_progress_total = total
 
@@ -3726,21 +3751,28 @@ def run_script(
                 last_gallery_update = processed_count
 
             log_text = "\n".join(log_lines[-500:])
+            label_de, label_en = STAGE_LABELS.get(stage_name, (stage_name, stage_name))
+            step_de = f"Schritt {stage_index}/{stage_total} · {label_de} · " if stage_total else ""
+            step_en = f"Step {stage_index}/{stage_total} · {label_en} · " if stage_total else ""
             if last_progress_total > 0:
                 status_de = (
-                    f"⏳ Läuft... {last_progress_idx}/{last_progress_total} "
-                    f"({int(progress*100)}%)"
+                    f"⏳ {step_de}{last_progress_idx}/{last_progress_total} "
+                    f"(gesamt {int(progress*100)}%)"
                 )
                 status_en = (
-                    f"⏳ Running... {last_progress_idx}/{last_progress_total} "
-                    f"({int(progress*100)}%)"
+                    f"⏳ {step_en}{last_progress_idx}/{last_progress_total} "
+                    f"(overall {int(progress*100)}%)"
                 )
                 if seconds_per_item is not None:
                     status_de += f" | {seconds_per_item:.1f} s/Bild"
                     status_en += f" | {seconds_per_item:.1f} s/image"
                 if eta_seconds is not None and last_progress_idx < last_progress_total:
-                    status_de += f" | Rest ca. {format_duration(eta_seconds)}"
-                    status_en += f" | ETA {format_duration(eta_seconds)}"
+                    rest_de = "Rest im Schritt" if stage_total else "Rest"
+                    status_de += f" | {rest_de} ca. {format_duration(eta_seconds)}"
+                    status_en += f" | {'step ETA' if stage_total else 'ETA'} {format_duration(eta_seconds)}"
+            elif stage_total:
+                status_de = f"⏳ {step_de}läuft (gesamt {int(progress*100)}%)"
+                status_en = f"⏳ {step_en}running (overall {int(progress*100)}%)"
             else:
                 status_de = f"⏳ Läuft... ({int(progress*100)}%)"
                 status_en = f"⏳ Running... ({int(progress*100)}%)"

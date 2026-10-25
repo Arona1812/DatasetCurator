@@ -38,6 +38,13 @@ warnings.filterwarnings(
     category=UserWarning,
 )
 logging.getLogger("huggingface_hub.utils._http").addFilter(_SuppressHfHubUnauthWarning())
+# InsightFace calls a deprecated scikit-image API. The face alignment is still
+# correct; the warning would otherwise appear once per face in the live log.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*`estimate` is deprecated.*",
+    category=FutureWarning,
+)
 
 import requests
 import numpy as np
@@ -4136,7 +4143,9 @@ def run_identity_consistency_check(
     # Embeddings sammeln
     embeddings: List[np.ndarray] = []
     rows_with_emb: List[Tuple[Dict[str, Any], np.ndarray]] = []
-    for row in selected_rows:
+    for face_index, row in enumerate(selected_rows, start=1):
+        if face_index % 5 == 0 or face_index == len(selected_rows):
+            safe_print(f"Face check ready: {face_index}/{len(selected_rows)}")
         # Originalpfad oder gecropter Pfad - body_aware_crop wird hier nicht
         # benutzt, weil ArcFace selber Face-Detection macht und das Original
         # mehr Kontext bietet (Hintergrund schadet ArcFace nicht).
@@ -9753,6 +9762,31 @@ def _sync_row_update(row_map: Dict[str, Dict[str, Any]], row: Dict[str, Any]) ->
                 target[key] = row[key]
 
 
+# ============================================================
+# Fortschritt ueber alle Schritte eines Laufs
+# ============================================================
+# Die Oberflaeche liest "[STAGE i/n] Name" fuer den Schrittwechsel und innerhalb
+# eines Schritts "[k/n] ..." bzw. "... ready: k/n" fuer den Teilfortschritt.
+_RUN_STAGES: List[str] = []
+_EXPORT_PROGRESS: Dict[str, int] = {"done": 0, "total": 0}
+
+
+def plan_run_stages(stages: List[str]) -> None:
+    """Declare the steps of this run in order; empty names are skipped."""
+    _RUN_STAGES[:] = [name for name in stages if name]
+
+
+def announce_stage(name: str) -> None:
+    """Print the stage marker the UI uses for its overall progress bar."""
+    if name in _RUN_STAGES:
+        safe_print(f"[STAGE {_RUN_STAGES.index(name) + 1}/{len(_RUN_STAGES)}] {name}")
+
+
+def start_export_progress(total: int) -> None:
+    """Reset the image counter of the export step."""
+    _EXPORT_PROGRESS.update({"done": 0, "total": max(0, int(total))})
+
+
 def _write_captioned_image(row: Dict[str, Any], out_dir: str, new_basename: str, global_rules: Dict[str, Any], subject_profile: Dict[str, Any]) -> None:
     row["new_basename"] = new_basename
     row["final_caption"] = build_caption(row, global_rules, subject_profile)
@@ -9762,6 +9796,9 @@ def _write_captioned_image(row: Dict[str, Any], out_dir: str, new_basename: str,
     cropped.save(img_out, "JPEG", quality=100)
     with open(txt_out, "w", encoding="utf-8") as f:
         f.write(row["final_caption"])
+    if _EXPORT_PROGRESS["total"]:
+        _EXPORT_PROGRESS["done"] += 1
+        safe_print(f"Export ready: {min(_EXPORT_PROGRESS['done'], _EXPORT_PROGRESS['total'])}/{_EXPORT_PROGRESS['total']} | {new_basename}")
     if row.get("initial_caption"):
         core_atomic_write_json(os.path.join(out_dir, f"{new_basename}.caption.json"), {
             "original_filename": row.get("original_filename"),
@@ -10245,7 +10282,9 @@ def continue_caption_from_profile() -> None:
     # Measure face similarity against the user's Priority/Core images, then
     # refresh the Review bucket for face outliers before roles are applied.
     apply_profile_role_metadata(all_rows, subject_profile)
+    plan_run_stages(["Face check" if USE_ARCFACE_IDENTITY_CHECK and HAVE_INSIGHTFACE else "", "Captions & export"])
     if USE_ARCFACE_IDENTITY_CHECK and HAVE_INSIGHTFACE:
+        announce_stage("Face check")
         run_identity_consistency_check(
             [r for r in all_rows if r.get("base_status") in {"keep", "review"}],
             reference_rows=[
@@ -10313,6 +10352,8 @@ def continue_caption_from_profile() -> None:
     if CAPTION_COMPOSITION_MODE == "luna_writer" and not API_KEY:
         raise ValueError("Luna captions need an OpenAI API key. Set it in the project or choose local composition.")
     begin_output_transaction("continue_from_profile")
+    announce_stage("Captions & export")
+    start_export_progress(len(selected_sorted) + len(unselected_keep) + (len(review_items) if EXPORT_REVIEW_IMAGES else 0))
     clean_caption_output_dirs()
     row_map = {row_identity_key(r): r for r in all_rows if row_identity_key(r)}
 
@@ -13080,6 +13121,15 @@ def main() -> None:
             "new_basename": "",
         })
 
+    face_check_stage = "Face check" if USE_ARCFACE_IDENTITY_CHECK and HAVE_INSIGHTFACE else ""
+    plan_run_stages([
+        "Audit",
+        face_check_stage,
+        "First descriptions" if INITIAL_CAPTION_ENGINE else "",
+        "Captions & export" if PIPELINE_MODE != "profile_then_caption" else "",
+    ])
+    announce_stage("Audit")
+
     # PASS 1: Audit pro Bild
     _audit_loop_started = time.perf_counter()
     for idx, image_path in enumerate(image_paths, start=1):
@@ -13786,6 +13836,7 @@ def main() -> None:
     # Gesichtsaehnlichkeit fuer alle Kandidaten VOR der Auswahl: Ausreisser
     # kommen nicht in die Auswahl (im Profil als Review), alle anderen
     # bekommen einen leichten Aehnlichkeitsbonus bzw. -abzug.
+    announce_stage("Face check")
     identity_summary = run_identity_consistency_check(
         [r for r in all_rows if r.get("base_status") in {"keep", "review"}]
     )
@@ -13907,6 +13958,7 @@ def main() -> None:
     # Retain descriptions for all non-reject candidates, including images that
     # can be promoted during manual profile review. Cached descriptions survive
     # profile, trigger and target changes.
+    announce_stage("First descriptions")
     prepare_initial_captions([r for r in all_rows if r.get("base_status") in {"keep", "review"} and r.get("arcface_flag") != "hard"])
     profile_source_rows = list(selected) + list(unselected_keep)
     subject_profile = build_subject_profile(profile_source_rows)
@@ -13951,6 +14003,8 @@ def main() -> None:
         return
 
     begin_output_transaction("single_pass_export")
+    announce_stage("Captions & export")
+    start_export_progress(len(selected_sorted) + len(unselected_keep) + (len(review_items) if EXPORT_REVIEW_IMAGES else 0))
 
     counters = {
         "train_ready": 1,

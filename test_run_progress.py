@@ -43,6 +43,39 @@ class RunProgress(unittest.TestCase):
         self.assertIn(1.0, progress)
         self.assertTrue(any("2/4" in str(u[3]) for u in updates))
 
+    def test_balken_bildet_alle_schritte_des_laufs_ab(self):
+        script = textwrap.dedent("""
+            print("[STAGE 1/2] Audit")
+            print("[1/2] a.jpg")
+            print("[2/2] b.jpg")
+            print("[STAGE 2/2] Captions & export")
+            print("Export ready: 1/2 | x_001")
+            print("Export ready: 2/2 | x_002")
+        """)
+        with tempfile.TemporaryDirectory() as folder:
+            script_path = Path(folder) / "fake_run.py"
+            script_path.write_text(script, encoding="utf-8")
+            with mock.patch.object(ui, "VENV_PYTHON", sys.executable), \
+                    mock.patch.object(ui, "SCRIPT_DIR", folder), \
+                    mock.patch.object(ui, "ACTIVE_RUN_STATE_PATH", str(Path(folder) / "state.json")):
+                updates = list(ui.run_script(str(script_path), str(Path(folder) / "cfg.json"), {}))
+        progress = [round(u[2], 2) for u in updates]
+        for expected in (0.25, 0.5, 0.75, 1.0):
+            self.assertIn(expected, progress)
+        self.assertLessEqual(progress.index(0.5), progress.index(0.75))
+        self.assertTrue(any(ui.tr("Schritt 2/2", "Step 2/2") in str(u[3]) for u in updates))
+
+
+class InsightFaceWarning(unittest.TestCase):
+    def test_veraltete_insightface_warnung_wird_ausgeblendet(self):
+        import warnings
+
+        import dataset_curator_v2  # noqa: F401  (installs the filter)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.warn("`estimate` is deprecated since version 0.26 and will be removed", FutureWarning)
+        self.assertEqual(caught, [])
+
 
 if __name__ == "__main__":
     unittest.main()
