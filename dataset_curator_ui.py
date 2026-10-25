@@ -6093,8 +6093,8 @@ def build_ui() -> gr.Blocks:
                         visible=S["c_initial_caption_engine"] == "florence2",
                         info=tr("Wirkt nur bei Florence. Very Detailed ist voreingestellt.", "Only affects Florence. Very Detailed is the default."),
                     )
-                gr.Markdown(tr("**2 · Trainingscaption:** Das Personenprofil und die Caption-Felder regeln die Zusammensetzung. Lokal nutzt sie die Audit-Merkmale; optional lassen sich Szenendetails aus der Erstbeschreibung ergänzen.",
-                               "**2 · Training caption:** The person profile and caption fields control composition. Local composition uses audited observations; optionally add scene details from the first description."))
+                gr.Markdown(tr("**2 · Trainingscaption:** Personenprofil und Caption-Regeln legen den Inhalt fest. Die Erstbeschreibung aus Schritt 1 dient nur als Referenz für Szenendetails und für die Profil-Gegenprüfung; die Trainingscaption formt entweder das Tool lokal oder Luna aus dem Exportbild.",
+                               "**2 · Training caption:** The person profile and caption rules decide the content. The first description from step 1 only serves as reference for scene details and the profile cross-check; the training caption is formed either locally by the tool or by Luna from the exported image."))
                 c_initial_caption_status = gr.Markdown(initial_caption_readiness_ui(S["c_initial_caption_engine"]))
                 c_initial_caption_engine.change(fn=initial_caption_readiness_ui, inputs=c_initial_caption_engine,
                                                 outputs=c_initial_caption_status, queue=False)
