@@ -1643,6 +1643,31 @@ def initial_caption_readiness_ui(engine):
                   "Local provider is not installed yet. See CAPTION_PIPELINE.md or choose Luna. A missing provider is reported before paid audits.")
 
 
+MODEL_PRESET_SETTING_KEYS = (
+    "c_model", "c_audit_reasoning_effort", "c_trigger_model", "c_trigger_reasoning_effort",
+    "c_review_escalation_model", "c_review_escalation_reasoning_effort",
+    "c_profile_normalizer_model", "c_profile_reasoning_effort",
+    "c_krea_caption_model", "c_krea_caption_reasoning_effort",
+    "c_krea_caption_repair_model", "c_krea_caption_repair_reasoning_effort",
+)
+
+
+def apply_and_save_model_preset(preset: str) -> Tuple[Any, ...]:
+    """Fill the model fields from a preset and save them right away.
+
+    Returns the twelve field values followed by a status message.
+    """
+    values = tuple(model_preset(preset))
+    try:
+        settings = load_settings()
+        settings.update(dict(zip(MODEL_PRESET_SETTING_KEYS, values)))
+        core_atomic_write_json(SETTINGS_PATH, settings)
+        status = tr("💾 Modelle übernommen und gespeichert.", "💾 Models applied and saved.")
+    except OSError as exc:
+        status = tr(f"⚠️ Modelle übernommen, Speichern fehlgeschlagen: {exc}", f"⚠️ Models applied, saving failed: {exc}")
+    return values + (status,)
+
+
 def caption_writer_config(settings: Dict[str, Any]) -> Dict[str, Any]:
     """Caption-writer models from saved settings; preview and export must use the same ones."""
     return {
@@ -6126,7 +6151,7 @@ def build_ui() -> gr.Blocks:
                         info=tr("Übernehmen aktualisiert alle sechs Modellrollen. Danach kannst du jede Rolle einzeln ändern.",
                                 "Apply updates all six model roles. You can then customize each role."),
                     )
-                    c_apply_models = gr.Button(tr("Modelle übernehmen", "Apply models"), variant="secondary")
+                    c_apply_models = gr.Button(tr("Modelle übernehmen und speichern", "Apply and save models"), variant="secondary")
                 gr.Markdown(tr(
                     "`chat-latest` folgt dem aktuellen ChatGPT-Modell. GPT-6 Luna ist die sparsame Voreinstellung für neue Projekte; gespeicherte Modelle bleiben erhalten.",
                     "`chat-latest` follows the current ChatGPT model. GPT-6 Luna is the economical default for new projects; saved models are preserved.",
@@ -7959,12 +7984,12 @@ def build_ui() -> gr.Blocks:
 
                 # Alle Curator-Inputs als Liste (fuer Save und Start)
                 c_apply_models.click(
-                    fn=model_preset, inputs=[c_model_preset],
+                    fn=apply_and_save_model_preset, inputs=[c_model_preset],
                     outputs=[c_model, c_audit_reasoning_effort, c_trigger_model, c_trigger_reasoning_effort,
                              c_review_escalation_model, c_review_escalation_reasoning_effort,
                              c_profile_normalizer_model, c_profile_reasoning_effort,
                              c_krea_caption_model, c_krea_caption_reasoning_effort,
-                             c_krea_caption_repair_model, c_krea_caption_repair_reasoning_effort],
+                             c_krea_caption_repair_model, c_krea_caption_repair_reasoning_effort, c_status],
                 )
                 curator_inputs = [
                     c_trigger, c_input, c_target, c_api_key, c_model, c_audit_reasoning_effort, c_openai_token_limit, c_use_trigger_check, c_trigger_model, c_trigger_reasoning_effort,

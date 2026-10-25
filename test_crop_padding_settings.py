@@ -32,5 +32,21 @@ class CropPaddingSettings(unittest.TestCase):
         self.assertEqual(self._load(saved)["c_crop_pad"], 1.5)
 
 
+
+class ModelPresetSaving(unittest.TestCase):
+    def test_modelle_uebernehmen_speichert_sie_dauerhaft(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "_ui_settings.json"
+            path.write_text(json.dumps({"c_model": "chat-latest", "c_trigger": "Nina"}), encoding="utf-8")
+            with mock.patch.object(ui, "SETTINGS_PATH", str(path)), \
+                    mock.patch.object(ui, "LANG_OVERRIDE_PATH", str(Path(folder) / "_lang.json")):
+                result = ui.apply_and_save_model_preset("economical")
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(len(result), len(ui.MODEL_PRESET_SETTING_KEYS) + 1)
+        self.assertEqual(saved["c_model"], result[0])
+        self.assertEqual(saved["c_trigger"], "Nina")
+        self.assertTrue(result[-1].startswith("💾"))
+
+
 if __name__ == "__main__":
     unittest.main()
