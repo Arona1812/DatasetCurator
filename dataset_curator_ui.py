@@ -476,29 +476,40 @@ def training_target_choices():
 
 
 def training_target_details_ui(value):
+    """Explain in a short list what the selected training target controls."""
     target = image_target(value)
-    caption = tr("strukturierte JSON-Captions", "structured JSON captions") if target.caption_format == "ideogram_json" else tr("natürliche Text-Captions", "natural text captions")
-    engine = tr("Zusammensetzung aus Audit und Profil; Erstbeschreibung separat wählbar", "composition from audit and profile; initial description chosen separately")
+    krea = is_krea_target(target.key)
     if target.key in {"ernie", "z_image_base", "krea2"}:
-        preset = tr("Eigenes Caption-Feld-Preset vorhanden.", "Dedicated caption-field preset available.")
-    elif target.key == "krea2_turbo":
-        preset = tr("Verwendet derzeit die allgemeinen Z-Image-Felder; ein eigenes Turbo-Preset ist noch nicht validiert.",
-                    "Currently uses the general Z-Image fields; a dedicated Turbo preset has not been validated.")
+        preset_de, preset_en = "eigenes Preset", "dedicated preset"
     else:
-        preset = tr("Verwendet derzeit die allgemeinen Z-Image-Felder; ein eigenes Ziel-Preset ist noch nicht validiert.",
-                    "Currently uses the general Z-Image fields; a dedicated target preset has not been validated.")
-    return tr(
-        f"**{target.label}:** {caption}, {engine}. Bildaudit und Profil sind vom Trainingsziel unabhängig. "
-        f"{preset} "
-        "Export für einzelne RGB-Bilder; Referenzpaare und Transparenz werden noch nicht exportiert. "
-        "AI-Toolkit-Unterstützung geprüft; Trainingsqualität dieses Exportprofils noch nicht gemessen. "
-        "Ein Zielwechsel setzt die Caption-Felder auf das Ziel-Preset zurück; andere Einstellungen bleiben erhalten.",
-        f"**{target.label}:** {caption}, {engine}. Image audit and profile are generator-independent. "
-        f"{preset} "
-        "Single RGB image export; reference pairs and transparency are not exported yet. "
-        "AI Toolkit support checked; training quality of this export profile has not been measured. "
-        "Changing targets resets caption fields to the target preset; other settings are preserved.",
-    )
+        preset_de, preset_en = "allgemeines Preset (noch nicht ziel-spezifisch validiert)", "general preset (not yet validated for this target)"
+    if target.caption_format == "ideogram_json":
+        format_de, format_en = "Caption im JSON-Format", "caption in JSON format"
+    else:
+        format_de, format_en = "Caption als natürlicher Text", "caption as natural text"
+    opening = "`Trigger, a portrait photo …`" if krea else "`A portrait photo of Trigger …`"
+    length_de = "kompakt, 25–60 Wörter" if target.key.startswith("flux2") else "ausführlich, 40–110 Wörter"
+    length_en = "compact, 25–60 words" if target.key.startswith("flux2") else "detailed, 40–110 words"
+    lines_de = [
+        f"**{target.label}** steuert:",
+        f"- **Startwerte der Caption-Regeln:** {preset_de}. Gilt nur beim Wechsel des Ziels; deine Häkchen danach bleiben gültig.",
+        f"- **Form:** {format_de}, Satzanfang {opening}" + ("; Identitätsanker (Haar, Augen, Haut) im ersten Satz" if target.key == "ernie" else "") + ".",
+        f"- **Luna-Text:** {length_de}.",
+        "- **Export:** Profil für AI Toolkit (`image_target.json`), einzelne RGB-Bilder.",
+    ]
+    lines_en = [
+        f"**{target.label}** controls:",
+        f"- **Starting caption rules:** {preset_en}. Applied only when the target changes; your checkboxes afterwards stay valid.",
+        f"- **Form:** {format_en}, opening {opening}" + ("; identity anchors (hair, eyes, skin) in the first sentence" if target.key == "ernie" else "") + ".",
+        f"- **Luna text:** {length_en}.",
+        "- **Export:** AI Toolkit profile (`image_target.json`), single RGB images.",
+    ]
+    if krea:
+        lines_de.append("- **Auswahl:** leichter Bonus für gute Körperreferenz bei Halb- und Ganzkörperbildern.")
+        lines_en.append("- **Selection:** small bonus for good body reference in medium and full-body shots.")
+    lines_de.append("Unabhängig vom Ziel: Bildaudit, Personenprofil und Erstbeschreibung. Die Trainingsqualität je Ziel ist noch nicht gemessen.")
+    lines_en.append("Independent of the target: image audit, person profile and first description. Training quality per target has not been measured yet.")
+    return tr("\n".join(lines_de), "\n".join(lines_en))
 
 
 def get_caption_preset_values(target: Optional[str]) -> List[str]:
@@ -3399,6 +3410,13 @@ STAGE_LABELS = {
 
 
 UI_LOG_REFRESH_SECONDS = 0.5
+# Harmless C++ console lines from MediaPipe/TensorFlow Lite. They bypass
+# Python logging and environment switches, so the live log drops them here.
+LOG_NOISE_RE = re.compile(
+    r"inference_feedback_manager\.cc|landmark_projection_calculator\.cc|"
+    r"^INFO: Created TensorFlow Lite XNNPACK delegate|"
+    r"^WARNING: All log messages before absl::InitializeLog\(\) is called"
+)
 
 
 def parse_stage(line: str) -> Optional[Tuple[int, int, str]]:
@@ -3739,6 +3757,8 @@ def run_script(
 
             for line in batch:
                 line = line.rstrip("\n\r")
+                if LOG_NOISE_RE.search(line):
+                    continue
                 log_lines.append(line)
                 if re.match(r"\s*\[\d+/\d+\]", line):
                     processed_count += 1

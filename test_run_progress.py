@@ -19,6 +19,12 @@ class ProgressParsing(unittest.TestCase):
     def test_erstbeschreibungen_zaehlen_als_fortschritt(self):
         self.assertEqual(ui.parse_progress("Initial caption ready: 3/72 | a.jpg"), (3, 72))
 
+    def test_mediapipe_konsolenzeilen_werden_herausgefiltert(self):
+        noise = "W0000 00:00:1792923278.429762   34900 inference_feedback_manager.cc:121] Feedback manager requires a model with a single signature inference."
+        self.assertTrue(ui.LOG_NOISE_RE.search(noise))
+        self.assertTrue(ui.LOG_NOISE_RE.search("INFO: Created TensorFlow Lite XNNPACK delegate for CPU."))
+        self.assertFalse(ui.LOG_NOISE_RE.search("[12/80] image.jpg"))
+
     def test_unterphasen_zaehlen_nicht(self):
         self.assertIsNone(ui.parse_progress("   START [12/80] local_subject_metrics a.jpg"))
         self.assertIsNone(ui.parse_progress("Text details ready. Refresh the preview."))
