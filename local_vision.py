@@ -23,6 +23,12 @@ from __future__ import annotations
 
 import os
 import threading
+
+# MediaPipe/TensorFlow Lite write C++ info lines ("Created TensorFlow Lite
+# XNNPACK delegate", "Feedback manager requires ...") straight to the console.
+# They are harmless; only warnings of level ERROR and above stay visible.
+os.environ.setdefault("GLOG_minloglevel", "2")
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple

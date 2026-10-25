@@ -11,6 +11,7 @@ automatisch wiederhergestellt.
 """
 
 import os
+import queue
 import re
 import json
 import inspect
@@ -3397,6 +3398,9 @@ STAGE_LABELS = {
 }
 
 
+UI_LOG_REFRESH_SECONDS = 0.5
+
+
 def parse_stage(line: str) -> Optional[Tuple[int, int, str]]:
     """'[STAGE 2/4] Face check' -> (2, 4, 'Face check'); None for other lines."""
     m = STAGE_RE.match(line)
@@ -3701,57 +3705,87 @@ def run_script(
         if stdout is None:
             raise RuntimeError("Subprocess stdout is unavailable")
 
-        for line in stdout:
+        # A reader thread keeps the pipe drained, so the curator never waits on
+        # the browser. The UI is refreshed at most every UI_LOG_REFRESH_SECONDS
+        # with everything that arrived in between, instead of once per log line.
+        line_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+
+        def _pump_output() -> None:
+            try:
+                for raw_line in stdout:
+                    line_queue.put(raw_line)
+            finally:
+                line_queue.put(None)
+
+        threading.Thread(target=_pump_output, name="curator-log-reader", daemon=True).start()
+        processed_count = 0
+        output_finished = False
+        while not output_finished:
             if _cancel_requested.is_set():
                 break
+            batch: List[str] = []
+            try:
+                item = line_queue.get(timeout=UI_LOG_REFRESH_SECONDS)
+                while True:
+                    if item is None:
+                        output_finished = True
+                        break
+                    batch.append(item)
+                    item = line_queue.get_nowait()
+            except queue.Empty:
+                pass
+            if not batch:
+                continue
 
-            line = line.rstrip("\n\r")
-            log_lines.append(line)
+            for line in batch:
+                line = line.rstrip("\n\r")
+                log_lines.append(line)
+                if re.match(r"\s*\[\d+/\d+\]", line):
+                    processed_count += 1
 
-            usage_delta = parse_openai_usage_delta(line)
-            if usage_delta:
-                delta_req, delta_in, delta_out, delta_total = usage_delta
-                openai_requests += delta_req
-                openai_input_tokens += delta_in
-                openai_output_tokens += delta_out
-                openai_total_tokens += delta_total
-                openai_usage_text = format_openai_usage_text(
-                    openai_requests,
-                    openai_input_tokens,
-                    openai_output_tokens,
-                    openai_total_tokens,
-                )
+                usage_delta = parse_openai_usage_delta(line)
+                if usage_delta:
+                    delta_req, delta_in, delta_out, delta_total = usage_delta
+                    openai_requests += delta_req
+                    openai_input_tokens += delta_in
+                    openai_output_tokens += delta_out
+                    openai_total_tokens += delta_total
+                    openai_usage_text = format_openai_usage_text(
+                        openai_requests,
+                        openai_input_tokens,
+                        openai_output_tokens,
+                        openai_total_tokens,
+                    )
 
-            stage = parse_stage(line)
-            if stage:
-                # A new step of the run: the item counter and its speed start over.
-                stage_index, stage_total, stage_name = stage
-                last_progress_idx, last_progress_total = 0, 0
-                seconds_per_item, eta_seconds = None, None
-                phase_started_at, phase_base_idx = time.time(), 0
-                progress = (stage_index - 1) / max(1, stage_total)
+                stage = parse_stage(line)
+                if stage:
+                    # A new step of the run: the item counter and its speed start over.
+                    stage_index, stage_total, stage_name = stage
+                    last_progress_idx, last_progress_total = 0, 0
+                    seconds_per_item, eta_seconds = None, None
+                    phase_started_at, phase_base_idx = time.time(), 0
+                    progress = (stage_index - 1) / max(1, stage_total)
 
-            p = parse_progress(line)
-            if p:
-                idx, total = p
-                if last_progress_total and (total != last_progress_total or idx < last_progress_idx):
-                    # A new stage (e.g. captions after the image audit) restarts
-                    # the count; its speed must not include the earlier stage.
-                    phase_started_at = time.time()
-                    phase_base_idx = idx
-                progress = idx / max(1, total)
-                if stage_total:
-                    progress = (stage_index - 1 + progress) / stage_total
-                last_progress_idx = idx
-                last_progress_total = total
+                p = parse_progress(line)
+                if p:
+                    idx, total = p
+                    if last_progress_total and (total != last_progress_total or idx < last_progress_idx):
+                        # A new stage (e.g. captions after the image audit) restarts
+                        # the count; its speed must not include the earlier stage.
+                        phase_started_at = time.time()
+                        phase_base_idx = idx
+                    progress = idx / max(1, total)
+                    if stage_total:
+                        progress = (stage_index - 1 + progress) / stage_total
+                    last_progress_idx = idx
+                    last_progress_total = total
 
-                elapsed = max(0.0, time.time() - phase_started_at)
-                if idx > phase_base_idx:
-                    seconds_per_item = elapsed / (idx - phase_base_idx)
-                    remaining_items = max(0, total - idx)
-                    eta_seconds = remaining_items * seconds_per_item
+                    elapsed = max(0.0, time.time() - phase_started_at)
+                    if idx > phase_base_idx:
+                        seconds_per_item = elapsed / (idx - phase_base_idx)
+                        remaining_items = max(0, total - idx)
+                        eta_seconds = remaining_items * seconds_per_item
 
-            processed_count = sum(1 for l in log_lines if re.match(r"\s*\[\d+/\d+\]", l))
             if image_scan_folder and processed_count - last_gallery_update >= 5:
                 images = load_gallery_images(scan_images(image_scan_folder))
                 last_gallery_update = processed_count

@@ -1134,13 +1134,21 @@ def format_elapsed(seconds: float) -> str:
     return f"{minutes}m {rest:.1f}s"
 
 
+# Steps that finish faster than this (cache hits) stay out of the live log.
+QUIET_PHASE_SECONDS = 1.0
+
+
 def start_phase_heartbeat(label: str, interval: float = HEARTBEAT_INTERVAL_SECONDS):
+    """Start timing a step; START appears only once the step runs longer than QUIET_PHASE_SECONDS."""
     started_at = time.time()
     stop_event = threading.Event()
-
-    safe_print(f"   ⏱️  START {label}")
+    stop_event.announced = False  # type: ignore[attr-defined]
 
     def _heartbeat() -> None:
+        if stop_event.wait(QUIET_PHASE_SECONDS):
+            return
+        stop_event.announced = True  # type: ignore[attr-defined]
+        safe_print(f"   ⏱️  START {label}")
         while not stop_event.wait(interval):
             if cancellation_requested():
                 return
@@ -1159,9 +1167,12 @@ def stop_phase_heartbeat(
     thread: threading.Thread,
     success: bool = True,
 ) -> None:
+    """Stop timing; DONE is printed only for steps that were announced, failures always."""
     stop_event.set()
     if thread.is_alive():
         thread.join(timeout=0.2)
+    if success and not getattr(stop_event, "announced", True):
+        return
     elapsed = format_elapsed(time.time() - started_at)
     status = "DONE" if success else "FAILED"
     icon = "✅" if success else "❌"
