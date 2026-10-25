@@ -12921,7 +12921,11 @@ def main() -> None:
     )
     safe_print(f"  Audit cache schema: {AUDIT_CACHE_SCHEMA_VERSION} | {AUDIT_PROMPT_VERSION}")
     safe_print(f"  Pipeline mode:      {PIPELINE_MODE}")
-    safe_print(f"  Frame detector:     {FRAME_DETECTOR_SCHEMA_VERSION} | {FRAME_CLEANUP_MODE}")
+    safe_print(f"  Frame detector:     {FRAME_DETECTOR_SCHEMA_VERSION} | {FRAME_CLEANUP_MODE}"
+               + ("" if ENABLE_IG_FRAME_CROP else " | skipped"))
+    safe_print(f"  First descriptions: {INITIAL_CAPTION_ENGINE or 'off'}")
+    safe_print(f"  Training captions:  {CAPTION_COMPOSITION_MODE}"
+               + (f" | {KREA_CAPTION_MODEL} (repair {KREA_CAPTION_REPAIR_MODEL})" if CAPTION_COMPOSITION_MODE == "luna_writer" else ""))
     safe_print("=" * 60)
     update_run_manifest("running", run_kind="continue_from_profile" if CONTINUE_FROM_PROFILE else "full_run")
 
