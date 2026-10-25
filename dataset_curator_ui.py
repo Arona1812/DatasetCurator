@@ -3996,7 +3996,11 @@ def audit_run_overview_ui(trigger_word, input_folder, target, model, pipeline_mo
     else:
         lines.append(tr("**Zuerst auf Start die Vorprüfung ausführen oder aktualisieren.**", "**Run or refresh preflight on Start first.**"))
     same_project = isinstance(frame_state, dict) and os.path.normcase(os.path.abspath(frame_state.get("output_root") or ".")) == os.path.normcase(os.path.abspath(output_root_for(input_folder or ".", trigger_word or "")))
-    if current and same_project and frame_state.get("records"):
+    frame_module_on = bool((workspace.get("frame") or {}).get("enabled"))
+    if not frame_module_on:
+        lines.append(tr("**Rahmen:** übersprungen – das Audit nutzt die Originalbilder.",
+                        "**Frames:** skipped – the audit uses the original images."))
+    elif current and same_project and frame_state.get("records"):
         records = frame_state["records"]
         mode, allowed = frame_state.get("frame_mode", "suggest_only"), frame_state.get("auto_accept_types", [])
         automatic = sum(r.get("user_decision", "auto") == "auto" and automatic_crop_bbox(r, mode, allowed) is not None for r in records)
@@ -4007,7 +4011,7 @@ def audit_run_overview_ui(trigger_word, input_folder, target, model, pipeline_mo
         if pending:
             lines.append(tr("Offene Vorschläge in Modul 1 prüfen; die eingestellte Rahmenregel bestimmt, ob der Lauf dafür pausiert.",
                             "Review pending proposals in module 1; the selected frame policy determines whether the run pauses for them."))
-    elif (workspace.get("frame") or {}).get("enabled"):
+    else:
         lines.append(tr("**Rahmen:** Modul 1 lokal laden, um aktuelle Entscheidungen und offene Vorschläge zu sehen.",
                         "**Frames:** load module 1 locally to see current decisions and pending proposals."))
     flow = tr("Audit → Profil prüfen → Captions und Export separat starten", "Audit → review profile → start captions and export separately") if pipeline_mode == "profile_then_caption" else tr("Audit → Profil → Captions → Export", "Audit → profile → captions → export")
@@ -4049,11 +4053,15 @@ def start_curator(*values):
         return
     if bool(frame_state.get("enabled")) and not bool(frame_state.get("analysis_completed")):
         yield tr(
-            "Das Rahmenmodul ist aktiviert, wurde aber noch nicht analysiert. Bitte zuerst Modul 1 'Rahmen' ausführen oder das Rahmenmodul auf der Startseite deaktivieren.",
-            "The frame module is enabled but has not been analysed yet. Run module 1 'Frames' first or disable frame processing on the start page.",
+            "Das Rahmenmodul ist aktiviert, wurde aber noch nicht analysiert. Entweder in Modul 1 'Rahmen' analysieren oder dort „Rahmen überspringen“ klicken.",
+            "The frame module is enabled but has not been analysed yet. Either analyse in module 1 'Frames' or click 'Skip frames' there.",
         ), [], 0, tr("❌ Rahmenanalyse fehlt", "❌ Frame analysis missing"), format_openai_usage_text(0, 0, 0, 0)
         return
     config = build_run_config_from_ui_values(values, continue_from_profile=False)
+    if not bool(frame_state.get("enabled")):
+        # Skipped or disabled frame module: no frame crops and no pause for
+        # unresolved frame proposals; the audit works on the original images.
+        config["ENABLE_IG_FRAME_CROP"] = False
     train_dir = os.path.join(output_root_for(v["input_folder"], v["trigger_word"]), "01_train_ready")
     yield from run_script(CURATOR_SCRIPT, CURATOR_CONFIG, config, train_dir)
 
@@ -4672,6 +4680,8 @@ def scan_frame_review_ui(
     workspace = dict(workspace or {})
     frame_state = dict(workspace.get("frame") or {})
     frame_state.update({
+        "enabled": True,
+        "skipped_by_user": False,
         "analysis_completed": True,
         "analysis_completed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "analysis_count": len(records),
@@ -4964,6 +4974,29 @@ def set_frame_automation_ui(state, mode, allowed_types, filter_value):
     message = tr(f"{count} Zuschnitte automatisch aktiv. Manuelle Entscheidungen bleiben bestehen; unsichere Grenzen brauchen Prüfung.",
                  f"{count} automatic crops active. Manual decisions are preserved; uncertain boundaries need review.")
     return updated, _frame_review_summary_md(updated), message
+
+
+def skip_frame_module_ui(trigger_word: str, input_folder: str) -> Tuple[str, str]:
+    """Turn the frame module off for this dataset so the audit can start right after preflight.
+
+    Saved frame decisions stay on disk; a later local frame analysis turns the
+    module on again.
+    """
+    trigger_word = str(trigger_word or "").strip()
+    input_folder = str(input_folder or "").strip()
+    if not trigger_word or not os.path.isdir(input_folder):
+        return tr("❌ Zuerst das Projekt auf der Startseite initialisieren.", "❌ Initialize the project on the start page first."), gr.update()
+    workspace = dict(load_project_workspace(input_folder, trigger_word) or {})
+    frame_state = dict(workspace.get("frame") or {})
+    frame_state.update({"enabled": False, "skipped_by_user": True, "skipped_at": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    workspace["frame"] = frame_state
+    workspace["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    core_atomic_write_json(os.path.join(output_root_for(input_folder, trigger_word), "_project_workspace.json"), workspace)
+    return (
+        tr("⏭ Rahmen übersprungen. Das Audit nutzt die Originalbilder; „Rahmen lokal analysieren“ schaltet das Modul wieder ein.",
+           "⏭ Frames skipped. The audit uses the original images; 'Analyze frames locally' turns the module on again."),
+        _workspace_summary_md(input_folder, trigger_word, workspace),
+    )
 
 
 def scan_frames_after_preflight_ui(trigger_word, input_folder, advanced_types, enabled, ready, progress=gr.Progress()):
@@ -5865,6 +5898,7 @@ def build_ui() -> gr.Blocks:
                 ))
                 with gr.Row():
                     fr_scan_btn = gr.Button(tr("🔎 Rahmen lokal analysieren", "🔎 Analyze frames locally"), variant="primary", scale=2)
+                    fr_skip_btn = gr.Button(tr("⏭ Rahmen überspringen · direkt zum Audit", "⏭ Skip frames · go straight to audit"), variant="secondary", scale=1)
                 with gr.Accordion(tr("Erkennung & Entscheidungen zurücksetzen", "Reset detection & decisions"), open=False):
                     fr_reset_cache_btn = gr.Button(tr("♻ Erkennung neu berechnen", "♻ Recompute detection"), variant="secondary", scale=1)
                     fr_reset_manual_btn = gr.Button(tr("↩ Manuelle Entscheidungen löschen", "↩ Clear manual decisions"), variant="secondary", scale=1)
@@ -8855,6 +8889,12 @@ def build_ui() -> gr.Blocks:
             ).then(
                 fn=lambda st, flt: navigate_frame_review_image_ui(st, flt, "", 0),
                 inputs=[fr_state, fr_filter], outputs=frame_navigation_outputs,
+            )
+            fr_skip_btn.click(
+                fn=skip_frame_module_ui,
+                inputs=[w_trigger, w_input],
+                outputs=[fr_status, workspace_summary],
+                queue=False,
             )
             fr_scan_btn.click(
                 fn=scan_frame_review_ui,

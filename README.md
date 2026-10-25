@@ -60,7 +60,7 @@ The Windows launcher is the maintained setup path. The manual installation uses 
 ## Your first dataset
 
 1. In **Start / Project**, choose the image folder, set a unique trigger word, and enter your API key.
-2. Run **Preflight**. Review any suggested frame crops in **Frames**; you can keep the original or exclude a photo.
+2. Run **Preflight**. Review any suggested frame crops in **Frames**; you can keep the original or exclude a photo. If you need no crops, continue with **Skip frames · go straight to audit**; the audit then uses the original images.
 3. In **Audit & Selection**, choose a training target and first-caption model. Choose **Review profile first** to pause before export, or use the automatic profile decision.
 4. Check the **Subject Profile** and caption preview, then export. Inspect the result under `curated_<trigger>/`.
 

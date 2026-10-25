@@ -10,6 +10,8 @@ The **Frames** module works after Preflight. It detects borders and proposes a p
 4. For a difficult image, use the optional AI finder or set the crop manually. Check that the person remains fully inside the selected region.
 5. If several images share a layout, use **Similar images** to preview and confirm the matching crops together. Deselect any image that needs a different boundary.
 
+**Skip frames · go straight to audit** turns the frame module off for this dataset when no crops are needed. The audit then uses the original images and never pauses for frame proposals. Saved frame decisions stay on disk; **Analyze frames locally** turns the module on again.
+
 Round frames and uncertain photo boundaries are kept for review instead of receiving an aggressive automatic crop. A confirmed manual decision takes precedence over automatic suggestions.
 
 **Exclude image from dataset** is reversible. The excluded view lets you restore the image later. After changing crop or exclusion decisions, run the normal curator again before exporting; the app blocks a continuation based on stale frame audits.

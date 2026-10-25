@@ -60,7 +60,7 @@ Der Windows-Launcher ist der gepflegte Installationsweg. Bei der manuellen Insta
 ## Der erste Datensatz
 
 1. Unter **Start / Projekt** den Bildordner wählen, ein eindeutiges Triggerwort festlegen und den API-Key eingeben.
-2. **Vorprüfung** starten. Unter **Rahmen** mögliche Zuschnitte prüfen; du kannst das Original behalten oder ein Bild ausschließen.
+2. **Vorprüfung** starten. Unter **Rahmen** mögliche Zuschnitte prüfen; du kannst das Original behalten oder ein Bild ausschließen. Brauchst du keine Zuschnitte, geht es mit **Rahmen überspringen · direkt zum Audit** weiter; das Audit nutzt dann die Originalbilder.
 3. Unter **Audit & Auswahl** Trainingsziel und Erstcaption-Modell wählen. Mit **Profil zuerst selbst prüfen** pausiert der Lauf vor dem Export; alternativ entscheidet das Profil automatisch.
 4. **Subject Profile** und Caption-Vorschau prüfen, dann exportieren. Das Ergebnis liegt unter `curated_<trigger>/`.
 
