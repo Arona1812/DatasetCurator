@@ -1,6 +1,6 @@
 # Installation notes
 
-The main application uses Python 3.13. The Windows launcher is the maintained setup path; the manual route below is useful for Linux, macOS, and customized Python environments. Local Florence 2 and JoyCaption captioners require additional CUDA environments and model weights.
+The main application uses Python 3.13. The Windows launcher is the maintained setup path; the manual route below is useful for Linux, macOS, and customized Python environments.
 
 ## Windows launcher
 
@@ -32,7 +32,6 @@ On Windows PowerShell, activate the environment with `.\.venv\Scripts\Activate.p
 
 ## First-caption models
 
-The Windows launcher installs the **main app**, not Florence 2 or JoyCaption model weights. Those local captioners need a CUDA GPU, their own Python environments, and pinned local weight snapshots. The required paths and metadata files are described in [CAPTION_PIPELINE.md](../CAPTION_PIPELINE.md#lokale-einrichtung). The app checks for those resources before starting a paid image audit.
 
 To use the app without local captioner setup, select **GPT-6 Luna** as the first-description model in *Audit & Selection*. This sends the selected images to OpenAI and uses API credit. An OpenAI key is also required for image auditing, even when the first-description model runs locally. Local preflight and frame suggestions do not require an API key.
 

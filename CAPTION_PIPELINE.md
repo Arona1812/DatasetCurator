@@ -1,10 +1,10 @@
 # Personen-LoRA: zwei Caption-Schritte
 
-Im Audit-Modul stehen Florence 2, JoyCaption und GPT-6 Luna unabhängig vom Trainingsziel zur Auswahl. Florence bietet Caption, Detailed Caption und Very Detailed Caption; voreingestellt ist Very Detailed. GPT-6.1 Sol und Qwen sind keine Erstcaption-Provider. Unabhängige Audit-/Profilmodelle bleiben separat konfigurierbar.
+Die Erstbeschreibung schreibt GPT-6 Luna, unabhängig vom Trainingsziel. Die lokalen Provider Florence 2 und JoyCaption wurden entfernt: Sie brachten bei deutlich längerer Rechenzeit keinen Mehrwert für die Trainingscaptions. Gespeicherte Einstellungen mit `florence2` oder `joycaption` wechseln automatisch zu Luna; bereits gespeicherte Luna-Beschreibungen bleiben gültig.
 
 ## Erstbeschreibung
 
-Nach der Bildauswahl und vor der Profilprüfung werden die effektiven Bilder beschrieben. Keep- und Review-Kandidaten werden vorbereitet, damit nachträglich ausgewählte Bilder verfügbar bleiben. Rejects und harte Identitätskonflikte sind ausgeschlossen. Rohtexte, Provider-/Prompt-Einstellungen, Modellrevisionen und Bild-Hashes bleiben im Cache und im gespeicherten Laufzustand erhalten. Profil, Trigger, Zielmodell und Caption-Schalter verändern den Erstcaption-Cache nicht. Andere Bildbytes, Florence-Stufen und Modellrevisionen erzeugen neue Einträge. Leere oder abgeschnittene Ausgaben stoppen den Lauf; es gibt keinen automatischen Wechsel zu einer kostenpflichtigen API.
+Nach der Bildauswahl und vor der Profilprüfung werden die effektiven Bilder beschrieben. Keep- und Review-Kandidaten werden vorbereitet, damit nachträglich ausgewählte Bilder verfügbar bleiben. Rejects und harte Identitätskonflikte sind ausgeschlossen. Rohtexte, Provider-/Prompt-Einstellungen, Modellrevisionen und Bild-Hashes bleiben im Cache und im gespeicherten Laufzustand erhalten. Profil, Trigger, Zielmodell und Caption-Schalter verändern den Erstcaption-Cache nicht. Andere Bildbytes erzeugen neue Einträge. Leere oder abgeschnittene Ausgaben stoppen den Lauf; es gibt keinen automatischen Wechsel zu einer kostenpflichtigen API.
 
 Bei der Profilbildung werden positive, eindeutig benannte Merkmale aus der Erstbeschreibung eng begrenzt ausgelesen: Haar- und Augenfarbe, sichtbare Brille sowie ausdrücklich genannte Piercings/Ohrschmuck und Tattoos. Ein Vergleich mit dem Bildaudit teilt sie in Übereinstimmungen, Widersprüche und nicht bestätigte Hinweise. Nur Übereinstimmungen werden dem Profil-Normalizer als zusätzliche Evidenz für bereits auditierte Merkmale übergeben. Einzelne Textbehauptungen ersetzen niemals einen Bildaudit, ändern keine Häufigkeitszählung und erzeugen keine neue Bildbeobachtung. Widersprüche und zusätzliche Hinweise erscheinen in der Profil-Diagnostik mit Bildnamen. Mehrpersonenbilder liefern keine Erstcaption-Evidenz für das Profil. Der Profil-Cache berücksichtigt die Text- und Provider-Provenienz; ein geänderter Erstcaption-Provider kann daher eine neue Profil-Normalisierung auslösen.
 
@@ -31,15 +31,7 @@ Der Luna-Modus wurde ausschließlich mit simulierten API-Antworten geprüft. Ein
 
 Exportierte `.txt`-Dateien enthalten die Trainingscaption. Daneben dokumentiert `.caption.json` die unveränderte Erstbeschreibung und finale Caption. Alte gespeicherte Läufe ohne Erstbeschreibung bleiben fortsetzbar. Automatische und manuelle Läufe speichern beide `_caption_stage.json`. Eine geänderte Quelldatei mit bestehender Erstbeschreibung blockiert die Fortsetzung vor dem Austausch der Trainingsausgabe.
 
-## Lokale Einrichtung
 
-Validierung am 12.10.2026: 94 lokale Tests bestanden. Beide GPU-Worker wurden außerdem jeweils auf demselben echten eingefrorenen Referenzbild geprüft; beide Ausgaben waren vollständig. Die Profil-Gegenprüfung wurde zusätzlich auf jeweils zwölf bereits gespeicherten Florence- und JoyCaption-Beschreibungen gegen vorhandene Luna-Bildbefunde erprobt: Florence ergab sieben Übereinstimmungen ohne Widerspruch, JoyCaption 16 Übereinstimmungen, einen Augenfarben-Widerspruch und neun nicht bestätigte Zusatzhinweise. Diese Luna-Befunde sind **kein bestätigter Goldstandard** und ersetzen keine Prüfung am echten Nutzerdatensatz. Es gab keine weiteren kostenpflichtigen Modelltests, keine Änderungen am Nutzerdatensatz und keinen LoRA-Trainingslauf.
+## Laufkonfiguration
 
-Die CPU-Hauptanwendung bleibt unter Python 3.13. GPU-Provider verwenden eigene Python-Umgebungen:
-
-- Florence: `.venv_florence/Scripts/python.exe`, CUDA PyTorch und Transformers 4.49 mit dem offiziellen Florence-Adapter.
-- JoyCaption: `.venv_caption/Scripts/python.exe`, CUDA PyTorch, Transformers 4.57.6 und BitsAndBytes; Sprachmodell in NF4, Bildteil in BF16.
-
-Gewichtsverweise liegen unter `_cache/caption_models/florence2_weights.json` beziehungsweise `joycaption_weights.json`, jeweils als Objekt mit `model`, `revision` und absolutem `snapshot`-Pfad. Bereits vorbereitete Vergleichsgewichte unter `Datasets/caption_benchmark` werden lokal ebenfalls gefunden. Gewichte werden nicht selbständig heruntergeladen.
-
-Für andere Installationspfade können in der Laufkonfiguration `INITIAL_CAPTION_PYTHON` und `INITIAL_CAPTION_WEIGHTS` gesetzt werden. `INITIAL_CAPTION_ENGINE` ist `florence2`, `joycaption` oder `gpt-6-luna`; `INITIAL_CAPTION_FLORENCE_TASK` ist `<CAPTION>`, `<DETAILED_CAPTION>` oder `<MORE_DETAILED_CAPTION>`. `CAPTION_COMPOSITION_MODE` ist `local` (Standard) oder `luna_writer`; der alte Wert `luna_text` wird zu `luna_writer`. Ohne Provider-Angabe behalten ältere CLI-Konfigurationen ihren bisherigen Ablauf.
+`CAPTION_COMPOSITION_MODE` ist `local` (Standard) oder `luna_writer`; der alte Wert `luna_text` wird zu `luna_writer`. `INITIAL_CAPTION_ENGINE` ist `gpt-6-luna` oder leer (keine Erstbeschreibung); alte Werte `florence2` und `joycaption` werden zu `gpt-6-luna`.

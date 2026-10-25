@@ -13,7 +13,7 @@
 - **Crop away stickers and stamps:** when the image audit finds a music sticker, date stamp or watermark, Luna locates it and the tool crops it away as long as the person stays complete and the image large enough. The crop is audited again and replaces the original only without overlay; otherwise the image goes to `03_caption_remove` as before. Switch under *Audit & selection → Quality & crops*.
 - **Select useful photos:** audit quality and identity, then keep a varied set of portraits, medium shots, and full-body images. With InsightFace every face is compared with the reference before selection (your favorites and core images, otherwise all candidates): outliers appear as *Review* in the profile, and images that match are preferred.
 - **Build a Subject Profile:** find the person's usual appearance while keeping visible changes such as hair, glasses, piercings, and tattoos controllable.
-- **Create training captions:** save first descriptions from Florence 2, JoyCaption, or GPT-6 Luna; caption rules and the person profile decide what goes into each final caption, which is written as whole sentences, locally or by GPT-6 Luna from the exported image and checked against the rules. Preview them before export.
+- **Create training captions:** GPT-6 Luna describes every usable image once; caption rules and the person profile decide what goes into each final caption, which is written as whole sentences, locally or by GPT-6 Luna from the exported image and checked against the rules. Preview them before export.
 - **Export for image LoRAs:** choose among nine image training targets, including ERNIE Image, Z-Image, Krea 2, Qwen-Image 2.1, FLUX.2, and experimental Ideogram 4.
 
 The image workflow is the focus. An optional Video Processor can extract candidate photos from videos.
@@ -22,7 +22,6 @@ The image workflow is the focus. An optional Video Processor can extract candida
 
 - **Python 3.13**.
 - **OpenAI API key and available credit** for image audits, optional AI frame finding, and GPT-6 Luna captions. Local preflight and frame suggestions work without a key.
-- **NVIDIA CUDA GPU** only if you want to run Florence 2 or JoyCaption locally. The main app and CPU installation do not require one.
 - **InsightFace** is optional for image curation; ArcFace identity matching and Video Processor face matching need it.
 - **MediaPipe models** for local face and pose detection (about 6 MB) are downloaded once on first use into `_models/`. Without them the frame detector still works but no longer checks crops against faces and bodies.
 - **CLIP** for duplicate detection: without an NVIDIA GPU the tool automatically uses the fast ViT-B-32 model, with a GPU ViT-L-14. The choice is under *Audit & Selection → Duplicate detection*.
@@ -40,8 +39,6 @@ cd DatasetCurator
 ```
 
 You can also double-click `start_curator.bat`. It creates a Python 3.13 environment, installs the app dependencies, and opens the interface. For an installation without CUDA packages, run `.\start_curator.bat --cpu`.
-
-Florence 2 and JoyCaption need **separate local model weights and a CUDA GPU**; the launcher does not install those workers. See [local caption setup](CAPTION_PIPELINE.md#lokale-einrichtung). To start without them, select **GPT-6 Luna** for first descriptions in *Audit & Selection*. Luna sends those images to OpenAI and uses API credit.
 
 ### Linux or macOS
 
@@ -75,6 +72,6 @@ For questions or problems, [open a GitHub issue](https://github.com/Arona1812/Da
 
 ## Privacy and license
 
-The app runs locally. Image audits and the optional Luna captioner send selected images to OpenAI; local preflight, frame suggestions, Florence 2, and JoyCaption run on your machine. API keys can be saved in ignored local settings files, so do not share those files.
+The app runs locally. Image audits and the optional Luna captioner send selected images to OpenAI; local preflight and frame suggestions run on your machine. API keys can be saved in ignored local settings files, so do not share those files.
 
 The code is [MIT licensed](LICENSE). Dependencies and model weights have their own terms; see [third-party licenses](thirdparty-lic.md).

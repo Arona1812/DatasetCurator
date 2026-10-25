@@ -30,7 +30,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import gradio as gr
 from PIL import Image, ImageDraw, ImageOps
-from initial_captions import ENGINES as INITIAL_CAPTION_ENGINES, FLORENCE_TASKS
+from initial_captions import ENGINE as INITIAL_CAPTION_ENGINE
 
 from openai_models import MODEL_CHOICES, FRAME_VISION_MODEL, model_preset
 from frame_group_review import build_group_plan, validate_group_selection
@@ -384,8 +384,6 @@ DEFAULTS: Dict[str, Any] = {
     "c_captions": list(SHARED_COMPACT_CAPTION_FIELDS),
     "c_variable_feature_mode": "canonical_deviations",
     "c_krea_caption_model": "gpt-6-luna",
-    "c_initial_caption_engine": "florence2",
-    "c_initial_caption_task": "<MORE_DETAILED_CAPTION>",
     "c_caption_composition_mode": "local",
     "c_krea_caption_reasoning_effort": "none",
     "c_use_krea_caption_repair": True,
@@ -707,7 +705,6 @@ def save_settings_fn(
     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
     c_profile_sample_threshold, c_profile_sample_size,
     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
-    c_initial_caption_engine, c_initial_caption_task,
     c_caption_composition_mode,
     # Video
     v_source, v_target, v_ref, v_fpm, v_fps, v_sim, v_sharp,
@@ -792,8 +789,6 @@ def save_settings_fn(
         "c_exp_review": c_exp_review, "c_exp_reject": c_exp_reject,
         "c_exp_compare": c_exp_compare,
         "c_controlled_buckets": c_controlled_buckets,
-        "c_initial_caption_engine": c_initial_caption_engine,
-        "c_initial_caption_task": c_initial_caption_task,
         "c_caption_composition_mode": c_caption_composition_mode,
         "v_source": v_source, "v_target": v_target, "v_ref": v_ref,
         "v_fpm": v_fpm, "v_fps": v_fps, "v_sim": v_sim, "v_sharp": v_sharp,
@@ -1627,20 +1622,6 @@ def profile_caption_choices(trigger_word, input_folder):
     names = [str(r.get("original_filename")) for r in rows if isinstance(r, dict)
              and r.get("base_status") in {"keep", "review"} and r.get("arcface_flag") != "hard"]
     return gr.update(choices=names, value=names[0] if names else None)
-
-
-def initial_caption_readiness_ui(engine):
-    if engine == "gpt-6-luna":
-        return tr("Luna nutzt den Projekt-API-Key. Neue Erstbeschreibungen senden Bilder an OpenAI und verbrauchen das eingestellte Tokenbudget.",
-                  "Luna uses the project API key. New descriptions send images to OpenAI and use the configured token budget.")
-    try:
-        from initial_captions import local_resources
-        local_resources(SCRIPT_DIR, engine)
-        return tr("Lokale Laufzeit und Modellgewichte gefunden. Die GPU muss beim Erstcaptioning ausreichend frei sein. Audit und Profilmodelle bleiben separat eingestellt.",
-                  "Local runtime and model weights found. The GPU needs enough free memory for initial captioning. Audit and profile models remain configured separately.")
-    except Exception:
-        return tr("Lokaler Provider noch nicht eingerichtet. Hinweise in CAPTION_PIPELINE.md; alternativ Luna wählen. Ein fehlender Provider wird vor dem kostenpflichtigen Audit gemeldet.",
-                  "Local provider is not installed yet. See CAPTION_PIPELINE.md or choose Luna. A missing provider is reported before paid audits.")
 
 
 MODEL_PRESET_SETTING_KEYS = (
@@ -3898,7 +3879,6 @@ CURATOR_INPUT_NAMES = (
     "krea_caption_model", "krea_caption_reasoning_effort", "use_krea_caption_repair", "krea_caption_repair_model", "krea_caption_repair_reasoning_effort",
     "c_pipeline_mode", "c_profile_normalizer_model", "profile_reasoning_effort", "c_profile_sample_threshold", "c_profile_sample_size",
     "export_review", "export_reject", "export_crop_compare", "controlled_buckets",
-    "initial_caption_engine", "initial_caption_task",
     "caption_composition_mode",
 )
 
@@ -3999,8 +3979,7 @@ def build_run_config_from_ui_values(values: Tuple[Any, ...], *, continue_from_pr
         "CAPTION_POLICY": caption_policy,
         "VARIABLE_FEATURE_CAPTION_MODE": str(v["variable_feature_mode"] or "canonical_deviations"),
         "USE_KREA_AI_CAPTIONING": False,
-        "INITIAL_CAPTION_ENGINE": str(v["initial_caption_engine"] or "florence2"),
-        "INITIAL_CAPTION_FLORENCE_TASK": str(v["initial_caption_task"] or "<MORE_DETAILED_CAPTION>"),
+        "INITIAL_CAPTION_ENGINE": INITIAL_CAPTION_ENGINE,
         "CAPTION_COMPOSITION_MODE": str(v["caption_composition_mode"] or "local"),
         "KREA_CAPTION_MODEL": str(v["krea_caption_model"] or "gpt-6-luna").strip(),
         "KREA_CAPTION_REASONING_EFFORT": str(v["krea_caption_reasoning_effort"] or "none"),
@@ -6103,28 +6082,10 @@ def build_ui() -> gr.Blocks:
                 )
                 c_training_target_details = gr.Markdown(training_target_details_ui(S.get("c_training_target")))
                 c_training_target.change(fn=training_target_details_ui, inputs=c_training_target, outputs=c_training_target_details, queue=False)
-                with gr.Row():
-                    c_initial_caption_engine = gr.Dropdown(
-                        label=tr("1 · Erstbeschreibung", "1 · Initial image description"),
-                        choices=[("Florence 2 · lokal", "florence2"), ("JoyCaption · lokal", "joycaption"), ("GPT-6 Luna · API", "gpt-6-luna")],
-                        value=S["c_initial_caption_engine"],
-                        info=tr("Unabhängig vom Trainingsziel. Die Rohbeschreibung bleibt erhalten. Lokale Modelle benötigen den eingerichteten GPU-Laufzeitordner; Luna sendet Bilder an OpenAI.",
-                                "Independent of training target. Raw descriptions are preserved. Local models need a configured GPU runtime; Luna sends images to OpenAI."),
-                    )
-                    c_initial_caption_task = gr.Dropdown(
-                        label=tr("Florence · Detailgrad", "Florence · Caption detail"),
-                        choices=[("Caption", "<CAPTION>"), ("Detailed Caption", "<DETAILED_CAPTION>"), ("Very Detailed Caption", "<MORE_DETAILED_CAPTION>")],
-                        value=S["c_initial_caption_task"],
-                        visible=S["c_initial_caption_engine"] == "florence2",
-                        info=tr("Wirkt nur bei Florence. Very Detailed ist voreingestellt.", "Only affects Florence. Very Detailed is the default."),
-                    )
+                gr.Markdown(tr("**1 · Erstbeschreibung:** GPT-6 Luna beschreibt jedes brauchbare Bild einmal (etwa 0,0004 USD pro Bild, danach je Bild gespeichert). Die Beschreibung dient als Referenz für Szenendetails und für die Profil-Gegenprüfung.",
+                               "**1 · Initial description:** GPT-6 Luna describes every usable image once (about 0.0004 USD per image, stored per image afterwards). It serves as reference for scene details and the profile cross-check."))
                 gr.Markdown(tr("**2 · Trainingscaption:** Personenprofil und Caption-Regeln legen den Inhalt fest. Die Erstbeschreibung aus Schritt 1 dient nur als Referenz für Szenendetails und für die Profil-Gegenprüfung; die Trainingscaption formt entweder das Tool lokal oder Luna aus dem Exportbild.",
                                "**2 · Training caption:** The person profile and caption rules decide the content. The first description from step 1 only serves as reference for scene details and the profile cross-check; the training caption is formed either locally by the tool or by Luna from the exported image."))
-                c_initial_caption_status = gr.Markdown(initial_caption_readiness_ui(S["c_initial_caption_engine"]))
-                c_initial_caption_engine.change(fn=initial_caption_readiness_ui, inputs=c_initial_caption_engine,
-                                                outputs=c_initial_caption_status, queue=False)
-                c_initial_caption_engine.change(fn=lambda engine: gr.update(visible=engine == "florence2"),
-                                                inputs=c_initial_caption_engine, outputs=c_initial_caption_task, queue=False)
                 c_caption_composition_mode = gr.Dropdown(
                     label=tr("2 · Zusammensetzung der Trainingscaption", "2 · Training caption composition"),
                     choices=[(tr("Lokal · Audit und Personenprofil", "Local · audit and person profile"), "local"),
@@ -8020,7 +7981,6 @@ def build_ui() -> gr.Blocks:
                     c_pipeline_mode, c_profile_normalizer_model, c_profile_reasoning_effort,
                     c_profile_sample_threshold, c_profile_sample_size,
                     c_exp_review, c_exp_reject, c_exp_compare, c_controlled_buckets,
-                    c_initial_caption_engine, c_initial_caption_task,
                     c_caption_composition_mode,
                 ]
 
@@ -8457,12 +8417,12 @@ def build_ui() -> gr.Blocks:
                     p_caption_preview_status = gr.Markdown(tr("Profil laden und Vorschau aktualisieren. Die Auswahl des Zielmodells und der Caption-Felder aus Modul 2 gilt auch hier.",
                                                             "Load the profile and refresh the preview. Target model and caption fields from module 2 apply here too."))
                     gr.Markdown(tr(
-                        "Florence- und JoyCaption-Texte werden beim Subject Profile mit dem Bildaudit gegengeprüft. "
+                        "Die Erstbeschreibungen werden beim Subject Profile mit dem Bildaudit gegengeprüft. "
                         "Übereinstimmungen stützen bereits auditierte Merkmale; Widersprüche erscheinen in der Profil-Diagnostik. "
-                        "Die Trainingscaption nutzt weiterhin Audit und Profil. Optional ergänzt Luna belegte Szenenpassagen aus dem Rohtext.",
-                        "Florence and JoyCaption descriptions are cross-checked against the image audit for the Subject Profile. "
+                        "Den Inhalt der Trainingscaption legen Caption-Regeln und Profil fest.",
+                        "First descriptions are cross-checked against the image audit for the Subject Profile. "
                         "Agreements support audited traits; conflicts appear in profile diagnostics. "
-                        "Training captions still use audit and profile. Luna can optionally add grounded scene excerpts from the raw text."))
+                        "Caption rules and the profile decide the content of the training caption."))
 
                 # Action bar
                 with gr.Row():

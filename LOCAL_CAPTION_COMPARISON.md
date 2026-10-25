@@ -1,5 +1,7 @@
 # Fünf Caption-Kandidaten für Personen-LoRAs
 
+> **Historisch:** Die lokalen Provider Florence 2 und JoyCaption wurden aus der App entfernt; die Erstbeschreibung schreibt GPT-6 Luna. Dieser Vergleich bleibt als Begründung erhalten.
+
 Stand: 12. Oktober 2026. Vergleich auf denselben zwölf eingefrorenen Bildkopien. Auf Wunsch wurden GPT-6 Luna und GPT-6.1 Sol als zwei zusätzliche Bildbeschreiber ausgeführt. Beide bekamen keine Ergebnisse der anderen Modelle. Es gab genau 24 OpenAI-Anfragen, keine Wiederholungen und keine zusätzlichen Bewertungsanfragen.
 
 ## Ergebnis und Empfehlung

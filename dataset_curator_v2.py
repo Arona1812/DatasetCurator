@@ -679,9 +679,6 @@ USE_KREA_AI_CAPTIONING = True
 # Empty retains the legacy CLI path. The UI explicitly selects a first-caption
 # provider; final composition then uses audited observations and profile rules.
 INITIAL_CAPTION_ENGINE = ""
-INITIAL_CAPTION_FLORENCE_TASK = "<MORE_DETAILED_CAPTION>"
-INITIAL_CAPTION_PYTHON = ""
-INITIAL_CAPTION_WEIGHTS = ""
 CAPTION_COMPOSITION_MODE = "local"
 KREA_CAPTION_MODEL = ROUTINE_MODEL
 USE_KREA_CAPTION_REPAIR = True
@@ -7457,9 +7454,6 @@ def canonical_hair_color_modifier(row: Dict[str, Any]) -> str:
 
 
 def _eyes_are_visible(row: Dict[str, Any]) -> bool:
-    local_facts = row.get("local_caption_facts", {}) or {}
-    if local_facts and local_facts.get("eye_visibility") != "visible":
-        return False
     color = normalize_text(row.get("eye_color", ""))
     if not color or not _profile_bool(row.get("face_visible")):
         return False
@@ -9555,16 +9549,9 @@ def prepare_initial_captions(rows: List[Dict[str, Any]]) -> None:
     """Describe effective images once, before profile composition. No silent fallback."""
     if not INITIAL_CAPTION_ENGINE:
         return
-    from initial_captions import (settings, local_resources, image_sha256,
-                                 cached_caption, store_caption, PROMPT)
-    import subprocess
-    import tempfile
-    root = Path(__file__).resolve().parent
+    from initial_captions import settings, image_sha256, cached_caption, store_caption, PROMPT
     engine = INITIAL_CAPTION_ENGINE
-    python, weights = "", {}
-    if engine != "gpt-6-luna":
-        python, weights = local_resources(root, engine, INITIAL_CAPTION_PYTHON, INITIAL_CAPTION_WEIGHTS)
-    config = settings(engine, INITIAL_CAPTION_FLORENCE_TASK, weights.get("revision", ""))
+    config = settings(engine)
     cache_dir = os.path.join(CACHE_DIR, "initial_captions")
     os.makedirs(cache_dir, exist_ok=True)
     pending = {}
@@ -9581,70 +9568,28 @@ def prepare_initial_captions(rows: List[Dict[str, Any]]) -> None:
         if len(pending[digest]) == 1:
             cases.append({"path": path, "image_sha256": digest})
     safe_print(f"First captions: {engine} | {len(cases)} new images, {len(rows) - sum(len(x) for x in pending.values())} cached")
-    if engine == "gpt-6-luna":
-        for index, case in enumerate(cases, 1):
-            raise_if_cancelled("initial Luna caption")
-            with open_local_image(case["path"]) as opened:
-                image = ImageOps.exif_transpose(opened).convert("RGB")
-            encoded = _encode_pil_for_api(image, max_side=max(image.size))
-            response = responses_api_call(engine, {
-                "model": engine, "reasoning": {"effort": "none"}, "max_output_tokens": 4096,
-                "input": [{"role": "user", "content": [
-                    {"type": "input_text", "text": PROMPT},
-                    {"type": "input_image", "image_url": "data:image/jpeg;base64," + encoded, "detail": "high"}]}],
-            }, phase_label="initial_caption")
-            if _responses_incomplete_reason(response):
-                raise ValueError("Initial Luna caption was incomplete; no final export was started.")
-            if image_sha256(case["path"]) != case["image_sha256"]:
-                raise RuntimeError("Image changed during initial captioning")
-            raw = extract_response_text(response)
-            record = store_caption(cache_dir, case["image_sha256"], config,
-                {"status": "ok", "caption": raw, "raw_output": raw, "hit_token_limit": False,
-                 "response_model": response.get("model", engine), "usage": response.get("usage", {})})
-            for row in pending[case["image_sha256"]]:
-                row["initial_caption"] = record
-            safe_print(f"Initial caption ready: {index}/{len(cases)} | {Path(case['path']).name}")
-    elif cases:
-        with tempfile.TemporaryDirectory(prefix="caption_batch_", dir=cache_dir) as batch:
-            job = os.path.join(batch, "job.json")
-            core_atomic_write_json(job, {"settings": config, "weights": weights, "cases": cases, "cache_dir": cache_dir})
-            with open(os.path.join(batch, "worker.log"), "w+", encoding="utf-8") as log:
-                proc = subprocess.Popen([python, str(root / "initial_caption_worker.py"), job],
-                    stdout=log, stderr=subprocess.STDOUT, cwd=str(root),
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                try:
-                    with open(os.path.join(batch, "worker.log"), "r", encoding="utf-8", errors="replace") as reader:
-                        pending_log = ""
-                        while proc.poll() is None:
-                            raise_if_cancelled("local initial captions")
-                            pending_log += reader.read().replace("\r", "\n")
-                            lines = pending_log.split("\n")
-                            pending_log = lines.pop()
-                            for line in lines:
-                                if "Initial caption ready:" in line:
-                                    safe_print(line)
-                            time.sleep(0.2)
-                        remainder = pending_log + reader.read()
-                        for line in remainder.splitlines():
-                            if "Initial caption ready:" in line:
-                                safe_print(line)
-                    if proc.returncode:
-                        log.seek(0)
-                        raise RuntimeError("Local initial captions failed: " + log.read()[-3000:])
-                finally:
-                    if proc.poll() is None:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                            proc.wait(timeout=5)
-        for case in cases:
-            record = cached_caption(cache_dir, case["image_sha256"], config)
-            if not record or image_sha256(case["path"]) != case["image_sha256"]:
-                raise RuntimeError("Local caption missing or image changed; final export blocked.")
-            for row in pending[case["image_sha256"]]:
-                row["initial_caption"] = record
+    for index, case in enumerate(cases, 1):
+        raise_if_cancelled("initial Luna caption")
+        with open_local_image(case["path"]) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+        encoded = _encode_pil_for_api(image, max_side=max(image.size))
+        response = responses_api_call(engine, {
+            "model": engine, "reasoning": {"effort": "none"}, "max_output_tokens": 4096,
+            "input": [{"role": "user", "content": [
+                {"type": "input_text", "text": PROMPT},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64," + encoded, "detail": "high"}]}],
+        }, phase_label="initial_caption")
+        if _responses_incomplete_reason(response):
+            raise ValueError("Initial Luna caption was incomplete; no final export was started.")
+        if image_sha256(case["path"]) != case["image_sha256"]:
+            raise RuntimeError("Image changed during initial captioning")
+        raw = extract_response_text(response)
+        record = store_caption(cache_dir, case["image_sha256"], config,
+            {"status": "ok", "caption": raw, "raw_output": raw, "hit_token_limit": False,
+             "response_model": response.get("model", engine), "usage": response.get("usage", {})})
+        for row in pending[case["image_sha256"]]:
+            row["initial_caption"] = record
+        safe_print(f"Initial caption ready: {index}/{len(cases)} | {Path(case['path']).name}")
 
 
 def save_caption_stage(
@@ -12898,11 +12843,6 @@ def generate_dashboard(all_rows: List[Dict[str, Any]], selected: List[Dict[str, 
 
 def main() -> None:
     raise_if_cancelled("startup")
-    if INITIAL_CAPTION_ENGINE and INITIAL_CAPTION_ENGINE != "gpt-6-luna" and not CONTINUE_FROM_PROFILE:
-        # Fail before paid audits when the selected local provider is not installed.
-        from initial_captions import local_resources
-        local_resources(Path(__file__).resolve().parent, INITIAL_CAPTION_ENGINE,
-                        INITIAL_CAPTION_PYTHON, INITIAL_CAPTION_WEIGHTS)
     reset_performance_stats()
     warnings: List[str] = []
     budget_limit_reached = False

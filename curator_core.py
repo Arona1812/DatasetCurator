@@ -150,15 +150,15 @@ def normalize_run_config_payload(payload: Optional[Mapping[str, Any]]) -> Dict[s
     data["CAPTION_POLICY"] = normalized_caption_policy(data.get("CAPTION_POLICY"))
     data["RUN_CONFIG_SCHEMA_VERSION"] = RUN_CONFIG_SCHEMA_VERSION
     data["ACTIVE_CAPTION_POLICY_SNAPSHOT"] = dict(data["CAPTION_POLICY"])
-    engine = str(data.get("INITIAL_CAPTION_ENGINE") or "")
+    from initial_captions import normalize_engine
+    engine = normalize_engine(data.get("INITIAL_CAPTION_ENGINE"))
+    if "INITIAL_CAPTION_ENGINE" in data:
+        data["INITIAL_CAPTION_ENGINE"] = engine
+    # Settings of the removed local providers are ignored.
+    for key in ("INITIAL_CAPTION_FLORENCE_TASK", "INITIAL_CAPTION_PYTHON", "INITIAL_CAPTION_WEIGHTS"):
+        data.pop(key, None)
     if "CAPTION_COMPOSITION_MODE" in data:
         data["CAPTION_COMPOSITION_MODE"] = normalize_caption_composition_mode(data["CAPTION_COMPOSITION_MODE"])
-    if engine:
-        from initial_captions import ENGINES, FLORENCE_TASKS
-        if engine not in ENGINES:
-            raise ValueError(f"Unsupported initial caption provider: {engine}")
-        if data.get("INITIAL_CAPTION_FLORENCE_TASK", "<MORE_DETAILED_CAPTION>") not in FLORENCE_TASKS:
-            raise ValueError("Unsupported Florence caption level")
     data["RUN_CONFIG_FINGERPRINT"] = stable_hash({
         "schema": RUN_CONFIG_SCHEMA_VERSION,
         "target": target,
@@ -171,9 +171,6 @@ def normalize_run_config_payload(payload: Optional[Mapping[str, Any]]) -> Dict[s
         "caption_model": data.get("KREA_CAPTION_MODEL", ""),
         "repair_model": data.get("KREA_CAPTION_REPAIR_MODEL", ""),
         "initial_caption_engine": engine,
-        "initial_caption_task": data.get("INITIAL_CAPTION_FLORENCE_TASK", ""),
-        "initial_caption_runtime": data.get("INITIAL_CAPTION_PYTHON", ""),
-        "initial_caption_weights": data.get("INITIAL_CAPTION_WEIGHTS", ""),
         "caption_composition_mode": data.get("CAPTION_COMPOSITION_MODE", "local"),
     })
     return data

@@ -2,10 +2,8 @@
 import json
 import tempfile
 import unittest
-import sys
 import inspect
-from pathlib import Path
-from unittest.mock import patch, Mock
+from unittest.mock import patch
 
 import initial_captions as initial
 import test_frames_export as fixtures
@@ -13,30 +11,36 @@ from curator_core import normalize_run_config_payload
 
 
 class InitialCaptionCache(unittest.TestCase):
-    def test_provider_and_level_validation(self):
-        for engine in initial.ENGINES:
-            normalize_run_config_payload({"INITIAL_CAPTION_ENGINE": engine})
+    def test_nur_luna_ist_anbieter_alte_lokale_werte_wechseln_zu_luna(self):
+        self.assertEqual(normalize_run_config_payload({"INITIAL_CAPTION_ENGINE": "gpt-6-luna"})["INITIAL_CAPTION_ENGINE"], "gpt-6-luna")
+        for legacy in ["florence2", "joycaption"]:
+            data = normalize_run_config_payload({"INITIAL_CAPTION_ENGINE": legacy, "INITIAL_CAPTION_FLORENCE_TASK": "<CAPTION>"})
+            self.assertEqual(data["INITIAL_CAPTION_ENGINE"], "gpt-6-luna")
+            self.assertNotIn("INITIAL_CAPTION_FLORENCE_TASK", data)
         for invalid in ["qwen", "gpt-6.1-sol", "unknown"]:
             with self.assertRaises(ValueError):
                 normalize_run_config_payload({"INITIAL_CAPTION_ENGINE": invalid})
-        with self.assertRaises(ValueError):
-            initial.settings("florence2", "invented")
 
-    def test_changed_bytes_task_revision_and_truncation_invalidate(self):
+    def test_gespeicherte_luna_beschreibungen_bleiben_gueltig(self):
+        # Settings of earlier releases for Luna; a changed value would invalidate every stored description.
+        earlier = {"version": "initial-caption-v1", "engine": "gpt-6-luna", "revision": "", "prompt": initial.PROMPT,
+                   "max_new_tokens": 4096, "do_sample": False, "seed": 20261012, "quantization": "api",
+                   "image_preparation": "exif-rgb-full-resolution-v1"}
+        self.assertEqual(initial.settings(), earlier)
+
+    def test_geaenderte_bytes_und_abgeschnittene_texte_werden_nicht_genutzt(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = initial.settings("florence2", revision="pinned")
+            config = initial.settings()
             raw = {"status": "ok", "caption": "A person standing outdoors.", "raw_output": "raw", "hit_token_limit": False}
             record = initial.store_caption(directory, "first-image", config, raw)
             self.assertEqual(initial.cached_caption(directory, "first-image", config), record)
             self.assertIsNone(initial.cached_caption(directory, "different-image", config))
-            self.assertIsNone(initial.cached_caption(directory, "first-image", initial.settings("florence2", "<CAPTION>", "pinned")))
-            self.assertIsNone(initial.cached_caption(directory, "first-image", initial.settings("florence2", revision="different")))
             for bad in [dict(raw, caption=""), dict(raw, hit_token_limit=True), dict(raw, status="error")]:
                 with self.assertRaises(ValueError): initial.store_caption(directory, "first-image", config, bad)
 
 
 class CaptionSettings(unittest.TestCase):
-    def test_ui_input_and_settings_contracts_include_all_three_new_options(self):
+    def test_ui_eingaben_und_einstellungen_passen_zusammen(self):
         import dataset_curator_ui as ui
         with patch.object(ui, "load_settings", return_value=dict(ui.DEFAULTS)):
             app = ui.build_ui()
@@ -44,14 +48,13 @@ class CaptionSettings(unittest.TestCase):
         values = tuple(component.value for component in start.inputs)
         self.assertEqual(len(values), len(ui.CURATOR_INPUT_NAMES))
         config = ui.build_run_config_from_ui_values(values)
-        self.assertEqual(config["INITIAL_CAPTION_ENGINE"], "florence2")
-        self.assertEqual(config["INITIAL_CAPTION_FLORENCE_TASK"], "<MORE_DETAILED_CAPTION>")
+        self.assertEqual(config["INITIAL_CAPTION_ENGINE"], "gpt-6-luna")
+        self.assertNotIn("INITIAL_CAPTION_FLORENCE_TASK", config)
         self.assertEqual(config["CAPTION_COMPOSITION_MODE"], "local")
         self.assertFalse(config["USE_KREA_AI_CAPTIONING"])
         save = next(block for block in app.fns.values() if getattr(block.fn, "__name__", "") == "save_settings_fn")
         arguments = inspect.signature(ui.save_settings_fn).bind(*(component.value for component in save.inputs)).arguments
-        self.assertEqual(arguments["c_initial_caption_engine"], "florence2")
-        self.assertEqual(arguments["c_initial_caption_task"], "<MORE_DETAILED_CAPTION>")
+        self.assertNotIn("c_initial_caption_engine", arguments)
         self.assertEqual(arguments["c_caption_composition_mode"], "local")
 
 
@@ -93,27 +96,6 @@ class TwoStageExports(unittest.TestCase):
              patch.object(self.backend, "TRAINING_TARGET", "flux2_dev"):
             self.backend.prepare_initial_captions(rows)
         self.assertEqual(rows[0]["initial_caption"], original)
-
-    def test_local_batch_loads_once_and_then_reuses_cache_without_worker(self):
-        self.fixture.stage()
-        rows = json.loads((self.fixture.output / "_caption_stage.json").read_text(encoding="utf-8"))["all_rows"]
-        def worker(args, **kwargs):
-            job = json.loads(Path(args[2]).read_text(encoding="utf-8"))
-            for index, case in enumerate(job["cases"], 1):
-                initial.store_caption(job["cache_dir"], case["image_sha256"], job["settings"],
-                    {"status": "ok", "caption": "A person standing outdoors.", "hit_token_limit": False})
-                kwargs["stdout"].write(f"Initial caption ready: {index}/{len(job['cases'])}\n")
-            kwargs["stdout"].flush()
-            process = Mock(returncode=0)
-            process.poll.return_value = 0
-            return process
-        with patch.object(self.backend, "INITIAL_CAPTION_ENGINE", "florence2"), \
-             patch.object(initial, "local_resources", return_value=(sys.executable, {"revision": "offline-test"})), \
-             patch("subprocess.Popen", side_effect=worker) as spawn:
-            self.backend.prepare_initial_captions(rows)
-            self.backend.prepare_initial_captions(rows)
-        spawn.assert_called_once()
-        self.assertTrue(all(r["initial_caption"]["status"] == "ok" for r in rows))
 
     def test_export_preserves_raw_sidecar_and_composes_without_image_calls(self):
         stage = self.prepared_stage()
