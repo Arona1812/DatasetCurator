@@ -106,13 +106,7 @@ def row_identity_key(row: Optional[Mapping[str, Any]]) -> str:
     return ""
 
 
-def normalize_training_target(value: Any) -> str:
-    v = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
-    if v in {"z_image_base", "zimage", "z_image"}:
-        return "z_image_base"
-    if v in {"krea2", "krea_2", "krea2_character", "krea_2_character"}:
-        return "krea2"
-    return "ernie"
+from training_targets import normalize_training_target, caption_profile_for_training_target, TARGET_REGISTRY_VERSION
 
 
 def normalize_pipeline_mode(value: Any) -> str:
@@ -131,18 +125,44 @@ def normalized_caption_policy(policy: Optional[Mapping[str, Any]]) -> Dict[str, 
     return {str(k): bool(raw.get(k)) for k in keys}
 
 
+# local: sentences composed on this computer from caption rules and profile.
+# luna_writer: the caption model phrases the same rule-derived facts for the
+# exported image. "luna_text" (verbatim scene excerpts) was replaced by it.
+CAPTION_COMPOSITION_MODES = ("local", "luna_writer")
+LEGACY_CAPTION_COMPOSITION_MODES = {"luna_text": "luna_writer"}
+
+
+def normalize_caption_composition_mode(value: Any) -> str:
+    """Return a supported caption composition mode; older values are migrated."""
+    mode = str(value or "local").strip()
+    mode = LEGACY_CAPTION_COMPOSITION_MODES.get(mode, mode)
+    if mode not in CAPTION_COMPOSITION_MODES:
+        raise ValueError("Unsupported caption composition mode")
+    return mode
+
+
 def normalize_run_config_payload(payload: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     data = dict(payload or {})
     target = normalize_training_target(data.get("TRAINING_TARGET") or data.get("CAPTION_PROFILE"))
     data["TRAINING_TARGET"] = target
-    data["CAPTION_PROFILE"] = "krea2_character" if target == "krea2" else target
+    data["CAPTION_PROFILE"] = caption_profile_for_training_target(target)
     data["PIPELINE_MODE"] = normalize_pipeline_mode(data.get("PIPELINE_MODE"))
     data["CAPTION_POLICY"] = normalized_caption_policy(data.get("CAPTION_POLICY"))
     data["RUN_CONFIG_SCHEMA_VERSION"] = RUN_CONFIG_SCHEMA_VERSION
     data["ACTIVE_CAPTION_POLICY_SNAPSHOT"] = dict(data["CAPTION_POLICY"])
+    from initial_captions import normalize_engine
+    engine = normalize_engine(data.get("INITIAL_CAPTION_ENGINE"))
+    if "INITIAL_CAPTION_ENGINE" in data:
+        data["INITIAL_CAPTION_ENGINE"] = engine
+    # Settings of the removed local providers are ignored.
+    for key in ("INITIAL_CAPTION_FLORENCE_TASK", "INITIAL_CAPTION_PYTHON", "INITIAL_CAPTION_WEIGHTS"):
+        data.pop(key, None)
+    if "CAPTION_COMPOSITION_MODE" in data:
+        data["CAPTION_COMPOSITION_MODE"] = normalize_caption_composition_mode(data["CAPTION_COMPOSITION_MODE"])
     data["RUN_CONFIG_FINGERPRINT"] = stable_hash({
         "schema": RUN_CONFIG_SCHEMA_VERSION,
         "target": target,
+        "target_registry": TARGET_REGISTRY_VERSION,
         "pipeline": data["PIPELINE_MODE"],
         "caption_policy": data["CAPTION_POLICY"],
         "variable_feature_mode": data.get("VARIABLE_FEATURE_CAPTION_MODE", "canonical_deviations"),
@@ -150,6 +170,8 @@ def normalize_run_config_payload(payload: Optional[Mapping[str, Any]]) -> Dict[s
         "profile_model": data.get("SUBJECT_PROFILE_NORMALIZER_MODEL", ""),
         "caption_model": data.get("KREA_CAPTION_MODEL", ""),
         "repair_model": data.get("KREA_CAPTION_REPAIR_MODEL", ""),
+        "initial_caption_engine": engine,
+        "caption_composition_mode": data.get("CAPTION_COMPOSITION_MODE", "local"),
     })
     return data
 
@@ -157,6 +179,12 @@ def normalize_run_config_payload(payload: Optional[Mapping[str, Any]]) -> Dict[s
 def stable_hash(payload: Any) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _is_lock_error(exc: OSError) -> bool:
+    """True for errors a short wait can resolve (access denied, sharing violation)."""
+    # WinError 5 = access denied; WinError 32 = sharing violation.
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {5, 32} or exc.errno in {13, 16}
 
 
 def replace_file_with_retry(tmp: str, path: str) -> None:
@@ -174,11 +202,8 @@ def replace_file_with_retry(tmp: str, path: str) -> None:
         try:
             os.replace(tmp, path)
             return
-        except PermissionError as exc:
-            last_error = exc
         except OSError as exc:
-            # WinError 5 = access denied; WinError 32 = sharing violation.
-            if getattr(exc, "winerror", None) not in {5, 32} and exc.errno not in {13, 16}:
+            if not _is_lock_error(exc):
                 raise
             last_error = exc
         time.sleep(delay)
@@ -300,6 +325,7 @@ def build_caption_fingerprint(
         "source": source_key,
         "image_id": image_id,
         "target": normalize_training_target(training_target),
+        "target_registry": TARGET_REGISTRY_VERSION,
         "trigger": trigger_word,
         "prompt": prompt_version,
         "primary": [primary_model, primary_reasoning],
@@ -310,6 +336,40 @@ def build_caption_fingerprint(
         "crop_variant": crop_variant or "original",
     }
     return stable_hash(payload)
+
+
+# Sync clients (Dropbox, OneDrive) and virus scanners briefly lock freshly
+# written folders on Windows; the same rename succeeds a few seconds later.
+DIR_REPLACE_RETRY_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 8.0)
+
+
+def replace_dir_with_retry(source: str, target: str) -> None:
+    """Rename the folder ``source`` to ``target``, retrying while it is locked.
+
+    Waits about 30 seconds in total; a lock that persists raises a
+    PermissionError that names the likely cause.
+    """
+    last_error: Optional[OSError] = None
+    for delay in DIR_REPLACE_RETRY_DELAYS:
+        try:
+            os.replace(source, target)
+            return
+        except OSError as exc:
+            if not _is_lock_error(exc):
+                raise
+            last_error = exc
+        print(f"   ⏳ Folder locked, retrying in {delay:.1f}s: {target}", flush=True)
+        time.sleep(delay)
+    try:
+        os.replace(source, target)
+    except OSError as exc:
+        if not _is_lock_error(exc):
+            raise
+        raise PermissionError(
+            f"Could not move '{source}' to '{target}' after repeated retries. "
+            "A cloud-sync client (e.g. Dropbox), antivirus scanner or an open "
+            "Explorer window may still be holding the folder."
+        ) from (last_error or exc)
 
 
 @dataclass
@@ -409,9 +469,9 @@ class OutputTransaction:
                 if os.path.exists(backup):
                     shutil.rmtree(backup, ignore_errors=True)
                 if os.path.exists(final_path):
-                    os.replace(final_path, backup)
+                    replace_dir_with_retry(final_path, backup)
                     backups[final_path] = backup
-                os.replace(staged, final_path)
+                replace_dir_with_retry(staged, final_path)
                 namespace[global_name] = final_path
             for backup in backups.values():
                 shutil.rmtree(backup, ignore_errors=True)
@@ -424,7 +484,7 @@ class OutputTransaction:
                 if os.path.exists(backup):
                     if os.path.exists(final_path):
                         shutil.rmtree(final_path, ignore_errors=True)
-                    os.replace(backup, final_path)
+                    replace_dir_with_retry(backup, final_path)
             self._write_manifest("failed", error=f"{type(exc).__name__}: {exc}")
             raise
         finally:
@@ -447,3 +507,30 @@ class OutputTransaction:
                 shutil.rmtree(os.path.join(output_root, name), ignore_errors=True)
                 count += 1
         return count
+
+
+# ---------------------------------------------------------------------------
+# OpenAI model presets (shared by UI and pipeline)
+# ---------------------------------------------------------------------------
+# The model list itself lives in openai_models. This module only keeps the
+# migration of retired presets from older settings files.
+
+
+# Saved settings from earlier releases point to retired presets. They are
+# moved to the tier that fills the same role in the GPT-6 family.
+LEGACY_MODEL_MIGRATION: Dict[str, str] = {
+    "gpt-5.6-luna": "gpt-6-luna",
+    "gpt-5.6-terra": "gpt-6.1-sol",
+    "gpt-5.6-sol": "gpt-6-astra",
+    "gpt-5.6": "gpt-6-astra",
+    "gpt-5.5": "gpt-6.1-sol",
+    "gpt-5.4": "gpt-6.1-sol",
+    "gpt-5.4-mini": "gpt-6-luna",
+    "gpt-5.4-nano": "gpt-6-luna",
+}
+
+
+def migrate_openai_model_name(value: Any) -> str:
+    """Return the GPT-6 replacement for a retired preset, else the value unchanged."""
+    text = str(value or "").strip()
+    return LEGACY_MODEL_MIGRATION.get(text.lower(), text)

@@ -3,7 +3,12 @@ import sys
 import json
 import cv2
 import numpy as np
+import warnings
 from glob import glob
+
+# InsightFace calls a deprecated scikit-image API; the alignment is correct and
+# the warning would otherwise repeat for every detected face.
+warnings.filterwarnings("ignore", message=r".*`estimate` is deprecated.*", category=FutureWarning)
 
 try:
     from insightface.app import FaceAnalysis

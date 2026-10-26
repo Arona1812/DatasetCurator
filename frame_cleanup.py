@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Local, reversible social-media frame and UI-border cleanup.
 
-The detector is intentionally local-only. It analyses a bounded preview, scores
-all four sides independently, creates one or more crop candidates, and persists
-both positive and negative decisions. Full-resolution source files are never
+The detector is intentionally local-only. It analyses a bounded preview in two
+ways: the side-seam analysis scores all four image sides independently (story
+bars, canvases, app chrome), and the content-rectangle analysis locates
+photo-like regions directly from block feature maps (nested photos, polaroid
+frames, borders wider than a third of the image, dark photos on black chrome).
+Both produce crop candidates; an inner photo is always ranked first. Positive
+and negative decisions are persisted. Full-resolution source files are never
 modified. User decisions are stored separately from detector cache entries.
 """
 from __future__ import annotations
@@ -14,7 +18,6 @@ import math
 import os
 import re
 import shutil
-import threading
 import time
 import warnings
 from collections import Counter
@@ -48,15 +51,11 @@ except Exception:  # pragma: no cover
     cv2 = None
 
 try:
-    import mediapipe as mp  # type: ignore
-except Exception:  # pragma: no cover - optional runtime safety enhancement
-    mp = None
+    import local_vision  # shared MediaPipe-Tasks/Haar face and pose detection
+except Exception:  # pragma: no cover - isolated loading of this module
+    local_vision = None
 
-_MP_POSE = None
-_MP_POSE_INIT_ATTEMPTED = False
-_MP_POSE_LOCK = threading.Lock()
-
-FRAME_DETECTOR_SCHEMA_VERSION = "smart-frame-v5-subject-safe-canvas-ranking"
+FRAME_DETECTOR_SCHEMA_VERSION = "smart-frame-v7-content-rectangles-complete-frame"
 FRAME_USER_DECISION_SCHEMA_VERSION = "v2-asset-id"
 FRAME_DECISION_FILENAME = "_frame_cleanup_decisions.json"
 FRAME_CACHE_SUBDIR = "frame_cleanup"
@@ -222,7 +221,7 @@ def save_user_decision(
 ) -> Dict[str, Any]:
     payload = load_user_decisions(output_root)
     normalized = str(decision or "auto").strip().lower()
-    if normalized not in {"auto", "accept", "keep_original", "manual"}:
+    if normalized not in {"auto", "accept", "keep_original", "manual", "exclude"}:
         raise ValueError(f"unsupported frame decision: {decision}")
     normalized_asset_id = int(asset_id) if asset_id not in (None, "") and int(asset_id) > 0 else None
     decision_key = f"asset:{normalized_asset_id}" if normalized_asset_id is not None else source_hash
@@ -247,6 +246,31 @@ def save_user_decision(
     payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     atomic_write_json(user_decision_path(output_root), payload)
     return record
+
+
+def filter_excluded_sources(image_paths: Iterable[str], output_root: str):
+    """Remove manual dataset exclusions before audits, independently of crops."""
+    decisions = load_user_decisions(output_root).get("decisions", {})
+    # Decisions are keyed by "asset:<id>" since the asset-ID migration and by
+    # source hash in older files; the record itself always carries the hash.
+    excluded_hashes = set()
+    for key, value in decisions.items():
+        if not isinstance(value, dict) or value.get("decision") != "exclude":
+            continue
+        excluded_hashes.add(str(value.get("source_hash") or key))
+        if not str(key).startswith("asset:"):
+            excluded_hashes.add(str(key))
+    survivors, rows = [], []
+    for path in image_paths:
+        if not excluded_hashes or file_sha1(path) not in excluded_hashes:
+            survivors.append(path)
+            continue
+        rows.append({"original_filename": os.path.basename(path), "original_path": os.path.abspath(path),
+                     "base_status": "reject", "final_status": "reject", "quality_total": 0,
+                     "short_reason": "user_excluded_in_frames", "status_notes": ["user_excluded_in_frames"],
+                     "selected": False, "output_bucket": "", "new_basename": "",
+                     "frame_cleanup_user_decision": "exclude"})
+    return survivors, rows
 
 
 def reset_user_decisions(output_root: str) -> int:
@@ -405,46 +429,13 @@ def _candidate_side_metrics(
 
 
 def _detect_face_boxes(preview: Image.Image) -> List[Tuple[int, int, int, int]]:
-    if cv2 is None:
+    """Return absolute face boxes using the shared local detectors."""
+    if local_vision is None:
         return []
     try:
-        cascade_path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-        cascade = cv2.CascadeClassifier(cascade_path)
-        if cascade.empty():
-            return []
-        rgb = np.asarray(preview.convert("RGB"))
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        boxes = cascade.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=4, minSize=(28, 28))
-        return [(int(x), int(y), int(w), int(h)) for x, y, w, h in boxes]
+        return local_vision.detect_face_boxes(np.asarray(preview.convert("RGB")))
     except Exception:
         return []
-
-
-def _get_pose_detector():
-    """Lazily create MediaPipe Pose for crop-safety checks.
-
-    The frame remover remains fully functional without MediaPipe. When it is
-    available (it is part of the normal project requirements), pose landmarks
-    are used only as a hard protection region. They never increase a crop
-    score and therefore never reward tighter portraits.
-    """
-    global _MP_POSE, _MP_POSE_INIT_ATTEMPTED
-    if _MP_POSE_INIT_ATTEMPTED:
-        return _MP_POSE
-    _MP_POSE_INIT_ATTEMPTED = True
-    if mp is None:
-        return None
-    try:
-        _MP_POSE = mp.solutions.pose.Pose(
-            static_image_mode=True,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.45,
-            min_tracking_confidence=0.45,
-        )
-    except Exception:
-        _MP_POSE = None
-    return _MP_POSE
 
 
 def _detect_subject_regions(
@@ -465,8 +456,9 @@ def _detect_subject_regions(
     # full body would block valid story-bar removal and would still be a guess.
     # Body protection is handled by actual pose landmarks below.
     for x, y, fw, fh in faces:
-        pad_x = max(4, int(round(fw * 0.18)))
-        pad_y = max(4, int(round(fh * 0.22)))
+        # MediaPipe boxes already enclose the whole face; keep the margin small.
+        pad_x = max(2, int(round(fw * 0.04)))
+        pad_y = max(2, int(round(fh * 0.04)))
         regions.append([
             max(0, x - pad_x),
             max(0, y - pad_y),
@@ -475,43 +467,58 @@ def _detect_subject_regions(
         ])
         sources.append("face")
 
-    pose = _get_pose_detector()
-    if pose is not None:
+    if local_vision is not None:
         try:
-            rgb = np.asarray(preview.convert("RGB"), dtype=np.uint8)
-            with _MP_POSE_LOCK:
-                result = pose.process(rgb)
-            landmarks = getattr(result, "pose_landmarks", None)
-            if landmarks is not None:
-                xs: List[float] = []
-                ys: List[float] = []
-                for landmark in landmarks.landmark:
-                    visibility = float(getattr(landmark, "visibility", 0.0) or 0.0)
-                    if visibility < 0.35:
-                        continue
-                    lx = float(getattr(landmark, "x", -1.0))
-                    ly = float(getattr(landmark, "y", -1.0))
-                    if -0.05 <= lx <= 1.05 and -0.05 <= ly <= 1.05:
-                        xs.append(lx * width)
-                        ys.append(ly * height)
-                if len(xs) >= 8:
-                    raw_x1, raw_x2 = min(xs), max(xs)
-                    raw_y1, raw_y2 = min(ys), max(ys)
-                    body_w = max(1.0, raw_x2 - raw_x1)
-                    body_h = max(1.0, raw_y2 - raw_y1)
-                    pad_x = max(8, int(round(max(width * 0.025, body_w * 0.12))))
-                    pad_y = max(8, int(round(max(height * 0.018, body_h * 0.10))))
-                    regions.append([
-                        max(0, int(math.floor(raw_x1)) - pad_x),
-                        max(0, int(math.floor(raw_y1)) - pad_y),
-                        min(width, int(math.ceil(raw_x2)) + pad_x),
-                        min(height, int(math.ceil(raw_y2)) + pad_y),
-                    ])
-                    sources.append("pose")
+            points = local_vision.detect_pose_points(np.asarray(preview.convert("RGB")), min_visibility=0.55)
+            # Legs (landmarks 25-32) are frequently extrapolated far outside
+            # the visible photo in tall screenshots; trust them only when the
+            # model is very sure. Head, torso and arms are reliable.
+            gray_preview = np.asarray(preview.convert("L"), dtype=np.float32)
+
+            def on_textured_content(px: float, py: float) -> bool:
+                ix, iy = int(round(px)), int(round(py))
+                patch = gray_preview[max(0, iy - 7):iy + 8, max(0, ix - 7):ix + 8]
+                return patch.size > 0 and float(patch.std()) > 2.5
+
+            # Landmarks are extrapolated onto flat canvas or chrome in tall
+            # screenshots. Only points on textured image content are real.
+            trusted = [
+                (x, y) for x, y, conf, index in points
+                if on_textured_content(x, y) and (index <= 24 or conf >= 0.85)
+            ]
+            xs = [float(x) for x, _y in trusted]
+            ys = [float(y) for _x, y in trusted]
+            if len(xs) >= 8:
+                raw_x1, raw_x2 = min(xs), max(xs)
+                raw_y1, raw_y2 = min(ys), max(ys)
+                body_w = max(1.0, raw_x2 - raw_x1)
+                body_h = max(1.0, raw_y2 - raw_y1)
+                pad_x = max(6, int(round(min(width * 0.02, body_w * 0.06))))
+                pad_y = max(6, int(round(min(height * 0.015, body_h * 0.05))))
+                regions.append([
+                    max(0, int(math.floor(raw_x1)) - pad_x),
+                    max(0, int(math.floor(raw_y1)) - pad_y),
+                    min(width, int(math.ceil(raw_x2)) + pad_x),
+                    min(height, int(math.ceil(raw_y2)) + pad_y),
+                ])
+                sources.append("pose")
         except Exception:
             pass
 
     return regions, sources
+
+
+def _bbox_preserves_faces(bbox: List[int], faces: List[Tuple[int, int, int, int]]) -> Tuple[bool, List[str]]:
+    """Face-only safety check used by the photo_regions refinements."""
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    flags: List[str] = []
+    for x, y, width, height in faces:
+        fx1, fy1, fx2, fy2 = x, y, x + width, y + height
+        intersection = max(0, min(x2, fx2) - max(x1, fx1)) * max(0, min(y2, fy2) - max(y1, fy1))
+        area = max(1, width * height)
+        if intersection / float(area) < 0.92:
+            flags.append("candidate_may_cut_detected_face")
+    return not flags, flags
 
 
 def _bbox_preserves_subject(
@@ -702,7 +709,9 @@ def _corner_layout_metrics(img: np.ndarray) -> Dict[str, Any]:
     top_dark = float(np.mean(gray[:band] < 35))
     bottom_dark = float(np.mean(gray[h - band:] < 35))
     aspect = h / float(max(1, w))
-    app_screenshot = bool(aspect >= 2.0 and top_dark >= 0.70 and bottom_dark >= 0.65)
+    # Story headers can extend into the first 8% band. The old 70% cutoff
+    # misclassified these screenshots as safe, simple top/bottom bars.
+    app_screenshot = bool(aspect >= 2.0 and top_dark >= 0.60 and bottom_dark >= 0.65)
     vertical_story_canvas = bool(
         aspect >= 1.45
         and horizontal_symmetry <= 22.0
@@ -1063,6 +1072,636 @@ def classify_crop_type(candidate: Optional[Dict[str, Any]], layout_class: str, l
     return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Content-rectangle candidates from block feature maps
+# ---------------------------------------------------------------------------
+# The side-seam analysis above only sees boundaries that run across the whole
+# preview.  Photos that are narrower than the screen (polaroid frames, nested
+# story photos, chat attachments), borders wider than a third of the image and
+# dark photos on black app chrome have no such boundary.  The functions below
+# locate "photo-like" regions directly: blocks with Laplacian energy or colour
+# saturation form connected regions, the region bounds are then refined row by
+# row against flat (synthetic) canvas and chrome.
+CONTENT_BLOCK_PX = 8
+CONTENT_BLOCK_SHARP_MIN = 18.0
+CONTENT_BLOCK_STD_MIN = 5.0
+CONTENT_BLOCK_SAT_MIN = 28.0
+CONTENT_ROW_LAP_MAX = 6.0
+CONTENT_ROW_STD_MAX = 4.0
+CONTENT_ROW_UNIFORM_STD = 2.0
+SYNTHETIC_ROW_STD_MAX = 2.0
+SYNTHETIC_FLAT_SHARE_MIN = 0.90
+SYNTHETIC_BAND_SHARE_MIN = 0.55
+SEAM_PIXEL_DELTA = 10.0
+SEAM_CONTINUITY_STRONG = 0.55
+SEAM_CONTINUITY_ACCEPT = 0.50
+CONTENT_MIN_AREA_FRACTION = 0.08
+CONTENT_MIN_INSIDE_ACTIVITY = 0.12
+CONTENT_FLAT_MARGIN_MAX_FRACTION = 0.06
+
+try:
+    from scipy import ndimage as _ndimage  # type: ignore
+except Exception:  # pragma: no cover - optional
+    _ndimage = None
+
+
+def _laplacian(gray: np.ndarray) -> np.ndarray:
+    lap = np.zeros_like(gray, dtype=np.float32)
+    lap[1:-1, 1:-1] = (
+        gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:] - 4.0 * gray[1:-1, 1:-1]
+    )
+    return lap
+
+
+def _block_feature_maps(img: np.ndarray, block: int = CONTENT_BLOCK_PX) -> Dict[str, np.ndarray]:
+    """Return per-block sharpness, spread and saturation plus pixel maps."""
+    gray = img.mean(axis=2).astype(np.float32)
+    lap = _laplacian(gray)
+    h, w = gray.shape
+    bh, bw = h // block, w // block
+    if bh < 4 or bw < 4:
+        return {}
+
+    def reduce(arr: np.ndarray, fn) -> np.ndarray:
+        trimmed = arr[: bh * block, : bw * block].reshape(bh, block, bw, block)
+        return fn(trimmed, axis=(1, 3)).astype(np.float32)
+
+    maxc = img.max(axis=2)
+    minc = img.min(axis=2)
+    sat_px = np.where(maxc > 1.0, (maxc - minc) / np.maximum(maxc, 1e-6) * 255.0, 0.0).astype(np.float32)
+    return {
+        "gray": gray,
+        "sat_px": sat_px,
+        "lap_abs": np.abs(lap),
+        "sharp": reduce(lap * lap, np.mean),
+        "std": reduce(gray, np.std),
+        "sat": reduce(sat_px, np.mean),
+        "block": np.int64(block),
+    }
+
+
+def _label_components(mask: np.ndarray) -> Tuple[np.ndarray, int]:
+    if _ndimage is not None:
+        labels, count = _ndimage.label(mask, structure=np.ones((3, 3), dtype=int))
+        return labels, int(count)
+    if cv2 is not None:
+        count, labels = cv2.connectedComponents(mask.astype(np.uint8), connectivity=8)
+        return labels, int(count) - 1
+    return np.zeros(mask.shape, dtype=int), 0
+
+
+def _close_and_fill(mask: np.ndarray, kernel: int) -> np.ndarray:
+    kernel = max(1, int(kernel))
+    if _ndimage is not None:
+        structure = np.ones((kernel, kernel), dtype=bool)
+        closed = _ndimage.binary_closing(mask, structure=structure, border_value=0)
+        return _ndimage.binary_fill_holes(closed)
+    if cv2 is not None:
+        element = np.ones((kernel, kernel), dtype=np.uint8)
+        closed = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, element)
+        # Flood fill from the border to find the background, invert for holes.
+        padded = np.pad(closed, 1, mode="constant", constant_values=0)
+        flood = padded.copy()
+        fill_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), dtype=np.uint8)
+        cv2.floodFill(flood, fill_mask, (0, 0), 2)
+        filled = (closed > 0) | (flood[1:-1, 1:-1] != 2)
+        return filled
+    return mask
+
+
+def _mask_rectangles(
+    mask: np.ndarray,
+    min_area_fraction: float = CONTENT_MIN_AREA_FRACTION,
+    max_rects: int = 3,
+) -> List[Tuple[int, int, int, int, float]]:
+    """Return block-space rectangles ``(x1, y1, x2, y2, fill_ratio)`` of mask regions."""
+    if mask.size == 0 or not np.any(mask):
+        return []
+    bh, bw = mask.shape
+    total = float(bh * bw)
+    labels, count = _label_components(mask)
+    cleaned = np.zeros_like(mask)
+    for index in range(1, count + 1):
+        component = labels == index
+        if float(component.sum()) / total >= 0.004:
+            cleaned |= component
+    if not np.any(cleaned):
+        return []
+    kernel = max(3, int(round(0.045 * max(bh, bw))))
+    filled = _close_and_fill(cleaned, kernel)
+    labels, count = _label_components(filled)
+    rects: List[Tuple[int, int, int, int, float]] = []
+    for index in range(1, count + 1):
+        ys, xs = np.nonzero(labels == index)
+        if ys.size == 0:
+            continue
+        area = float(ys.size)
+        if area / total < min_area_fraction:
+            continue
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        # Thin strips (message bars, navigation rows, headers) are chrome.
+        if (x2 - x1) < 0.12 * bw or (y2 - y1) < 0.12 * bh:
+            continue
+        raw_area = float(np.sum(cleaned[y1:y2, x1:x2]))
+        fill_ratio = raw_area / float(max(1, (x2 - x1) * (y2 - y1)))
+        rects.append((x1, y1, x2, y2, round(fill_ratio, 4)))
+    rects.sort(key=lambda item: (item[2] - item[0]) * (item[3] - item[1]), reverse=True)
+    return rects[:max_rects]
+
+
+def _edge_profiles(
+    segment: np.ndarray,
+    lap_segment: np.ndarray,
+    feature_segment: Optional[np.ndarray] = None,
+) -> Dict[str, np.ndarray]:
+    """Row statistics for a 2-D segment whose index 0 is the image boundary."""
+    rows = segment.shape[0]
+    row_std = segment.std(axis=1)
+    row_mean = segment.mean(axis=1)
+    row_lap = (lap_segment * lap_segment).mean(axis=1)
+    flat_share = (lap_segment < 1.5).mean(axis=1)
+    if segment.shape[1] >= 2:
+        along = np.abs(np.diff(segment, axis=1))
+        smooth_step = np.percentile(along, 98, axis=1)
+    else:
+        smooth_step = np.zeros(rows, dtype=np.float32)
+    if rows >= 2:
+        diff = np.abs(np.diff(segment, axis=0))
+        continuity = np.concatenate([(diff > SEAM_PIXEL_DELTA).mean(axis=1), [0.0]]).astype(np.float32)
+        seam = np.concatenate([diff.mean(axis=1), [0.0]]).astype(np.float32)
+    else:
+        continuity = np.zeros(rows, dtype=np.float32)
+        seam = np.zeros(rows, dtype=np.float32)
+    # Flat chrome, uniform fills and smooth gradients are all "canvas". A
+    # gradient varies slowly along the line, so its largest pixel step is tiny
+    # even when the overall spread is not.
+    canvas = (
+        ((row_std < CONTENT_ROW_STD_MAX) & (row_lap < CONTENT_ROW_LAP_MAX))
+        | (row_std < CONTENT_ROW_UNIFORM_STD)
+        | ((smooth_step < 2.5) & (row_lap < CONTENT_ROW_LAP_MAX))
+    )
+    # Synthetic bands are uniform along the line. A smooth photographic sky
+    # is also smooth, but it still varies across the width.
+    synthetic = (row_std < SYNTHETIC_ROW_STD_MAX) & (flat_share >= SYNTHETIC_FLAT_SHARE_MIN)
+    pure = (row_std < 1.0) & ((row_mean < 4.0) | (row_mean > 251.0))
+    if feature_segment is not None:
+        # Saturation mode: a desaturated line is "canvas" for a colour photo
+        # pasted on a monochrome duplicate, and a saturation step is a seam.
+        feature_mean = feature_segment.mean(axis=1)
+        # Only a monochrome surround counts; pale sky inside a colour photo
+        # still carries some saturation.
+        desaturated = feature_mean < 6.0
+        canvas = canvas | desaturated
+        # A desaturated band plays the role of the synthetic band here.
+        synthetic = synthetic | desaturated
+        if rows >= 2:
+            feature_diff = np.abs(np.diff(feature_segment, axis=0))
+            feature_continuity = np.concatenate([(feature_diff > 12.0).mean(axis=1), [0.0]]).astype(np.float32)
+            continuity = np.maximum(continuity, feature_continuity)
+    return {
+        "std": row_std,
+        "mean": row_mean,
+        "lap": row_lap,
+        "canvas": canvas,
+        "synthetic": synthetic,
+        "pure": pure,
+        "continuity": continuity,
+        "seam": seam,
+    }
+
+
+def _refine_low_edge(
+    profiles: Dict[str, np.ndarray],
+    interior: int,
+    min_extent: int,
+    min_border: int,
+) -> Dict[str, Any]:
+    """Move one rectangle edge to the real photo boundary.
+
+    ``interior`` is a row index that lies safely inside the photo (the row of
+    highest block activity).  Index 0 is the image boundary on this side.  The
+    scan runs outward from the interior through photo rows until a run of flat
+    canvas rows or a strong straight seam followed by canvas rows is reached.
+    Returns the refined edge plus support measurements; an edge of 0 means
+    "no crop on this side".
+    """
+    canvas = profiles["canvas"]
+    synthetic = profiles["synthetic"]
+    pure = profiles["pure"]
+    continuity = profiles["continuity"]
+    row_mean = profiles["mean"]
+    n = int(canvas.shape[0])
+    synthetic_cumulative = np.cumsum(synthetic.astype(np.float32))
+
+    def supported(candidate_edge: int) -> int:
+        """Return the accepted edge near ``candidate_edge`` or 0."""
+        if candidate_edge <= 0:
+            return 0
+        lo, hi = max(0, candidate_edge - 5), min(n - 1, candidate_edge + 3)
+        if hi > lo:
+            local = continuity[lo:hi]
+            best = int(np.argmax(local)) + lo
+            if float(local.max()) >= SEAM_CONTINUITY_ACCEPT:
+                return best + 1
+        # A synthetic band must start right at the edge: a photo region with
+        # a large chrome bar further out is not a boundary.
+        near = synthetic[max(0, candidate_edge - 6):candidate_edge]
+        near_share = float(np.mean(near)) if near.size else 0.0
+        band_share = float(synthetic_cumulative[candidate_edge - 1]) / float(candidate_edge)
+        if near_share >= 0.8 and band_share >= SYNTHETIC_BAND_SHARE_MIN:
+            return candidate_edge
+        # Rows of pure black or pure white never belong to a photograph, even
+        # when the photo fades into them without a seam (dark app gradients).
+        beyond_pure = pure[max(0, candidate_edge - 3):candidate_edge]
+        if beyond_pure.size >= 2 and bool(np.all(beyond_pure)):
+            return candidate_edge
+        return 0
+
+    # Walk outward from the interior. A boundary needs flat canvas (or a
+    # strong seam followed by uniform rows) beyond it *and* support: a
+    # straight seam or a synthetic band up to the image edge. Flat stretches
+    # inside the photo (sky, walls, dark margins) fail the support test and
+    # are passed; a horizon line is followed by sky, not by uniform rows.
+    edge = 0
+    r = max(0, min(n - 1, int(interior)))
+    while r >= 0:
+        window = canvas[max(0, r - 2):r + 1]
+        flat_run = bool(np.all(window)) and (len(window) == 3 or r <= 1)
+        beyond = synthetic[max(0, r - 3):r]
+        strong_seam = (
+            continuity[r] >= SEAM_CONTINUITY_STRONG and beyond.size and float(np.mean(beyond)) >= 0.66
+        )
+        if flat_run or strong_seam:
+            accepted = supported(r + 1)
+            if accepted > 0:
+                edge = accepted
+                break
+        r -= 1
+
+    # Flat photo margin: a thin flat band between the photo and outer canvas
+    # that is separated from the canvas by a strong seam belongs to the photo.
+    outer_edge = edge
+    if 0 < edge < n:
+        r = edge - 1
+        reference = float(row_mean[edge - 1])
+        while r >= 0 and canvas[r] and abs(float(row_mean[r]) - reference) < 6.0:
+            r -= 1
+        if 0 <= r < edge - 1 and continuity[r] >= 0.6 and bool(np.all(canvas[max(0, r - 2):r + 1])):
+            outer_edge = r + 1
+
+    result: Dict[str, Any] = {
+        "edge": int(edge),
+        "outer_edge": int(outer_edge),
+        "continuity": 0.0,
+        "synthetic_share": 0.0,
+        "accepted": False,
+        "reason": "open",
+    }
+    if edge <= 0:
+        return result
+    if n - edge < min_extent:
+        result.update({"edge": 0, "outer_edge": 0, "reason": "too_small"})
+        return result
+    if edge < min_border:
+        result.update({"edge": 0, "outer_edge": 0, "reason": "below_min_border"})
+        return result
+    cont = float(continuity[edge - 1])
+    synth = float(np.mean(synthetic[:edge]))
+    result["continuity"] = round(cont, 4)
+    result["synthetic_share"] = round(synth, 4)
+    if cont >= SEAM_CONTINUITY_ACCEPT:
+        result["accepted"] = True
+        result["reason"] = "seam"
+    elif synth >= SYNTHETIC_BAND_SHARE_MIN:
+        result["accepted"] = True
+        result["reason"] = "synthetic_band"
+    elif bool(np.all(pure[max(0, edge - 3):edge])):
+        result["accepted"] = True
+        result["reason"] = "pure_band"
+    else:
+        result.update({"edge": 0, "outer_edge": 0, "reason": "no_support"})
+    return result
+
+
+def _activity_core(density: np.ndarray, block: int, limit: int, separators: Optional[np.ndarray] = None) -> Tuple[int, int, int]:
+    """Return ``(core_lo, core_hi, peak)`` in pixels for a block density profile.
+
+    ``separators`` marks pixel rows (or columns) of pure black/white that split
+    the rectangle into segments; the segment with the largest amount of
+    activity wins.  That keeps dense UI text rows from outranking the photo.
+    """
+    if density.size == 0:
+        return 0, limit, limit // 2
+    # Smooth over a broad window so that a thin, busy text row cannot outrank
+    # the large photo region when the peak is chosen.
+    smoothed = uniform_filter1d(density.astype(np.float32), max(3, int(round(0.12 * density.size))), mode="nearest")
+    best_lo, best_hi, best_score = 0, int(density.size), -1.0
+    if separators is not None and separators.size >= 3:
+        # Segments between runs of at least three pure rows.
+        pure_block = np.array([
+            bool(np.all(separators[i * block:(i + 1) * block])) if (i + 1) * block <= separators.size else False
+            for i in range(int(density.size))
+        ])
+        start = 0
+        for index in range(int(density.size) + 1):
+            if index == density.size or pure_block[index]:
+                if index > start:
+                    seg_density = density[start:index]
+                    score = float(seg_density.sum())
+                    if score > best_score:
+                        best_lo, best_hi, best_score = start, index, score
+                start = index + 1
+    peak_slice = smoothed[best_lo:best_hi]
+    if peak_slice.size == 0:
+        return 0, limit, limit // 2
+    peak = best_lo + int(np.argmax(peak_slice))
+    threshold = max(0.10, 0.50 * float(smoothed[peak]))
+    lo = peak
+    while lo > best_lo and smoothed[lo - 1] >= threshold:
+        lo -= 1
+    hi = peak
+    while hi + 1 < best_hi and smoothed[hi + 1] >= threshold:
+        hi += 1
+    core_lo = lo * block
+    core_hi = min(limit, (hi + 1) * block)
+    # The scan starts in the middle of the core run, never at its first row:
+    # a flat density profile would otherwise put the peak on the photo edge.
+    peak_px = min(limit - 1, (core_lo + core_hi) // 2)
+    return core_lo, core_hi, peak_px
+
+
+def _refine_rectangle(
+    maps: Dict[str, np.ndarray],
+    active: np.ndarray,
+    rect: Tuple[int, int, int, int],
+    min_extent: int,
+    min_border: int,
+    feature: Optional[np.ndarray] = None,
+) -> Tuple[List[int], Dict[str, Dict[str, Any]], Optional[List[int]]]:
+    """Refine a block-mask rectangle against the pixel maps.
+
+    Edge scans start at the row/column of highest block activity (the photo
+    core) and profile the other axis only across that core, so flat frame
+    bands and chrome merged into the raw rectangle cannot mislead the scan.
+    Returns the refined bbox, per-side support details and an optional wider
+    alternative that keeps flat photo margins.
+    """
+    gray = maps["gray"]
+    lap_abs = maps["lap_abs"]
+    block = int(maps["block"])
+    h, w = gray.shape
+    x1, y1, x2, y2 = [int(v) for v in rect]
+    bx1, bx2 = max(0, x1 // block), max(x1 // block + 1, x2 // block)
+    by1, by2 = max(0, y1 // block), max(y1 // block + 1, y2 // block)
+    sub = active[by1:by2, bx1:bx2]
+    if sub.size == 0:
+        return [x1, y1, x2, y2], {}, None
+    row_density = sub.mean(axis=1)
+    col_density = sub.mean(axis=0)
+    region = gray[by1 * block:by2 * block, bx1 * block:bx2 * block]
+    if region.size:
+        row_mean = region.mean(axis=1)
+        col_mean = region.mean(axis=0)
+        pure_rows = (region.std(axis=1) < 1.0) & ((row_mean < 4.0) | (row_mean > 251.0))
+        pure_cols = (region.std(axis=0) < 1.0) & ((col_mean < 4.0) | (col_mean > 251.0))
+    else:
+        pure_rows = pure_cols = None
+    core_y_lo, core_y_hi, peak_y = _activity_core(row_density, block, h, pure_rows)
+    core_x_lo, core_x_hi, peak_x = _activity_core(col_density, block, w, pure_cols)
+    core_y_lo, core_y_hi, peak_y = core_y_lo + by1 * block, core_y_hi + by1 * block, peak_y + by1 * block
+    core_x_lo, core_x_hi, peak_x = core_x_lo + bx1 * block, core_x_hi + bx1 * block, peak_x + bx1 * block
+    core_y_hi, peak_y = min(h, core_y_hi), min(h - 1, peak_y)
+    core_x_hi, peak_x = min(w, core_x_hi), min(w - 1, peak_x)
+    details: Dict[str, Dict[str, Any]] = {}
+    outer = [0, 0, w, h]
+
+    def refine_axis(axis: str, lo: int, hi: int, peak: int) -> Tuple[int, int]:
+        if axis == "y":
+            seg = gray[:, lo:hi]
+            lap_seg = lap_abs[:, lo:hi]
+            feat_seg = feature[:, lo:hi] if feature is not None else None
+            n = h
+        else:
+            seg = gray[lo:hi, :].T
+            lap_seg = lap_abs[lo:hi, :].T
+            feat_seg = feature[lo:hi, :].T if feature is not None else None
+            n = w
+        if seg.shape[1] < 8:
+            return 0, n
+        first = _refine_low_edge(_edge_profiles(seg, lap_seg, feat_seg), peak, min_extent, min_border)
+        second = _refine_low_edge(
+            _edge_profiles(seg[::-1], lap_seg[::-1], feat_seg[::-1] if feat_seg is not None else None),
+            n - 1 - peak, min_extent, min_border,
+        )
+        new_a = int(first["edge"])
+        new_b = n - int(second["edge"])
+        low_name, high_name = ("top", "bottom") if axis == "y" else ("left", "right")
+        details[low_name] = first
+        details[high_name] = second
+        if axis == "y":
+            outer[1], outer[3] = int(first["outer_edge"]), n - int(second["outer_edge"])
+        else:
+            outer[0], outer[2] = int(first["outer_edge"]), n - int(second["outer_edge"])
+        return new_a, new_b
+
+    y1, y2 = refine_axis("y", core_x_lo, core_x_hi, peak_y)
+    x1, x2 = refine_axis("x", core_y_lo, core_y_hi, peak_x)
+    bbox = [x1, y1, x2, y2]
+    alternative: Optional[List[int]] = None
+    if outer != bbox and outer[0] <= bbox[0] and outer[1] <= bbox[1] and outer[2] >= bbox[2] and outer[3] >= bbox[3]:
+        margins = [bbox[0] - outer[0], bbox[1] - outer[1], outer[2] - bbox[2], outer[3] - bbox[3]]
+        limits = [w, h, w, h]
+        thin = all(m <= CONTENT_FLAT_MARGIN_MAX_FRACTION * lim for m, lim in zip(margins, limits))
+        if thin:
+            bbox = list(outer)
+        else:
+            alternative = list(outer)
+    return bbox, details, alternative
+
+
+def _content_rectangle_candidates(
+    img: np.ndarray,
+    original_size: Tuple[int, int],
+    subject_regions: List[List[int]],
+    subject_region_sources: List[str],
+    settings: DetectorSettings,
+) -> List[Dict[str, Any]]:
+    """Return crop candidates found from photo-like regions of the preview."""
+    maps = _block_feature_maps(img)
+    if not maps:
+        return []
+    h, w = img.shape[:2]
+    block = int(maps["block"])
+    scale_x = original_size[0] / float(w)
+    scale_y = original_size[1] / float(h)
+    min_extent = max(48, int(round(settings.min_content_px / max(scale_x, scale_y, 1e-6))))
+    min_border = max(3, int(round(settings.min_border_px / max(scale_x, scale_y, 1e-6))))
+
+    sharp = maps["sharp"]
+    active = (sharp > CONTENT_BLOCK_SHARP_MIN) | (maps["std"] > CONTENT_BLOCK_STD_MIN)
+    saturated = maps["sat"] > CONTENT_BLOCK_SAT_MIN
+    masks: List[Tuple[str, np.ndarray]] = [("sharp", active)]
+    # A saturated region inside a desaturated surround is a colour photo pasted
+    # on a monochrome/blurred duplicate.
+    if 0.03 <= float(saturated.mean()) <= 0.85:
+        masks.append(("saturation", saturated & active))
+
+    candidates: List[Dict[str, Any]] = []
+    seen: List[Tuple[int, int, int, int]] = []
+    sat_blocks = maps["sat"]
+    for mask_name, mask in masks:
+        for bx1, by1, bx2, by2, fill_ratio in _mask_rectangles(mask):
+            if mask_name == "saturation":
+                # Only a colour region inside a clearly less saturated surround
+                # is a pasted photo; skin on a colourful photo is not.
+                inside_sat = float(np.mean(sat_blocks[by1:by2, bx1:bx2]))
+                ring = max(1, int(round(0.06 * max(sat_blocks.shape))))
+                ring_mask = np.zeros(sat_blocks.shape, dtype=bool)
+                ring_mask[max(0, by1 - ring):by2 + ring, max(0, bx1 - ring):bx2 + ring] = True
+                ring_mask[by1:by2, bx1:bx2] = False
+                ring_sat = float(np.mean(sat_blocks[ring_mask])) if np.any(ring_mask) else inside_sat
+                if inside_sat < 40.0 or inside_sat < 1.8 * max(ring_sat, 1.0):
+                    continue
+            rect = (bx1 * block, by1 * block, min(w, bx2 * block), min(h, by2 * block))
+            bbox, details, alternative = _refine_rectangle(
+                maps, active, rect, min_extent, min_border,
+                feature=maps["sat_px"] if mask_name == "saturation" else None,
+            )
+            for variant_index, preview_bbox in enumerate([bbox] + ([alternative] if alternative else [])):
+                px1, py1, px2, py2 = [int(v) for v in preview_bbox]
+                if px2 - px1 < min_extent or py2 - py1 < min_extent:
+                    continue
+                if px1 <= 0 and py1 <= 0 and px2 >= w and py2 >= h:
+                    continue
+                key = (px1, py1, px2, py2)
+                if any(_bbox_iou(key, prior) >= 0.92 for prior in seen):
+                    continue
+                inside = active[py1 // block:max(py1 // block + 1, py2 // block), px1 // block:max(px1 // block + 1, px2 // block)]
+                inside_activity = float(inside.mean()) if inside.size else 0.0
+                if inside_activity < CONTENT_MIN_INSIDE_ACTIVITY:
+                    continue
+                cropped_sides = []
+                if px1 > 0:
+                    cropped_sides.append("left")
+                if py1 > 0:
+                    cropped_sides.append("top")
+                if px2 < w:
+                    cropped_sides.append("right")
+                if py2 < h:
+                    cropped_sides.append("bottom")
+                if not cropped_sides:
+                    continue
+                if mask_name == "saturation" and len(cropped_sides) < 4:
+                    # A pasted colour photo is surrounded on all sides; partial
+                    # rectangles are just saturated regions of the photo itself.
+                    continue
+                supports = []
+                seam_supports = []
+                for side in cropped_sides:
+                    info = details.get(side, {})
+                    cont = float(info.get("continuity", 0.0) or 0.0)
+                    synth = float(info.get("synthetic_share", 0.0) or 0.0)
+                    supports.append(max(cont, synth if cont < SEAM_CONTINUITY_ACCEPT else cont))
+                    seam_supports.append(cont)
+                mean_support = float(np.mean(supports)) if supports else 0.0
+                min_support = float(np.min(supports)) if supports else 0.0
+                min_seam = float(np.min(seam_supports)) if seam_supports else 0.0
+                confidence = 0.48 + 0.32 * mean_support + 0.14 * min_support
+                signals = [f"content_rect:{mask_name}", f"edge_support:{mean_support:.2f}", f"fill:{fill_ratio:.2f}"]
+                if variant_index == 1:
+                    signals.append("flat_photo_margin_kept")
+                if min_seam < SEAM_CONTINUITY_ACCEPT:
+                    # Accepted only through a synthetic band: never auto-apply.
+                    confidence = min(confidence, settings.high_confidence - 0.02)
+                    signals.append("edge_without_straight_seam")
+                bbox_original = _scale_preview_bbox_to_original(key, (w, h), original_size)
+                if bbox_original[2] - bbox_original[0] < settings.min_content_px or bbox_original[3] - bbox_original[1] < settings.min_content_px:
+                    continue
+                retained = ((px2 - px1) * (py2 - py1)) / float(max(1, w * h))
+                # A side that ends on a straight seam is the photo's own
+                # boundary; the subject cannot be cut there. Only sides that
+                # were accepted without a seam can intrude into the subject.
+                check_bbox = list(key)
+                for side in cropped_sides:
+                    cont_side = float(details.get(side, {}).get("continuity", 0.0) or 0.0)
+                    if cont_side >= SEAM_CONTINUITY_ACCEPT:
+                        if side == "left":
+                            check_bbox[0] = 0
+                        elif side == "top":
+                            check_bbox[1] = 0
+                        elif side == "right":
+                            check_bbox[2] = w
+                        else:
+                            check_bbox[3] = h
+                subject_safe, safety_flags = _bbox_preserves_subject(check_bbox, subject_regions, subject_region_sources)
+                if not subject_safe:
+                    confidence = min(confidence - 0.30, 0.57)
+                inset_all_sides = len(cropped_sides) == 4
+                outside_synthetic = all(
+                    float(details.get(side, {}).get("synthetic_share", 0.0) or 0.0) >= SYNTHETIC_BAND_SHARE_MIN
+                    for side in cropped_sides
+                )
+                seen.append(key)
+                candidates.append({
+                    "bbox": bbox_original,
+                    "preview_bbox": list(key),
+                    "sides": sorted(cropped_sides),
+                    "side_details": {side: dict(details.get(side, {})) for side in cropped_sides},
+                    "confidence": round(float(np.clip(confidence, 0.0, 0.97)), 5),
+                    "retained_area_ratio": round(retained, 5),
+                    "signals": signals + safety_flags,
+                    "face_safe": bool(subject_safe),
+                    "subject_safe": bool(subject_safe),
+                    "subject_protection_sources": sorted(set(subject_region_sources)),
+                    "edge_min_support": round(min_support, 4),
+                    "edge_mean_support": round(mean_support, 4),
+                    "inside_activity": round(inside_activity, 4),
+                    "content_source": mask_name,
+                    "inset_all_sides": inset_all_sides,
+                    "outside_synthetic": outside_synthetic,
+                })
+    return candidates
+
+
+def _bbox_iou(a: Iterable[int], b: Iterable[int]) -> float:
+    ax1, ay1, ax2, ay2 = [int(v) for v in a]
+    bx1, by1, bx2, by2 = [int(v) for v in b]
+    inter = max(0, min(ax2, bx2) - max(ax1, bx1)) * max(0, min(ay2, by2) - max(ay1, by1))
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / float(union) if union > 0 else 0.0
+
+
+def _bbox_contains(outer: Iterable[int], inner: Iterable[int], margin: int = 0) -> bool:
+    ox1, oy1, ox2, oy2 = [int(v) for v in outer]
+    ix1, iy1, ix2, iy2 = [int(v) for v in inner]
+    return ox1 <= ix1 - margin and oy1 <= iy1 - margin and ox2 >= ix2 + margin and oy2 >= iy2 + margin
+
+
+def _classify_content_candidate(candidate: Dict[str, Any], others: List[Dict[str, Any]], preview_size: Tuple[int, int]) -> str:
+    """Assign a UI crop type to a content-rectangle candidate."""
+    w, h = preview_size
+    bbox = candidate.get("preview_bbox") or [0, 0, w, h]
+    margin = max(2, int(round(0.02 * min(w, h))))
+    contained = any(
+        _bbox_contains(other.get("preview_bbox") or [0, 0, w, h], bbox, margin)
+        for other in others
+        if other is not candidate
+    )
+    if candidate.get("inset_all_sides") and (contained or not candidate.get("outside_synthetic")):
+        return "nested_inner_image"
+    sides = set(candidate.get("sides") or [])
+    if sides == {"top", "bottom"}:
+        return "story_bars"
+    if sides == {"left", "right"}:
+        return "side_canvas"
+    if len(sides) >= 3:
+        return "uniform_canvas"
+    if len(sides) == 1:
+        return "single_side_border"
+    return "multi_side_border"
+
+
 def _analyse_preview(
     preview: Image.Image,
     original_size: Tuple[int, int],
@@ -1395,12 +2034,141 @@ def _analyse_preview(
         return (subject_safe, float(item.get("ranking_score", 0.0)), retained, -residual)
 
     candidates.sort(key=_candidate_rank, reverse=True)
+    legacy_candidates = list(candidates)
 
+    # Content rectangles: photo-like regions found directly from feature maps.
+    # They cover nested photos, borders wider than a third of the image and
+    # dark photos on black chrome, which the side-seam analysis cannot reach.
+    content_candidates: List[Dict[str, Any]] = []
+    if settings.advanced_types:
+        try:
+            content_candidates = _content_rectangle_candidates(
+                img, original_size, subject_regions, subject_region_sources, settings
+            )
+        except Exception as exc:  # the legacy path must survive any detector error
+            content_candidates = []
+            layout_metrics["content_rect_error"] = f"{type(exc).__name__}: {exc}"
+    all_for_classification = content_candidates + legacy_candidates
+    for candidate in content_candidates:
+        candidate["crop_type"] = _classify_content_candidate(candidate, all_for_classification, (w, h))
+    # Drop legacy proposals that duplicate a content rectangle.
+    deduped_legacy = [
+        legacy for legacy in legacy_candidates
+        if not any(
+            _bbox_iou(legacy.get("preview_bbox") or [0, 0, w, h], content.get("preview_bbox") or [0, 0, w, h]) >= 0.90
+            for content in content_candidates
+        )
+    ]
+
+    def _content_rank(item: Dict[str, Any]) -> Tuple[int, int, float, float]:
+        subject_safe = 1 if bool(item.get("subject_safe", True)) else 0
+        nested = 1 if str(item.get("crop_type", "")) == "nested_inner_image" else 0
+        return (subject_safe, nested, float(item.get("confidence", 0.0)), -float(item.get("retained_area_ratio", 1.0)))
+
+    content_candidates.sort(key=_content_rank, reverse=True)
+    strong_content = [
+        c for c in content_candidates
+        if bool(c.get("subject_safe", True)) and float(c.get("confidence", 0.0)) >= settings.medium_confidence
+    ]
+    weak_content = [c for c in content_candidates if c not in strong_content]
+    # Innermost photo first (user policy), then the remaining proposals.
+    candidates = strong_content + deduped_legacy + weak_content
+    # When a content rectangle already leads with solid per-side support, the
+    # photo_regions refinements below only add alternatives behind it.
+    content_lead = bool(strong_content)
+
+    app_photo_candidates = []
+    if settings.advanced_types and bool(layout_metrics.get("app_screenshot")):
+        from photo_regions import app_photo_viewport, colour_inset_photo
+        viewport = app_photo_viewport(preview)
+        inset = colour_inset_photo(preview) if cv2 is not None else None
+        for box, signal in ((viewport,"app_photo_texture_viewport"),(inset,"colour_inset_photo")):
+            if not box:
+                continue
+            original_box = _scale_preview_bbox_to_original(box,(w,h),original_size)
+            safe,_ = _bbox_preserves_faces(box,faces)
+            if safe and min(original_box[2]-original_box[0],original_box[3]-original_box[1]) >= settings.min_content_px:
+                app_photo_candidates.append({"bbox":original_box,"preview_bbox":box,"sides":["inner_photo"],
+                    "side_details":{},"confidence":.74,"face_safe":True,
+                    "retained_area_ratio":(box[2]-box[0])*(box[3]-box[1])/(w*h),
+                    "signals":[signal],"crop_type":"nested_inner_image"})
+
+    if settings.advanced_types and candidates and nested_context and not content_lead:
+        from photo_regions import expand_photo_region, refine_photo_region
+        expanded = expand_photo_region(preview, candidates[0]["preview_bbox"])
+        if expanded:
+            recovered = dict(candidates[0])
+            recovered.update(
+                bbox=_scale_preview_bbox_to_original(expanded["bbox"], (w, h), original_size),
+                preview_bbox=expanded["bbox"], retained_area_ratio=round(expanded["area"], 5),
+                confidence=.74, crop_type="nested_inner_image",
+                signals=["photo_area_recovered"], side_details={},
+            )
+            candidates.insert(0, recovered)
+        refined = refine_photo_region(preview, candidates[0]["preview_bbox"])
+        if refined:
+            photo_bbox = _scale_preview_bbox_to_original(refined["bbox"], (w,h), original_size)
+            face_safe, _ = _bbox_preserves_faces(refined["bbox"], faces)
+            if face_safe and min(photo_bbox[2]-photo_bbox[0], photo_bbox[3]-photo_bbox[1]) >= settings.min_content_px:
+                candidates.insert(0, {
+                    "bbox": photo_bbox, "preview_bbox": refined["bbox"], "sides": ["inner_photo"],
+                    "side_details": {}, "confidence": .74, "face_safe": True,
+                    "retained_area_ratio": round(refined["area"],5),
+                    "signals": ["photo_region_refined", f"photo_seam_support:{refined['support']:.3f}"],
+                    "crop_type": "nested_inner_image",
+                })
+
+    if candidates and bool(layout_metrics.get("uniform_canvas")) and not content_lead:
+        from photo_regions import complete_black_frame
+        complete_frame = complete_black_frame(preview, min(min_border_x, min_border_y))
+        if complete_frame and complete_frame[1] >= min_border_y and h-complete_frame[3] >= min_border_y:
+            base = candidates[0]["preview_bbox"]
+            # Fill only an omitted outside edge. Never tighten an existing
+            # photo boundary or replace a recovered complete photo.
+            box = [complete_frame[i] if base[i] == (0 if i<2 else w if i==2 else h) else base[i] for i in range(4)]
+            completed = _scale_preview_bbox_to_original(box, (w,h), original_size)
+            safe, _ = _bbox_preserves_faces(box, faces)
+            if box != base and safe and min(completed[2]-completed[0], completed[3]-completed[1]) >= min(256, settings.min_content_px):
+                candidates.insert(0, {"bbox":completed,"preview_bbox":box,
+                    "sides":[side for side,distance in zip(("left","top","right","bottom"),(box[0],box[1],w-box[2],h-box[3])) if distance>0],
+                    "side_details":{},"confidence":.95,"face_safe":True,
+                    "retained_area_ratio":(box[2]-box[0])*(box[3]-box[1])/(w*h),
+                    "signals":["complete_black_frame"],"crop_type":"uniform_canvas"})
+
+    # Dedicated app domains supersede outer-shell crops; keep every previous
+    # alternative available. Both rules always require explicit review.
+    for choice in app_photo_candidates:
+        base = candidates[0] if candidates else None
+        outside_shell = bool(base and base["preview_bbox"][0]<=2 and base["preview_bbox"][2]>=w-2
+                             and base.get("crop_type") != "nested_inner_image")
+        if ("colour_inset_photo" in choice["signals"] or outside_shell) and not content_lead:
+            candidates.insert(0, choice)
+        else:
+            candidates.append(choice)
+        nested_candidates.insert(0,choice)
     best = candidates[0] if candidates else None
     confidence = float(best.get("confidence", 0)) if best else 0.0
     layout_flags: List[str] = []
-    if any(str(c.get("crop_type", "")) == "nested_inner_image" for c in candidates):
+    if best and min(best["bbox"][2]-best["bbox"][0], best["bbox"][3]-best["bbox"][1]) < settings.min_content_px:
+        layout_flags.append("content_below_minimum")
+    # Legacy side-seam proposals inside app screenshots get an extra seam
+    # check. Content-rectangle proposals already carry their own per-side
+    # support and cap their confidence when a side lacks a straight seam.
+    if (
+        best
+        and settings.advanced_types
+        and nested_context
+        and "complete_black_frame" not in best.get("signals", [])
+        and not best.get("content_source")
+    ):
+        from photo_regions import boundary_evidence as photo_boundary_evidence
+        seam_support, _ = photo_boundary_evidence(preview, best["preview_bbox"])
+        if seam_support and min(seam_support) < .60:
+            layout_flags.append("photo_boundary_uncertain")
+    if best and str(best.get("crop_type", "")) == "nested_inner_image":
         layout_flags.append("nested_inner_image_detected")
+    elif any(str(c.get("crop_type", "")) == "nested_inner_image" for c in candidates):
+        layout_flags.append("nested_inner_image_available")
     if bool(layout_metrics.get("app_screenshot")):
         layout_flags.append("nested_app_screenshot")
     best_kinds = {
@@ -1420,7 +2188,12 @@ def _analyse_preview(
         level = "low"
         recommendation = "keep_original"
     elif (
-        "nested_app_screenshot" in layout_flags
+        (
+            "nested_app_screenshot" in layout_flags
+            and float((best or {}).get("edge_min_support", 0.0) or 0.0) < 0.75
+        )
+        or "content_below_minimum" in layout_flags
+        or "photo_boundary_uncertain" in layout_flags
         or "overlay_crosses_frame_boundary" in layout_flags
         or "nested_inner_image_detected" in layout_flags
         or str((best or {}).get("crop_type", "")) == "nested_inner_image"
@@ -1603,16 +2376,52 @@ def materialize_crop(
     return destination
 
 
+def automatic_crop_bbox(analysis: Dict[str, Any], mode: str, allowed_types: Iterable[str]) -> Optional[List[int]]:
+    """One policy for the UI queue and the actual pipeline crop.
+
+    Complex layouts always require a decision, even if their type is allowed.
+    """
+    if set(analysis.get("layout_flags") or []) & {
+        "nested_app_screenshot", "nested_inner_image_detected", "overlay_crosses_frame_boundary",
+        "semantic_review_required",
+        "photo_boundary_uncertain",
+        "content_below_minimum",
+    } or analysis.get("layout_class") in {"collage", "circular_crop"} or analysis.get("crop_type") in {"nested_inner_image", "semantic_photo"}:
+        return None
+    level = analysis.get("confidence_level", "low")
+    eligible = (mode == "auto_high_review_medium" and level == "high") or (
+        mode == "auto_high_keep_medium" and level in {"high", "medium"}
+    )
+    bbox = analysis.get("candidate_bbox")
+    if eligible and analysis.get("crop_type") in set(allowed_types) and isinstance(bbox, list) and len(bbox) == 4:
+        return list(bbox)
+    return None
+
+
+def frame_needs_review(analysis: Dict[str, Any], mode: str, allowed_types: Iterable[str], user_decision: str = "auto") -> bool:
+    if user_decision != "auto":
+        return False
+    if automatic_crop_bbox(analysis, mode, allowed_types) is not None:
+        return False
+    return analysis.get("confidence_level") in {"high", "medium"} or analysis.get("recommendation") == "review"
+
+
 def resolve_frame_cleanup(
     image_path: str,
     source_hash: str,
     cache_dir: str,
     output_root: str,
-    mode: str = "auto_high_review_medium",
+    mode: str = "suggest_only",
     settings: Optional[DetectorSettings] = None,
     asset_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     analysis = analyze_frame_cleanup(image_path, cache_dir, source_hash, settings=settings, use_cache=True)
+    # Semantic proposals are optional, separately cached, and never auto-applied.
+    from vision_frames import load_photo_proposal, attach_photo_proposal
+    semantic = load_photo_proposal(cache_dir, source_hash)
+    if semantic:
+        analysis = dict(analysis)
+        attach_photo_proposal(analysis, semantic)
     user_payload = load_user_decisions(output_root)
     decisions = user_payload.get("decisions", {}) or {}
     normalized_asset_id = int(asset_id) if asset_id not in (None, "") and int(asset_id) > 0 else None
@@ -1627,18 +2436,17 @@ def resolve_frame_cleanup(
         applied_by = f"user_{user_decision}"
     elif user_decision == "keep_original":
         applied_by = "user_keep_original"
+    elif user_decision == "exclude":
+        applied_by = "user_exclude"
     else:
-        mode = str(mode or "auto_high_review_medium")
+        mode = str(mode or "suggest_only")
         crop_type = str(analysis.get("crop_type", "unknown") or "unknown")
-        allowed_types = {str(v) for v in (settings.auto_accept_types if settings else ())}
-        type_allowed = crop_type in allowed_types
-        if mode == "auto_high_review_medium" and analysis.get("confidence_level") == "high" and type_allowed:
-            bbox = analysis.get("candidate_bbox")
-            applied_by = f"auto_high:{crop_type}"
-        elif mode == "auto_high_keep_medium" and analysis.get("confidence_level") in {"high", "medium"} and type_allowed:
-            bbox = analysis.get("candidate_bbox")
-            applied_by = f"auto_high_or_medium:{crop_type}"
-        elif mode in {"auto_high_review_medium", "auto_high_keep_medium"} and analysis.get("confidence_level") in {"high", "medium"} and not type_allowed:
+        allowed_types = settings.auto_accept_types if settings else DetectorSettings().auto_accept_types
+        bbox = automatic_crop_bbox(analysis, mode, allowed_types)
+        if bbox is not None:
+            prefix = "auto_high" if mode == "auto_high_review_medium" else "auto_high_or_medium"
+            applied_by = f"{prefix}:{crop_type}"
+        elif mode in {"auto_high_review_medium", "auto_high_keep_medium"} and frame_needs_review(analysis, mode, allowed_types):
             applied_by = f"policy_review:{crop_type}"
         elif mode == "suggest_only":
             applied_by = "suggest_only"
@@ -1656,6 +2464,10 @@ def resolve_frame_cleanup(
         "frame_cleanup_applied": effective_path != image_path,
         "frame_cleanup_applied_by": applied_by,
         "frame_cleanup_user_decision": user_decision,
+        "dataset_excluded": user_decision == "exclude",
+        "frame_cleanup_review_pending": frame_needs_review(
+            analysis, mode, (settings or DetectorSettings()).auto_accept_types, user_decision
+        ),
         "frame_cleanup_bbox": [int(v) for v in bbox] if isinstance(bbox, list) and len(bbox) == 4 else None,
         "frame_cleanup_analysis": analysis,
     }
