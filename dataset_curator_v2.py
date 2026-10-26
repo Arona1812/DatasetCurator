@@ -12318,16 +12318,15 @@ def written_caption_errors(caption: str, facts: Dict[str, Any]) -> List[str]:
 
 
 def _caption_writer_cache_path(item: Dict[str, Any], facts: Dict[str, Any], reference: str) -> str:
-    from caption_writer import cache_key
+    from caption_writer import cache_key, writer_request
 
     image_key = str(item.get("effective_file_hash") or item.get("file_hash") or "")
     if not image_key:
         path = row_effective_image_path(item)
         image_key = file_sha1(path) if path and os.path.exists(path) else profile_image_id(item)
     key = cache_key(
-        facts,
+        writer_request(facts, image_target(TRAINING_TARGET).label, reference),
         f"{image_key}|{item.get('crop_variant') or 'original'}",
-        reference,
         {
             "primary": [KREA_CAPTION_MODEL, KREA_CAPTION_REASONING_EFFORT],
             "repair": [bool(USE_KREA_CAPTION_REPAIR), KREA_CAPTION_REPAIR_MODEL, KREA_CAPTION_REPAIR_REASONING_EFFORT],
