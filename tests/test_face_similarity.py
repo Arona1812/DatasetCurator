@@ -1,5 +1,5 @@
 """Face similarity before selection, with synthetic embeddings only:
-python -m unittest test_face_similarity -v."""
+python -m unittest tests.test_face_similarity -v."""
 import tempfile
 import unittest
 from pathlib import Path

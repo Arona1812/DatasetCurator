@@ -92,7 +92,7 @@ Geprüft wurden automatische und manuelle Zuschnitte, Original behalten, Ausschl
 
 Dabei wurden zwei Ablaufprobleme korrigiert: Ausschlüsse greifen jetzt vor der Duplikatauswahl und verändern deren Cache-Fingerprint. Frühere Prioritätsmarkierungen oder Trainingsrollen aus dem Profil können explizit in Frames ausgeschlossene Bilder nicht mehr in die Trainingsauswahl zurückholen. Zur Wiederaufnahme muss zuerst der Ausschluss in Frames aufgehoben werden.
 
-Prüfaufruf: `python -m unittest test_curator_workflows test_photo_regions test_frame_group_review test_frames_controls test_frames_export`.
+Prüfaufruf: `python -m unittest tests.test_curator_workflows tests.test_photo_regions tests.test_frame_group_review tests.test_frames_controls tests.test_frames_export`.
 
 ## Separate Referenzprüfung vorbereitet
 

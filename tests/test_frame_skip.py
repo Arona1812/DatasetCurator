@@ -1,4 +1,4 @@
-"""Skipping the frame module after preflight: python -m unittest test_frame_skip -v."""
+"""Skipping the frame module after preflight: python -m unittest tests.test_frame_skip -v."""
 import json
 import tempfile
 import unittest

@@ -1,4 +1,4 @@
-"""Offline regressions for the export swap on locked folders: python -m unittest test_export_transaction -v."""
+"""Offline regressions for the export swap on locked folders: python -m unittest tests.test_export_transaction -v."""
 import os
 import tempfile
 import unittest

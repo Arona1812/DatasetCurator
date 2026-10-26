@@ -1,4 +1,4 @@
-"""Offline regressions for the live progress bar: python -m unittest test_run_progress -v."""
+"""Offline regressions for the live progress bar: python -m unittest tests.test_run_progress -v."""
 import sys
 import tempfile
 import textwrap

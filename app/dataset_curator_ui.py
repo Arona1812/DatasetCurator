@@ -177,9 +177,13 @@ def _normalize_lang(value: Optional[str]) -> str:
 # PFADE
 # ============================================================
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CURATOR_SCRIPT = os.path.join(SCRIPT_DIR, "dataset_curator_v2.py")
-VIDEO_SCRIPT = os.path.join(SCRIPT_DIR, "video_Processor.py")
+from project_paths import APP_DIR, PROJECT_ROOT
+
+# Project folder: settings, run configs, curator_env and the working directory
+# of child processes. The scripts themselves live in app/.
+SCRIPT_DIR = PROJECT_ROOT
+CURATOR_SCRIPT = os.path.join(APP_DIR, "dataset_curator_v2.py")
+VIDEO_SCRIPT = os.path.join(APP_DIR, "video_Processor.py")
 CURATOR_CONFIG = os.path.join(SCRIPT_DIR, "_ui_config.json")
 VIDEO_CONFIG = os.path.join(SCRIPT_DIR, "_ui_video_config.json")
 SETTINGS_PATH = os.path.join(SCRIPT_DIR, "_ui_settings.json")
@@ -1728,7 +1732,7 @@ def preview_profile_caption(trigger_word, input_folder, raw_profile_json, filena
                                             "global_rules": stage.get("global_rules", {}),
                                             "cache_dir": os.path.join(output_root_for(input_folder, trigger_word), "_cache"),
                                             "preview_image_path": preview_image_path})
-            proc = subprocess.run([sys.executable, os.path.join(SCRIPT_DIR, "caption_preview.py"), request, result],
+            proc = subprocess.run([sys.executable, os.path.join(APP_DIR, "caption_preview.py"), request, result],
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if proc.returncode:

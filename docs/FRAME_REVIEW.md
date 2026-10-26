@@ -20,12 +20,12 @@ The optional AI photo-region finder sends the selected image to OpenAI and incur
 
 ## Reference benchmark for development
 
-`frame_benchmark.py` can make a separate local review page for manually confirmed photo boundaries. Use an output folder outside the source image folder:
+`benchmark/frame_benchmark.py` can make a separate local review page for manually confirmed photo boundaries. Use an output folder outside the source image folder:
 
 ```bash
-python frame_benchmark.py Datasets/frames Datasets/frame_finder_review/benchmark
+python benchmark/frame_benchmark.py Datasets/frames Datasets/frame_finder_review/benchmark
 ```
 
-Open the generated `review.html`, confirm or correct boundaries, then save the JSON references. These references are manual development data, not automatic truth. Optional HEIC/HEIF inputs need `requirements-benchmark.txt`; the normal curator handles JPG, PNG, WebP, and BMP.
+Open the generated `review.html`, confirm or correct boundaries, then save the JSON references. These references are manual development data, not automatic truth. Optional HEIC/HEIF inputs need `benchmark/requirements-benchmark.txt`; the normal curator handles JPG, PNG, WebP, and BMP.
 
-The scoring and comparison scripts are `frame_benchmark_score.py` and `frame_benchmark_compare.py`. Their measurements and current limitations are documented in [PROJECT_REVIEW.md](../PROJECT_REVIEW.md).
+The scoring and comparison scripts are `benchmark/frame_benchmark_score.py` and `benchmark/frame_benchmark_compare.py`. Their measurements and current limitations are documented in [PROJECT_REVIEW.md](PROJECT_REVIEW.md).

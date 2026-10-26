@@ -1,4 +1,9 @@
 """Render frozen validation results without changing proposals or references."""
+import os as _os
+import sys as _sys
+
+# The detector modules live in ../app.
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "app"))
 import argparse
 import base64
 from html import escape

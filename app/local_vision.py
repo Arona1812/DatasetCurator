@@ -45,7 +45,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     cv2 = None
 
-MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_models")
+MODEL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "_models")
 
 FACE_MODEL_FILENAME = "blaze_face_short_range.tflite"
 FACE_MODEL_URL = (

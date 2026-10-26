@@ -23,8 +23,9 @@ class FramesExport(unittest.TestCase):
     def setUpClass(cls):
         # Import-time config must never touch the user's saved dataset or key.
         cls.import_root = tempfile.TemporaryDirectory()
-        source = Path(__file__).with_name('dataset_curator_v2.py')
-        config_path = str(source.with_name('_ui_config.json'))
+        project = Path(__file__).resolve().parent.parent
+        source = project/'app'/'dataset_curator_v2.py'
+        config_path = str(project/'_ui_config.json')
         config = json.dumps({'INPUT_FOLDER': cls.import_root.name,
                              'TRIGGER_WORD': 'offline', 'API_KEY': '',
                              'ENABLE_CACHE': False, 'USE_AI_TRIGGERWORD_CHECK': False})

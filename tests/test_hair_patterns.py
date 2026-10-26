@@ -1,4 +1,4 @@
-"""Multi-colored hair: detection, profile canon and captions: python -m unittest test_hair_patterns -v."""
+"""Multi-colored hair: detection, profile canon and captions: python -m unittest tests.test_hair_patterns -v."""
 import unittest
 from unittest import mock
 

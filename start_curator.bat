@@ -105,7 +105,7 @@ if /I "%~1"=="--check-only" (
 )
 
 :: --- Step 3: Start UI ---
-if not exist "dataset_curator_ui.py" goto err_missing
+if not exist "app\dataset_curator_ui.py" goto err_missing
 
 echo Step 3 of 3: Starting UI
 echo.
@@ -117,7 +117,7 @@ echo ========================================
 echo.
 
 :run_ui
-python dataset_curator_ui.py
+python app\dataset_curator_ui.py
 
 :: Exit code 5 = UI requested restart (e.g. after language change)
 if %errorlevel%==5 (
@@ -136,7 +136,7 @@ exit /b 0
 :: ============================================================
 :verify_dependencies
 
-python check_runtime.py
+python app\check_runtime.py
 
 exit /b %errorlevel%
 
@@ -146,7 +146,7 @@ exit /b %errorlevel%
 :: ============================================================
 :verify_optional_dependencies
 
-python check_runtime.py --optional
+python app\check_runtime.py --optional
 
 exit /b %errorlevel%
 
@@ -270,10 +270,11 @@ exit /b 1
 
 :err_missing
 echo.
-echo ERROR: dataset_curator_ui.py not found
-echo Please copy the following files here:
-echo   - dataset_curator_ui.py
-echo   - dataset_curator_v2.py
-echo   - video_Processor.py
+echo ERROR: app\dataset_curator_ui.py not found
+echo Please update the program folder, e.g. with: git pull
+echo Expected files:
+echo   - app\dataset_curator_ui.py
+echo   - app\dataset_curator_v2.py
+echo   - app\video_Processor.py
 pause
 exit /b 1

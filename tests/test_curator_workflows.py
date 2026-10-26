@@ -1,4 +1,4 @@
-"""Offline regressions: run with python -m unittest test_curator_workflows -v."""
+"""Offline regressions: run with python -m unittest tests.test_curator_workflows -v."""
 import json
 import tempfile
 import unittest

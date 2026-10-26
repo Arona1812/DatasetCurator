@@ -1,4 +1,4 @@
-"""Natural sentences for training captions: python -m unittest test_caption_grammar -v."""
+"""Natural sentences for training captions: python -m unittest tests.test_caption_grammar -v."""
 import unittest
 
 import caption_grammar as grammar
