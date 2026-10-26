@@ -4003,7 +4003,9 @@ def build_run_config_from_ui_values(values: Tuple[Any, ...], *, continue_from_pr
         "USE_CLIP_DUPLICATE_SCORING": bool(v["use_clip"]),
         "USE_PHASH_DUPLICATE_SCORING": bool(v["use_phash"]),
         "PHASH_HAMMING_THRESHOLD": int(v["phash_threshold"]),
-        "CLIP_COSINE_THRESHOLD": float(v["clip_threshold"]),
+        # The slider sets the similarity from which two images always count as
+        # duplicates; below it, down to 0.96, only with matching shot and scene.
+        "CLIP_HARD_DUPLICATE_THRESHOLD": float(v["clip_threshold"]),
         "CLIP_MODEL_CHOICE": str(v["clip_model"] or "auto"),
         "ENABLE_SMART_PRECROP": bool(v["enable_smart_crop"]),
         "SMART_PRECROP_MIN_GAIN": float(v["crop_min_gain"]),
@@ -7026,14 +7028,14 @@ def build_ui() -> gr.Blocks:
                                         ),
                                     )
                                     c_clip_thresh = gr.Slider(
-                                        label=tr("CLIP-Ähnlichkeits-Schwelle", "CLIP similarity threshold"),
+                                        label=tr("CLIP: ab hier immer Duplikat", "CLIP: always a duplicate from here"),
                                         minimum=0.90,
                                         maximum=1.0,
                                         step=0.005,
                                         value=S["c_clip_thresh"],
                                         info=tr(
-                                            "Ab welcher Ähnlichkeit (0–1) zwei Bilder als inhaltlich gleich gelten. Empfohlen: 0.985 (konservativ, nur wirklich ähnliche werden gefiltert). Niedriger als 0.97 wird aggressiv und kann unterschiedliche Bilder derselben Person zusammenwerfen.",
-                                            "At what similarity (0–1) two images count as the same content. Recommended: 0.985 (conservative, only truly similar images get filtered). Below 0.97 becomes aggressive and may merge different images of the same person.",
+                                            "Ab dieser Ähnlichkeit (0–1) gilt ein Bild immer als Duplikat. Zwischen 0.96 und diesem Wert nur, wenn zusätzlich Aufnahmeart und Kleidung, Hintergrund oder Serie übereinstimmen. Empfohlen: 0.985. Niedriger als 0.97 wird aggressiv, etwa bei Spiegelselfies im selben Raum mit anderem Outfit.",
+                                            "From this similarity (0–1) an image always counts as a duplicate. Between 0.96 and this value only when shot type and clothing, background or series also match. Recommended: 0.985. Below 0.97 becomes aggressive, e.g. mirror selfies in the same room with another outfit.",
                                         ),
                                     )
 

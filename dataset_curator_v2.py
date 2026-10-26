@@ -504,18 +504,18 @@ USE_PHASH_DUPLICATE_SCORING = True
 
 PHASH_HAMMING_THRESHOLD = 8
 
-# Soft-Threshold: CLIP-Aehnlichkeit ab der ein Bild als near-duplicate gilt,
-# WENN zusaetzlich Metadaten-Match (gleicher Shot + gleiche Clothing/BG/Session)
-# zustimmt. Frueher 0.985 - praktisch nie ausgeloest. 0.96 fängt semantische
-# Naehe ohne dass unterschiedliche Outfits faelschlich verschmolzen werden.
+# Zwei Stufen der CLIP-Duplikatsuche:
+# - Soft: ab CLIP_COSINE_THRESHOLD nur dann Duplikat, wenn zusaetzlich
+#   Aufnahmeart UND Kleidung, Hintergrund oder Serie uebereinstimmen.
+# - Hard: ab CLIP_HARD_DUPLICATE_THRESHOLD immer Duplikat (Regler in der UI).
+# Die harte Schwelle muss UEBER der weichen liegen; frueher lag sie mit 0.92
+# darunter, verwarf damit jedes Paar ab 0.92 ohne Abgleich und machte die
+# weiche Stufe und den UI-Regler wirkungslos.
 CLIP_COSINE_THRESHOLD = 0.96
-
-# Hard-Threshold: Bei sehr hoher CLIP-Aehnlichkeit (>= 0.92) wird ohne
-# Metadaten-Bedingung als Duplicate gewertet. Schuetzt vor Style-Cluster-
-# Dominanz (z.B. 5 B/W-Closeups derselben Person mit minimal anderer Pose und
-# nominell unterschiedlicher Sweater-Beschreibung). Hard-Threshold MUSS unter
-# Soft-Threshold liegen.
-CLIP_HARD_DUPLICATE_THRESHOLD = 0.92
+CLIP_HARD_DUPLICATE_THRESHOLD = 0.985
+# Final-set guard: same shot, CLIP >= 0.90 and a similar outfit description.
+FINAL_CLIP_SCENE_THRESHOLD = 0.90
+FINAL_CLIP_SAME_OUTFIT_JACCARD = 0.45
 
 # Visual-Style-Diversity: Erkennt Konzentration von Bildern mit gleichem
 # Bild-Stil (B/W oder dominanter Farbstich) im Final-Set. Soft-Penalty,
@@ -8275,6 +8275,11 @@ def post_audit_reject_reason(row: Dict[str, Any]) -> str:
 
     if str(row.get("arcface_flag", "") or "").strip().lower() == "hard":
         parts.append("ArcFace hard identity flag")
+    if row.get("duplicate_of"):
+        method = str(row.get("duplicate_method", "") or "")
+        similarity = row.get("duplicate_distance", "")
+        label = f"CLIP {float(similarity):.3f}" if method.startswith("clip") and similarity != "" else method or "duplicate"
+        parts.append(f"duplicate of {row['duplicate_of']} ({label})")
 
     for field in ("local_override_reasons", "issues"):
         value = row.get(field)
@@ -10746,6 +10751,8 @@ def mark_duplicates(items: List[Dict[str, Any]]) -> None:
     """
     candidates = [i for i in items if i.get("base_status") in {"keep", "review"}]
     candidates.sort(key=lambda x: x.get("quality_total", 0), reverse=True)
+    hard_threshold = float(CLIP_HARD_DUPLICATE_THRESHOLD)
+    soft_threshold = min(float(CLIP_COSINE_THRESHOLD), hard_threshold)
 
     representatives: List[Dict[str, Any]] = []
 
@@ -10794,7 +10801,7 @@ def mark_duplicates(items: List[Dict[str, Any]]) -> None:
                 # Hard-Threshold: sehr hohe semantische Aehnlichkeit -> Duplicate
                 # OHNE Metadaten-Bedingung. Faengt z.B. mehrere Closeups derselben
                 # Person mit minimal anderer Pose / Beschreibung im selben Stil.
-                if sim >= CLIP_HARD_DUPLICATE_THRESHOLD:
+                if sim >= hard_threshold:
                     item["duplicate_of"] = rep["original_filename"]
                     item["duplicate_method"] = "clip_hard"
                     item["duplicate_distance"] = round(sim, 6)
@@ -10812,7 +10819,7 @@ def mark_duplicates(items: List[Dict[str, Any]]) -> None:
                 same_bg = item_bg == coarse_key(rep.get("background_description"), 3)
                 same_session = item_session == build_session_cluster_key(rep)
 
-                if sim >= CLIP_COSINE_THRESHOLD and same_shot and (same_clothing or same_bg or same_session):
+                if sim >= soft_threshold and same_shot and (same_clothing or same_bg or same_session):
                     item["duplicate_of"] = rep["original_filename"]
                     item["duplicate_method"] = "clip"
                     item["duplicate_distance"] = round(sim, 6)
@@ -10987,15 +10994,16 @@ def is_final_scene_duplicate(a: Dict[str, Any], b: Dict[str, Any]) -> Tuple[bool
     if str(a.get("shot_type", "") or "") != str(b.get("shot_type", "") or ""):
         return False, "", 0.0
 
-    # CLIP, if present, is the strongest signal. Keep the threshold lower than
-    # the global duplicate filter because this only runs inside the already
-    # selected final set.
+    clothing_sim = _token_jaccard(a.get("clothing_description"), b.get("clothing_description"))
+
+    # CLIP, if present, is the strongest signal. Inside the already selected
+    # set a lower similarity counts, but only with a similar outfit: the same
+    # mirror or room with another outfit is a different photo, not a duplicate.
     if USE_CLIP_DUPLICATE_SCORING and a.get("clip_embedding") is not None and b.get("clip_embedding") is not None:
         sim = clip_cosine(a.get("clip_embedding"), b.get("clip_embedding"))
-        if sim >= 0.90:
+        if sim >= float(CLIP_HARD_DUPLICATE_THRESHOLD) or (sim >= FINAL_CLIP_SCENE_THRESHOLD and clothing_sim >= FINAL_CLIP_SAME_OUTFIT_JACCARD):
             return True, "final_clip_scene", float(sim)
 
-    clothing_sim = _token_jaccard(a.get("clothing_description"), b.get("clothing_description"))
     background_sim = _token_jaccard(a.get("background_description"), b.get("background_description"))
     pose_sim = _token_jaccard(
         " ".join(str(a.get(f, "") or "") for f in ["pose_description", "expression", "gaze_direction"]),
