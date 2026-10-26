@@ -475,6 +475,17 @@ def training_target_choices():
     return [(t.label, t.key) for t in IMAGE_TARGETS.values()]
 
 
+def hair_pattern_choices() -> List[Tuple[str, str]]:
+    """Labels for the canonical hair pattern dropdown."""
+    return [
+        (tr("keines · einfarbig", "none · single color"), "none"),
+        (tr("Strähnen vorn (z. B. weiß)", "front streaks (e.g. white)"), "front_streaks"),
+        (tr("zweigeteilt (Split Dye)", "split dye (two halves)"), "split_dye"),
+        ("Highlights", "highlights"), ("Ombré", "ombre"), ("Balayage", "balayage"),
+        (tr("mehrfarbig", "multicolored"), "multicolor"),
+    ]
+
+
 def training_target_details_ui(value):
     """Explain in a short list what the selected training target controls."""
     target = image_target(value)
@@ -1036,6 +1047,8 @@ def _profile_summary_markdown(profile: Dict[str, Any]) -> str:
         f"**Body height impression:** {stable.get('body_height_impression', '-')}",
         f"**Appearance mode:** {profile.get('profile_appearance_mode', '-')}",
         f"**Canonical hair color:** {canonical.get('hair_color', '-')}",
+        f"**Canonical hair pattern:** {canonical.get('hair_pattern', 'none') or 'none'}"
+        + (f" ({canonical.get('hair_accent_color')})" if canonical.get("hair_accent_color") else ""),
         f"**Canonical beard:** {canonical.get('beard_pattern', '-') or '-'} / {canonical.get('beard_color', '-') or '-'}",
         "",
         f"**Glasses:** {glasses.get('canonical_description', '-') if glasses.get('wears_regularly') else 'not regular'}",
@@ -1244,6 +1257,7 @@ def _empty_editor_payload(status_msg: str) -> Tuple:
         tr("_Kein Cluster ausgewählt._", "_No cluster selected._"), [],
         "", gr.update(choices=IDENTITY_CLUSTER_ROLE_CHOICES, value="variation"),
         status_msg,
+        gr.update(value="none"), gr.update(value=""),  # hair pattern, accent color
     )
 
 
@@ -1538,11 +1552,14 @@ def load_profile_for_editor(trigger_word: str, input_folder: str):
             value=_identity_cluster_role_for_id(profile, str((_identity_cluster_by_id(profile) or {}).get("cluster_id", "") or "")),
         ),
         status,
+        gr.update(value=str(canonical.get("hair_pattern") or "none")),
+        gr.update(value=str(canonical.get("hair_accent_color") or "")),
     )
 
 
 
-def apply_profile_editor_values(profile, gender, skin_tone, eye_color, hair_texture, body_build, body_height_impression, hair_color_baseline, beard_pattern, beard_color, glasses_regular, glasses_desc, freckles_present, freckles_desc, piercing_table):
+def apply_profile_editor_values(profile, gender, skin_tone, eye_color, hair_texture, body_build, body_height_impression, hair_color_baseline, beard_pattern, beard_color, glasses_regular, glasses_desc, freckles_present, freckles_desc, piercing_table,
+                                hair_pattern=None, hair_accent_color=None):
     """Apply the same unsaved editor fields for preview and persistence."""
     profile = json.loads(json.dumps(profile))
     stable = profile.setdefault("stable_identity", {})
@@ -1558,6 +1575,10 @@ def apply_profile_editor_values(profile, gender, skin_tone, eye_color, hair_text
     canonical["eye_color"] = (eye_color or "").strip()
     canonical["beard_pattern"] = (beard_pattern or "").strip()
     canonical["beard_color"] = (beard_color or "").strip()
+    if hair_pattern is not None:
+        canonical["hair_pattern"] = (hair_pattern or "none").strip()
+    if hair_accent_color is not None:
+        canonical["hair_accent_color"] = (hair_accent_color or "").strip()
 
     markers = profile.setdefault("identity_markers", {})
     glasses = markers.setdefault("glasses", {"wears_regularly": False, "canonical_description": "", "frequency": ""})
@@ -1754,6 +1775,8 @@ def save_profile_from_editor(
     freckles_present: bool,
     freckles_desc: str,
     piercing_table: Any,
+    hair_pattern: Optional[str] = None,
+    hair_accent_color: Optional[str] = None,
 ) -> str:
     """Speichert die Editor-Werte zurueck ins _subject_profile.json.
 
@@ -1784,7 +1807,8 @@ def save_profile_from_editor(
     if not profile:
         return tr("❌ Kein Profil zum Speichern vorhanden.", "❌ No profile to save.")
 
-    profile = apply_profile_editor_values(profile, gender, skin_tone, eye_color, hair_texture, body_build, body_height_impression, hair_color_baseline, beard_pattern, beard_color, glasses_regular, glasses_desc, freckles_present, freckles_desc, piercing_table)
+    profile = apply_profile_editor_values(profile, gender, skin_tone, eye_color, hair_texture, body_build, body_height_impression, hair_color_baseline, beard_pattern, beard_color, glasses_regular, glasses_desc, freckles_present, freckles_desc, piercing_table,
+                                          hair_pattern, hair_accent_color)
 
     notes = profile.setdefault("normalizer_notes", [])
     if isinstance(notes, list):
@@ -8195,6 +8219,23 @@ def build_ui() -> gr.Blocks:
                                 interactive=True,
                                 allow_custom_value=True,
                             )
+                        with gr.Row():
+                            p_hair_pattern = gr.Dropdown(
+                                label=tr("Kanonisches Haarmuster", "Canonical hair pattern"),
+                                choices=hair_pattern_choices(),
+                                value="none",
+                                interactive=True,
+                                info=tr("Mehrfarbige Haare, die zum festen Look gehören, z. B. weiße Strähnen vorn oder links blond, rechts schwarz. Bilder, die davon abweichen, werden captioniert.",
+                                        "Multi-colored hair that belongs to the fixed look, e.g. white front streaks or blonde on one side, black on the other. Images that deviate are captioned."),
+                            )
+                            p_hair_accent = gr.Dropdown(
+                                label=tr("Zweitfarbe des Musters", "Second color of the pattern"),
+                                choices=[""] + PROFILE_VOCAB_HAIR_COLOR,
+                                value="",
+                                interactive=True,
+                                allow_custom_value=True,
+                                info=tr("Farbe der Strähnen bzw. der zweiten Hälfte.", "Color of the streaks or of the second half."),
+                            )
 
                         gr.Markdown(tr("**Brille (Identity Marker)**", "**Glasses (identity marker)**"))
                         with gr.Row():
@@ -8518,6 +8559,7 @@ def build_ui() -> gr.Blocks:
                     p_cluster_md, p_cluster_table, p_cluster_preview_md, p_cluster_gallery,
                     p_selected_cluster_id, p_cluster_role_editor,
                     p_status,
+                    p_hair_pattern, p_hair_accent,
                 ]
                 p_load_btn.click(
                     fn=load_profile_for_editor,
@@ -8532,7 +8574,8 @@ def build_ui() -> gr.Blocks:
                 p_editor_inputs = [p_trigger, p_input, p_raw_json,
                     p_gender, p_skin, p_eyes, p_hair_texture, p_body, p_body_height,
                     p_hair_color_baseline, p_beard_pattern, p_beard_color,
-                    p_glasses_regular, p_glasses_desc, p_freckles_present, p_freckles_desc, p_piercing_md]
+                    p_glasses_regular, p_glasses_desc, p_freckles_present, p_freckles_desc, p_piercing_md,
+                    p_hair_pattern, p_hair_accent]
                 p_caption_reload.click(fn=profile_caption_choices, inputs=[p_trigger, p_input], outputs=[p_caption_image_choice])
                 for main_control, profile_control in [(c_training_target, p_caption_target),
                                                       (c_captions, p_caption_fields),
@@ -8655,7 +8698,7 @@ def build_ui() -> gr.Blocks:
                         p_hair_color_baseline, p_beard_pattern, p_beard_color,
                         p_glasses_regular, p_glasses_desc,
                         p_freckles_present, p_freckles_desc,
-                        p_piercing_md,
+                        p_piercing_md, p_hair_pattern, p_hair_accent,
                     ],
                     outputs=[p_status],
                 )

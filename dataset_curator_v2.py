@@ -5777,7 +5777,16 @@ def get_hair_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_
 
     current_color = normalize_text(image_traits.get("hair_color_base", ""))
     current_modifier = normalize_text(image_traits.get("hair_color_modifier", ""))
+    current_accent = normalize_text(image_traits.get("hair_color_accent", ""))
+    if item.get("hair_description"):
+        # The audit text is the source; profiles built before the pattern
+        # detection existed carry older trait snapshots.
+        current_modifier = canonical_hair_color_modifier(item)
+        current_accent = canonical_hair_accent_color(item)
     current_form = normalize_text(image_traits.get("hair_form", ""))
+    baseline_pattern = normalize_text(canonical.get("hair_pattern", ""))
+    baseline_pattern = "" if baseline_pattern == "none" else baseline_pattern
+    baseline_accent = normalize_text(canonical.get("hair_accent_color", ""))
     baseline_color = normalize_text(canonical.get("hair_color", "")) or _stats_mode_token(color_stats)
     baseline_form = normalize_text(canonical.get("hair_form", "")) or _stats_mode_token(form_stats)
 
@@ -5802,21 +5811,33 @@ def get_hair_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_
     else:
         include_color = include_form = False
 
+    # The color pattern (streaks, split dye, highlights) follows the same rule
+    # as the color: its canonical form belongs to the trigger, deviations are named.
+    pattern_deviation = current_modifier != baseline_pattern or bool(
+        current_modifier and current_accent and baseline_accent and current_accent != baseline_accent)
+    if include_all or (include_variable and mode == "all_visible_when_variable"):
+        include_pattern = bool(current_modifier)
+    elif include_variable:
+        include_pattern = bool(current_color or current_modifier) and pattern_deviation
+    else:
+        include_pattern = False
+
     phrase = profile_hair_caption(current_color if include_color else "", current_form if include_form else "")
-    if current_modifier and (include_color or include_variable or include_all):
-        modifier_phrase = {
-            "blonde_highlights": "blonde highlights",
-            "red_highlights": "red highlights",
-            "highlights": "highlights",
-            "ombre": "ombre coloring",
-            "balayage": "balayage",
-        }.get(current_modifier, _phrase_from_token(current_modifier))
+    if include_pattern and current_modifier == "split_dye":
+        form_words = re.sub(r"\s*hair$", "", profile_hair_caption("", current_form if include_form else ""))
+        phrase = " ".join(x for x in [form_words, hair_pattern_phrase(current_modifier, current_accent, current_color)] if x)
+    elif include_pattern and current_modifier:
+        modifier_phrase = hair_pattern_phrase(current_modifier, current_accent, current_color)
         if phrase:
             phrase = f"{phrase} with {modifier_phrase}"
         elif current_color:
             phrase = f"{_phrase_from_token(current_color)} hair with {modifier_phrase}"
         else:
             phrase = modifier_phrase
+    elif include_pattern and baseline_pattern and current_color:
+        # Canonical streaks or split dye are missing in this image.
+        base_phrase = phrase or f"{_phrase_from_token(current_color)} hair"
+        phrase = f"{base_phrase} without {hair_pattern_phrase(baseline_pattern, baseline_accent, baseline_color)}"
     return {
         "phrase": phrase,
         "must_caption": bool(phrase),
@@ -5824,6 +5845,9 @@ def get_hair_feature_state(item: Dict[str, Any], profile: Dict[str, Any], image_
         "baseline": baseline_color,
         "current_form": current_form,
         "current_modifier": current_modifier,
+        "current_accent": current_accent,
+        "baseline_pattern": baseline_pattern,
+        "baseline_accent": baseline_accent,
         "baseline_form": baseline_form,
         "color_variable": color_variable,
         "form_variable": form_variable,
@@ -6109,7 +6133,8 @@ _HAIR_DESCRIPTORS = (
     r"brunette|blonde|blond|red|auburn|burgundy|ginger|copper|gray|grey|silver|white|pink|blue|green|purple|"
     r"bleached|dyed|highlighted|ombre|colored|coloured"
 )
-_HAIRSTYLE_WORDS = r"braids?|ponytail|pigtails|bun|updo|dreadlocks|cornrows|pixie cut|bob cut|bangs|fringe"
+_HAIRSTYLE_WORDS = (r"braids?|ponytail|pigtails|bun|updo|dreadlocks|cornrows|pixie cut|bob cut|bangs|fringe|"
+                    r"streaks|money piece|split-dyed|two-tone hair|highlights|balayage|ombre")
 
 
 def _describes_hair(caption: str) -> bool:
@@ -7396,6 +7421,10 @@ def canonical_hair_color(row: Dict[str, Any]) -> str:
         flags=re.IGNORECASE,
     )
     base_text = re.sub(r"\b(?:ombre|ombré|balayage)(?:\s+coloring)?\b", " ", base_text, flags=re.IGNORECASE)
+    # Front streaks name a second color ("platinum money piece"); it is not the base color.
+    base_text = re.sub(
+        r"\b(?:[a-z-]+[\s-]+)?(?:front |face[- ]framing )?(?:[a-z-]+ )?(?:streaks?|strands?|pieces?|sections?|money piece|skunk stripe)\b",
+        " ", base_text, flags=re.IGNORECASE)
     base_text = re.sub(r"\s+", " ", base_text).strip()
     text = base_text or text
     # Continue scanning the cleaned description for the underlying color.
@@ -7444,13 +7473,81 @@ def canonical_hair_color(row: Dict[str, Any]) -> str:
 
 
 
+# Multi-colored hair: two named colors split left/right, or contrasting
+# streaks at the front (money piece, face-framing strands, Rogue style).
+HAIR_PATTERN_VOCAB: List[str] = ["none", "front_streaks", "split_dye", "highlights", "blonde_highlights",
+                                 "red_highlights", "ombre", "balayage", "multicolor"]
+_HAIR_ACCENT_WORDS = {
+    "platinum": "platinum", "white": "white", "silver": "silver", "gray": "gray", "grey": "gray",
+    "blonde": "blonde", "blond": "blonde", "black": "black", "brown": "brown", "brunette": "dark_brown",
+    "red": "red", "copper": "copper", "auburn": "auburn", "burgundy": "burgundy", "pink": "pink",
+    "blue": "blue", "teal": "blue", "purple": "purple", "violet": "purple", "lilac": "purple",
+    "green": "green", "orange": "copper",
+}
+_SPLIT_DYE_RE = re.compile(
+    r"split[- ]dye[d]?|two[- ]tone[d]?|half[- ]and[- ]half|\bhalf\s+[a-z-]+[\s,-]+(?:and\s+)?half\s+[a-z-]+|"
+    r"\bone side\b[^.]{0,30}\bother side\b|\b(?:left|right) (?:side|half) (?:is |of (?:her|his|the) hair )?[a-z-]+"
+)
+_FRONT_STREAKS_RE = re.compile(
+    r"money piece|skunk stripe|face[- ]framing (?:[a-z-]+ )?(?:streaks?|strands?|pieces?|sections?|highlights?)|"
+    r"front (?:[a-z-]+ )?(?:streaks?|strands?|pieces?|sections?)|(?:streaks?|strands?|pieces?|sections?) (?:at|in|framing|around) (?:the |her |his )?(?:front|face)"
+)
+
+
+def _hair_text(row: Dict[str, Any]) -> str:
+    return normalize_text(" ".join([str(row.get("hair_description", "")), str(row.get("hair_texture", ""))]))
+
+
+def _second_hair_color(text: str, base: str, anchor: Optional["re.Match[str]"] = None) -> str:
+    """First named hair color that differs from the base; with an anchor, the one closest before or inside it."""
+    found = [(m.start(), _HAIR_ACCENT_WORDS[m.group(1)]) for m in re.finditer(r"\b(" + "|".join(_HAIR_ACCENT_WORDS) + r")\b", text)]
+    if anchor is not None:
+        near = [color for pos, color in found if pos <= anchor.end() and color != base]
+        if near:
+            return near[-1]
+    return next((color for _pos, color in found if color != base), "")
+
+
+def canonical_hair_accent_color(row: Dict[str, Any]) -> str:
+    """Second color of split-dyed hair or of front streaks; '' for other hair."""
+    pattern = canonical_hair_color_modifier(row)
+    if pattern not in {"split_dye", "front_streaks"}:
+        return ""
+    text = _hair_text(row)
+    anchor = _FRONT_STREAKS_RE.search(text) if pattern == "front_streaks" else None
+    return _second_hair_color(text, canonical_hair_color(row), anchor)
+
+
+def hair_pattern_phrase(pattern: str, accent: str = "", base: str = "") -> str:
+    """Natural phrase for a hair color pattern, e.g. 'white front streaks'."""
+    pattern = normalize_text(pattern)
+    accent_text, base_text = _phrase_from_token(accent), _phrase_from_token(base)
+    if pattern == "front_streaks":
+        return f"{accent_text} front streaks" if accent_text else "contrasting front streaks"
+    if pattern == "split_dye":
+        return f"split-dyed {base_text} and {accent_text} hair" if base_text and accent_text else "split-dyed two-tone hair"
+    return {
+        "blonde_highlights": "blonde highlights",
+        "red_highlights": "red highlights",
+        "highlights": "highlights",
+        "ombre": "ombre coloring",
+        "balayage": "balayage",
+        "multicolor": "multicolored hair",
+    }.get(pattern, _phrase_from_token(pattern))
+
+
 def canonical_hair_color_modifier(row: Dict[str, Any]) -> str:
-    text = normalize_text(" ".join([
-        str(row.get("hair_description", "")),
-        str(row.get("hair_texture", "")),
-    ]))
+    text = _hair_text(row)
     if not text:
         return ""
+    if _SPLIT_DYE_RE.search(text):
+        return "split_dye"
+    front = _FRONT_STREAKS_RE.search(text)
+    # "Loose strands framing her face" is a hairstyle; streaks need a second
+    # color or a word that always means color (streaks, money piece).
+    if front and (re.search(r"streaks?|money piece|skunk stripe", front.group(0))
+                  or _second_hair_color(text, canonical_hair_color(row), front)):
+        return "front_streaks"
     if _contains_any(text, ["balayage"]):
         return "balayage"
     if _contains_any(text, ["ombre", "ombré"]):
@@ -8039,6 +8136,7 @@ def per_image_profile_traits(row: Dict[str, Any], profile: Dict[str, Any]) -> Di
         "identity_cluster_role": row.get("identity_cluster_role", ""),
         "hair_color_base": canonical_hair_color(row),
         "hair_color_modifier": canonical_hair_color_modifier(row),
+        "hair_color_accent": canonical_hair_accent_color(row),
         "hair_form": canonical_hair_form(row),
         "hair_length": canonical_hair_length(row),
         "eye_color_base": canonical_eye_color(row) if eye_color_is_reliable(row) else "",
@@ -9102,6 +9200,20 @@ def attach_profile_variability_policies(profile: Dict[str, Any], rows: List[Dict
         canonical["hair_color"] = confirmed_canonical["hair_color"]
     if not normalize_text(canonical.get("hair_form", "")):
         canonical["hair_form"] = _weighted_trait_mode(trait_rows, "hair_form") or hair_form_stats.get("mode", "")
+    if "hair_pattern" in confirmed_canonical:
+        canonical["hair_pattern"] = confirmed_canonical.get("hair_pattern", "")
+        canonical["hair_accent_color"] = confirmed_canonical.get("hair_accent_color", "")
+    else:
+        # A pattern seen in at least half of the images with visible hair is
+        # part of the look (e.g. white front streaks); otherwise "none".
+        visible_patterns = [normalize_text(t.get("hair_color_modifier", "")) for t in trait_rows if normalize_text(t.get("hair_color_base", ""))]
+        pattern_counts = Counter(p for p in visible_patterns if p)
+        top_pattern, top_count = pattern_counts.most_common(1)[0] if pattern_counts else ("", 0)
+        canonical_pattern = top_pattern if visible_patterns and top_count / len(visible_patterns) >= 0.5 else "none"
+        canonical["hair_pattern"] = canonical_pattern
+        accents = Counter(normalize_text(t.get("hair_color_accent", "")) for t in trait_rows
+                          if normalize_text(t.get("hair_color_modifier", "")) == canonical_pattern and normalize_text(t.get("hair_color_accent", "")))
+        canonical["hair_accent_color"] = accents.most_common(1)[0][0] if accents else ""
     if "eye_color" in confirmed_canonical or "eye_color" in confirmed_stable:
         canonical["eye_color"] = confirmed_canonical.get("eye_color", confirmed_stable.get("eye_color", ""))
         if "eye_color" in confirmed_stable:
