@@ -5800,6 +5800,25 @@ def _normalize_asset_id(value: Any) -> int:
     return result if result > 0 else 0
 
 
+def clamp_slider_values(blocks: gr.Blocks) -> List[str]:
+    """Pull saved slider values back into the slider range.
+
+    Gradio rejects every event that reads a slider holding a value outside its
+    range, so one stale value in _ui_settings.json would break Start and Save.
+    Returns the labels of the adjusted sliders.
+    """
+    adjusted: List[str] = []
+    for block in blocks.blocks.values():
+        if not isinstance(block, gr.Slider) or not isinstance(block.value, (int, float)):
+            continue
+        clamped = min(max(block.value, block.minimum), block.maximum)
+        if clamped != block.value:
+            print(f"Setting '{block.label}': saved value {block.value} is outside {block.minimum}-{block.maximum}, using {clamped}.")
+            block.value = clamped
+            adjusted.append(str(block.label))
+    return adjusted
+
+
 def build_ui() -> gr.Blocks:
 
     S = load_settings()
@@ -9173,6 +9192,7 @@ def build_ui() -> gr.Blocks:
             all_save_inputs = [ui_language] + curator_inputs + video_inputs
             c_save_btn.click(fn=save_settings_fn, inputs=all_save_inputs, outputs=[c_status])
 
+    clamp_slider_values(app)
     return app
 
 
