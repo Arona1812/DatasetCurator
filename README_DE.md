@@ -2,7 +2,7 @@
 
 **Aus einem Ordner mit Personenfotos wird ein prüfbarer Trainingsdatensatz für Personen-LoRAs.** DatasetCurator ist eine lokale Weboberfläche zum Bereinigen und Auswählen von Bildern, zum Bilden eines Personenprofils und zum Exportieren passender Trainingscaptions.
 
-[English](README.md) · [Lizenz](LICENSE) · [Caption-Ablauf](CAPTION_PIPELINE.md)
+[English](README.md) · [Lizenz](LICENSE) · [Caption-Ablauf](docs/CAPTION_PIPELINE.md)
 
 ![DatasetCurator-Ablauf: Bilder laden, prüfen, Profil und Captions erstellen, Datensatz exportieren](docs/assets/workflow.svg)
 
@@ -49,7 +49,7 @@ python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python dataset_curator_ui.py
+python app/dataset_curator_ui.py
 ```
 
 Der Windows-Launcher ist der gepflegte Installationsweg. Bei der manuellen Installation benötigen optionales InsightFace und GPU-Pakete eine plattformspezifische Einrichtung. Siehe [Installationshinweise](docs/INSTALLATION.md).
@@ -67,8 +67,19 @@ In `01_train_ready` liegen die ausgewählten Bilder und gleichnamige `.txt`-Capt
 
 Die neun Trainingsziele sind Exportoptionen, keine neun bereits bewiesenen LoRA-Rezepte. ERNIE Image, Z-Image Base und Krea 2 Raw haben eigene Caption-Feld-Voreinstellungen; die übrigen starten derzeit mit allgemeinen, anpassbaren Regeln. Ideogram 4 verwendet einen experimentellen JSON-Export. **Prüfe Bilder und Captions vor dem Training.** Die Trainingsqualität wurde noch nicht für alle Ziele gemessen.
 
-Mehr Details: [Caption-Ablauf](CAPTION_PIPELINE.md), [Rahmen prüfen](docs/FRAME_REVIEW.md) und [Projektstand](PROJECT_REVIEW.md).
+Mehr Details: [Caption-Ablauf](docs/CAPTION_PIPELINE.md), [Rahmen prüfen](docs/FRAME_REVIEW.md) und [Projektstand](docs/PROJECT_REVIEW.md).
 Bei Fragen oder Problemen kannst du [ein GitHub-Issue eröffnen](https://github.com/Arona1812/DatasetCurator/issues).
+
+## Ordner
+
+| Ordner | Inhalt |
+|---|---|
+| `app/` | das Programm (Oberfläche, Pipeline, Rahmen-Detektor, Captions) |
+| `tests/` | Offline-Tests: `python -m unittest discover -s tests -t .` |
+| `benchmark/` | Entwicklungswerkzeuge für Messungen am Rahmen-Detektor |
+| `docs/` | Caption-Ablauf, Rahmenprüfung, Installation und Projektnotizen |
+
+Einstellungen (`_ui_settings.json`), Laufkonfigurationen, `curator_env` und geladene Modelle bleiben im Hauptordner.
 
 ## Datenschutz und Lizenz
 

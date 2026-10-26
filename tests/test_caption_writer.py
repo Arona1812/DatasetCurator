@@ -1,5 +1,5 @@
 """Luna caption writer on a real offline export, with simulated responses only:
-python -m unittest test_caption_writer -v."""
+python -m unittest tests.test_caption_writer -v."""
 import json
 import unittest
 from unittest.mock import patch

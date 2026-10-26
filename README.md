@@ -2,7 +2,7 @@
 
 **Turn a folder of person photos into a reviewable LoRA training dataset.** DatasetCurator is a local web app that helps you clean images, check identity consistency, build a person profile, and export images with training captions.
 
-[Deutsch](README_DE.md) · [License](LICENSE) · [Caption pipeline](CAPTION_PIPELINE.md)
+[Deutsch](README_DE.md) · [License](LICENSE) · [Caption pipeline](docs/CAPTION_PIPELINE.md)
 
 ![DatasetCurator workflow: import, review, profile and caption, export](docs/assets/workflow.svg)
 
@@ -49,7 +49,7 @@ python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python dataset_curator_ui.py
+python app/dataset_curator_ui.py
 ```
 
 The Windows launcher is the maintained setup path. The manual installation uses portable packages; optional InsightFace and GPU builds need platform-specific setup. See [installation notes](docs/INSTALLATION.md).
@@ -67,8 +67,19 @@ The Windows launcher is the maintained setup path. The manual installation uses 
 
 The nine targets are export choices, not nine proven LoRA recipes. ERNIE Image, Z-Image Base, and Krea 2 Raw have dedicated caption-field presets; the others currently start from general settings that you can change. Ideogram 4 uses an experimental JSON export. **Review the images and captions before training.** Training quality has not yet been measured across all targets.
 
-For deeper use, see the [caption workflow](CAPTION_PIPELINE.md), [frame review guide](docs/FRAME_REVIEW.md), and [current project status](PROJECT_REVIEW.md).
+For deeper use, see the [caption workflow](docs/CAPTION_PIPELINE.md), [frame review guide](docs/FRAME_REVIEW.md), and [current project status](docs/PROJECT_REVIEW.md).
 For questions or problems, [open a GitHub issue](https://github.com/Arona1812/DatasetCurator/issues).
+
+## Folder layout
+
+| Folder | Content |
+|---|---|
+| `app/` | the program (UI, pipeline, frame detector, captions) |
+| `tests/` | offline tests: `python -m unittest discover -s tests -t .` |
+| `benchmark/` | development tools for frame-detector measurements |
+| `docs/` | caption workflow, frame review, installation and project notes |
+
+Settings (`_ui_settings.json`), run configs, `curator_env` and downloaded models stay in the main folder.
 
 ## Privacy and license
 

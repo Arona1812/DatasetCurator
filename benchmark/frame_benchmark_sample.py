@@ -1,4 +1,9 @@
 """Freeze a validation selection without using detector scores or proposals."""
+import os as _os
+import sys as _sys
+
+# The detector modules live in ../app.
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "app"))
 import argparse
 import hashlib
 import json

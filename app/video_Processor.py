@@ -42,7 +42,8 @@ RUN_ID = ""
 CANCEL_FILE = ""
 
 # ── UI-Config Override ────────────────────────────────────────────────────────
-_UI_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_video_config.json")
+from project_paths import PROJECT_ROOT
+_UI_CONFIG_PATH = os.path.join(PROJECT_ROOT, "_ui_video_config.json")
 if os.path.exists(_UI_CONFIG_PATH):
     try:
         with open(_UI_CONFIG_PATH, "r", encoding="utf-8") as _f:

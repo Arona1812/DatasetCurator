@@ -33,9 +33,12 @@ curated_*/
 _cache/
 **/_cache/
 
-# Internal tests, regression suites and test assets
-# (the synthetic frame-detector suite under tests/frame_detector is versioned)
+# Internal tests, regression suites and test assets. Versioned: the unit
+# tests directly in tests/ and the synthetic frame-detector suite; other
+# local test material in tests/ stays private.
 /tests/*
+!/tests/__init__.py
+!/tests/test_*.py
 !/tests/frame_detector/
 /tools/
 RegressionSuite/

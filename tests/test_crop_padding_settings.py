@@ -1,4 +1,4 @@
-"""Offline regressions for the headshot padding setting: python -m unittest test_crop_padding_settings -v."""
+"""Offline regressions for the headshot padding setting: python -m unittest tests.test_crop_padding_settings -v."""
 import json
 import tempfile
 import unittest

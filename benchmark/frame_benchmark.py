@@ -1,5 +1,10 @@
 """Build an offline reference review; never calls an API or changes sources."""
 from __future__ import annotations
+import os as _os
+import sys as _sys
+
+# The detector modules live in ../app.
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "app"))
 
 import argparse
 import base64

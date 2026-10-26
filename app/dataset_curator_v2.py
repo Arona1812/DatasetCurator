@@ -877,7 +877,8 @@ _caption_profile_for_target_bootstrap = caption_profile_for_training_target
 # ── UI-Config Override ────────────────────────────────────────────────────────
 # Wird von dataset_curator_ui.py geschrieben. Überschreibt die Standardwerte
 # oben mit den Werten aus der Weboberfläche. Ohne UI wird dieser Block ignoriert.
-_UI_CONFIG_PATH = os.environ.get("DATASET_CURATOR_CONFIG_PATH") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "_ui_config.json")
+from project_paths import PROJECT_ROOT as _PROJECT_ROOT
+_UI_CONFIG_PATH = os.environ.get("DATASET_CURATOR_CONFIG_PATH") or os.path.join(_PROJECT_ROOT, "_ui_config.json")
 # Interne Konstanten, die nie von der UI ueberschrieben werden duerfen.
 # IG_FRAME_CACHE_VERSION insbesondere: wenn der User eine alte UI-Config mit
 # einer veralteten Version auf den Curator losliesse, wuerden alte Caches

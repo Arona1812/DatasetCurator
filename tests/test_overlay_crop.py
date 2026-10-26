@@ -1,5 +1,5 @@
 """Overlay crop: geometry and the audited replacement, offline only:
-python -m unittest test_overlay_crop -v."""
+python -m unittest tests.test_overlay_crop -v."""
 import tempfile
 import unittest
 from pathlib import Path

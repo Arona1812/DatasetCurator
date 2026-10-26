@@ -1,4 +1,4 @@
-"""CLIP duplicate rules with synthetic embeddings: python -m unittest test_duplicates -v."""
+"""CLIP duplicate rules with synthetic embeddings: python -m unittest tests.test_duplicates -v."""
 import unittest
 from unittest import mock
 

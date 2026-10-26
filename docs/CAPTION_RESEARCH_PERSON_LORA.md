@@ -2,7 +2,7 @@
 
 Recherche: 11.10.2026. Fokus: eine konkrete Person in neuen Posen, Kleidungen und Umgebungen reproduzieren. Kein Ausbau auf Stil-/Objekt-LoRAs oder Video. Dieses Dokument ist eine Forschungsgrundlage; Produktlogik wurde dafuer nicht weitergebaut, Modelle wurden nicht installiert und keine Bilder an APIs gesendet.
 
-Nachtrag 12.10.2026: Nach Freigabe des GPU-Speichers wurden die lokalen Captioner tatsaechlich auf 12 unveraenderten Bildkopien verglichen, einschliesslich dreier Florence-Stufen und Large-ft-Kontrolle. [Messwerte und begrenzte Sichtbewertung](Datasets/caption_benchmark/ASSESSMENT.md). Kein LoRA-Training; keine API-Bilduebertragung.
+Nachtrag 12.10.2026: Nach Freigabe des GPU-Speichers wurden die lokalen Captioner tatsaechlich auf 12 unveraenderten Bildkopien verglichen, einschliesslich dreier Florence-Stufen und Large-ft-Kontrolle. [Messwerte und begrenzte Sichtbewertung](../Datasets/caption_benchmark/ASSESSMENT.md). Kein LoRA-Training; keine API-Bilduebertragung.
 
 ## Evidenz richtig einordnen
 

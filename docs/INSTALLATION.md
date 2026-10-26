@@ -25,16 +25,19 @@ python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python dataset_curator_ui.py
+python app/dataset_curator_ui.py
 ```
 
 On Windows PowerShell, activate the environment with `.\.venv\Scripts\Activate.ps1`. The portable `requirements.txt` installs CPU-oriented defaults. GPU acceleration needs PyTorch and ONNX Runtime builds that match the computer's driver and platform. The launcher-specific CUDA packages are not installed by this command.
 
-## First-caption models
+## First descriptions
 
-
-To use the app without local captioner setup, select **GPT-6 Luna** as the first-description model in *Audit & Selection*. This sends the selected images to OpenAI and uses API credit. An OpenAI key is also required for image auditing, even when the first-description model runs locally. Local preflight and frame suggestions do not require an API key.
+GPT-6 Luna writes the first image descriptions; local captioners are no longer used. An OpenAI key is required for image audits and first descriptions. Local preflight and frame suggestions do not require an API key.
 
 ## Data and settings
 
 Choose an existing image folder in *Start / Project*. The curator writes its output to a separate `curated_<trigger>/` folder. Original images are not overwritten. The API key can be saved in `_ui_settings.json`, which Git ignores; keep that file private.
+
+## Folder layout and tests
+
+The program lives in `app/`; the Windows launcher starts `app\dataset_curator_ui.py`. Settings, run configs, `curator_env` and the downloaded models (`_models/`) stay in the main folder. Run the offline tests from the main folder with `python -m unittest discover -s tests -t .` and the frame-detector suite with `python -m pytest tests/frame_detector`.

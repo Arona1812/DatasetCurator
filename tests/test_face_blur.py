@@ -1,4 +1,4 @@
-"""Offline regressions for the face-sharpness check: python -m unittest test_face_blur -v."""
+"""Offline regressions for the face-sharpness check: python -m unittest tests.test_face_blur -v."""
 import tempfile
 import unittest
 from pathlib import Path
