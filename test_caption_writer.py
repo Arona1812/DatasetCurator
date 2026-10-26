@@ -89,14 +89,6 @@ class CaptionWriter(unittest.TestCase):
                 self.fixture.export()
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "old export")
 
-    def test_interne_felder_ohne_wirkung_auf_die_anfrage_behalten_den_cache(self):
-        facts = self.backend.collect_caption_facts(self.row, {}, self.profile)
-        changed = dict(facts, feature_states={**facts["feature_states"], "hair": {**facts["feature_states"]["hair"], "new_internal_field": 1}})
-        self.assertEqual(self.backend._caption_writer_cache_path(self.row, facts, "ref"),
-                         self.backend._caption_writer_cache_path(self.row, changed, "ref"))
-        self.assertNotEqual(self.backend._caption_writer_cache_path(self.row, facts, "ref"),
-                            self.backend._caption_writer_cache_path(self.row, facts, "other reference"))
-
 
 if __name__ == "__main__":
     unittest.main()

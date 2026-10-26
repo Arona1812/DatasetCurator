@@ -120,17 +120,12 @@ def rule_errors(caption: str, facts: Dict[str, Any]) -> List[str]:
     return errors
 
 
-def cache_key(request: Dict[str, Any], image_key: str, models: Dict[str, Any]) -> str:
-    """Key over exactly what the model sees (instructions, payload, image) and the models.
-
-    Internal fields of the caption facts that never reach the model do not
-    invalidate stored captions; any change to rules, profile phrases, scene
-    notes or the reference text does.
-    """
+def cache_key(facts: Dict[str, Any], image_key: str, reference: str, models: Dict[str, Any]) -> str:
+    """Key that changes with the image, the rule-derived facts, the reference text and the models."""
     return stable_hash({
         "version": PROMPT_VERSION,
         "image": image_key,
-        "instructions": request.get("instructions", ""),
-        "payload": request.get("payload", {}),
+        "facts": facts,
+        "reference": stable_hash(str(reference or "")),
         "models": models,
     })
