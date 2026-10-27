@@ -12,6 +12,10 @@ import os
 import sys
 from collections import Counter, defaultdict
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
+
+from shot_types import audit_shot_type, face_height_ratio, reconcile_shot_type
+
 SHOTS = ("headshot", "medium", "full_body")
 TRAIN_ROLES = {"core", "variation", "body_reference"}
 
@@ -107,12 +111,35 @@ def print_reject_reasons(rows: list) -> None:
         print(f"  {shot:<10} {top}")
 
 
+def print_reconciled(rows: list) -> None:
+    print("\nshot_type from the audit -> shot_type in the next run (face size and subtype):")
+    moves = Counter((audit_shot_type(r) or "(none)", reconcile_shot_type(r) or "(none)") for r in rows)
+    for (before, after), n in sorted(moves.items()):
+        print(f"  {before:<10} -> {after:<10} {n}")
+    after = Counter(reconcile_shot_type(r) for r in rows if text(r, "base_status") != "reject")
+    print("  usable (not reject) after correction: " + ", ".join(f"{s} {after.get(s, 0)}" for s in SHOTS))
+
+
+def print_face_heights(rows: list) -> None:
+    print("\nface height / image height per audit shot_type and subtype (median, n):")
+    groups = defaultdict(list)
+    for row in rows:
+        height = face_height_ratio(row)
+        if height is not None:
+            groups[(audit_shot_type(row), text(row, "frame_subtype") or "-")].append(height)
+    for (shot, subtype), values in sorted(groups.items()):
+        values.sort()
+        print(f"  {shot or '(none)':<10} {subtype:<20} {values[len(values) // 2]:.2f}  ({len(values)})")
+
+
 def main() -> None:
     folder = sys.argv[1] if len(sys.argv) > 1 else "."
     rows = load_rows(folder)
     print_table(stage_counts(rows))
     print_subtypes(rows)
     print_reject_reasons(rows)
+    print_face_heights(rows)
+    print_reconciled(rows)
 
 
 if __name__ == "__main__":
