@@ -59,6 +59,7 @@ from frame_cleanup import (
 )
 from preflight import ensure_asset_registry as ensure_project_asset_registry
 
+from shot_types import apply_shot_type
 from caption_grammar import (
     caption_opening as _caption_opening,
     descriptive_sentence as _descriptive_sentence,
@@ -2251,6 +2252,7 @@ def evaluate_overlay_crop(row: Dict[str, Any], image_path: str, file_hash: str, 
             "clip_embedding": compute_clip_embedding(crop_path, crop_hash) if USE_CLIP_DUPLICATE_SCORING else None,
         }
         crop_row.update(crop_audit)
+        apply_shot_type(crop_row, from_audit=True)
         crop_row["grundscore"] = crop_score
         crop_row["score_nach_eskalation"] = ""
         crop_row = apply_local_score_adjustments(crop_row)
@@ -13441,6 +13443,7 @@ def main() -> None:
                 )
 
             row.update(audit)
+            apply_shot_type(row, from_audit=True)
             # CSV-Audit: primaeren Score separat behalten. Falls spaeter eine
             # Review-Eskalation greift, wird quality_total durch das staerkere
             # Modell ueberschrieben; grundscore bleibt der Score der ersten
@@ -13477,6 +13480,7 @@ def main() -> None:
 
                 if not (escalated_audit.get("AUDIT_PROVIDER_REFUSAL") or escalated_audit.get("NSFW_BLOCKED")):
                     row.update(escalated_audit)
+                    apply_shot_type(row, from_audit=True)
                     row["score_nach_eskalation"] = row.get("quality_total", "")
                     row.setdefault("status_notes", []).append("review_escalation_applied")
                     row["audit_model_used"] = REVIEW_ESCALATION_MODEL
