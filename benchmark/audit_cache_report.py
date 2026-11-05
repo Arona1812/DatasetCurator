@@ -39,6 +39,12 @@ def explain(path: str, asset_id: int) -> tuple:
     effective_hash = v2.file_sha1(effective)
     label = "crop" if cropped else "original"
     if cached(effective_hash):
+        # A second entry for the same source shows that an earlier run
+        # audited another version of this image.
+        if cropped and cached(source_hash):
+            return "hit (crop), earlier also audited uncropped", frame.get("frame_cleanup_applied_by", "")
+        if any(cached(v2.file_sha1(p)) for p in other_crops(source_hash, effective if cropped else "")):
+            return f"hit ({label}), earlier also audited with another frame crop", ""
         return f"hit ({label})", ""
     if cropped and cached(source_hash):
         return "miss: cached for the uncropped original", frame.get("frame_cleanup_applied_by", "")
@@ -66,7 +72,7 @@ def main() -> None:
         asset_id = int(asset_ids.get(os.path.normcase(os.path.abspath(path)), 0) or 0)
         outcome, detail = explain(path, asset_id)
         results[outcome] += 1
-        if outcome.startswith("miss") and len(examples) < 12:
+        if (outcome.startswith("miss") or "earlier" in outcome) and len(examples) < 12:
             examples.append(f"  {os.path.basename(path)}: {outcome} {detail}".rstrip())
     print(f"\nImages: {len(paths)}")
     for outcome, count in results.most_common():
